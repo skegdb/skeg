@@ -1451,5 +1451,4 @@ mod tests {
         // recovered set contains exactly the disk-backed index.
         assert!(shards.vget("persist", 42).await.unwrap().is_some());
     }
-
 }
