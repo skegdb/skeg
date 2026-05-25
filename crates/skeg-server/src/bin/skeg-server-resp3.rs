@@ -1,18 +1,17 @@
 #![deny(unsafe_code)]
 
 //! skeg-server-resp3: same engine as the `skeg` binary (binary protocol),
-//! but speaks Redis wire (RESP2/RESP3) on the listener. M9 v0.1 surface item.
+//! but speaks Redis wire (RESP2/RESP3) on the listener.
 //!
 //! Differences from the `skeg` binary:
 //! - Default address `127.0.0.1:6379` (Redis port), not `7379`.
 //! - `Server::run_resp3()` instead of `run()`.
 //!
-//! Everything else matches: jemalloc + decay tuning, --data-dir, --mode
-//! serve, --tier for the tier-1 quantisation (int8 default, pq:M:K).
+//! This binary ships single-tenant. The multi-tenant flavour lives in
+//! a separate crate (`skeg-server-tenant`) under the BUSL-1.1 tenant
+//! repository, which installs a `TenantBackend` on top of this engine.
 
 use skeg_server::Server;
-#[cfg(feature = "tenant")]
-use skeg_server::tenant_ctx::TenantContext;
 use skeg_vector::QuantKind;
 use tracing_subscriber::EnvFilter;
 
@@ -81,31 +80,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?
     };
-    #[cfg(feature = "tenant")]
-    let server = if let Some(path) = cfg.tenant_auth.as_ref() {
-        let ctx = if cfg.tenant_strict {
-            tracing::info!("--tenant-auth {} (strict): anonymous HELLO rejected", path);
-            TenantContext::open_strict(path)?
-        } else {
-            tracing::info!(
-                "--tenant-auth {} (lenient): anonymous HELLO maps to ZERO",
-                path
-            );
-            TenantContext::open_lenient(path)?
-        };
-        server.with_tenant_ctx(ctx)
-    } else {
-        server
-    };
-
-    #[cfg(not(feature = "tenant"))]
-    let server = if cfg.tenant_auth.is_some() {
-        return Err(
-            "--tenant-auth requires a tenant-enabled build (cargo build -p skeg-server --features tenant)".into(),
-        );
-    } else {
-        server
-    };
     tracing::info!("skeg-resp3 listening on {}", server.local_addr()?);
     server.run_resp3().await?;
     Ok(())
@@ -136,24 +110,10 @@ struct Config {
     data_dir: String,
     serve: bool,
     tier: QuantKind,
-    /// Opt-in early-termination on the Vamana graph walk (see skeg-server
-    /// main for the recall/QPS trade). Forwarded as `SKEG_SPEED=1`.
     speed: bool,
-    /// Opt-in VSEARCH worker pool (Q11 / Tier 2). See skeg-server main for
-    /// the rationale. `0` = inline (default), `> 0` = dispatch via
-    /// `tokio::task::spawn_blocking`.
     workers: usize,
-    /// Opt-in TurboQuant tier paging (Position 2 of VeloANN discussion).
-    /// See skeg-server main for the rationale. Env var `SKEG_TIER_MMAP`.
     tier_mmap: bool,
-    /// Opt-in graph paging (Position 2.5). Env var `SKEG_GRAPH_MMAP`.
     graph_mmap: bool,
-    /// Path to the auth.kdb store. When set, HELLO 3 AUTH user pass is
-    /// honoured. Env var `SKEG_TENANT_AUTH`.
-    tenant_auth: Option<String>,
-    /// When `tenant_auth` is set, reject anonymous HELLO 3 (no AUTH).
-    /// Default: lenient (anonymous maps to TenantId::ZERO).
-    tenant_strict: bool,
 }
 
 impl Config {
@@ -177,11 +137,6 @@ impl Config {
             ),
             graph_mmap: matches!(
                 std::env::var("SKEG_GRAPH_MMAP").as_deref(),
-                Ok("1") | Ok("true") | Ok("on")
-            ),
-            tenant_auth: std::env::var("SKEG_TENANT_AUTH").ok(),
-            tenant_strict: matches!(
-                std::env::var("SKEG_TENANT_STRICT").as_deref(),
                 Ok("1") | Ok("true") | Ok("on")
             ),
         };
@@ -225,16 +180,6 @@ impl Config {
                 }
                 "--graph-mmap" => {
                     cfg.graph_mmap = true;
-                    i += 1;
-                }
-                "--tenant-auth" => {
-                    if let Some(v) = args.get(i + 1) {
-                        cfg.tenant_auth = Some(v.clone());
-                    }
-                    i += 2;
-                }
-                "--tenant-strict" => {
-                    cfg.tenant_strict = true;
                     i += 1;
                 }
                 _ => i += 1,

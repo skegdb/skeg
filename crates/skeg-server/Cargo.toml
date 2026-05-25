@@ -24,24 +24,12 @@ path = "src/main.rs"
 name = "skeg-resp3"
 path = "src/bin/skeg-server-resp3.rs"
 
-[features]
-default = []
-# Multi-tenant authentication, scoped keys, quota tracking. Off by
-# default: the engine ships single-tenant Apache-2.0. Enabling the
-# feature pulls in `skeg-tenant` (BUSL-1.1), which lives next to this
-# directory but outside the workspace.
-tenant = ["dep:skeg-tenant"]
-
 [dependencies]
 skeg-proto = { path = "../skeg-proto", version = "0.1.0" }
 skeg-core = { path = "../skeg-core", version = "0.1.0" }
 skeg-platform = { path = "../skeg-platform", version = "0.1.0" }
 skeg-vector = { path = "../skeg-vector", version = "0.1.0" }
 skeg-resp3 = { path = "../skeg-resp3", version = "0.1.0" }
-# skeg-tenant is BUSL-1.1 and not on crates.io. Resolved only when the
-# `tenant` feature is enabled. Path-only (no `version`) because the
-# crate is not published.
-skeg-tenant = { path = "../skeg-tenant", optional = true }
 socket2 = "0.5"
 tokio = { workspace = true }
 bytes = { workspace = true }

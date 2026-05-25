@@ -5,15 +5,15 @@
 #![allow(clippy::too_many_arguments)]
 
 //! `skeg-server` - TCP server library.
+//!
+//! Ships single-tenant by default. A separate crate (see the
+//! `tenant` module docs) can install a multi-tenant layer at runtime
+//! via [`Server::with_tenant_backend`].
 
 pub mod handler;
 pub mod resp3_handler;
 pub mod shard;
-#[cfg(feature = "tenant")]
-pub mod tenant_ctx;
-#[cfg(not(feature = "tenant"))]
-#[path = "tenant_ctx_stub.rs"]
-pub mod tenant_ctx;
+pub mod tenant;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -26,15 +26,15 @@ use handler::handle_connection;
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
 use skeg_vector::QuantKind;
-use tenant_ctx::TenantContext;
+pub use tenant::{AnonymousPolicy, TenantBackend, TenantId};
 
 pub struct Server {
     listener: TcpListener,
     shards: ShardSet,
-    /// Optional tenant configuration. `None` keeps single-tenant
-    /// semantics; wiring an `Arc<TenantContext>` enables RESP3 AUTH +
-    /// per-tenant key scoping on this listener.
-    tenant_ctx: Option<Arc<TenantContext>>,
+    /// Optional multi-tenant backend. `None` keeps single-tenant
+    /// semantics; wiring an `Arc<dyn TenantBackend>` enables RESP3
+    /// AUTH + per-tenant key scoping on this listener.
+    tenant_backend: Option<Arc<dyn TenantBackend>>,
 }
 
 impl Server {
@@ -116,15 +116,17 @@ impl Server {
         Ok(Self {
             listener,
             shards,
-            tenant_ctx: None,
+            tenant_backend: None,
         })
     }
 
-    /// Install a `TenantContext` on a server already built by one of the
-    /// `bind*` constructors. Builder-style for clarity at the call site.
+    /// Install a multi-tenant backend on a server already built by one
+    /// of the `bind*` constructors. Builder-style for clarity at the
+    /// call site. When set, the RESP3 handler honours `HELLO 3 AUTH`
+    /// and scopes KV / vector ops by tenant id.
     #[must_use]
-    pub fn with_tenant_ctx(mut self, ctx: Arc<TenantContext>) -> Self {
-        self.tenant_ctx = Some(ctx);
+    pub fn with_tenant_backend(mut self, backend: Arc<dyn TenantBackend>) -> Self {
+        self.tenant_backend = Some(backend);
         self
     }
 
@@ -187,7 +189,7 @@ impl Server {
         Ok(Self {
             listener,
             shards,
-            tenant_ctx: None,
+            tenant_backend: None,
         })
     }
 
@@ -215,7 +217,7 @@ impl Server {
         let Self {
             listener,
             shards,
-            tenant_ctx: _,
+            tenant_backend: _,
         } = self;
         info!(addr = ?listener.local_addr()?, n_shards = shards.n_shards(), "server listening (binary protocol)");
         loop {
@@ -239,21 +241,21 @@ impl Server {
         let Self {
             listener,
             shards,
-            tenant_ctx,
+            tenant_backend,
         } = self;
         info!(
             addr = ?listener.local_addr()?,
             n_shards = shards.n_shards(),
-            tenant = tenant_ctx.is_some(),
+            tenant = tenant_backend.is_some(),
             "server listening (RESP3)"
         );
         loop {
             let (stream, _) = listener.accept().await?;
             tune_socket(&stream);
             let shards = shards.clone();
-            let ctx = tenant_ctx.clone();
+            let backend = tenant_backend.clone();
             tokio::spawn(async move {
-                handle_connection_resp3(stream, shards, ctx).await;
+                handle_connection_resp3(stream, shards, backend).await;
             });
         }
     }
@@ -266,15 +268,9 @@ impl Server {
 /// swallowed because they don't prevent the connection from working
 /// (they just degrade tail-case behaviour).
 fn tune_socket(stream: &TcpStream) {
-    // TCP_NODELAY: skeg ops are small request/reply pairs; Nagle's
-    // algorithm only hurts us. tokio already does this in some paths
-    // but we set it explicitly to be sure.
     if let Err(e) = stream.set_nodelay(true) {
         warn!("set_nodelay failed: {e}");
     }
-    // Keepalive: 60s idle + 10s probe interval. Catches a peer that
-    // crashed / network partitioned in ~90s instead of the kernel
-    // default of 2-3 hours.
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(60))

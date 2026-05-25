@@ -31,7 +31,17 @@ use skeg_resp3::{
 };
 
 use crate::shard::ShardSet;
-use crate::tenant_ctx::{TenantContext, TenantId, scoped_vindex_name};
+use crate::tenant::{AnonymousPolicy, TenantBackend, TenantId};
+
+/// Format a VINDEX name with the tenant scope. `TenantId::ZERO` returns the
+/// raw name (single-tenant deployments stay byte-identical to pre-tenancy).
+fn scoped_vindex_name(tenant: TenantId, name: &str) -> String {
+    if tenant.is_zero() {
+        name.to_string()
+    } else {
+        format!("{tenant}::{name}")
+    }
+}
 
 /// Bytes that have been confirmed to carry the tenant scope (or to be
 /// part of the anonymous `ZERO` namespace). Constructed only via
@@ -87,13 +97,13 @@ fn scope_key(tenant: TenantId, key: &Bytes) -> ScopedKey {
 /// match a real bound tenant id. Without this check an anon client could
 /// craft `<tenant_id 16B><target_key>` to read or overwrite an
 /// authenticated tenant's scoped key (TenantId::from_name is a public
-/// non-secret hash). Single-tenant deployments (`tenant_ctx == None`)
+/// non-secret hash). Single-tenant deployments (`tenant_backend == None`)
 /// skip the check, so byte-layout stays identical to the pre-tenancy
 /// path.
 fn anon_key_collides_with_tenant(
     tenant: TenantId,
     key: &[u8],
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> bool {
     if !tenant.is_zero() || key.len() < TenantId::LEN {
         return false;
@@ -132,7 +142,7 @@ static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
 pub async fn handle_connection_resp3(
     mut stream: TcpStream,
     shards: ShardSet,
-    tenant_ctx: Option<Arc<TenantContext>>,
+    tenant_backend: Option<Arc<dyn TenantBackend>>,
 ) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, "RESP3 connection accepted");
@@ -166,7 +176,14 @@ pub async fn handle_connection_resp3(
 
         let response = match parse_command(frame) {
             Ok(cmd) => {
-                dispatch_command(cmd, &mut state, &mut tenant, &shards, tenant_ctx.as_ref()).await
+                dispatch_command(
+                    cmd,
+                    &mut state,
+                    &mut tenant,
+                    &shards,
+                    tenant_backend.as_ref(),
+                )
+                .await
             }
             Err(e) => Frame::Error(format!("ERR {e}")),
         };
@@ -186,22 +203,27 @@ async fn dispatch_command(
     state: &mut ConnectionState,
     tenant: &mut TenantId,
     shards: &ShardSet,
-    tenant_ctx: Option<&Arc<TenantContext>>,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     match cmd {
         Command::Hello(args) => {
-            // If AUTH is supplied and we have a tenant context wired in,
-            // verify the credentials before letting HELLO proceed. On
-            // success we stamp the resolved tenant on this connection.
-            if let Some(ctx) = tenant_ctx
-                && let Some((user, pass)) = args.auth.as_ref()
-            {
-                match ctx.verify_login(user, pass.as_bytes()) {
-                    Ok(tid) => {
-                        *tenant = tid;
-                    }
-                    Err(_) => {
-                        return Frame::Error("WRONGPASS invalid username-password pair".into());
+            // Verify credentials when AUTH is supplied. When AUTH is
+            // absent and the backend asks for `Strict`, reject the
+            // connection with -NOAUTH (RESP3 standard error).
+            if let Some(ctx) = tenant_backend {
+                match args.auth.as_ref() {
+                    Some((user, pass)) => match ctx.verify_login(user, pass.as_bytes()) {
+                        Some(tid) => *tenant = tid,
+                        None => {
+                            return Frame::Error("WRONGPASS invalid username-password pair".into());
+                        }
+                    },
+                    None => {
+                        if matches!(ctx.anonymous_policy(), AnonymousPolicy::Strict) {
+                            return Frame::Error(
+                                "NOAUTH authentication required (server is in strict mode)".into(),
+                            );
+                        }
                     }
                 }
             }
@@ -215,7 +237,7 @@ async fn dispatch_command(
                 args,
                 shards,
                 *tenant,
-                tenant_ctx,
+                tenant_backend,
             )
             .await
         }
@@ -227,22 +249,22 @@ async fn dispatch_unknown(
     args: Vec<Bytes>,
     shards: &ShardSet,
     tenant: TenantId,
-    tenant_ctx: Option<&Arc<TenantContext>>,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if let Some(rest) = name.strip_prefix("SKEG.") {
-        return dispatch_skeg(rest, args, shards, tenant, tenant_ctx).await;
+        return dispatch_skeg(rest, args, shards, tenant, tenant_backend).await;
     }
     match name {
-        "GET" => kv_get(&args, shards, tenant, tenant_ctx).await,
-        "SET" => kv_set(&args, shards, tenant, tenant_ctx).await,
-        "DEL" => kv_del(&args, shards, tenant, tenant_ctx).await,
-        "EXISTS" => kv_exists(&args, shards, tenant, tenant_ctx).await,
-        "MGET" => kv_mget(&args, shards, tenant, tenant_ctx).await,
-        "MSET" => kv_mset(&args, shards, tenant, tenant_ctx).await,
-        "INCR" => kv_incr_by(&args, shards, 1, tenant, tenant_ctx).await,
-        "DECR" => kv_incr_by(&args, shards, -1, tenant, tenant_ctx).await,
-        "INCRBY" => kv_incrby_arg(&args, shards, 1, tenant, tenant_ctx).await,
-        "DECRBY" => kv_incrby_arg(&args, shards, -1, tenant, tenant_ctx).await,
+        "GET" => kv_get(&args, shards, tenant, tenant_backend).await,
+        "SET" => kv_set(&args, shards, tenant, tenant_backend).await,
+        "DEL" => kv_del(&args, shards, tenant, tenant_backend).await,
+        "EXISTS" => kv_exists(&args, shards, tenant, tenant_backend).await,
+        "MGET" => kv_mget(&args, shards, tenant, tenant_backend).await,
+        "MSET" => kv_mset(&args, shards, tenant, tenant_backend).await,
+        "INCR" => kv_incr_by(&args, shards, 1, tenant, tenant_backend).await,
+        "DECR" => kv_incr_by(&args, shards, -1, tenant, tenant_backend).await,
+        "INCRBY" => kv_incrby_arg(&args, shards, 1, tenant, tenant_backend).await,
+        "DECRBY" => kv_incrby_arg(&args, shards, -1, tenant, tenant_backend).await,
         "SELECT" => kv_select(&args),
         other => Frame::Error(format!("ERR unknown command '{other}'")),
     }
@@ -256,12 +278,12 @@ async fn dispatch_skeg(
     args: Vec<Bytes>,
     shards: &ShardSet,
     tenant: TenantId,
-    tenant_ctx: Option<&Arc<TenantContext>>,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     match verb {
         "STATS" => skeg_stats(shards).await,
         "SHARDS" => skeg_shards(shards).await,
-        "WHOAMI" => skeg_whoami(tenant, tenant_ctx.is_some()),
+        "WHOAMI" => skeg_whoami(tenant, tenant_backend.is_some()),
         "AUTH" => skeg_auth(&args),
         "VINDEX.LIST" => skeg_vindex_list(shards, tenant).await,
         "VINDEX.CREATE" => skeg_vindex_create(&args, shards, tenant).await,
@@ -593,7 +615,7 @@ async fn kv_get(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.len() != 1 {
         return Frame::Error("ERR wrong number of arguments for 'GET'".into());
@@ -613,7 +635,7 @@ async fn kv_set(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.len() != 2 {
         return Frame::Error("ERR wrong number of arguments for 'SET'".into());
@@ -632,7 +654,7 @@ async fn kv_del(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'DEL'".into());
@@ -658,7 +680,7 @@ async fn kv_exists(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'EXISTS'".into());
@@ -701,7 +723,7 @@ async fn kv_mget(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'MGET'".into());
@@ -727,7 +749,7 @@ async fn kv_mset(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.is_empty() || args.len() % 2 != 0 {
         return Frame::Error("ERR wrong number of arguments for 'MSET'".into());
@@ -755,7 +777,7 @@ async fn kv_incr_by(
     shards: &ShardSet,
     sign: i64,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.len() != 1 {
         return Frame::Error("ERR wrong number of arguments for 'INCR/DECR'".into());
@@ -772,7 +794,7 @@ async fn kv_incrby_arg(
     shards: &ShardSet,
     sign: i64,
     tenant: TenantId,
-    ctx: Option<&Arc<TenantContext>>,
+    ctx: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
     if args.len() != 2 {
         return Frame::Error("ERR wrong number of arguments for 'INCRBY/DECRBY'".into());
@@ -817,6 +839,14 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet) -> Frame {
 
 #[cfg(test)]
 mod tests {
+    /// Local deterministic tenant id from a string. Mirrors what the
+    /// real tenant backend does (xxh3_128 of the name) for tests that
+    /// need stable ids without pulling in a full backend impl.
+    fn tid_from_name(name: &str) -> TenantId {
+        let h = xxhash_rust::xxh3::xxh3_128(name.as_bytes());
+        TenantId::from_bytes(h.to_le_bytes())
+    }
+
     use super::*;
     use tempfile::TempDir;
 
@@ -968,7 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn skeg_whoami_reports_resolved_tenant() {
-        let alice = TenantId::from_name("alice");
+        let alice = tid_from_name("alice");
         let f = skeg_whoami(alice, true);
         match f {
             Frame::Bulk(b) => {
@@ -986,8 +1016,8 @@ mod tests {
         // on disk: scope_key prefixes with the tenant id, so each lands
         // in a distinct entry in the shard.
         let (_dir, shards) = fresh_shards().await;
-        let alice = TenantId::from_name("alice");
-        let bob = TenantId::from_name("bob");
+        let alice = tid_from_name("alice");
+        let bob = tid_from_name("bob");
 
         let _ = kv_set(&args(&["k", "alice-value"]), &shards, alice, None).await;
         let _ = kv_set(&args(&["k", "bob-value"]), &shards, bob, None).await;
@@ -1006,8 +1036,8 @@ mod tests {
     #[tokio::test]
     async fn tenant_del_only_affects_own_namespace() {
         let (_dir, shards) = fresh_shards().await;
-        let alice = TenantId::from_name("alice");
-        let bob = TenantId::from_name("bob");
+        let alice = tid_from_name("alice");
+        let bob = tid_from_name("bob");
         let _ = kv_set(&args(&["k", "av"]), &shards, alice, None).await;
         let _ = kv_set(&args(&["k", "bv"]), &shards, bob, None).await;
 
@@ -1025,8 +1055,8 @@ mod tests {
         // Two tenants both incrementing the same logical key: counters
         // must advance independently.
         let (_dir, shards) = fresh_shards().await;
-        let alice = TenantId::from_name("alice");
-        let bob = TenantId::from_name("bob");
+        let alice = tid_from_name("alice");
+        let bob = tid_from_name("bob");
 
         for _ in 0..3 {
             let _ = kv_incr_by(&args(&["hits"]), &shards, 1, alice, None).await;
