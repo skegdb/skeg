@@ -16,6 +16,11 @@ on:
 # `dry_run` (manual trigger only) skips publish-crates and bump-homebrew
 # so you can validate the binary build pipeline without releasing.
 
+# `contents: write` is required by softprops/action-gh-release to
+# create/update the GitHub Release for the tag.
+permissions:
+  contents: write
+
 jobs:
   guard:
     # Reject tags that do not point at a commit reachable from `release`.
