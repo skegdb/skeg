@@ -1,0 +1,72 @@
+[package]
+name = "skeg-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Vector tier for skeg: Vamana graph, int8/PQ/TurboQuant quantizers, flat scan"
+readme = "../../README.md"
+keywords = ["vector-database", "ann", "vamana", "quantization", "skeg"]
+categories = ["database", "algorithms"]
+
+[dependencies]
+skeg-simd = { path = "../skeg-simd", version = "0.1.0" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.0" }
+parking_lot = { workspace = true }
+smallvec = { workspace = true }
+fixedbitset = { workspace = true }
+ahash = { workspace = true }
+ordered-float = { workspace = true }
+rand = { workspace = true }
+rayon = "1"
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "vamana"
+harness = false
+
+[[bench]]
+name = "flat_index"
+harness = false
+
+[[bench]]
+name = "cache_locality"
+harness = false
+
+[[bench]]
+name = "build_profile"
+harness = false
+
+[[bench]]
+name = "degree_histogram"
+harness = false
+
+[[bench]]
+name = "visit_skew"
+harness = false
+
+[[bench]]
+name = "pq_gate"
+harness = false
+
+[[bench]]
+name = "walk_visited"
+harness = false
+
+[[bench]]
+name = "tq_flat_gate"
+harness = false
+
+[[bench]]
+name = "tq_walk_gate"
+harness = false

@@ -1,0 +1,101 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip the publish steps (crates.io + brew bump). Build binaries only."
+        required: false
+        type: boolean
+        default: true
+
+# Three concurrent jobs: publish crates, build & upload binaries, then
+# (final) bump the Homebrew tap formula.
+#
+# `dry_run` (manual trigger only) skips publish-crates and bump-homebrew
+# so you can validate the binary build pipeline without releasing.
+
+jobs:
+  publish-crates:
+    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: publish library crates in dep order
+        # Note: skeg-server is NOT in this list because it depends on
+        # the private skeg-tenant crate which is not on crates.io. The
+        # server binary is distributed via GitHub Releases + Homebrew
+        # tap, not via `cargo install`.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          for crate in skeg-proto skeg-simd skeg-platform skeg-core skeg-vector skeg-resp3; do
+            echo "::group::publish $crate"
+            (cd crates/$crate && cargo publish --locked)
+            sleep 30
+            echo "::endgroup::"
+          done
+
+  build-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.1 targets aarch64 only. NEON SIMD kernels are aarch64-
+        # specific; x86_64 builds would compile via the scalar
+        # fallback and the published bench numbers would not apply.
+        # Add x86_64 once an AVX2 path lands.
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }} \
+            --bin skeg --bin skeg-resp3 -p skeg-server --locked
+      - name: package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz skeg skeg-resp3
+          shasum -a 256 skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+      - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push'
+        with:
+          files: |
+            target/${{ matrix.target }}/release/skeg-*.tar.gz
+            target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: skeg-${{ github.sha }}-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/skeg-*.tar.gz
+            target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
+
+  bump-homebrew:
+    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dawidd6/action-homebrew-bump-formula@v3
+        with:
+          token: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+          tap: skegdb/tap
+          formula: skeg
+          tag: ${{ github.ref }}
+          revision: ${{ github.sha }}

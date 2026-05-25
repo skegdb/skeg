@@ -1,0 +1,12 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    uses: skegdb/.github/.github/workflows/rust-ci.yml@main
+    with:
+      workspace: true
+      msrv: "1.86"

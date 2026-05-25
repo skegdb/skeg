@@ -1,0 +1,36 @@
+[package]
+name = "skeg-tenant"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "BUSL-1.1"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Hashing: argon2id for passwords (RAM-tunable cost).
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# HMAC-SHA256 for tokens (constant-time verify via subtle).
+hmac = "0.12"
+sha2 = "0.10"
+# Constant-time byte compare for token validation.
+subtle = "2.5"
+# Random nonce/salt material.
+rand = "0.9"
+
+# Persistence + IO
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+parking_lot = "0.12"
+ahash = "0.8"
+
+# Encoding for persistent records
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

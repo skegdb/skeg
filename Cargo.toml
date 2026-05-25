@@ -1,0 +1,96 @@
+[workspace]
+members = [
+    "crates/skeg-proto",
+    "crates/skeg-core",
+    "crates/skeg-simd",
+    "crates/skeg-platform",
+    "crates/skeg-vector",
+    "crates/skeg-server",
+    "crates/skeg-resp3",
+]
+# Fuzz targets live outside the workspace (own Cargo.toml).
+# skeg-tenant is excluded too: it ships under BUSL-1.1 from a separate
+# repository, and its source-tree presence here is for the optional
+# `tenant` feature in skeg-server only. It is not part of the Apache
+# engine workspace.
+exclude = ["fuzz", "crates/skeg-tenant"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Edition 2024 stabilised in 1.85; a few 1.86 niceties in use.
+rust-version = "1.86"
+license = "Apache-2.0"
+repository = "https://github.com/skegdb/skeg"
+homepage = "https://github.com/skegdb/skeg"
+authors = ["skeg contributors"]
+description = "RAM-frugal KV + vector store for Personal AI inference machines"
+keywords = ["vector-database", "kv-store", "personal-ai", "vamana", "ann"]
+categories = ["database", "data-structures"]
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Framing & bytes
+bytes = "1"
+bitflags = "2"
+
+# Hashing & checksum
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32c = "0.6"
+
+# Sync
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# Strutture
+smallvec = { version = "1", features = ["union"] }
+fixedbitset = "0.5"
+ahash = "0.8"
+
+# Float ordering
+ordered-float = "4"
+
+# Compressione
+lz4_flex = "0.11"
+
+# Platform
+libc = "0.2"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Allocator (Consolidation Hygiene): jemalloc returns freed pages to the OS
+# on a decay timer, so streaming-insert consolidation churn does not stay
+# pinned in RSS the way it does with the system allocator.
+tikv-jemallocator = "0.6"
+
+# Random
+rand = "0.9"
+
+# Error / log
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Test
+proptest = "1"
+tempfile = "3"
+
+# Bench
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+# Loopback / cross-repo integration tests live in the skeg-testing
+# repository (https://github.com/skegdb/skeg-testing). This workspace
+# is fully self-contained.

@@ -1,0 +1,24 @@
+[package]
+name = "skeg-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Platform abstractions (mmap, fsync, F_NOCACHE, F_FULLFSYNC) for skeg"
+readme = "../../README.md"
+keywords = ["mmap", "fsync", "platform", "skeg", "io"]
+categories = ["filesystem", "os::macos-apis", "os::unix-apis"]
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

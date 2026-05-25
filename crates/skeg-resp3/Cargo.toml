@@ -1,0 +1,20 @@
+[package]
+name = "skeg-resp3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "RESP3 (Redis-compatible) frame parser and encoder for skeg"
+readme = "../../README.md"
+keywords = ["resp3", "redis", "protocol", "skeg", "framing"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,40 @@
+[package]
+name = "skeg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+skeg-proto = { path = "../crates/skeg-proto" }
+skeg-core = { path = "../crates/skeg-core" }
+
+# Fuzz targets must each compile as a separate binary. Each `[[bin]]` entry
+# below maps to a file in `fuzz_targets/`. `test = false` and `doc = false`
+# match the cargo-fuzz convention.
+
+[[bin]]
+name = "fuzz_proto_frame"
+path = "fuzz_targets/fuzz_proto_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_vlog_record"
+path = "fuzz_targets/fuzz_vlog_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_index_snapshot"
+path = "fuzz_targets/fuzz_index_snapshot.rs"
+test = false
+doc = false
+bench = false

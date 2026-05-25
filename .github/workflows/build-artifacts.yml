@@ -1,0 +1,72 @@
+name: Build artifacts
+
+# On-demand build of release binaries for the 4 target platforms.
+# Triggered manually from the GitHub UI (workflow_dispatch) or on every
+# push to `main` (nightly-style). Artefacts uploaded to the workflow
+# run page; not attached to any GitHub Release and not tagged on
+# crates.io. Use this to smoke-test the build pipeline before tagging
+# a real release.
+#
+# To produce signed/published artefacts, push a tag matching `v*` and
+# the `release.yml` workflow takes over.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: "Suffix appended to the version label (e.g. nightly, rc1)"
+        required: false
+        default: "dev"
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 only (NEON SIMD path). See release.yml for the
+        # rationale.
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: install linux aarch64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: cargo build
+        run: |
+          cargo build --release --locked \
+            --target ${{ matrix.target }} \
+            --bin skeg --bin skeg-resp3 -p skeg-server
+      - name: package
+        id: pkg
+        run: |
+          SUFFIX="${{ github.event.inputs.version_suffix || 'dev' }}"
+          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          NAME="skeg-${SUFFIX}-${SHA}-${{ matrix.target }}"
+          cd target/${{ matrix.target }}/release
+          tar -czf "${NAME}.tar.gz" skeg skeg-resp3
+          shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+      - name: upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            target/${{ matrix.target }}/release/skeg-${{ github.event.inputs.version_suffix || 'dev' }}-*-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/skeg-${{ github.event.inputs.version_suffix || 'dev' }}-*-${{ matrix.target }}.tar.gz.sha256
+          retention-days: 14
