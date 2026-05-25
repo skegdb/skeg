@@ -8,9 +8,7 @@
 
 Vector database and context layer for AI agents. Multi-tenant, RAM-frugal.
 
-> **Pre-release.** The first public version (`v0.1.0`) is not tagged yet. The code in this repository builds and runs from source. There are no published packages and no release binaries.
->
-> **Hardware target.** skeg was written and optimised for Apple Silicon (M-series). The benchmarks below are from an M1. Native validation and architecture-specific optimisation for x86_64 (Linux, server hardware) will follow as soon as we have the hardware to test on. Building from source on x86_64 is expected to work, but the binary is not yet tuned for that architecture.
+> **Hardware target.** skeg was written and optimised for Apple Silicon (M-series). The benchmarks below are from an M1. Native validation and architecture-specific optimisation for x86_64 (Linux, server hardware) will follow as soon as we have the hardware to test on. The v0.1.0 release ships aarch64 binaries only (Apple Silicon, Linux ARM); the source builds on x86_64 but is not yet tuned for it.
 
 ## The point
 
@@ -45,11 +43,42 @@ The index lives on the SSD. The Vamana graph is walked on disk, with a small in-
 
 The substrate, the design decisions, and the eleven falsifications that produced this architecture are documented in [the series on the project blog](https://amanitaproject.com/).
 
-## Build from source
+## Install
 
-Build from source is the only install path right now. Distribution through a Homebrew custom tap, crates.io, and PyPI is in the roadmap.
+Three install paths are supported in v0.1.0. The Homebrew tap and the pre-built tarballs ship aarch64 binaries (Apple Silicon, Linux ARM); `cargo install` and the source build work on any host with a Rust toolchain.
 
-Requirements: Rust 1.86 or newer.
+### Homebrew (macOS and Linux ARM)
+
+```sh
+brew tap skegdb/tap
+brew install skeg
+```
+
+The formula installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd service definition.
+
+### Pre-built tarball
+
+```sh
+TARGET=aarch64-apple-darwin   # or aarch64-unknown-linux-gnu
+curl -L -o skeg.tar.gz \
+  "https://github.com/skegdb/skeg/releases/download/v0.1.0/skeg-v0.1.0-${TARGET}.tar.gz"
+tar -xzf skeg.tar.gz
+./skeg --help
+```
+
+SHA256 checksums are published alongside each tarball at the same URL with a `.sha256` suffix.
+
+### From crates.io
+
+```sh
+cargo install skeg-server
+```
+
+This compiles from source on the host machine and installs `skeg` and `skeg-resp3` into `$CARGO_HOME/bin`. Requires a Rust toolchain (MSRV 1.88).
+
+The published library crates are `skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-resp3`, `skeg-core`, `skeg-vector`, and `skeg-server`.
+
+### From source
 
 ```sh
 git clone https://github.com/skegdb/skeg
@@ -57,16 +86,18 @@ cd skeg
 cargo build --release --bin skeg --bin skeg-resp3
 ```
 
-The binaries are at `target/release/skeg` and `target/release/skeg-resp3`.
+Requirements: Rust 1.88 or newer. The binaries are at `target/release/skeg` and `target/release/skeg-resp3`.
 
 ## Quickstart
 
 Start the server. The native binary protocol listens on 7379; RESP3 listens on 6379.
 
 ```sh
-./target/release/skeg --data-dir ./data --addr 127.0.0.1:7379 &
-./target/release/skeg-resp3 --data-dir ./data --addr 127.0.0.1:6379 &
+skeg --data-dir ./data --addr 127.0.0.1:7379 &
+skeg-resp3 --data-dir ./data --addr 127.0.0.1:6379 &
 ```
+
+If you built from source, the binaries are at `./target/release/skeg` and `./target/release/skeg-resp3`.
 
 Key-value through any Redis client:
 
@@ -113,12 +144,10 @@ The vector payload in `VSET` and `VSEARCH` is a binary buffer in the native prot
 
 The components listed below are functional in development and validated against the same test suite as the engine. They are not in v0.1 because they need the stabilisation and release work that accompanies a first public version. They will be released in the weeks and months following v0.1.
 
-- Multi-tenant operations: prefix routing, per-tenant isolation, and the `HELLO 3 AUTH` authentication path with argon2id are implemented and tested. What remains is operational hardening for public release.
-- Distribution through a Homebrew custom tap (`brew tap skegdb/tap && brew install skeg`), crates.io for the Rust client, and PyPI for the Python SDK.
-- Companion repositories: Rust client, Python SDK, terminal dashboard, LlamaIndex and Ollama integrations, Gleam BEAM client.
+- Multi-tenant operations: prefix routing, per-tenant isolation, and the `HELLO 3 AUTH` authentication path with argon2id are implemented and tested. They ship in the BUSL-licensed `skeg-server-tenant` wrapper (separate repository) and are not part of the Apache-2.0 v0.1.0 surface.
+- Companion repositories: Rust client, Python SDK, terminal dashboard, LlamaIndex and Ollama integrations, Gleam BEAM client. PyPI distribution for the Python SDK will follow.
 - The benchmark harness repository.
-- Native validation and architecture-specific tuning for x86_64 (Linux server hardware). The current build runs through Docker; the SIMD path is NEON-only, the AVX2/AVX-512 equivalents need a machine to be written and benchmarked on.
-- Build artifacts for Linux aarch64 (cloud ARM instances).
+- Native validation and architecture-specific tuning for x86_64 (Linux server hardware). The v0.1.0 binaries are aarch64 only; the SIMD path is NEON-only, the AVX2/AVX-512 equivalents need a machine to be written and benchmarked on.
 
 ## Documentation
 
