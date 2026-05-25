@@ -70,3 +70,6 @@ harness = false
 [[bench]]
 name = "tq_walk_gate"
 harness = false
+
+[lints]
+workspace = true

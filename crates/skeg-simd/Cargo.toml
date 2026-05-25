@@ -22,3 +22,6 @@ criterion = { workspace = true }
 [[bench]]
 name = "distances"
 harness = false
+
+[lints]
+workspace = true

@@ -29,6 +29,13 @@ description = "RAM-frugal KV + vector store for Personal AI inference machines"
 keywords = ["vector-database", "kv-store", "personal-ai", "vamana", "ann"]
 categories = ["database", "data-structures"]
 
+[workspace.lints.clippy]
+# Two lints muted because their stable/unstable status flips across
+# the MSRV (1.88) and the toolchain newer contributors use. Keeping
+# them as warn-only would make CI green on one and red on the other.
+uninlined_format_args = "allow"   # 1.88 deny vs 1.93 noise; cosmetic
+manual_is_multiple_of = "allow"   # 1.93 asks for `.is_multiple_of()` which is unstable < 1.87
+
 [workspace.dependencies]
 # Async
 tokio = { version = "1", features = ["full"] }
