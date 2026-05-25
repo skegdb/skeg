@@ -57,11 +57,23 @@ jobs:
         # `skeg-server` is published since the open-core refactor moved
         # the multi-tenant layer to a separate BUSL crate. The
         # `skeg-tenant` wrapper consumes `skeg-server` from crates.io.
+        #
+        # The loop is idempotent: each crate is skipped if its version
+        # is already on crates.io. This lets a partially-failed run
+        # (e.g. rate limit on a single crate) be resumed by re-running
+        # the job without `cargo publish` erroring on the crates that
+        # already shipped.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "workspace version: $VERSION"
           for crate in skeg-proto skeg-simd skeg-platform skeg-resp3 skeg-core skeg-vector skeg-server; do
+            if curl -sf "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null 2>&1; then
+              echo "$crate $VERSION already on crates.io, skip"
+              continue
+            fi
             echo "::group::publish $crate"
             (cd crates/$crate && cargo publish --locked)
             sleep 30
