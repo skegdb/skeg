@@ -275,7 +275,7 @@ async fn dispatch_skeg(
 
 /// Parse a bulk-string argument as raw little-endian `f32` bytes.
 fn parse_vector(b: &Bytes) -> Result<Vec<f32>, &'static str> {
-    if !b.len().is_multiple_of(4) {
+    if b.len() % 4 != 0 {
         return Err("vector byte length must be a multiple of 4 (f32 LE)");
     }
     let mut out = Vec::with_capacity(b.len() / 4);
@@ -729,7 +729,7 @@ async fn kv_mset(
     tenant: TenantId,
     ctx: Option<&Arc<TenantContext>>,
 ) -> Frame {
-    if args.is_empty() || !args.len().is_multiple_of(2) {
+    if args.is_empty() || args.len() % 2 != 0 {
         return Frame::Error("ERR wrong number of arguments for 'MSET'".into());
     }
     for chunk in args.chunks(2) {

@@ -422,7 +422,7 @@ fn largest_pow2_factor(n: usize) -> usize {
     }
     let mut p = 1;
     let mut m = n;
-    while m.is_multiple_of(2) {
+    while m % 2 == 0 {
         p *= 2;
         m /= 2;
     }
@@ -504,11 +504,7 @@ pub(crate) fn tq4_adc_swar(code: &[u8], centroids: &[f32], q_rot: &[f32], dim: u
     let mut i = chunks * 16;
     while i < dim {
         let byte = code[i / 2];
-        let bucket = (if i.is_multiple_of(2) {
-            byte & 0x0F
-        } else {
-            byte >> 4
-        }) as usize;
+        let bucket = (if i % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as usize;
         acc += q_rot[i] * centroids[bucket];
         i += 1;
     }

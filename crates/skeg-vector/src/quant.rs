@@ -638,7 +638,7 @@ impl QuantizedVectors {
         let mut sample: Vec<f32> = Vec::with_capacity(sample_n * dim);
         let mut seen = 0usize;
         for_each_row(&mut |row| {
-            if seen.is_multiple_of(step) && sample.len() < sample_n * dim {
+            if seen % step == 0 && sample.len() < sample_n * dim {
                 let mut unit = vec![0.0f32; dim];
                 normalize_into(row, &mut unit);
                 sample.extend_from_slice(&unit);

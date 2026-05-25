@@ -118,7 +118,7 @@ impl MmapVectorSource {
         // The payload bytes are viewed as f32, so the start must be 4-byte
         // aligned. A memory map begins on a page boundary, so in practice this
         // reduces to `byte_offset` being a multiple of 4.
-        if !(mapped.as_bytes().as_ptr().addr() + byte_offset).is_multiple_of(4) {
+        if (mapped.as_bytes().as_ptr().addr() + byte_offset) % 4 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "vector payload is not 4-byte aligned for f32 access",
