@@ -326,7 +326,7 @@ pub fn tq4_adc_i8_scalar(
     let mut acc = 0.0f32;
     for i in 0..dim {
         let byte = code[i / 2];
-        let bucket = (if i.is_multiple_of(2) {
+        let bucket = (if i % 2 == 0 {
             byte & 0x0F
         } else {
             byte >> 4
@@ -415,7 +415,7 @@ pub fn tq4_adc_i8_neon(
     let tail_start = chunks * 16;
     for i in tail_start..dim {
         let byte = code[i / 2];
-        let bucket = (if i.is_multiple_of(2) {
+        let bucket = (if i % 2 == 0 {
             byte & 0x0F
         } else {
             byte >> 4
