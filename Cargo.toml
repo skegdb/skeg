@@ -20,7 +20,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 # Edition 2024 stabilised in 1.85; a few 1.86 niceties in use.
-rust-version = "1.86"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/skegdb/skeg"
 homepage = "https://github.com/skegdb/skeg"

@@ -10,4 +10,4 @@ jobs:
     uses: skegdb/.github/.github/workflows/rust-ci.yml@main
     with:
       workspace: true
-      msrv: "1.86"
+      msrv: "1.88"
