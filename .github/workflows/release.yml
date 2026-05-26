@@ -130,58 +130,77 @@ jobs:
             target/${{ matrix.target }}/release/skeg-*.tar.gz
             target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
 
-  # Two bump jobs, one per platform. Each runs on its own OS so that the
-  # Ruby `if OS.mac? ... elsif OS.linux?` block in Formula/skeg.rb is
-  # evaluated to the matching branch, and mislav/bump-homebrew-formula-action
-  # rewrites only that branch's url/sha256. The linux job needs the mac
-  # one (via needs:) to serialise pushes to the tap.
-
-  bump-homebrew-mac:
+  # Custom one-shot brew bump. mislav's action stops working on the
+  # second invocation because the version field is already at the
+  # target ("Skipping: the formula is already at version X"), which
+  # would leave the linux branch's sha256 stale. This job clones the
+  # tap, rewrites `version`, the mac sha256, and the linux sha256 in
+  # a single commit, then pushes. Both url lines are kept as the
+  # `v#{version}` template, so only the version + the two checksums
+  # ever need touching here.
+  bump-homebrew:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
     needs: build-binaries
-    runs-on: macos-latest
-    steps:
-      - name: fetch sha256 of darwin tarball
-        id: sha
-        run: |
-          curl -sLo /tmp/skeg.sha "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz.sha256"
-          echo "value=$(awk '{print $1}' /tmp/skeg.sha)" >> "$GITHUB_OUTPUT"
-      - uses: mislav/bump-homebrew-formula-action@v4
-        with:
-          formula-name: skeg
-          formula-path: Formula/skeg.rb
-          homebrew-tap: skegdb/homebrew-tap
-          tag-name: ${{ github.ref_name }}
-          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
-          download-sha256: ${{ steps.sha.outputs.value }}
-          create-pullrequest: false
-          create-branch: false
-          commit-message: |
-            skeg {{version}}: bump aarch64-apple-darwin sha256
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
-
-  bump-homebrew-linux:
-    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
-    needs: bump-homebrew-mac
     runs-on: ubuntu-latest
+    env:
+      FORMULA: Formula/skeg.rb
+      DOWNLOAD_BASE: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+      TARBALL_PREFIX: skeg-${{ github.ref_name }}
     steps:
-      - name: fetch sha256 of linux tarball
+      - name: fetch per-platform sha256 from the GitHub Release
         id: sha
         run: |
-          curl -sLo /tmp/skeg.sha "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz.sha256"
-          echo "value=$(awk '{print $1}' /tmp/skeg.sha)" >> "$GITHUB_OUTPUT"
-      - uses: mislav/bump-homebrew-formula-action@v4
-        with:
-          formula-name: skeg
-          formula-path: Formula/skeg.rb
-          homebrew-tap: skegdb/homebrew-tap
-          tag-name: ${{ github.ref_name }}
-          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
-          download-sha256: ${{ steps.sha.outputs.value }}
-          create-pullrequest: false
-          create-branch: false
-          commit-message: |
-            skeg {{version}}: bump aarch64-unknown-linux-gnu sha256
+          set -eo pipefail
+          MAC=$(curl -sL "${DOWNLOAD_BASE}/${TARBALL_PREFIX}-aarch64-apple-darwin.tar.gz.sha256" | awk '{print $1}')
+          LINUX=$(curl -sL "${DOWNLOAD_BASE}/${TARBALL_PREFIX}-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          [ -n "$MAC" ] && [ -n "$LINUX" ] || { echo "missing sha256"; exit 1; }
+          echo "mac=$MAC" >> "$GITHUB_OUTPUT"
+          echo "linux=$LINUX" >> "$GITHUB_OUTPUT"
+      - name: clone the tap
         env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+          TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: |
+          set -eo pipefail
+          git clone --depth=1 "https://x-access-token:${TOKEN}@github.com/skegdb/homebrew-tap.git" tap
+      - name: rewrite version + per-platform sha256
+        env:
+          MAC_SHA: ${{ steps.sha.outputs.mac }}
+          LINUX_SHA: ${{ steps.sha.outputs.linux }}
+        run: |
+          set -eo pipefail
+          VERSION_NO_V="${GITHUB_REF_NAME#v}"
+          python3 - "tap/${FORMULA}" "$VERSION_NO_V" "$MAC_SHA" "$LINUX_SHA" <<'PY'
+          import re, sys
+          path, version, mac_sha, linux_sha = sys.argv[1:5]
+          lines = open(path).read().split('\n')
+          state = None
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if re.match(r'if OS\.mac\?', stripped):
+                  state = 'mac'
+              elif re.match(r'elsif OS\.linux\?', stripped):
+                  state = 'linux'
+              elif stripped == 'end':
+                  state = None
+              if stripped.startswith('version "'):
+                  lines[i] = re.sub(r'"[^"]*"', f'"{version}"', line, count=1)
+              elif 'sha256 "' in line:
+                  sha = mac_sha if state == 'mac' else linux_sha if state == 'linux' else None
+                  if sha:
+                      lines[i] = re.sub(r'sha256 "[^"]*"', f'sha256 "{sha}"', line, count=1)
+          open(path, 'w').write('\n'.join(lines))
+          PY
+      - name: commit and push
+        run: |
+          set -eo pipefail
+          cd tap
+          git config user.name "skegdb-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add "$FORMULA"
+          if git diff --cached --quiet; then
+            echo "formula unchanged; nothing to commit"
+            exit 0
+          fi
+          VERSION_NO_V="${GITHUB_REF_NAME#v}"
+          git commit -m "skeg ${VERSION_NO_V}: bump version + aarch64 darwin/linux sha256"
+          git push origin main
