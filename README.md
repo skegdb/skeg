@@ -18,12 +18,12 @@ skeg is built for the opposite case: a machine where the language model already 
 
 The numbers below are from the same hardware that ran the model.
 
-| 1M vectors at recall@10 >= 0.95 |    RSS |     p99 |   qps |
-| ------------------------------- | -----: | ------: | ----: |
+| 1M vectors at recall@10 >= 0.95 |         RSS |     p99 |   qps |
+| ------------------------------- | ----------: | ------: | ----: |
 | skeg (pq:128:256)               | **419 MiB** |  3.6 ms |   489 |
-| skeg (int8)                     | 1252 MiB | 10.2 ms |   299 |
-| qdrant (hnsw)                   | 4162 MiB | 38.9 ms |   168 |
-| chroma (hnsw)                   | 4417 MiB |  9.7 ms |   196 |
+| skeg (int8)                     |    1252 MiB | 10.2 ms |   299 |
+| qdrant (hnsw)                   |    4162 MiB | 38.9 ms |   168 |
+| chroma (hnsw)                   |    4417 MiB |  9.7 ms |   196 |
 
 Four gigabytes against four hundred megabytes. The ten times that come back to you are not a benchmark trick. They are the memory you can give to a larger model, a longer context window, a second model loaded alongside the first, a vision encoder, a speech pipeline, the application doing the actual work. Or you can give them to nothing and let the operating system breathe.
 
@@ -45,7 +45,7 @@ The substrate, the design decisions, and the eleven falsifications that produced
 
 ## Install
 
-Three install paths are supported in v0.1.0. The Homebrew tap and the pre-built tarballs ship aarch64 binaries (Apple Silicon, Linux ARM); `cargo install` and the source build work on any host with a Rust toolchain.
+Three install paths. The Homebrew tap and the pre-built tarballs ship aarch64 binaries (Apple Silicon, Linux ARM); `cargo install` and the source build work on any host with a Rust toolchain.
 
 ### Homebrew (macOS and Linux ARM)
 
@@ -61,10 +61,13 @@ The formula installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd 
 ```sh
 TARGET=aarch64-apple-darwin   # or aarch64-unknown-linux-gnu
 curl -L -o skeg.tar.gz \
-  "https://github.com/skegdb/skeg/releases/download/v0.1.0/skeg-v0.1.0-${TARGET}.tar.gz"
+  "https://github.com/skegdb/skeg/releases/latest/download/skeg-$(curl -s https://api.github.com/repos/skegdb/skeg/releases/latest | grep tag_name | cut -d'"' -f4)-${TARGET}.tar.gz"
 tar -xzf skeg.tar.gz
 ./skeg --help
 ```
+
+Or pin a specific version from the
+[releases page](https://github.com/skegdb/skeg/releases).
 
 SHA256 checksums are published alongside each tarball at the same URL with a `.sha256` suffix.
 
@@ -169,7 +172,7 @@ Protocol and operational documentation will be added to this repository in the d
 
 ## Contributing
 
-Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before opening a pull request. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before opening a pull request.
 
 ## Security
 
