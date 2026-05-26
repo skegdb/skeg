@@ -130,15 +130,58 @@ jobs:
             target/${{ matrix.target }}/release/skeg-*.tar.gz
             target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
 
-  bump-homebrew:
+  # Two bump jobs, one per platform. Each runs on its own OS so that the
+  # Ruby `if OS.mac? ... elsif OS.linux?` block in Formula/skeg.rb is
+  # evaluated to the matching branch, and mislav/bump-homebrew-formula-action
+  # rewrites only that branch's url/sha256. The linux job needs the mac
+  # one (via needs:) to serialise pushes to the tap.
+
+  bump-homebrew-mac:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
     needs: build-binaries
+    runs-on: macos-latest
+    steps:
+      - name: fetch sha256 of darwin tarball
+        id: sha
+        run: |
+          curl -sLo /tmp/skeg.sha "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz.sha256"
+          echo "value=$(awk '{print $1}' /tmp/skeg.sha)" >> "$GITHUB_OUTPUT"
+      - uses: mislav/bump-homebrew-formula-action@v4
+        with:
+          formula-name: skeg
+          formula-path: Formula/skeg.rb
+          homebrew-tap: skegdb/homebrew-tap
+          tag-name: ${{ github.ref_name }}
+          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+          download-sha256: ${{ steps.sha.outputs.value }}
+          create-pullrequest: false
+          create-branch: false
+          commit-message: |
+            skeg {{version}}: bump aarch64-apple-darwin sha256
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+
+  bump-homebrew-linux:
+    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    needs: bump-homebrew-mac
     runs-on: ubuntu-latest
     steps:
-      - uses: dawidd6/action-homebrew-bump-formula@v3
+      - name: fetch sha256 of linux tarball
+        id: sha
+        run: |
+          curl -sLo /tmp/skeg.sha "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz.sha256"
+          echo "value=$(awk '{print $1}' /tmp/skeg.sha)" >> "$GITHUB_OUTPUT"
+      - uses: mislav/bump-homebrew-formula-action@v4
         with:
-          token: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
-          tap: skegdb/tap
-          formula: skeg
-          tag: ${{ github.ref }}
-          revision: ${{ github.sha }}
+          formula-name: skeg
+          formula-path: Formula/skeg.rb
+          homebrew-tap: skegdb/homebrew-tap
+          tag-name: ${{ github.ref_name }}
+          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/skeg-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
+          download-sha256: ${{ steps.sha.outputs.value }}
+          create-pullrequest: false
+          create-branch: false
+          commit-message: |
+            skeg {{version}}: bump aarch64-unknown-linux-gnu sha256
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
