@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bytes",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "memmap2",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags",
  "bytes",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-resp3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "proptest",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-simd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "proptest",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-vector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bytemuck",

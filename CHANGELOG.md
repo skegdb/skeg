@@ -8,6 +8,23 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.1.1] — 2026-05-26
+
+### Added
+
+- `skeg --help`, `skeg -h`, `skeg --version`, `skeg -V` (and the same on
+  `skeg-resp3`). The binaries now print a usage block and exit
+  cleanly instead of starting the server when these flags are
+  passed. Unblocks the canonical `brew install` smoke test.
+
+### Fixed
+
+- README quickstart used the wrong vector command syntax. All vector
+  operations are namespaced under `SKEG.*` and take positional args
+  (`SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`), not the
+  `VINDEX.CREATE docs DIM 1024 METRIC cosine` form that the previous
+  README implied.
+
 ## [Unreleased] — pre-release v0.1.0
 
 ### Added

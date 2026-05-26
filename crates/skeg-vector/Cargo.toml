@@ -13,8 +13,8 @@ keywords = ["vector-database", "ann", "vamana", "quantization", "skeg"]
 categories = ["database", "algorithms"]
 
 [dependencies]
-skeg-simd = { path = "../skeg-simd", version = "0.1.0" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.0" }
+skeg-simd = { path = "../skeg-simd", version = "0.1.1" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.1" }
 parking_lot = { workspace = true }
 smallvec = { workspace = true }
 fixedbitset = { workspace = true }

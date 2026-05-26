@@ -109,27 +109,34 @@ OK
 "hello"
 ```
 
-Vector operations: create an index, insert, search.
+Vector operations are namespaced under `SKEG.*` to stay out of the
+Redis command surface. Create an index, insert, search:
 
 ```text
-> VINDEX.CREATE docs DIM 1024 METRIC cosine
+> SKEG.VINDEX.CREATE docs 1024 int8 flat
 OK
-> VSET docs doc1 [0.12, 0.34, ...]
+> SKEG.VINDEX.LIST
+name=docs dim=1024 kind=int8 backend=flat n_vectors=0
+> SKEG.VSET docs doc1 <1024-float vector as bytes>
 OK
-> VSEARCH docs [0.13, 0.31, ...] LIMIT 10
+> SKEG.VSEARCH docs 10 100 <query vector bytes>
 1) doc1  0.987
 2) doc7  0.954
 ...
 ```
 
-The vector payload in `VSET` and `VSEARCH` is a binary buffer in the native protocol and a base64 string in RESP3. Protocol documentation will be published in this repository shortly.
+Command form: `SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>` where
+`kind` is `int8 | f32 | pq | tq1 | tq2 | tq4` and `backend` is
+`flat | disk`. The vector payload in `SKEG.VSET` and `SKEG.VSEARCH`
+is a raw byte buffer (native protocol) or a bulk string (RESP3).
+Protocol documentation will be published in this repository shortly.
 
 ## Status
 
 **Working today.**
 
 - KV operations on both protocols: `GET`, `SET`, `DEL`, `MGET`, `MSET`, `INCR`, `DECR`, `EXISTS`.
-- Vector operations on both protocols: `VINDEX.CREATE`, `VINDEX.DROP`, `VINDEX.LIST`, `VSET`, `VDEL`, `VSEARCH`.
+- Vector operations on both protocols: `SKEG.VINDEX.CREATE`, `SKEG.VINDEX.DROP`, `SKEG.VINDEX.LIST`, `SKEG.VSET`, `SKEG.VDEL`, `SKEG.VSEARCH`.
 - Three durability tiers: relaxed (`sync_data`), kernel (`fsync`), and power-loss (`F_FULLFSYNC` on macOS).
 - Test suite covers the workspace with no clippy warnings under `cargo clippy --workspace --all-targets`.
 

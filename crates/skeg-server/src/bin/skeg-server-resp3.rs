@@ -26,13 +26,56 @@ pub static malloc_conf: Option<&'static core::ffi::c_char> = Some(
     unsafe { &*c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr() },
 );
 
+const HELP: &str = concat!(
+    "\
+skeg-resp3 ",
+    env!("CARGO_PKG_VERSION"),
+    "
+
+USAGE:
+    skeg-resp3 [OPTIONS]
+
+OPTIONS:
+    --addr <HOST:PORT>     Listen address. Default 127.0.0.1:6379 (Redis port).
+                             Env: SKEG_RESP3_ADDR.
+    --data-dir <PATH>      Data directory. Default ./data. Env: SKEG_DATA_DIR.
+    --mode <MODE>          'rw' (default) or 'serve' (read-only, mmap tier).
+    --tier <KIND>          Quantizer for the serve tier:
+                             int8 (default) | pq | pq:M:K |
+                             turboquant-1 | turboquant-2 | turboquant-4
+                             (aliases: tq1, tq2, tq4)
+    --speed                Opt-in early-termination in greedy walk
+                             (-0.3 to -0.7% recall@10, +40-60% QPS).
+                             Also: SKEG_SPEED=1.
+    --workers <N>          Dispatch SKEG.VSEARCH to a worker pool (N threads).
+                             0 (default) = inline on shard. Also: SKEG_WORKERS.
+    --tier-mmap            mmap the TurboQuant tier. Also: SKEG_TIER_MMAP=1.
+    --graph-mmap           mmap the Vamana graph Node array. Also: SKEG_GRAPH_MMAP=1.
+    -h, --help             Print this help.
+    -V, --version          Print the version.
+
+PROTOCOL: RESP3 (Redis-compatible). Use redis-cli, redis-py, etc.
+DOCS:     https://github.com/skegdb/skeg
+"
+);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", HELP);
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("skeg-resp3 {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cfg = Config::parse(std::env::args().skip(1));
+    let cfg = Config::parse(args.into_iter());
     if cfg.speed {
         // Latch the opt-in into skeg-vector's process-wide flag before any
         // shard runs a search. Failure means it was set already (env-var

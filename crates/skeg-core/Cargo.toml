@@ -13,8 +13,8 @@ keywords = ["kv-store", "vlog", "lsm", "skeg", "database"]
 categories = ["database", "data-structures"]
 
 [dependencies]
-skeg-proto = { path = "../skeg-proto", version = "0.1.0" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.0" }
+skeg-proto = { path = "../skeg-proto", version = "0.1.1" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.1" }
 bytes = { workspace = true }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
