@@ -9,9 +9,9 @@ ram-reduction/
 turboquant/
 resp3/
 
-# tests + benches not needed for image build
-**/tests/
-**/benches/
+# Bench/test directories must stay: Cargo.toml manifests reference
+# them under [[bench]] and [[test]], so excluding them breaks
+# cargo's manifest parse even when we only ask for --bin builds.
 fuzz/
 
 # editor / OS
