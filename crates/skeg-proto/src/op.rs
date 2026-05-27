@@ -2,8 +2,8 @@
 
 /// Op codes used in the frame header.
 ///
-/// Request ops (0x01–0x7F) are sent by the client.
-/// Response ops (0xC0–0xFF) are sent by the server.
+/// Request ops (0x01..=0x7F) are sent by the client.
+/// Response ops (0xC0..=0xFF) are sent by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Op {
