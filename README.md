@@ -91,6 +91,19 @@ cargo build --release --bin skeg --bin skeg-resp3
 
 Requirements: Rust 1.88 or newer. The binaries are at `target/release/skeg` and `target/release/skeg-resp3`.
 
+### Docker
+
+```sh
+docker run -d --name skeg \
+  -p 7379:7379 \
+  -v skeg-data:/var/lib/skeg \
+  ghcr.io/skegdb/skeg:latest
+```
+
+The image bundles both `skeg` (native protocol, port 7379) and `skeg-resp3` (Redis-compat, port 6379). The default entrypoint is `skeg`; for the RESP3 surface override with `--entrypoint /usr/local/bin/skeg-resp3` and publish 6379 instead. Built for `linux/arm64`.
+
+For an Ollama companion setup with `docker compose`, see [`docker-compose.example.yml`](docker-compose.example.yml).
+
 ## Quickstart
 
 Start the server. The native binary protocol listens on 7379; RESP3 listens on 6379.

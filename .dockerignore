@@ -1,0 +1,33 @@
+target/
+.git/
+.github/
+docs/
+bench-compare/
+reasearch/
+optimizations/
+ram-reduction/
+turboquant/
+resp3/
+
+# tests + benches not needed for image build
+**/tests/
+**/benches/
+fuzz/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+.claude/
+.cursor/
+
+# logs and local data
+*.log
+data/
+**/.venv*/
+**/__pycache__/
+
+# misc
+*.md
+!README.md
+!LICENSE

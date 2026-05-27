@@ -1,0 +1,67 @@
+# Example: skeg as a vector + KV companion to a local Ollama daemon.
+#
+# Bring up:
+#   docker compose -f docker-compose.example.yml up -d
+#
+# Then from Python (with skeg-ollama installed):
+#
+#   from skeg_ollama import OllamaRetriever
+#   r = OllamaRetriever(
+#       skeg_addr=("localhost", 7379),
+#       ollama_url="http://localhost:11434",
+#       index_name="notes",
+#       ollama_model="nomic-embed-text",
+#   )
+#   r.add(["the sky is blue", "grass is green"])
+#   print(r.search("what colour is the sky?", k=1))
+#
+# Pull the embedding model once:
+#   docker compose exec ollama ollama pull nomic-embed-text
+
+services:
+  skeg:
+    image: ghcr.io/skegdb/skeg:latest
+    container_name: skeg
+    restart: unless-stopped
+    ports:
+      - "7379:7379"   # native protocol (skeg-py, skeg-ollama, skeg-client-rs)
+    volumes:
+      - skeg-data:/var/lib/skeg
+    environment:
+      SKEG_ADDR: 0.0.0.0:7379
+      SKEG_DATA_DIR: /var/lib/skeg
+      RUST_LOG: info
+
+  # Optional: Redis-compat RESP3 surface on 6379.
+  # Uncomment if you want redis-cli / redis-py to talk to skeg.
+  # skeg-resp3:
+  #   image: ghcr.io/skegdb/skeg:latest
+  #   container_name: skeg-resp3
+  #   entrypoint: ["/usr/local/bin/skeg-resp3"]
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - skeg-data:/var/lib/skeg
+  #   environment:
+  #     SKEG_ADDR: 0.0.0.0:6379
+  #     SKEG_DATA_DIR: /var/lib/skeg
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    # Uncomment for Nvidia GPU passthrough:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: [gpu]
+
+volumes:
+  skeg-data:
+  ollama-data:
