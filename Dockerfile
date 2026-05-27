@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- builder ----------------------------------------------------------
-FROM rust:1.84-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 WORKDIR /src
 
 # Cache dependency builds: copy manifests first, fetch, then bring in sources.
