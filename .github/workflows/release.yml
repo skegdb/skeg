@@ -68,7 +68,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -eo pipefail
-          for crate in skeg-proto skeg-simd skeg-platform skeg-resp3 skeg-core skeg-vector skeg-server; do
+          for crate in skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core skeg-vector skeg-server; do
             echo "::group::publish $crate"
             if out=$(cd crates/$crate && cargo publish --locked 2>&1); then
               echo "$out"
