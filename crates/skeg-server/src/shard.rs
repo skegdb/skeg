@@ -386,12 +386,21 @@ fn run_shard(
                 // the shard accepts writes; a serve-mode shard skips both.
                 if !read_only {
                     // Background compaction: reclaim dead space on this shard.
+                    // Telemetry tick each time a compaction run starts.
                     let cvlog = vlog.clone();
                     tokio::task::spawn_local(async move {
                         loop {
                             tokio::time::sleep(COMPACTION_INTERVAL).await;
-                            if let Err(e) = cvlog.maybe_compact().await {
-                                error!("shard {shard_id}: compaction failed: {e}");
+                            match cvlog.maybe_compact().await {
+                                Ok(Some(_seg_id)) => {
+                                    skeg_telemetry::tick_counter(
+                                        skeg_telemetry::Counter::CompactionRunsTotal,
+                                    );
+                                }
+                                Ok(None) => { /* nothing to compact this tick */ }
+                                Err(e) => {
+                                    error!("shard {shard_id}: compaction failed: {e}");
+                                }
                             }
                         }
                     });
@@ -419,9 +428,18 @@ fn run_shard(
                     let vlog = vlog.clone();
                     let vindexes = vindexes.clone();
                     let dir = dir.clone();
+                    let shard_id_u16 = shard_id as u16;
                     tokio::task::spawn_local(async move {
+                        // Telemetry: classify the op, time the work, record.
+                        // `op_kind` is borrowed-only · no Send cost on the
+                        // hot path (the enum is `Copy`).
+                        let op_kind = telemetry_op(&msg.req);
+                        let t0 = std::time::Instant::now();
                         let resp =
                             process(&vlog, &vindexes, &dir, msg.req, read_only, workers).await;
+                        if let Some(op) = op_kind {
+                            skeg_telemetry::record_op(op, shard_id_u16, t0.elapsed());
+                        }
                         let _ = msg.reply.send(resp);
                         drop(permit); // release on completion
                     });
@@ -448,6 +466,37 @@ fn is_mutation(req: &ShardReq) -> bool {
 }
 
 #[allow(clippy::too_many_lines)] // one arm per shard request kind; splitting hurts readability
+// TODO(telemetry): wire `Gauge::VindexVectors` and `Gauge::VindexSizeBytes`
+// at the four vindex-mutating arms below (`VindexCreate`, `VindexDrop`,
+// `Vset`, `Vdel`). Today they read `0` from STATS/metrics. The wiring
+// needs to aggregate across all vindexes on the shard · iterate
+// `vindexes.read().iter()` and call `set_gauge` after a mutation. Cost is
+// fine off the hot path; the rare cost of vset+vdel is dwarfed by the
+// embedding pipeline anyway.
+
+/// Map a `ShardReq` to the corresponding telemetry op classifier.
+///
+/// Returns `None` for ops that should not appear in the operation
+/// counters (e.g. internal `Stats` ping). Kept as a free function so
+/// the hot-path call site stays trivially inlineable.
+#[inline]
+fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
+    use skeg_telemetry::Op;
+    match req {
+        ShardReq::Get(_) | ShardReq::MgetBatch(_) => Some(Op::Get),
+        ShardReq::Set(..) => Some(Op::Set),
+        ShardReq::Del(..) => Some(Op::Del),
+        ShardReq::Vset { .. } => Some(Op::VSet),
+        ShardReq::Vsearch { .. } => Some(Op::VSearch),
+        ShardReq::Vdel { .. } => Some(Op::VDel),
+        ShardReq::Vget { .. }
+        | ShardReq::VindexCreate { .. }
+        | ShardReq::VindexList
+        | ShardReq::VindexDrop { .. }
+        | ShardReq::Stats => None,
+    }
+}
+
 async fn process(
     vlog: &VLog,
     vindexes: &Arc<RwLock<VindexSet>>,
@@ -650,6 +699,13 @@ async fn process(
         }
         ShardReq::Stats => {
             let (bytes, evictions, n_keys, budget) = vlog.cache_stats();
+            // Side-effect: refresh telemetry gauges from live vlog counters.
+            // These are gauges (current values, not monotonic counters), so
+            // polling them via STATS does not double-count anything.
+            skeg_telemetry::set_gauge(
+                skeg_telemetry::Gauge::VlogLiveBytes,
+                bytes as u64,
+            );
             ShardResp::Stats(bytes, evictions, n_keys, budget)
         }
     }

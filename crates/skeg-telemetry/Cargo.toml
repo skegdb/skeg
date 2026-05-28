@@ -1,0 +1,40 @@
+[package]
+name = "skeg-telemetry"
+description = "Zero-overhead atomic counters and histograms for skeg. Optional Prometheus and RESP3 STATS exporters, gated behind features."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[features]
+# Default = telemetry counters compiled in, dump available via the in-process
+# `stats::dump_text` (used by the RESP3 STATS command). No background threads.
+default = ["stats"]
+
+# Only the static counters, plus the in-process snapshot dumper. Zero deps.
+stats = []
+
+# Adds a tiny HTTP exporter on a dedicated thread, surfacing /metrics in
+# Prometheus text format. Pulls one extra dep (`tiny_http`).
+http = ["dep:tiny_http", "stats"]
+
+# Compile-out: when neither `stats` nor `http` is enabled, every public
+# function is an `#[inline(always)]` no-op the compiler removes entirely.
+# Verified with `cargo asm`.
+
+[dependencies]
+tiny_http = { version = "0.12", optional = true, default-features = false }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "overhead"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true }

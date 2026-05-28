@@ -189,10 +189,25 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
     let write_result = file.write_at(*w_offset, combined).await;
     match write_result {
         Ok(()) => {
+            // Telemetry: tick one batch per call regardless of durability.
+            // Inexpensive (atomic fetch_add); off the hot per-op path.
+            skeg_telemetry::tick_counter(
+                skeg_telemetry::Counter::VlogGroupCommitBatches,
+            );
             let sync_result = match batch_durability {
                 Durability::Relaxed => Ok(()),
-                Durability::Kernel => file.sync_data().await,
-                Durability::Power => file.sync_durable().await,
+                Durability::Kernel => {
+                    skeg_telemetry::tick_counter(
+                        skeg_telemetry::Counter::VlogSyncs,
+                    );
+                    file.sync_data().await
+                }
+                Durability::Power => {
+                    skeg_telemetry::tick_counter(
+                        skeg_telemetry::Counter::VlogSyncs,
+                    );
+                    file.sync_durable().await
+                }
             };
             let sync_err = sync_result
                 .as_ref()

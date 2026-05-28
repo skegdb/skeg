@@ -8,6 +8,48 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.1.2] — 2026-05-28
+
+### Added
+
+- **Telemetry.** New `skeg-telemetry` crate provides zero-overhead
+  `AtomicU64` counters and exponential histograms for the hot path.
+  - Per-op counters (`skeg_ops_total{op}`) and duration histograms
+    (`skeg_op_duration_seconds_*`) for `get`, `set`, `del`, `vset`,
+    `vsearch`, `vdel`, `ping`.
+  - Cache counters: `skeg_cache_hits_total`, `_misses_total`,
+    `_evictions_total` (wired in `skeg-core/cache`).
+  - vLog counters: `skeg_vlog_syncs_total`,
+    `_group_commit_batches_total`, `_compaction_runs_total`,
+    `_compaction_bytes_total`. Gauge `skeg_vlog_live_bytes`
+    refreshes on each `STATS` call.
+  - Measured hot-path cost: `record_op` ≈ 4.7 ns on Apple M1;
+    `criterion` gate in `crates/skeg-telemetry/benches/overhead.rs`.
+  - Three exposure modes:
+    - default: counters compiled in, dump via RESP3 `SKEG.STATS`.
+    - `--no-default-features` on the crate: every public function
+      is a compile-out `#[inline(always)]` no-op.
+    - `--features metrics-http` on `skeg-server`: tiny HTTP
+      exporter on a dedicated thread, surfaces `/metrics` in
+      Prometheus text format.
+- **`--metrics-port <PORT>` CLI flag** on `skeg` (and the matching
+  `SKEG_METRICS_PORT` env). Spawns the Prometheus exporter on
+  `127.0.0.1:PORT` when the binary is built with `metrics-http`.
+- `SKEG.STATS` response is now extended with the full telemetry
+  dump after the legacy `cache_bytes=…` summary line, separated by
+  a blank line. Old clients that grep for `cache_bytes=` keep
+  working unchanged.
+
+### Notes
+
+- Five gauges remain unwired in this release
+  (`VlogSegmentsLive`, `VlogSegmentsCompacting`, `VlogTotalBytes`,
+  `CompactionInProgress`, `VindexSizeBytes`, `VindexVectors`). They
+  read `0` from `STATS` and `/metrics`. Wiring sites are marked
+  with `TODO(telemetry):` comments in `vlog.rs` and `shard.rs` and
+  will land in a follow-up; the schema is stable and dashboards
+  written today will not need to change.
+
 ## [0.1.1] — 2026-05-26
 
 ### Added

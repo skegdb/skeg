@@ -59,6 +59,10 @@ OPTIONS:
     --tier-mmap            mmap the TurboQuant tier (tier.cache.bin) instead of
                              holding it in RAM. Also: SKEG_TIER_MMAP=1.
     --graph-mmap           mmap the Vamana graph Node array. Also: SKEG_GRAPH_MMAP=1.
+    --metrics-port <PORT>  Bind a Prometheus /metrics exporter on 127.0.0.1:PORT.
+                            Requires the binary to be built with the
+                            `metrics-http` cargo feature. Default: off.
+                            Env: SKEG_METRICS_PORT.
     -h, --help             Print this help.
     -V, --version          Print the version.
 
@@ -66,6 +70,35 @@ PROTOCOL: native binary on the listen port (use skeg-resp3 for RESP3 / Redis).
 DOCS:     https://github.com/skegdb/skeg
 "
 );
+
+/// Spawn the Prometheus exporter on `127.0.0.1:port`.
+///
+/// Feature-gated: when the binary is built without `metrics-http`, the
+/// function logs a warning and returns without spawning anything · the
+/// flag is parsed in either build but only effective when the feature
+/// is enabled.
+fn spawn_metrics_exporter(port: u16) {
+    #[cfg(feature = "metrics-http")]
+    {
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        match skeg_telemetry::http::spawn(addr) {
+            Ok(_handle) => {
+                tracing::info!("--metrics-port {port}: Prometheus exporter on http://{addr}/metrics");
+            }
+            Err(e) => {
+                tracing::warn!("--metrics-port {port}: exporter failed to bind: {e}");
+            }
+        }
+    }
+    #[cfg(not(feature = "metrics-http"))]
+    {
+        let _ = port;
+        tracing::warn!(
+            "--metrics-port set but binary was built without the `metrics-http` feature; \
+             use `STATS` over RESP3 instead, or rebuild with `--features metrics-http`."
+        );
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,6 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(
             "--graph-mmap: graph.vmn opened as MappedFile, Node array reinterpreted from mmap"
         );
+    }
+    if let Some(port) = cfg.metrics_port {
+        spawn_metrics_exporter(port);
     }
     let data_dir = std::path::Path::new(&cfg.data_dir);
     let server = if cfg.serve {
@@ -200,6 +236,12 @@ struct Config {
     /// with `--tier-mmap` to make the whole disk index paginable.
     /// Env var `SKEG_GRAPH_MMAP`.
     graph_mmap: bool,
+    /// Opt-in Prometheus metrics HTTP exporter. When set, a tiny HTTP
+    /// server runs on `127.0.0.1:<port>` and serves `/metrics` in the
+    /// Prometheus text format from the same telemetry counters that the
+    /// RESP3 `STATS` command reads. Only available when the binary is
+    /// built with `--features metrics-http`. Env var `SKEG_METRICS_PORT`.
+    metrics_port: Option<u16>,
 }
 
 impl Config {
@@ -225,6 +267,9 @@ impl Config {
                 std::env::var("SKEG_GRAPH_MMAP").as_deref(),
                 Ok("1") | Ok("true") | Ok("on")
             ),
+            metrics_port: std::env::var("SKEG_METRICS_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         };
         let args: Vec<String> = args.collect();
         let mut i = 0;
@@ -267,6 +312,12 @@ impl Config {
                 "--graph-mmap" => {
                     cfg.graph_mmap = true;
                     i += 1;
+                }
+                "--metrics-port" => {
+                    if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                        cfg.metrics_port = Some(v);
+                    }
+                    i += 2;
                 }
                 _ => i += 1,
             }

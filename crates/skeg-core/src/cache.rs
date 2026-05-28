@@ -88,9 +88,11 @@ impl<V: Clone> S3Fifo<V> {
         if let Some(e) = self.map.get_mut(key) {
             e.freq = (e.freq + 1).min(3);
             self.hits += 1;
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheHits);
             Some(e.value.clone())
         } else {
             self.misses += 1;
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheMisses);
             None
         }
     }
@@ -228,6 +230,9 @@ impl<V: Clone> S3Fifo<V> {
                 self.small_bytes -= sz;
                 self.ghost_push(kh);
                 self.evictions += 1;
+                skeg_telemetry::tick_counter(
+                    skeg_telemetry::Counter::CacheEvictions,
+                );
                 return true;
             }
         }
@@ -250,6 +255,9 @@ impl<V: Clone> S3Fifo<V> {
                 self.map.remove(&key);
                 self.total_bytes -= sz;
                 self.evictions += 1;
+                skeg_telemetry::tick_counter(
+                    skeg_telemetry::Counter::CacheEvictions,
+                );
                 return;
             }
         }

@@ -469,6 +469,10 @@ impl VLog {
         if self.inner.active.borrow().id == seg_id {
             return Ok(0); // never compact the segment being appended to
         }
+        // TODO(telemetry): wire `Gauge::CompactionInProgress` (++ here, ‑‑
+        // before each early return below) and `Gauge::VlogSegmentsCompacting`
+        // similarly, so dashboards can show concurrent compaction count
+        // without polling at the right millisecond.
         let file = {
             let segs = self.inner.read_segments.borrow();
             segs.iter().find(|s| s.id == seg_id).map(|s| s.file.clone())
@@ -482,6 +486,10 @@ impl VLog {
         scan_file(&file, |off, rec| records.push((off, rec)))?;
 
         let mut moved = 0usize;
+        // Track padded bytes relocated during this compaction run so we can
+        // tick the `CompactionBytesTotal` counter once at the end. Padded
+        // sizes are what we actually wrote to the destination segment.
+        let mut moved_bytes: u64 = 0;
         let mut dest_segments: Vec<u16> = Vec::new();
         let note_dest = |seg: u16, dests: &mut Vec<u16>| {
             if !dests.contains(&seg) {
@@ -519,6 +527,7 @@ impl VLog {
                 .append_raw(&rec.key, &rec.value, rec.kind, rec.ts, Durability::Relaxed)
                 .await?;
             moved += 1;
+            moved_bytes += u64::from(npad);
             note_dest(nseg, &mut dest_segments);
 
             // Recheck-CAS: a concurrent SET may have moved the key during the
@@ -550,6 +559,13 @@ impl VLog {
                 dest_file.sync_durable().await?;
             }
         }
+
+        // Telemetry: amount of live data the compaction moved across to
+        // new segments. Ticked once per successful run.
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::CompactionBytesTotal,
+            moved_bytes,
+        );
 
         self.inner
             .read_segments
@@ -657,6 +673,12 @@ impl VLog {
             file: pf,
             live: Cell::new(0),
         });
+        // TODO(telemetry): set `Gauge::VlogSegmentsLive` to
+        // `self.inner.read_segments.borrow().len() as u64` here (rotation)
+        // and after the `retain` in `compact_segment` (segment removal).
+        // Also bump `Gauge::VlogTotalBytes` with the running sum from the
+        // index map · gives operators a "how much disk does skeg own"
+        // single number without a separate du(1).
         *self.inner.active.borrow_mut() = ActiveState {
             id: new_id,
             size: 0,

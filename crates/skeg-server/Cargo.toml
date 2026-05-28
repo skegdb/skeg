@@ -25,11 +25,12 @@ name = "skeg-resp3"
 path = "src/bin/skeg-server-resp3.rs"
 
 [dependencies]
-skeg-proto = { path = "../skeg-proto", version = "0.1.1" }
-skeg-core = { path = "../skeg-core", version = "0.1.1" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.1" }
-skeg-vector = { path = "../skeg-vector", version = "0.1.1" }
-skeg-resp3 = { path = "../skeg-resp3", version = "0.1.1" }
+skeg-proto = { path = "../skeg-proto", version = "0.1.2" }
+skeg-core = { path = "../skeg-core", version = "0.1.2" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.2" }
+skeg-vector = { path = "../skeg-vector", version = "0.1.2" }
+skeg-resp3 = { path = "../skeg-resp3", version = "0.1.2" }
+skeg-telemetry = { path = "../skeg-telemetry", version = "0.1.2" }
 socket2 = "0.5"
 tokio = { workspace = true }
 bytes = { workspace = true }
@@ -39,6 +40,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tikv-jemallocator = { workspace = true }
 parking_lot = { workspace = true }
+
+[features]
+# Opt-in HTTP Prometheus exporter. Default off so the server binary
+# stays slim; pull in with `--features metrics-http` on the build.
+default = []
+metrics-http = ["skeg-telemetry/http"]
 
 [dev-dependencies]
 tokio = { workspace = true }

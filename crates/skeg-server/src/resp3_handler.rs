@@ -594,13 +594,17 @@ fn skeg_auth(_args: &[Bytes]) -> Frame {
 async fn skeg_stats(shards: &ShardSet) -> Frame {
     match shards.stats().await {
         Ok(s) => {
-            // Single-line summary, easy to consume from redis-cli without
-            // a dedicated client. A future revision can return a Map frame
-            // once RESP3 typed responses are in scope.
-            Frame::Bulk(Bytes::from(format!(
+            // Combine the legacy single-line cache summary with the
+            // full Prometheus-flavoured telemetry dump. The first line is
+            // kept verbatim so existing redis-cli scripts that grep for
+            // `cache_bytes=` keep working; the rest is the telemetry
+            // section, separated by a blank line.
+            let cache_line = format!(
                 "cache_bytes={} evictions={} n_keys={} budget={}",
                 s.cache_bytes, s.cache_evictions, s.n_keys, s.cache_budget,
-            )))
+            );
+            let body = format!("{cache_line}\n\n{}", skeg_telemetry::stats::dump_text());
+            Frame::Bulk(Bytes::from(body))
         }
         Err(e) => shard_error(&e),
     }

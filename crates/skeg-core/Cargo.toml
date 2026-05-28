@@ -13,8 +13,9 @@ keywords = ["kv-store", "vlog", "lsm", "skeg", "database"]
 categories = ["database", "data-structures"]
 
 [dependencies]
-skeg-proto = { path = "../skeg-proto", version = "0.1.1" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.1" }
+skeg-proto = { path = "../skeg-proto", version = "0.1.2" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.2" }
+skeg-telemetry = { path = "../skeg-telemetry", version = "0.1.2", default-features = false, features = ["stats"] }
 bytes = { workspace = true }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
