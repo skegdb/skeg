@@ -465,7 +465,8 @@ fn is_mutation(req: &ShardReq) -> bool {
     )
 }
 
-#[allow(clippy::too_many_lines)] // one arm per shard request kind; splitting hurts readability
+#[allow(clippy::too_many_lines)]
+// one arm per shard request kind; splitting hurts readability
 // TODO(telemetry): wire `Gauge::VindexVectors` and `Gauge::VindexSizeBytes`
 // at the four vindex-mutating arms below (`VindexCreate`, `VindexDrop`,
 // `Vset`, `Vdel`). Today they read `0` from STATS/metrics. The wiring
@@ -702,10 +703,7 @@ async fn process(
             // Side-effect: refresh telemetry gauges from live vlog counters.
             // These are gauges (current values, not monotonic counters), so
             // polling them via STATS does not double-count anything.
-            skeg_telemetry::set_gauge(
-                skeg_telemetry::Gauge::VlogLiveBytes,
-                bytes as u64,
-            );
+            skeg_telemetry::set_gauge(skeg_telemetry::Gauge::VlogLiveBytes, bytes as u64);
             ShardResp::Stats(bytes, evictions, n_keys, budget)
         }
     }

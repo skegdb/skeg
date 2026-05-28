@@ -191,21 +191,15 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
         Ok(()) => {
             // Telemetry: tick one batch per call regardless of durability.
             // Inexpensive (atomic fetch_add); off the hot per-op path.
-            skeg_telemetry::tick_counter(
-                skeg_telemetry::Counter::VlogGroupCommitBatches,
-            );
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogGroupCommitBatches);
             let sync_result = match batch_durability {
                 Durability::Relaxed => Ok(()),
                 Durability::Kernel => {
-                    skeg_telemetry::tick_counter(
-                        skeg_telemetry::Counter::VlogSyncs,
-                    );
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
                     file.sync_data().await
                 }
                 Durability::Power => {
-                    skeg_telemetry::tick_counter(
-                        skeg_telemetry::Counter::VlogSyncs,
-                    );
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
                     file.sync_durable().await
                 }
             };

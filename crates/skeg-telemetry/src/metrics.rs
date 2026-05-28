@@ -21,8 +21,7 @@ pub const MAX_SHARDS: usize = 32;
 static OP_COUNTERS: [[AtomicU64; Op::COUNT]; MAX_SHARDS] = {
     // Build a zero-init array. `AtomicU64::new(0)` is `const`.
     const Z: AtomicU64 = AtomicU64::new(0);
-    const ROW: [AtomicU64; Op::COUNT] =
-        [Z, Z, Z, Z, Z, Z, Z]; // mirror Op::COUNT (must update if Op grows)
+    const ROW: [AtomicU64; Op::COUNT] = [Z, Z, Z, Z, Z, Z, Z]; // mirror Op::COUNT (must update if Op grows)
     // SAFETY-equivalent: copy the row 32 times; everything is `const`.
     [
         ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW,

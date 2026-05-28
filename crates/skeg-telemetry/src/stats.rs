@@ -13,8 +13,9 @@
 use core::fmt::Write;
 
 use crate::{
+    Counter, Gauge, Op,
     histograms::{self, BUCKET_BOUNDS_US, BUCKETS},
-    metrics, Counter, Gauge, Op,
+    metrics,
 };
 
 /// Serialise the full metric set into a `String` in Prometheus text
@@ -30,12 +31,7 @@ pub fn dump_text() -> String {
     out.push_str("# TYPE skeg_ops_total counter\n");
     for &op in &Op::ALL {
         let total = metrics::op_total(op);
-        let _ = writeln!(
-            &mut out,
-            "skeg_ops_total{{op=\"{}\"}} {}",
-            op.name(),
-            total
-        );
+        let _ = writeln!(&mut out, "skeg_ops_total{{op=\"{}\"}} {}", op.name(), total);
     }
 
     // Per-op duration histograms (Prometheus histogram convention:

@@ -52,24 +52,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags needed to diff each crate against the
+          # previous release and skip unchanged ones.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: publish library + server crates in dep order
-        # `skeg-server` is published since the open-core refactor moved
-        # the multi-tenant layer to a separate BUSL crate. The
-        # `skeg-tenant` wrapper consumes `skeg-server` from crates.io.
+      - name: publish changed crates in dep order
+        # Per-crate versioning: each crate carries its own `version` and
+        # is published only when its source tree changed since the
+        # previous tag. Unchanged crates are skipped without invoking
+        # `cargo publish` (avoids version-bump noise on crates.io when a
+        # release touches only some crates).
         #
-        # The loop is idempotent: each crate is skipped if its version
-        # is already on crates.io. This lets a partially-failed run
-        # (e.g. rate limit on a single crate) be resumed by re-running
-        # the job without `cargo publish` erroring on the crates that
-        # already shipped.
+        # Failure modes still covered:
+        # - First tag (no previous): every crate is published.
+        # - Re-run of a partially-failed publish: the "already exists on
+        #   crates.io index" branch still skips already-shipped crates.
+        # - Manual workflow_dispatch with dry_run=false: also publishes
+        #   only changed crates.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -eo pipefail
+          # Find the previous release tag (excluding HEAD). On the very
+          # first release, `prev_tag` is empty and every crate publishes.
+          prev_tag=$(git tag --sort=-creatordate | grep -E '^v[0-9]' | grep -v "^${GITHUB_REF_NAME}\$" | head -n 1 || true)
+          if [ -n "$prev_tag" ]; then
+            echo "diffing against previous tag: $prev_tag"
+          else
+            echo "no previous tag found; will publish every crate"
+          fi
           for crate in skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core skeg-vector skeg-server; do
             echo "::group::publish $crate"
+            if [ -n "$prev_tag" ] && git diff --quiet "$prev_tag" HEAD -- "crates/$crate"; then
+              echo "$crate: no changes since $prev_tag, skipping cargo publish"
+              echo "::endgroup::"
+              continue
+            fi
             if out=$(cd crates/$crate && cargo publish --locked 2>&1); then
               echo "$out"
               sleep 30

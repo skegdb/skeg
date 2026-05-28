@@ -83,7 +83,9 @@ fn spawn_metrics_exporter(port: u16) {
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
         match skeg_telemetry::http::spawn(addr) {
             Ok(_handle) => {
-                tracing::info!("--metrics-port {port}: Prometheus exporter on http://{addr}/metrics");
+                tracing::info!(
+                    "--metrics-port {port}: Prometheus exporter on http://{addr}/metrics"
+                );
             }
             Err(e) => {
                 tracing::warn!("--metrics-port {port}: exporter failed to bind: {e}");

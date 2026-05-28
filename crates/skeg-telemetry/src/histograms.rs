@@ -27,8 +27,28 @@ pub const BUCKETS: usize = 22;
 /// Upper bound (exclusive) for each bucket, in microseconds. Last entry
 /// is the sentinel "+Inf" bucket.
 pub const BUCKET_BOUNDS_US: [u64; BUCKETS] = [
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536,
-    131_072, 262_144, 524_288, 1_048_576, u64::MAX,
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1_024,
+    2_048,
+    4_096,
+    8_192,
+    16_384,
+    32_768,
+    65_536,
+    131_072,
+    262_144,
+    524_288,
+    1_048_576,
+    u64::MAX,
 ];
 
 /// Per-op buckets.

@@ -7,8 +7,8 @@
 
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use skeg_telemetry::{record_op, Op};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use skeg_telemetry::{Op, record_op};
 
 fn bench_record_op(c: &mut Criterion) {
     let dur = Duration::from_micros(123);

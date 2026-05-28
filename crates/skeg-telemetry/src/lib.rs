@@ -66,7 +66,13 @@ impl Op {
     /// All variants in declaration order. Used by the dumpers to iterate
     /// without unsafe transmutes.
     pub const ALL: [Op; Self::COUNT] = [
-        Op::Get, Op::Set, Op::Del, Op::VSet, Op::VSearch, Op::VDel, Op::Ping,
+        Op::Get,
+        Op::Set,
+        Op::Del,
+        Op::VSet,
+        Op::VSearch,
+        Op::VDel,
+        Op::Ping,
     ];
 
     /// Compact textual name used in metric labels.

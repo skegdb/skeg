@@ -25,9 +25,8 @@ use crate::stats;
 /// ```
 pub fn serve_blocking(addr: SocketAddr) -> std::io::Result<()> {
     let server = Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let ct_metrics =
-        Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..])
-            .expect("header is valid ASCII");
+    let ct_metrics = Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..])
+        .expect("header is valid ASCII");
     let ct_html = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
         .expect("header is valid ASCII");
 

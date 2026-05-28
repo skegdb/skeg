@@ -1,6 +1,6 @@
 [package]
 name = "skeg-resp3"
-version.workspace = true
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

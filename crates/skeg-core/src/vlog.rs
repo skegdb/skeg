@@ -562,10 +562,7 @@ impl VLog {
 
         // Telemetry: amount of live data the compaction moved across to
         // new segments. Ticked once per successful run.
-        skeg_telemetry::add_counter(
-            skeg_telemetry::Counter::CompactionBytesTotal,
-            moved_bytes,
-        );
+        skeg_telemetry::add_counter(skeg_telemetry::Counter::CompactionBytesTotal, moved_bytes);
 
         self.inner
             .read_segments

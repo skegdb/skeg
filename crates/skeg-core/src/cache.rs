@@ -230,9 +230,7 @@ impl<V: Clone> S3Fifo<V> {
                 self.small_bytes -= sz;
                 self.ghost_push(kh);
                 self.evictions += 1;
-                skeg_telemetry::tick_counter(
-                    skeg_telemetry::Counter::CacheEvictions,
-                );
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheEvictions);
                 return true;
             }
         }
@@ -255,9 +253,7 @@ impl<V: Clone> S3Fifo<V> {
                 self.map.remove(&key);
                 self.total_bytes -= sz;
                 self.evictions += 1;
-                skeg_telemetry::tick_counter(
-                    skeg_telemetry::Counter::CacheEvictions,
-                );
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheEvictions);
                 return;
             }
         }
