@@ -1,9 +1,14 @@
 //! Fixed-bucket exponential histograms.
 //!
-//! Bucket edges are powers of two from 1 µs to ~1 s, plus a final
-//! `+Inf` bucket. 22 buckets per op, [`Op::COUNT`] ops, one
-//! `AtomicU64` per bucket. Total static: 22 × 7 × 8 = 1232 bytes ≈ 20
+//! Bucket edges are powers of two from 1 µs to ~16.8 s, plus a final
+//! `+Inf` bucket. 26 buckets per op, [`Op::COUNT`] ops, one
+//! `AtomicU64` per bucket. Total static: 26 × 7 × 8 = 1456 bytes ≈ 23
 //! cache lines.
+//!
+//! The range was extended from 22 to 26 buckets in v0.2.0 so downstream
+//! consumers with longer-tail operations (`skeg-kv-cache` blob
+//! restore, future tenant-quota checks) can still observe outliers up
+//! to ~16 s without clipping to `+Inf`.
 //!
 //! Bucket index for a duration of `us` microseconds:
 //!
@@ -22,10 +27,11 @@ use crate::Op;
 
 /// Number of buckets per op. Increment if extending the time range; the
 /// underlying array literal below must be extended too.
-pub const BUCKETS: usize = 22;
+pub const BUCKETS: usize = 26;
 
 /// Upper bound (exclusive) for each bucket, in microseconds. Last entry
-/// is the sentinel "+Inf" bucket.
+/// is the sentinel "+Inf" bucket. Bounds form a power-of-two ladder so
+/// `bucket_idx` can use `64 - leading_zeros(us)` to pick the slot.
 pub const BUCKET_BOUNDS_US: [u64; BUCKETS] = [
     1,
     2,
@@ -48,36 +54,29 @@ pub const BUCKET_BOUNDS_US: [u64; BUCKETS] = [
     262_144,
     524_288,
     1_048_576,
+    2_097_152,
+    4_194_304,
+    8_388_608,
+    16_777_216,
     u64::MAX,
 ];
 
-/// Per-op buckets.
-static HISTOGRAMS: [[AtomicU64; BUCKETS]; Op::COUNT] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    const ROW: [AtomicU64; BUCKETS] = [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-    ];
-    [ROW, ROW, ROW, ROW, ROW, ROW, ROW] // mirror Op::COUNT
-};
+/// Per-op buckets. One independent `AtomicU64` per (op, bucket) slot.
+static HISTOGRAMS: [[AtomicU64; BUCKETS]; Op::COUNT] =
+    [const { [const { AtomicU64::new(0) }; BUCKETS] }; Op::COUNT];
 
 /// Cumulative count of all observations per op (for the `_count` line
 /// in the Prometheus output).
-static OP_COUNT: [AtomicU64; Op::COUNT] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z]
-};
+static OP_COUNT: [AtomicU64; Op::COUNT] = [const { AtomicU64::new(0) }; Op::COUNT];
 
 /// Cumulative sum of microseconds per op (for the `_sum` line and for
 /// computing average latency).
-static OP_SUM_US: [AtomicU64; Op::COUNT] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z]
-};
+static OP_SUM_US: [AtomicU64; Op::COUNT] = [const { AtomicU64::new(0) }; Op::COUNT];
 
 /// Pick the right bucket index for an observed microsecond value.
 ///
-/// `us = 0` lands in bucket 0 (the `< 1 µs` bucket). `us ≥ 524 288`
-/// lands in the `+Inf` bucket.
+/// `us = 0` lands in bucket 0 (the `< 1 µs` bucket). `us ≥ 16 777 216`
+/// (i.e. >= 16.78 s) lands in the `+Inf` bucket.
 #[inline(always)]
 pub fn bucket_idx(us: u64) -> usize {
     if us == 0 {
@@ -167,7 +166,10 @@ mod tests {
         assert_eq!(bucket_idx(2), 2);
         assert_eq!(bucket_idx(3), 2);
         assert_eq!(bucket_idx(4), 3);
-        assert_eq!(bucket_idx(1_048_576), BUCKETS - 1);
+        // 10 s sits below 2^24 (16.78 s) so it now falls in a real bucket
+        // rather than the +Inf sentinel that v0.1.x clipped it to.
+        assert!(bucket_idx(10_000_000) < BUCKETS - 1);
+        assert_eq!(bucket_idx(16_777_216), BUCKETS - 1);
         assert_eq!(bucket_idx(u64::MAX), BUCKETS - 1);
     }
 }

@@ -26,6 +26,8 @@
 #![cfg_attr(not(any(feature = "stats", feature = "http")), allow(dead_code))]
 
 #[cfg(any(feature = "stats", feature = "http"))]
+pub mod dynamic;
+#[cfg(any(feature = "stats", feature = "http"))]
 pub mod histograms;
 #[cfg(any(feature = "stats", feature = "http"))]
 pub mod metrics;
@@ -34,6 +36,18 @@ pub mod stats;
 
 #[cfg(feature = "http")]
 pub mod http;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Re-exports for the dynamic registry (v0.2.0). Downstream crates that need
+// their own metrics should reach for these instead of patching the closed
+// enums below; see [`dynamic`] for the design rationale and pool sizing.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "stats", feature = "http"))]
+pub use dynamic::{DynHistogram, DynOp, register_counter, register_gauge, register_histogram};
+
+#[cfg(any(feature = "stats", feature = "http"))]
+pub use metrics::MAX_SHARDS;
 
 /// Enumeration of operations tracked on the hot path.
 ///

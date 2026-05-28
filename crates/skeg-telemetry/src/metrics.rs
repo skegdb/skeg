@@ -18,28 +18,14 @@ pub const MAX_SHARDS: usize = 32;
 ///
 /// `OP_COUNTERS[shard][op]` is one `AtomicU64`. With `MAX_SHARDS = 32` and
 /// `Op::COUNT = 7`, that's 32 × 7 × 8 = 1792 bytes ≈ 28 cache lines.
-static OP_COUNTERS: [[AtomicU64; Op::COUNT]; MAX_SHARDS] = {
-    // Build a zero-init array. `AtomicU64::new(0)` is `const`.
-    const Z: AtomicU64 = AtomicU64::new(0);
-    const ROW: [AtomicU64; Op::COUNT] = [Z, Z, Z, Z, Z, Z, Z]; // mirror Op::COUNT (must update if Op grows)
-    // SAFETY-equivalent: copy the row 32 times; everything is `const`.
-    [
-        ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW,
-        ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW, ROW,
-    ]
-};
+static OP_COUNTERS: [[AtomicU64; Op::COUNT]; MAX_SHARDS] =
+    [const { [const { AtomicU64::new(0) }; Op::COUNT] }; MAX_SHARDS];
 
 /// Global counters not tied to a shard.
-static COUNTERS: [AtomicU64; Counter::COUNT] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z] // mirror Counter::COUNT
-};
+static COUNTERS: [AtomicU64; Counter::COUNT] = [const { AtomicU64::new(0) }; Counter::COUNT];
 
 /// Gauges (overwriteable current values).
-static GAUGES: [AtomicU64; Gauge::COUNT] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z] // mirror Gauge::COUNT
-};
+static GAUGES: [AtomicU64; Gauge::COUNT] = [const { AtomicU64::new(0) }; Gauge::COUNT];
 
 /// Tick a per-op counter on the requesting shard.
 ///

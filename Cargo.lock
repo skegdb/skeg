@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-server"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-telemetry"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "tiny_http",

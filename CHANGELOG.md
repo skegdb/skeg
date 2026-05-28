@@ -8,6 +8,63 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.2.0] — 2026-05-28
+
+### Added
+
+- **`skeg-telemetry` dynamic registry.** Downstream consumers
+  (`skeg-kv-cache`, `skeg-tenant`, applications on top of skeg) can now
+  register their own counters, histograms, and gauges without patching
+  the engine's closed enums.
+  - `register_counter(name) -> &'static [AtomicU64; MAX_SHARDS]`
+  - `register_histogram(name) -> &'static DynHistogram`
+  - `register_gauge(name) -> &'static AtomicU64`
+  - `register_op!("base_name")` macro: derives `<name>_total` (sharded
+    counter) and `<name>_duration_seconds` (histogram) from a single
+    base, returns a `DynOp` bundling both.
+  - Idempotent: repeated calls with the same name return the same
+    `&'static` handle, so `OnceLock::get_or_init(|| register_*(…))`
+    patterns are safe.
+  - Pool sizing: 256 sharded counter slots (64 KiB), 64 histogram
+    slots (14 KiB), 64 gauge slots (512 B). All `static` `AtomicU64`s,
+    no allocator on the hot path.
+  - Hot-path cost: same shape as the closed-enum path (one
+    `OnceLock::get` branch + one or two `fetch_add(Relaxed)`). Measured
+    ~2 ns on Apple M1.
+- Histogram buckets extended from 22 to 26 (1 µs → 16.78 s upper
+  bound, then `+Inf`). The previous range clipped any observation
+  ≥ 1.05 s into the sentinel; downstream consumers with longer-tail
+  operations (`skeg-kv-cache` blob restore, tenant quota probes) now
+  observe the real distribution out to ~16 s.
+- `SKEG.STATS` and `/metrics` output now appends the dynamic registry
+  contents (sorted by name) after the engine's static metric block.
+  Engine schema is grep-stable; downstream metrics are added below the
+  blank-line separator.
+
+### Changed
+
+- **Per-crate versioning** (workspace-level): each crate now carries
+  its own `version` field instead of inheriting from
+  `[workspace.package]`. The release workflow diffs each crate's tree
+  against the previous tag and skips `cargo publish` for unchanged
+  crates, so a release that touches only `skeg-telemetry` no longer
+  republishes the seven other crates as identical no-op bumps on
+  crates.io.
+- `skeg-server` bumped to `0.2.0` to track the new telemetry dep
+  surface and stay aligned with the user-facing release tag (the
+  Homebrew / GitHub Release naming follows the tag).
+
+### Notes
+
+- `skeg-core` keeps version `0.1.2` on crates.io: its source did not
+  change in this release. The local workspace dep requirement was
+  bumped to `skeg-telemetry = "0.2"` so the bench/dev path build
+  works; a future skeg-core release will carry that requirement out.
+- The seven unwired gauges from v0.1.2 (`VlogSegmentsLive`,
+  `VlogSegmentsCompacting`, `VlogTotalBytes`, `CompactionInProgress`,
+  `VindexSizeBytes`, `VindexVectors`) are still TODO. The schema is
+  stable; dashboards written against v0.1.2 keep working.
+
 ## [0.1.2] — 2026-05-28
 
 ### Added

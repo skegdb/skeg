@@ -13,7 +13,7 @@
 use core::fmt::Write;
 
 use crate::{
-    Counter, Gauge, Op,
+    Counter, Gauge, Op, dynamic,
     histograms::{self, BUCKET_BOUNDS_US, BUCKETS},
     metrics,
 };
@@ -40,9 +40,8 @@ pub fn dump_text() -> String {
     out.push_str("# TYPE skeg_op_duration_seconds histogram\n");
     for &op in &Op::ALL {
         let mut cumulative: u64 = 0;
-        for b in 0..BUCKETS {
+        for (b, &le_us) in BUCKET_BOUNDS_US.iter().enumerate() {
             cumulative += histograms::bucket(op, b);
-            let le_us = BUCKET_BOUNDS_US[b];
             // Prometheus convention: last bucket is `+Inf`.
             let le_str = if b == BUCKETS - 1 {
                 String::from("+Inf")
@@ -50,7 +49,7 @@ pub fn dump_text() -> String {
                 // Render in seconds (le_us is the exclusive upper edge,
                 // we report seconds with enough precision to be unique).
                 let secs = le_us as f64 / 1_000_000.0;
-                format!("{:.6}", secs)
+                format!("{secs:.6}")
             };
             let _ = writeln!(
                 &mut out,
@@ -89,6 +88,11 @@ pub fn dump_text() -> String {
         let _ = writeln!(&mut out, "# TYPE {} gauge", g.name());
         let _ = writeln!(&mut out, "{} {}", g.name(), metrics::gauge(g));
     }
+
+    // Dynamic registry — downstream-registered metrics. Appended at the
+    // end so the engine's own schema is grep-stable across releases even
+    // as consumers add their own counters.
+    dynamic::dump_text(&mut out);
 
     out
 }
