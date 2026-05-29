@@ -209,7 +209,7 @@ impl VLog {
             (0u16, 0u64, pf)
         };
 
-        let committer = GroupCommitter::start(active_file, active_size);
+        let committer = GroupCommitter::start(active_file, active_size).await;
 
         Ok(Self {
             inner: Rc::new(VLogInner {
@@ -608,7 +608,8 @@ impl VLog {
         ts: u64,
         durability: Durability,
     ) -> Result<(u16, u32, u32)> {
-        self.maybe_rotate(padded_record_size(key.len(), value.len()) as u64)?;
+        self.maybe_rotate(padded_record_size(key.len(), value.len()) as u64)
+            .await?;
         let encoded = encode_record(key, value, kind, ts);
         let (committer, seg_id) = {
             let a = self.inner.active.borrow();
@@ -659,9 +660,10 @@ impl VLog {
     }
 
     /// Rotate to a fresh segment if the next record would overflow the active
-    /// one. Contains no `.await`: the rotation is atomic against other tasks on
-    /// the single-threaded runtime.
-    fn maybe_rotate(&self, incoming: u64) -> Result<()> {
+    /// one. Awaits when the new committer is `DeviceGlobal`-backed (the
+    /// `SharedCommitter` attach round-trips through its bg task); the
+    /// `PerFile` path resolves synchronously.
+    async fn maybe_rotate(&self, incoming: u64) -> Result<()> {
         let needs = {
             let a = self.inner.active.borrow();
             a.size + incoming > self.inner.max_seg_size
@@ -678,7 +680,7 @@ impl VLog {
             &self.inner.dir,
             new_id,
         ))?);
-        let committer = GroupCommitter::start(pf.clone(), 0);
+        let committer = GroupCommitter::start(pf.clone(), 0).await;
         self.inner.read_segments.borrow_mut().push(ReadSegment {
             id: new_id,
             file: pf,

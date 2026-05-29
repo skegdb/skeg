@@ -1,10 +1,4 @@
 #![deny(unsafe_code)]
-// M3 of the shared-committer workstream rewires the GroupCommitter
-// facade's DeviceGlobal arm to this module; until then nothing under
-// `lib.rs` consumes the types defined here, so dead_code would flood
-// the build output. The tests in the bottom of this file cover the
-// public surface and pin the contract.
-#![allow(dead_code)]
 
 //! Cross-shard group committer for `DurabilityModel::DeviceGlobal`
 //! platforms.
@@ -81,8 +75,12 @@ enum Msg {
         durability: Durability,
         reply: oneshot::Sender<io::Result<(u64, u32)>>,
     },
+    /// Flush the entire pending batch. file_id is dropped on the
+    /// floor: a flush is a synchronisation point for *all* shards on
+    /// this device, not just the caller's file, which matches what a
+    /// user expects when they ask for durability on a DeviceGlobal
+    /// platform.
     Flush {
-        file_id: FileId,
         reply: oneshot::Sender<io::Result<()>>,
     },
 }
@@ -107,7 +105,32 @@ impl SharedCommitter {
 
     fn new() -> Self {
         let (tx, rx) = mpsc::channel(BATCH_INBOX_CAP);
-        tokio::spawn(committer_loop(rx));
+        // The bg task lives on a dedicated OS thread with its own
+        // `current_thread` tokio runtime, not on the caller's runtime.
+        // Tests construct (and drop) a fresh tokio runtime per
+        // `#[tokio::test]` invocation; if the bg task lived on the
+        // caller's runtime, the very first test to call `global()`
+        // would leave a dangling singleton with a dead receiver for
+        // every subsequent test (manifested as "file detached during
+        // batch" once the new test attached its own files).
+        //
+        // Running the loop on a dedicated thread + runtime means the
+        // bg task survives for the entire process lifetime and every
+        // caller's runtime can talk to it through the channel. The
+        // tokio mpsc Sender is runtime-agnostic, and async file ops
+        // inside the loop use `spawn_blocking` against tokio's global
+        // blocking pool, so neither side cares about the runtime
+        // boundary.
+        std::thread::Builder::new()
+            .name("skeg-shared-committer".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("shared committer runtime build");
+                rt.block_on(committer_loop(rx));
+            })
+            .expect("shared committer thread spawn");
         Self { tx }
     }
 
@@ -141,32 +164,50 @@ impl SharedCommitter {
             let _ = rx.await;
         }
         SharedCommitterEntry {
-            file_id,
-            tx: self.tx.clone(),
+            inner: Arc::new(EntryInner {
+                file_id,
+                tx: self.tx.clone(),
+            }),
         }
     }
 }
 
-/// Per-file handle into the shared committer. Cloneable; the
-/// underlying detach happens when the last clone drops.
+/// Per-file handle into the shared committer.
+///
+/// Cheap to clone: clones share the underlying `Arc<EntryInner>`. The
+/// detach side-effect fires only when the **last** clone drops, so a
+/// caller passing the entry into nested `GroupCommitter` clones does
+/// not accidentally rip the file out from under in-flight writes.
+#[derive(Clone)]
 pub struct SharedCommitterEntry {
+    inner: Arc<EntryInner>,
+}
+
+struct EntryInner {
     file_id: FileId,
     tx: mpsc::Sender<Msg>,
 }
 
-impl Clone for SharedCommitterEntry {
-    fn clone(&self) -> Self {
-        // Reuse the same file_id so all clones route to the same
-        // FileState in the bg task. Detach fires only when the last
-        // strong reference drops — see `Drop` below for the contract.
-        Self {
+impl Drop for EntryInner {
+    fn drop(&mut self) {
+        // Best-effort detach; if the inbox is full the FileState
+        // sticks around (bounded leak: at most one stale state per
+        // entry that was ever attached, finite by construction).
+        let _ = self.tx.try_send(Msg::Detach {
             file_id: self.file_id,
-            tx: self.tx.clone(),
-        }
+        });
     }
 }
 
 impl SharedCommitterEntry {
+    fn file_id(&self) -> FileId {
+        self.inner.file_id
+    }
+
+    fn tx(&self) -> &mpsc::Sender<Msg> {
+        &self.inner.tx
+    }
+
     /// Submit a write at the requested durability. Returns the
     /// (offset, padded_size) assigned by the committer once the
     /// containing batch has been flushed.
@@ -176,9 +217,9 @@ impl SharedCommitterEntry {
     /// the underlying IO/sync error if the batch flush failed.
     pub async fn append(&self, data: Vec<u8>, durability: Durability) -> io::Result<(u64, u32)> {
         let (tx, rx) = oneshot::channel();
-        self.tx
+        self.tx()
             .send(Msg::Append {
-                file_id: self.file_id,
+                file_id: self.file_id(),
                 data,
                 durability,
                 reply: tx,
@@ -196,28 +237,12 @@ impl SharedCommitterEntry {
     /// the underlying flush error.
     pub async fn flush(&self) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Msg::Flush {
-                file_id: self.file_id,
-                reply: tx,
-            })
+        self.tx()
+            .send(Msg::Flush { reply: tx })
             .await
             .map_err(|_| io::Error::other("shared committer shut down"))?;
         rx.await
             .map_err(|_| io::Error::other("shared committer shut down"))?
-    }
-}
-
-impl Drop for SharedCommitterEntry {
-    fn drop(&mut self) {
-        // Best-effort: if the inbox is full or the committer is gone
-        // the file state will eventually be reclaimed by the next
-        // batch (FileState holds the Arc<PlatformFile>, which is
-        // cheap to keep around — leaks bound by the number of
-        // currently-live entries, which is finite by construction).
-        let _ = self.tx.try_send(Msg::Detach {
-            file_id: self.file_id,
-        });
     }
 }
 
@@ -280,7 +305,7 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
                             should_flush = true;
                         }
                     }
-                    Some(Msg::Flush { file_id: _, reply }) => {
+                    Some(Msg::Flush { reply }) => {
                         flush_batch(&mut state, &mut batch).await;
                         batch_bytes = 0;
                         batch_deadline = None;
@@ -457,17 +482,11 @@ mod tests {
         let e2 = sc.attach(f2.clone(), 0).await;
 
         let h1 = tokio::spawn({
-            let e1 = SharedCommitterEntry {
-                file_id: e1.file_id,
-                tx: e1.tx.clone(),
-            };
+            let e1 = e1.clone();
             async move { e1.append(vec![0u8; 100], Durability::Power).await }
         });
         let h2 = tokio::spawn({
-            let e2 = SharedCommitterEntry {
-                file_id: e2.file_id,
-                tx: e2.tx.clone(),
-            };
+            let e2 = e2.clone();
             async move { e2.append(vec![0u8; 200], Durability::Power).await }
         });
         let (r1, r2) = (h1.await.unwrap().unwrap(), h2.await.unwrap().unwrap());
