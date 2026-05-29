@@ -23,5 +23,11 @@ memmap2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 
+[features]
+# Exposes the `set_durability_model_for_tests` /
+# `reset_durability_model_cache_for_tests` helpers in release builds.
+# Used by `skeg-core`'s committer tests; not needed by end users.
+testing = []
+
 [lints]
 workspace = true
