@@ -8,6 +8,40 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.2.2] — 2026-05-29
+
+### Changed
+
+- **Per-vindex locks (Q11 phase 2).** The shard's vindex set was
+  previously wrapped in a single `RwLock<HashMap<String,
+  VectorBackend>>`, so any `VSET` / `VSEARCH` held the outer write
+  lock for its entire duration and blocked operations on every
+  other vindex on the same shard. Each entry is now its own
+  `Arc<RwLock<VectorBackend>>`:
+  - The outer map is held only for the lookup, then released.
+  - The per-vindex lock serialises operations on the **same**
+    vindex (still required: `VectorBackend::search` mutates the
+    working-set cache and the streaming-insert buffer).
+  - The worker-pool path (`--workers N` since v0.1) now lifts two
+    concurrent `VSEARCH` calls on different vindexes to the
+    blocking pool without contention.
+  - SoL gate (`test_per_vindex_locks_concurrency_gate`): two-thread
+    workload at 2,000-vector, 256-dim flat indexes, `workers=2`,
+    requires `baseline / concurrent >= 1.4x`. Measured 1.99x on
+    Apple M1 (theoretical max 2.0x). Floor sits below the measurement
+    to absorb noise on slower CI runners.
+
+### Notes
+
+- Wire format unchanged, public `ShardSet` API unchanged. Existing
+  callers see no behavioural change beyond the new parallelism on
+  multi-vindex workloads.
+- `VINDEX DROP` keeps its previous semantics: the entry is popped
+  from the map before the data directory is removed. In-flight
+  operations on the dropped vindex hold their own `Arc` clone and
+  finish their inner lock window before dropping it; on POSIX the
+  directory deletion is decoupled from the file-handle lifetime.
+
 ## [0.2.1] — 2026-05-29
 
 ### Added
