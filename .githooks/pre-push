@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Pre-push gate for Rust crates. Mirrors the CI matrix on main so that
+# `git push` never lands a commit that would turn the CI red.
+#
+# Enable per clone with:
+#   git config core.hooksPath .githooks
+#
+# Bypass (use sparingly, e.g. when amending a docs-only commit) with:
+#   SKIP_PREPUSH=1 git push
+#
+# Gate order is fmt -> clippy -> test. Each step blocks the push on
+# failure with a clear message. test is the slowest step; it runs last
+# so the cheaper checks fail fast.
+
+set -euo pipefail
+
+if [[ "${SKIP_PREPUSH:-0}" == "1" ]]; then
+    echo "pre-push: SKIP_PREPUSH=1, bypassing gate" >&2
+    exit 0
+fi
+
+if [[ ! -f Cargo.toml ]]; then
+    # Not a Rust workspace at the repo root; nothing to gate.
+    exit 0
+fi
+
+step() {
+    printf '\n\033[1;36m▸ pre-push: %s\033[0m\n' "$1" >&2
+}
+
+fail() {
+    printf '\n\033[1;31m✗ pre-push failed at: %s\033[0m\n' "$1" >&2
+    printf '  fix and retry, or use SKIP_PREPUSH=1 if you really must push as-is.\n' >&2
+    exit 1
+}
+
+step "cargo fmt --all -- --check"
+cargo fmt --all -- --check || fail "cargo fmt"
+
+step "cargo clippy --workspace --all-features -- -D warnings"
+cargo clippy --workspace --all-features --no-deps -- -D warnings || fail "cargo clippy"
+
+step "cargo test --workspace --all-features --no-fail-fast"
+cargo test --workspace --all-features --no-fail-fast || fail "cargo test"
+
+printf '\n\033[1;32m✓ pre-push gate passed\033[0m\n' >&2

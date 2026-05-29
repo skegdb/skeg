@@ -187,6 +187,14 @@ Protocol and operational documentation will be added to this repository in the d
 
 Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before opening a pull request.
 
+A pre-push hook is shipped at `.githooks/pre-push` that runs the same three commands locally so `git push` blocks if any of them would fail. Enable it once per clone with:
+
+```
+git config core.hooksPath .githooks
+```
+
+Bypass (e.g. for a docs-only commit) with `SKIP_PREPUSH=1 git push`.
+
 ## Security
 
 Security issues should be reported by opening an issue with a brief description and a request to move the conversation private. A dedicated mailbox will be activated shortly. See [`SECURITY.md`](SECURITY.md).
