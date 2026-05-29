@@ -141,6 +141,35 @@ pub fn set_gauge(g: Gauge, value: u64) {
     }
 }
 
+/// Increment a gauge by one. Pair with [`decr_gauge`] for "in flight"
+/// counters where the natural API is `incr` at the start of an
+/// operation and `decr` at the end.
+#[inline(always)]
+pub fn incr_gauge(g: Gauge) {
+    #[cfg(any(feature = "stats", feature = "http"))]
+    {
+        metrics::incr_gauge(g);
+    }
+    #[cfg(not(any(feature = "stats", feature = "http")))]
+    {
+        let _ = g;
+    }
+}
+
+/// Decrement a gauge by one. Safe to call when the gauge is already
+/// zero (wraps; pair calls correctly with [`incr_gauge`] for symmetry).
+#[inline(always)]
+pub fn decr_gauge(g: Gauge) {
+    #[cfg(any(feature = "stats", feature = "http"))]
+    {
+        metrics::decr_gauge(g);
+    }
+    #[cfg(not(any(feature = "stats", feature = "http")))]
+    {
+        let _ = g;
+    }
+}
+
 /// Increment a counter that is not tied to a specific operation.
 #[inline(always)]
 pub fn tick_counter(c: Counter) {
@@ -208,18 +237,18 @@ impl Counter {
 
 /// Gauges (current value, not monotonic).
 ///
-/// Wiring status (as of v0.1.2):
-/// - `VlogLiveBytes`         wired in `skeg-server` `Stats` handler
-/// - `VlogSegmentsLive`      TODO · wire from `vlog::seal_active`
-/// - `VlogSegmentsCompacting` TODO · wire from `vlog::compact_segment` start/end
-/// - `VlogTotalBytes`        TODO · wire from `vlog::append_raw` running sum
-/// - `CompactionInProgress`  TODO · increment at compact_segment start, decrement at end
-/// - `VindexSizeBytes`       TODO · wire from `vindex` create/drop/resize hooks
-/// - `VindexVectors`         TODO · wire from `vset`/`vdel` handlers (per-name aggregate)
+/// Wiring status (as of v0.2.1):
+/// - `VlogLiveBytes`          wired in `skeg-server` `STATS` handler
+/// - `VlogSegmentsLive`       wired in `skeg-server` `STATS` handler
+/// - `VlogTotalBytes`         wired in `skeg-server` `STATS` handler
+/// - `CompactionInProgress`   wired by RAII guard in `vlog::compact_segment`
+/// - `VlogSegmentsCompacting` wired by RAII guard in `vlog::compact_segment`
+/// - `VindexSizeBytes`        wired in `skeg-server` `STATS` handler
+/// - `VindexVectors`          wired in `skeg-server` `STATS` handler
 ///
-/// Each unwired gauge currently reads `0` from `STATS` and `/metrics`.
-/// They are kept in the enum so the metric schema is stable; wiring is
-/// a follow-up that does not change the API.
+/// The vlog-segment and vindex gauges refresh on every `STATS` call
+/// (cheap arithmetic, no allocation). The compaction gauges use
+/// `incr`/`decr` so the count is accurate between polls.
 #[repr(usize)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Gauge {

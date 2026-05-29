@@ -385,6 +385,20 @@ impl VLog {
         self.inner.read_segments.borrow().len()
     }
 
+    /// Approximate total bytes the vlog owns on disk, including dead
+    /// records pending compaction. Sealed segments are sized at their
+    /// rotation cap (`max_seg_size`); the trailing active segment uses
+    /// its current write offset. Cheap to call (no `stat()`), suitable
+    /// for the `STATS` / `/metrics` refresh path.
+    #[must_use]
+    pub fn disk_bytes_total(&self) -> u64 {
+        let segs = self.inner.read_segments.borrow();
+        let active_id = self.inner.active.borrow().id;
+        let active_size = self.inner.active.borrow().size;
+        let sealed_count = segs.iter().filter(|s| s.id != active_id).count() as u64;
+        sealed_count.saturating_mul(self.inner.max_seg_size) + active_size
+    }
+
     /// Hot-key cache statistics: `(bytes_used, evictions, n_keys, byte_budget)`.
     #[must_use]
     pub fn cache_stats(&self) -> (u64, u64, u64, u64) {
@@ -469,10 +483,6 @@ impl VLog {
         if self.inner.active.borrow().id == seg_id {
             return Ok(0); // never compact the segment being appended to
         }
-        // TODO(telemetry): wire `Gauge::CompactionInProgress` (++ here, ‑‑
-        // before each early return below) and `Gauge::VlogSegmentsCompacting`
-        // similarly, so dashboards can show concurrent compaction count
-        // without polling at the right millisecond.
         let file = {
             let segs = self.inner.read_segments.borrow();
             segs.iter().find(|s| s.id == seg_id).map(|s| s.file.clone())
@@ -480,6 +490,10 @@ impl VLog {
         let Some(file) = file else {
             return Ok(0); // already gone
         };
+        // Telemetry: track that this compaction is in flight from now
+        // until any return path. The RAII guard handles the `--` side
+        // for all early returns and the normal end.
+        let _gauge = InFlightCompaction::start();
 
         // Scan the source segment fully (synchronous reads).
         let mut records: Vec<(u64, Record)> = Vec::new();
@@ -670,18 +684,37 @@ impl VLog {
             file: pf,
             live: Cell::new(0),
         });
-        // TODO(telemetry): set `Gauge::VlogSegmentsLive` to
-        // `self.inner.read_segments.borrow().len() as u64` here (rotation)
-        // and after the `retain` in `compact_segment` (segment removal).
-        // Also bump `Gauge::VlogTotalBytes` with the running sum from the
-        // index map · gives operators a "how much disk does skeg own"
-        // single number without a separate du(1).
+        // VlogSegmentsLive + VlogTotalBytes are refreshed from the
+        // server's STATS handler, which has cheap access to both via
+        // `segment_count()` and `disk_bytes_total()`; no per-rotation
+        // gauge writes here.
         *self.inner.active.borrow_mut() = ActiveState {
             id: new_id,
             size: 0,
             committer,
         };
         Ok(())
+    }
+}
+
+/// RAII telemetry guard for [`VLog::compact_segment`]. Increments the
+/// `CompactionInProgress` + `VlogSegmentsCompacting` gauges on
+/// construction and decrements both on drop, so every return path
+/// (early return, `?`, normal end) leaves the gauges balanced.
+struct InFlightCompaction;
+
+impl InFlightCompaction {
+    fn start() -> Self {
+        skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::CompactionInProgress);
+        skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::VlogSegmentsCompacting);
+        Self
+    }
+}
+
+impl Drop for InFlightCompaction {
+    fn drop(&mut self) {
+        skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::CompactionInProgress);
+        skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::VlogSegmentsCompacting);
     }
 }
 

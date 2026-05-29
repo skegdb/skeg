@@ -66,6 +66,23 @@ impl VectorBackend {
         }
     }
 
+    /// Approximate RAM footprint of this vindex in bytes. Used to
+    /// refresh the `VindexSizeBytes` gauge from STATS. Cheap enough
+    /// (no allocation, just arithmetic on len/dim) to be polled.
+    ///
+    /// Flat indexes carry the full f32 row buffer in RAM. Disk indexes
+    /// only keep tier-1 codes resident (int8 today = 1 byte per
+    /// coordinate); the graph and full f32 vectors live on disk and
+    /// are paged in by the OS, so they are not counted here.
+    fn approx_ram_bytes(&self) -> u64 {
+        let n = self.len() as u64;
+        let d = self.dim() as u64;
+        match self {
+            VectorBackend::Flat(_) => n * d * 4,
+            VectorBackend::Disk(_) => n * d, // int8 tier
+        }
+    }
+
     /// Wire kind byte for this VINDEX (mirrors `QuantKind::wire()` on the
     /// disk side; flat indexes always carry full f32 in RAM).
     fn kind_byte(&self) -> u8 {
@@ -465,14 +482,6 @@ fn is_mutation(req: &ShardReq) -> bool {
     )
 }
 
-// TODO(telemetry): wire `Gauge::VindexVectors` and `Gauge::VindexSizeBytes`
-// at the four vindex-mutating arms below (`VindexCreate`, `VindexDrop`,
-// `Vset`, `Vdel`). Today they read `0` from STATS/metrics. The wiring
-// needs to aggregate across all vindexes on the shard · iterate
-// `vindexes.read().iter()` and call `set_gauge` after a mutation. Cost is
-// fine off the hot path; the rare cost of vset+vdel is dwarfed by the
-// embedding pipeline anyway.
-
 /// Map a `ShardReq` to the corresponding telemetry op classifier.
 ///
 /// Returns `None` for ops that should not appear in the operation
@@ -698,10 +707,21 @@ async fn process(
         }
         ShardReq::Stats => {
             let (bytes, evictions, n_keys, budget) = vlog.cache_stats();
-            // Side-effect: refresh telemetry gauges from live vlog counters.
-            // These are gauges (current values, not monotonic counters), so
-            // polling them via STATS does not double-count anything.
-            skeg_telemetry::set_gauge(skeg_telemetry::Gauge::VlogLiveBytes, bytes);
+            // Refresh telemetry gauges from live vlog + vindex state.
+            // Gauges use `store` semantics, so polling them via STATS
+            // does not double-count.
+            use skeg_telemetry::Gauge;
+            skeg_telemetry::set_gauge(Gauge::VlogLiveBytes, bytes);
+            skeg_telemetry::set_gauge(Gauge::VlogSegmentsLive, vlog.segment_count() as u64);
+            skeg_telemetry::set_gauge(Gauge::VlogTotalBytes, vlog.disk_bytes_total());
+            let (n_vec, sz_bytes) = {
+                let v = vindexes.read();
+                v.values().fold((0u64, 0u64), |(acc_n, acc_b), b| {
+                    (acc_n + b.len() as u64, acc_b + b.approx_ram_bytes())
+                })
+            };
+            skeg_telemetry::set_gauge(Gauge::VindexVectors, n_vec);
+            skeg_telemetry::set_gauge(Gauge::VindexSizeBytes, sz_bytes);
             ShardResp::Stats(bytes, evictions, n_keys, budget)
         }
     }

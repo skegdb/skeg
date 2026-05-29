@@ -1,6 +1,6 @@
 [package]
 name = "skeg-core"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,8 +13,8 @@ keywords = ["kv-store", "vlog", "lsm", "skeg", "database"]
 categories = ["database", "data-structures"]
 
 [dependencies]
-skeg-proto = { path = "../skeg-proto", version = "0.1.2" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.2" }
+skeg-proto = { path = "../skeg-proto", version = "0.1" }
+skeg-platform = { path = "../skeg-platform", version = "0.1" }
 skeg-telemetry = { path = "../skeg-telemetry", version = "0.2", default-features = false, features = ["stats"] }
 bytes = { workspace = true }
 xxhash-rust = { workspace = true }

@@ -50,6 +50,32 @@ pub fn set_gauge(g: Gauge, value: u64) {
     GAUGES[g as usize].store(value, Ordering::Relaxed);
 }
 
+/// Add `delta` to a gauge (signed, via wrapping `fetch_add`).
+///
+/// Useful for "in flight" counts where the natural API is
+/// `incr` at the start of an operation and `decr` at the end. Returns
+/// the previous value to let the caller validate symmetry in debug
+/// builds if they want to.
+#[inline(always)]
+#[allow(clippy::cast_sign_loss)]
+pub fn add_gauge(g: Gauge, delta: i64) -> u64 {
+    GAUGES[g as usize].fetch_add(delta as u64, Ordering::Relaxed)
+}
+
+/// Convenience: `add_gauge(g, +1)`.
+#[inline(always)]
+pub fn incr_gauge(g: Gauge) {
+    let _ = add_gauge(g, 1);
+}
+
+/// Convenience: `add_gauge(g, -1)`. Safe to call when the gauge is
+/// already zero (the wrapping semantics still produce a defined value;
+/// the next `incr_gauge` returns it to the expected level).
+#[inline(always)]
+pub fn decr_gauge(g: Gauge) {
+    let _ = add_gauge(g, -1);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Read helpers (used by the dumpers, never the hot path).
 // ───────────────────────────────────────────────────────────────────────────

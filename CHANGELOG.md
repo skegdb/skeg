@@ -8,6 +8,38 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.2.1] — 2026-05-29
+
+### Added
+
+- All seven engine gauges now report live values; the five that read
+  `0` in v0.2.0 are wired:
+  - `skeg_vlog_segments_live`     refreshed on each `SKEG.STATS` call
+    from `VLog::segment_count()`.
+  - `skeg_vlog_total_bytes`       refreshed similarly via the new
+    `VLog::disk_bytes_total()` helper (sealed × max_seg_size + active
+    write offset, no `stat()`).
+  - `skeg_compaction_in_progress` and
+    `skeg_vlog_segments_compacting` use an RAII guard in
+    `VLog::compact_segment` so every return path (including `?` and
+    early no-ops) leaves the gauges balanced.
+  - `skeg_vindex_vectors` and `skeg_vindex_size_bytes` are aggregated
+    on `STATS` from the shard's vindex set; the size approximation is
+    `n * dim * 4` for flat indexes and `n * dim` for disk (tier-1
+    int8 codes only — the graph and full f32 vectors live on disk and
+    are not counted as RAM).
+- `skeg_telemetry::incr_gauge` / `decr_gauge` / `add_gauge` for
+  delta-style updates on gauges (used by the compaction RAII guard).
+  The closed-enum and dynamic registry APIs both gain the new
+  helpers; same `#[inline(always)]` / no-op compile-out story.
+
+### Notes
+
+- v0.2.1 is an additive release: no engine behaviour change, no wire
+  format change, no schema change. Dashboards built against v0.2.0
+  start displaying real values on the previously-empty gauges with
+  no rewrite.
+
 ## [0.2.0] — 2026-05-28
 
 ### Added
