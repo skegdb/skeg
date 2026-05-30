@@ -355,7 +355,7 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
 
     for (file_id, items) in by_file {
         let Some(fs) = state.get_mut(&file_id) else {
-            // File detached mid-batch — ack each pending entry with
+            // File detached mid-batch: ack each pending entry with
             // an error. This is rare and bounded (only happens on
             // race with Drop), but the ack must still arrive so the
             // caller is not left waiting.
@@ -516,6 +516,91 @@ mod tests {
             .unwrap();
         entry.flush().await.unwrap();
         assert_eq!(file.sync_count(), 0);
+    }
+
+    /// M4 correctness gate: 4 shards drive Power appends concurrently
+    /// through one SharedCommitter. After the dust settles every byte
+    /// must land at the expected per-file offset. Pins the contract
+    /// the M4 perf bench is measuring against (no point recovering
+    /// throughput if data placement breaks under contention).
+    #[tokio::test]
+    async fn test_four_shards_parallel_power_writes_data_consistent() {
+        const SHARDS: usize = 4;
+        const WRITES_PER_SHARD: usize = 64;
+        const RECORD_BYTES: usize = 128;
+
+        let dir = TempDir::new().unwrap();
+        let sc = SharedCommitter::new();
+
+        let mut entries = Vec::with_capacity(SHARDS);
+        let mut files = Vec::with_capacity(SHARDS);
+        for s in 0..SHARDS {
+            let f = Arc::new(PlatformFile::create(&dir.path().join(format!("s{s}.bin"))).unwrap());
+            let e = sc.attach(f.clone(), 0).await;
+            entries.push(e);
+            files.push(f);
+        }
+
+        // Each shard writes its own marker byte so we can verify
+        // cross-file isolation: shard s writes bytes == s as u8.
+        let mut handles = Vec::new();
+        for (s, entry) in entries.iter().cloned().enumerate() {
+            let marker = u8::try_from(s).unwrap();
+            handles.push(tokio::spawn(async move {
+                let mut acks = Vec::with_capacity(WRITES_PER_SHARD);
+                for _ in 0..WRITES_PER_SHARD {
+                    let ack = entry
+                        .append(vec![marker; RECORD_BYTES], Durability::Power)
+                        .await
+                        .unwrap();
+                    acks.push(ack);
+                }
+                acks
+            }));
+        }
+
+        let mut per_shard_acks: Vec<Vec<(u64, u32)>> = Vec::with_capacity(SHARDS);
+        for h in handles {
+            per_shard_acks.push(h.await.unwrap());
+        }
+
+        // Per-file: offsets monotone 0..N*RECORD_BYTES, size == RECORD_BYTES.
+        for (s, acks) in per_shard_acks.iter().enumerate() {
+            assert_eq!(acks.len(), WRITES_PER_SHARD, "shard {s} ack count");
+            for (i, &(off, sz)) in acks.iter().enumerate() {
+                assert_eq!(
+                    sz,
+                    u32::try_from(RECORD_BYTES).unwrap(),
+                    "shard {s} entry {i} size"
+                );
+                assert_eq!(
+                    off,
+                    u64::try_from(i * RECORD_BYTES).unwrap(),
+                    "shard {s} entry {i} offset not sequential"
+                );
+            }
+        }
+
+        // Read-back: every byte in every file must equal the shard's marker.
+        for (s, file) in files.iter().enumerate() {
+            let total = WRITES_PER_SHARD * RECORD_BYTES;
+            let data = file.pread(0, total).await.unwrap();
+            let marker = u8::try_from(s).unwrap();
+            assert!(
+                data.iter().all(|&b| b == marker),
+                "shard {s} file content corrupted under contention"
+            );
+        }
+
+        // Sync amortisation: total fsync count must be far less than
+        // SHARDS * WRITES_PER_SHARD. Loose upper bound (exact count
+        // depends on batch timing) but proves aggregation happened.
+        let total_sync: u64 = files.iter().map(|f| f.sync_count()).sum();
+        let writes = u64::try_from(SHARDS * WRITES_PER_SHARD).unwrap();
+        assert!(
+            total_sync < writes,
+            "expected fsync amortisation, got {total_sync} syncs for {writes} writes"
+        );
     }
 
     #[tokio::test]
