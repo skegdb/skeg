@@ -603,6 +603,150 @@ mod tests {
         );
     }
 
+    /// M5 crash-recovery gate. 100 deterministic iterations driven by
+    /// a seeded xorshift PRNG: each iteration randomises
+    /// (shards, writes-per-shard, record bytes), commits every write
+    /// at `Durability::Power`, then *drops* every handle (committer
+    /// entries + file Arcs) and reopens each backing file fresh.
+    ///
+    /// Post-condition: every acked Power write must be readable from
+    /// the reopened file at the exact (offset, size) the committer
+    /// returned, with byte-for-byte content match. Captures three
+    /// classes of bug at once:
+    ///   - lost writes (batch dropped before sync)
+    ///   - mis-routed writes (shard A's bytes land in shard B's file)
+    ///   - offset accounting drift (sequential writes overlap or skip)
+    ///
+    /// Deterministic seed: failures reproduce by re-running the same
+    /// iteration index.
+    #[tokio::test]
+    async fn test_crash_recovery_100_iter_random_seed() {
+        // Tiny xorshift64* PRNG. Avoids pulling rand into core dev-deps.
+        // Period 2^64-1, statistical quality good enough for randomising
+        // workload shapes.
+        struct Rng(u64);
+        impl Rng {
+            fn new(seed: u64) -> Self {
+                Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
+            }
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn range(&mut self, lo: usize, hi_inclusive: usize) -> usize {
+                let span = (hi_inclusive - lo + 1) as u64;
+                lo + (self.next_u64() % span) as usize
+            }
+            fn byte(&mut self) -> u8 {
+                (self.next_u64() & 0xFF) as u8
+            }
+        }
+
+        const ITERATIONS: u64 = 100;
+
+        for seed in 0..ITERATIONS {
+            let mut rng = Rng::new(seed);
+            let shards = rng.range(1, 4);
+            let writes_per_shard = rng.range(8, 80);
+            let record_bytes = rng.range(16, 256);
+
+            let dir = TempDir::new().unwrap();
+            let sc = SharedCommitter::new();
+
+            // Pre-generate the payload for each (shard, write_idx) so
+            // both write side and verify side use the same bytes.
+            // Shape: payloads[shard][write_idx] = Vec<u8> of record_bytes.
+            let mut payloads: Vec<Vec<Vec<u8>>> = Vec::with_capacity(shards);
+            for s in 0..shards {
+                let mut shard_payloads: Vec<Vec<u8>> = Vec::with_capacity(writes_per_shard);
+                for w in 0..writes_per_shard {
+                    let marker = rng
+                        .byte()
+                        .wrapping_add(u8::try_from(s & 0xFF).unwrap())
+                        .wrapping_add(u8::try_from(w & 0xFF).unwrap());
+                    shard_payloads.push(vec![marker; record_bytes]);
+                }
+                payloads.push(shard_payloads);
+            }
+
+            // Attach each shard's file; keep paths for the reopen pass.
+            let mut paths = Vec::with_capacity(shards);
+            let mut entries = Vec::with_capacity(shards);
+            for s in 0..shards {
+                let path = dir.path().join(format!("s{s}.bin"));
+                let file = Arc::new(PlatformFile::create(&path).unwrap());
+                let entry = sc.attach(file.clone(), 0).await;
+                paths.push(path);
+                entries.push(entry);
+                // Original file Arc dropped end-of-iteration with the
+                // entry; the committer holds its own clone internally
+                // until Detach completes.
+            }
+
+            // Drive writes concurrently across shards. Order within a
+            // shard is sequential to make offset verification trivial.
+            let mut handles = Vec::with_capacity(shards);
+            for (s, entry) in entries.iter().cloned().enumerate() {
+                let shard_payloads = payloads[s].clone();
+                handles.push(tokio::spawn(async move {
+                    let mut acks = Vec::with_capacity(shard_payloads.len());
+                    for payload in shard_payloads {
+                        let ack = entry.append(payload, Durability::Power).await.unwrap();
+                        acks.push(ack);
+                    }
+                    acks
+                }));
+            }
+            let mut per_shard_acks: Vec<Vec<(u64, u32)>> = Vec::with_capacity(shards);
+            for h in handles {
+                per_shard_acks.push(h.await.unwrap());
+            }
+
+            // Force a flush before tearing down to make sure the last
+            // batch hits the disk. Mirrors what a graceful shutdown
+            // does; an actual crash mid-batch is outside this test's
+            // scope (handled at the vLog recovery-scan layer).
+            for entry in &entries {
+                entry.flush().await.unwrap();
+            }
+
+            // Simulated crash: drop every committer entry + the original
+            // file Arc by clearing the vectors. The bg task's
+            // FileState clone is the only thing keeping the fd alive
+            // briefly; once Detach is processed it goes too.
+            drop(entries);
+
+            // Verify pass: reopen each file fresh and read back.
+            for (s, path) in paths.iter().enumerate() {
+                let reopened = PlatformFile::open(path).unwrap();
+                for (w, &(off, sz)) in per_shard_acks[s].iter().enumerate() {
+                    assert_eq!(
+                        sz as usize, record_bytes,
+                        "seed {seed} shard {s} entry {w}: size mismatch"
+                    );
+                    let mut buf = vec![0u8; sz as usize];
+                    let n = reopened.pread_sync(off, &mut buf).unwrap_or_else(|e| {
+                        panic!(
+                            "seed {seed} shard {s} entry {w}: pread at off={off} sz={sz} failed: {e}"
+                        )
+                    });
+                    assert_eq!(
+                        n, sz as usize,
+                        "seed {seed} shard {s} entry {w}: short read {n} < {sz}"
+                    );
+                    assert_eq!(
+                        buf, payloads[s][w],
+                        "seed {seed} shard {s} entry {w} off={off} content mismatch"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_relaxed_in_mixed_batch_gets_durability() {
         let dir = TempDir::new().unwrap();
