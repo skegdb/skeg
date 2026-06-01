@@ -29,6 +29,19 @@ tokio = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# The `testing` feature exposes runtime overrides on
+# `skeg-platform::durability` so committer tests can exercise both the
+# PerFile and DeviceGlobal dispatch paths regardless of the host
+# platform. Pulled only at test time; release builds do not see it.
+skeg-platform = { path = "../skeg-platform", features = ["testing"] }
+
+# Pre-registered M4 gate for the shared-committer workstream. Custom
+# main (`harness = false`) because criterion's iter_custom adds noise
+# on fsync-heavy benches where wall-clock medians are the figure of
+# merit, not statistical mean+CI.
+[[bench]]
+name = "sharded_commit"
+harness = false
 
 [lints]
 workspace = true

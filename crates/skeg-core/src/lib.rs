@@ -7,6 +7,7 @@ pub mod group_commit;
 pub mod index;
 pub mod record;
 pub mod segment;
+pub(crate) mod shared_committer;
 pub mod snapshot;
 pub mod vlog;
 

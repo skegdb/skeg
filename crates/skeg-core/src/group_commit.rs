@@ -15,6 +15,8 @@ use skeg_platform::PlatformFile;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
+use crate::shared_committer::{SharedCommitter, SharedCommitterEntry};
+
 const MAX_BATCH_BYTES: usize = 256 * 1024; // 256 KB
 const MAX_BATCH_ENTRIES: usize = 256;
 const TIMER_MICROS: u64 = 200;
@@ -51,38 +53,116 @@ enum Msg {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Clone-able handle to an async group committer task.
+/// Façade in front of the platform-specific committer strategy.
 ///
-/// Multiple producers (connection handlers) share one committer per segment.
-/// Each `append` call sends the pre-encoded record through a channel; the
-/// background task accumulates entries and flushes them with a single
-/// `sync_durable` call, then acks all entries at once.
+/// On a [`DurabilityModel::PerFile`] platform (Linux, default), each
+/// committer owns its own background task and a per-file flush loop;
+/// `N` shards => `N` parallel `fdatasync` calls that the kernel
+/// schedules independently.
+///
+/// On a [`DurabilityModel::DeviceGlobal`] platform (macOS, default),
+/// every `sync_durable` is a device-wide barrier, so per-shard
+/// committers serialize on the hardware. The dispatch routes through
+/// the process-wide [`SharedCommitter`] which aggregates writes from
+/// every shard on the device into a single `sync_durable` per batch.
+///
+/// Cloneable: handles share the underlying background task / entry.
+///
+/// [`DurabilityModel::PerFile`]: skeg_platform::DurabilityModel::PerFile
+/// [`DurabilityModel::DeviceGlobal`]: skeg_platform::DurabilityModel::DeviceGlobal
 #[derive(Clone)]
 pub struct GroupCommitter {
-    tx: Arc<mpsc::UnboundedSender<Msg>>,
+    inner: CommitterImpl,
+}
+
+#[derive(Clone)]
+enum CommitterImpl {
+    /// Standalone background task per file. Linux default.
+    PerFile(PerFileCommitter),
+    /// Handle into the process-wide shared committer. Every entry
+    /// routes appends to the same bg task, which amortises one
+    /// `sync_durable` across all the device's shards.
+    DeviceGlobal(SharedCommitterEntry),
 }
 
 impl GroupCommitter {
-    /// Start a committer task that writes to `file` starting at `initial_offset`.
+    /// Start a committer for `file` starting at `initial_offset`. Picks
+    /// the strategy by consulting [`resolve_durability_model`]; the
+    /// returned handle is cheap to clone, every clone shares the
+    /// underlying background task.
     ///
-    /// The returned handle is cheap to clone - all clones share the same task.
-    #[must_use]
-    pub fn start(file: Arc<PlatformFile>, initial_offset: u64) -> Self {
+    /// The async signature is required because the `DeviceGlobal` arm
+    /// has to attach the file to the shared committer's registry
+    /// before the first append; the attach round-trips through the
+    /// bg task. The `PerFile` arm is sync underneath but pays a
+    /// no-op `async` wrapper for API symmetry.
+    ///
+    /// [`resolve_durability_model`]: skeg_platform::resolve_durability_model
+    pub async fn start(file: Arc<PlatformFile>, initial_offset: u64) -> Self {
+        let model = skeg_platform::resolve_durability_model();
+        let inner = match model {
+            skeg_platform::DurabilityModel::PerFile => {
+                CommitterImpl::PerFile(PerFileCommitter::start(file, initial_offset))
+            }
+            skeg_platform::DurabilityModel::DeviceGlobal => {
+                let entry = SharedCommitter::global().attach(file, initial_offset).await;
+                CommitterImpl::DeviceGlobal(entry)
+            }
+        };
+        Self { inner }
+    }
+
+    /// Submit a pre-encoded record for a write at the given durability.
+    ///
+    /// Returns `(start_offset, padded_size_bytes)` once the containing
+    /// batch has been flushed at (at least) the requested durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the committer task has shut down or if
+    /// the underlying write or flush fails.
+    pub async fn append(&self, data: Vec<u8>, durability: Durability) -> io::Result<(u64, u32)> {
+        match &self.inner {
+            CommitterImpl::PerFile(c) => c.append(data, durability).await,
+            CommitterImpl::DeviceGlobal(c) => c.append(data, durability).await,
+        }
+    }
+
+    /// Force-flush all pending writes immediately.
+    ///
+    /// Blocks until the flush completes. Useful for graceful shutdown
+    /// or tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the committer task has shut down or if
+    /// the flush fails.
+    pub async fn flush(&self) -> io::Result<()> {
+        match &self.inner {
+            CommitterImpl::PerFile(c) => c.flush().await,
+            CommitterImpl::DeviceGlobal(c) => c.flush().await,
+        }
+    }
+}
+
+/// Single-file group committer: one background task per file, batches
+/// writes from every producer into one `sync_durable` per batch. Used
+/// directly on `PerFile` platforms and as the underlying implementation
+/// of the placeholder `DeviceGlobal` branch until M2 of the
+/// shared-committer workstream lands.
+#[derive(Clone)]
+struct PerFileCommitter {
+    tx: Arc<mpsc::UnboundedSender<Msg>>,
+}
+
+impl PerFileCommitter {
+    fn start(file: Arc<PlatformFile>, initial_offset: u64) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(committer_task(file, rx, initial_offset));
         Self { tx: Arc::new(tx) }
     }
 
-    /// Submit a pre-encoded record for a write at the given durability.
-    ///
-    /// Returns `(start_offset, padded_size_bytes)` once the containing batch
-    /// has been flushed at (at least) the requested durability.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the committer task has shut down or if the
-    /// underlying write or flush fails.
-    pub async fn append(&self, data: Vec<u8>, durability: Durability) -> io::Result<(u64, u32)> {
+    async fn append(&self, data: Vec<u8>, durability: Durability) -> io::Result<(u64, u32)> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Msg::Write(WriteReq {
@@ -95,14 +175,7 @@ impl GroupCommitter {
             .map_err(|_| io::Error::other("committer shut down"))?
     }
 
-    /// Force-flush all pending writes immediately.
-    ///
-    /// Blocks until the flush completes. Useful for graceful shutdown or tests.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the committer task has shut down or if the flush fails.
-    pub async fn flush(&self) -> io::Result<()> {
+    async fn flush(&self) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Msg::Flush(tx))
@@ -235,15 +308,34 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Most tests in this module check `file.sync_count()` to verify a
+    /// flush happened. That contract is per-file and matches the
+    /// `PerFile` committer; under `DeviceGlobal` the shared committer
+    /// would issue one fsync on whichever file in the batch happened
+    /// to be the first successful write, leaving sibling files with a
+    /// 0 sync_count even though they are durable (device-wide
+    /// barrier). Force `PerFile` for the assertions in this module
+    /// to make sense; the DeviceGlobal semantics are covered by
+    /// `shared_committer::tests` instead.
+    ///
+    /// Idempotent across tests: every `#[tokio::test]` here calls
+    /// `force_per_file()` first so test ordering does not matter.
+    fn force_per_file() {
+        skeg_platform::durability::set_durability_model_for_tests(
+            skeg_platform::DurabilityModel::PerFile,
+        );
+    }
+
     fn make_file(dir: &TempDir) -> Arc<PlatformFile> {
         Arc::new(PlatformFile::create(dir.path().join("gc.bin").as_path()).unwrap())
     }
 
     #[tokio::test]
     async fn test_group_commit_single_write() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         let (off, sz) = gc
             .append(vec![0xAAu8; 128], Durability::Power)
@@ -258,9 +350,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_commit_batch_of_n() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         // Launch 10 concurrent writers - they should batch into ≤ 2 syncs.
         let n: u64 = 10;
@@ -300,9 +393,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_commit_timer_flush() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         // Submit a single entry - well under batch limits.
         // The committer should auto-flush after the 200 µs timer.
@@ -331,9 +425,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_commit_explicit_flush() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         // Start an append without awaiting it yet.
         let write_handle = tokio::spawn({
@@ -352,9 +447,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_commit_sequential_offsets() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         let (off0, sz0) = gc.append(vec![1u8; 128], Durability::Power).await.unwrap();
         let (off1, sz1) = gc.append(vec![2u8; 256], Durability::Power).await.unwrap();
@@ -367,9 +463,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_durability_relaxed_no_sync() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         let (off, sz) = gc
             .append(vec![0u8; 128], Durability::Relaxed)
@@ -383,9 +480,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_durability_kernel_syncs() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         gc.append(vec![1u8; 128], Durability::Kernel).await.unwrap();
         assert!(file.sync_count() >= 1, "Kernel must issue a flush");
@@ -393,9 +491,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_durability_batch_takes_max() {
+        force_per_file();
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
-        let gc = GroupCommitter::start(file.clone(), 0);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
 
         // One Power write among Relaxed ones must drag the whole batch to a
         // durable flush.
@@ -418,5 +517,34 @@ mod tests {
             file.sync_count() >= 1,
             "a Power entry must force the batch to flush"
         );
+    }
+
+    /// M1 dispatch smoke test: the façade builds on both
+    /// `DurabilityModel::PerFile` and `DurabilityModel::DeviceGlobal`
+    /// and round-trips an append. Until M2 lands, both branches
+    /// delegate to `PerFileCommitter`, so behaviour is observationally
+    /// identical; this test pins that contract so the M2 rewire is
+    /// caught if it accidentally regresses the `PerFile` codepath.
+    #[tokio::test]
+    async fn test_facade_dispatches_on_durability_model() {
+        force_per_file();
+        use skeg_platform::{DurabilityModel, durability};
+
+        for model in [DurabilityModel::PerFile, DurabilityModel::DeviceGlobal] {
+            durability::set_durability_model_for_tests(model);
+
+            let dir = TempDir::new().unwrap();
+            let file = make_file(&dir);
+            let gc = GroupCommitter::start(file.clone(), 0).await;
+
+            let (off, sz) = gc
+                .append(vec![0xAAu8; 64], Durability::Kernel)
+                .await
+                .unwrap();
+            assert_eq!(off, 0, "model {model:?}: first append must start at 0");
+            assert_eq!(sz, 64, "model {model:?}: padded size mismatch");
+        }
+
+        durability::reset_durability_model_cache_for_tests();
     }
 }

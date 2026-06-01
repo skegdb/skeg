@@ -5,10 +5,12 @@
 
 pub mod affinity;
 pub mod aligned;
+pub mod durability;
 pub mod file;
 
 pub use affinity::{QosClass, current_thread_qos, pin_current_thread_to_performance_core};
 pub use aligned::AlignedBytes;
+pub use durability::{DURABILITY_MODEL, DurabilityModel, resolve_durability_model};
 pub use file::{BUFFER_ALIGNMENT, MappedFile, PlatformFile};
 
 /// Return the number of performance (P-) cores available.
