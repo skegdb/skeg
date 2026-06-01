@@ -8,6 +8,55 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.0] - 2026-06-01
+
+### Added
+
+- **`SharedCommitter` for multi-shard write throughput on Apple Silicon.**
+  `F_FULLFSYNC` (the macOS power-loss durability call) is a device-wide
+  barrier: concurrent fsyncs on different files serialize at the
+  hardware. Previously, multi-shard write throughput on macOS regressed
+  going from 1 shard to 4 shards because each shard issued its own
+  barrier. The new process-wide `SharedCommitter` aggregates pending
+  writes from every shard into a single fsync per batch, amortising
+  the barrier across all shards.
+
+  Measured on a MacBook Pro M1 (1000 power-durable appends per shard,
+  128 byte records, 5 runs each variant, median wall clock):
+
+  | variant       | durability model | shards | median  | ops/s   |
+  | ------------- | ---------------- | ------ | ------- | ------- |
+  | 1sh_perfile   | per-file fsync   | 1      | 6.60 s  | 152     |
+  | 4sh_perfile   | per-file fsync   | 4      | 20.52 s | 195     |
+  | 1sh_devglobal | shared committer | 1      | 6.93 s  | 144     |
+  | 4sh_devglobal | shared committer | 4      | 7.87 s  | **508** |
+
+  4-shard shared committer recovers to within 1.19x of the 1-shard
+  baseline (cap 1.5x), a 2.61x improvement over the per-shard fsync
+  regression (floor 1.5x). A 100-iteration random-seed crash-recovery
+  test passes with zero data loss.
+
+- **Per-platform durability dispatch via `skeg-platform::DurabilityModel`.**
+  Linux keeps the per-file group committer (per-file `fdatasync`
+  parallelism is already efficient there); macOS routes through the
+  shared committer. The model is detected at runtime via
+  `resolve_durability_model()`. Tests can override the model via the
+  `testing` feature of `skeg-platform`.
+
+### Changed
+
+- **`skeg-core::group_commit::GroupCommitter::start` is now `async`.**
+  Required because the shared-committer arm attaches the file to its
+  internal registry before the first append. In-tree callers
+  (`VLog::open`, `VLog::maybe_rotate`) are already updated to `.await`.
+  **Breaking** for any out-of-tree user of `GroupCommitter`.
+
+### Versions bumped
+
+- `skeg-core` 0.1.3 -> 0.2.0 (breaking: `GroupCommitter::start` async)
+- `skeg-platform` 0.1.2 -> 0.1.3 (additive: `DurabilityModel`)
+- `skeg-server` 0.2.2 -> 0.3.0
+
 ## [0.2.2] — 2026-05-29
 
 ### Changed
