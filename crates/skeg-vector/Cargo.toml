@@ -79,5 +79,9 @@ harness = false
 name = "flat_block_throughput"
 harness = false
 
+[[bench]]
+name = "flat_block_pareto"
+harness = false
+
 [lints]
 workspace = true
