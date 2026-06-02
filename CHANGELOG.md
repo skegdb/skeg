@@ -8,6 +8,27 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.1] - 2026-06-01
+
+### Added
+
+- **`skeg-tenant` crate.** Multi-tenant primitives shipped as a
+  first-class workspace member: tenant id (xxh3_128), argon2id
+  password hashing, HMAC-SHA256 tokens, on-disk auth store
+  (`auth.kdb`), quota tracker. Apache-2.0, same as the engine.
+- **`skeg-server-tenant` crate.** Multi-tenant server binary
+  that wraps `skeg-server` and installs `skeg-tenant` as the
+  `TenantBackend`. Ships a binary called `skeg-server` (same name
+  as the OSS one; different package). Two extra flags vs the OSS
+  server: `--tenant-auth <path>` (enable tenant resolution against
+  an `auth.kdb`) and `--tenant-strict` (reject anonymous `HELLO 3`).
+  Apache-2.0.
+
+### Versions bumped
+
+- `skeg-tenant` (new) 0.1.0
+- `skeg-server-tenant` (new) 0.1.0
+
 ## [0.3.0] - 2026-06-01
 
 ### Added
