@@ -1,14 +1,24 @@
 name: Docker publish
 
-# Publishes a container image to ghcr.io independent of the release/tag cycle.
+# Publishes a container image to ghcr.io on every release-track event.
 #
-# - push to main → publishes `:edge` and `:sha-<short>`
-# - manual dispatch → publishes the user-provided tag (defaults to the
+# - push to `release` → publishes `:release-edge` and `:sha-<short>`
+#   (this is the staging build that follows main into release; users who
+#   want "what is about to ship" pull this tag)
+# - push tag `v*`     → publishes the version tag (e.g. `:0.3.3`) plus
+#   `:latest` (immutable shipped artefact tracking crates.io / brew)
+# - manual dispatch   → publishes the user-provided tag (defaults to the
 #   short SHA), useful for back-publishing a stable image for a code state
-#   that has already shipped under crates.io / brew (e.g. v0.1.1 today).
+#   that has already shipped under crates.io / brew.
+#
+# Pushes to feature branches and to `main` do NOT trigger an image
+# publish. Iteration on main happens via the CI workflow alone; the
+# Docker layer is intentionally gated to the release track to keep
+# ghcr storage tidy and avoid noise on the public image listing.
 on:
   push:
-    branches: [main]
+    branches: [release]
+    tags: ['v*']
     paths:
       - 'Dockerfile'
       - '.dockerignore'
@@ -46,6 +56,7 @@ jobs:
         id: meta
         run: |
           SHA_SHORT="${GITHUB_SHA::7}"
+          REF="${GITHUB_REF}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             INPUT_TAG="${{ github.event.inputs.tag }}"
             PRIMARY="${INPUT_TAG:-$SHA_SHORT}"
@@ -53,8 +64,14 @@ jobs:
             if [ "${{ github.event.inputs.also_latest }}" = "true" ]; then
               TAGS="${TAGS}\nghcr.io/skegdb/skeg:latest"
             fi
+          elif [[ "${REF}" == refs/tags/v* ]]; then
+            # Release tag: strip the leading `v` so the image tag is
+            # `0.3.3` (matching crates.io / brew). Also tag :latest.
+            VERSION="${REF#refs/tags/v}"
+            TAGS="ghcr.io/skegdb/skeg:${VERSION}\nghcr.io/skegdb/skeg:latest\nghcr.io/skegdb/skeg:sha-${SHA_SHORT}"
           else
-            TAGS="ghcr.io/skegdb/skeg:edge\nghcr.io/skegdb/skeg:sha-${SHA_SHORT}"
+            # Push to the `release` branch: staging-edge build.
+            TAGS="ghcr.io/skegdb/skeg:release-edge\nghcr.io/skegdb/skeg:sha-${SHA_SHORT}"
           fi
           {
             echo "tags<<EOF"
