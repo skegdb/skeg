@@ -10,10 +10,13 @@ members = [
     "crates/skeg-telemetry",
     "crates/skeg-tenant",
     "crates/skeg-server-tenant",
-    "crates/skeg-multi-tenant",
 ]
 # Fuzz targets live outside the workspace (own Cargo.toml).
-exclude = ["fuzz"]
+# skeg-multi-tenant is excluded: the `live-attach` feature pulls in
+# path deps to the sibling skeg-rigging-net repository, which is not
+# available in fresh checkouts (CI, cloners). Build it standalone:
+#   cargo build --manifest-path crates/skeg-multi-tenant/Cargo.toml
+exclude = ["fuzz", "crates/skeg-multi-tenant"]
 resolver = "2"
 
 [workspace.package]

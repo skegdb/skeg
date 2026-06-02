@@ -1,20 +1,22 @@
 [package]
 name = "skeg-multi-tenant"
+# Concrete values, not `.workspace = true`: this crate is excluded
+# from the engine workspace (see root Cargo.toml) because the
+# `live-attach` feature pulls in path deps to a sibling repo that is
+# not always on disk. version / edition / rust-version track the
+# workspace; license matches the rest of the engine.
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-authors.workspace = true
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+authors = ["skeg contributors"]
+repository = "https://github.com/skegdb/skeg"
+homepage = "https://github.com/skegdb/skeg"
 description = "Multi-tenant orchestration layer on top of skeg-tenant: on-disk root, per-tenant handles, token-based open, quota enforcement."
 readme = "../../README.md"
 keywords = ["multi-tenant", "skeg"]
 categories = ["database"]
-# Not on crates.io for now: this crate is an orchestration layer for
-# rigging consumers (hansa, custom orchestrators). Promote to
-# `publish = true` once the consumer ecosystem stabilises.
-publish = false
 
 [lib]
 path = "src/lib.rs"
@@ -25,8 +27,9 @@ path = "src/lib.rs"
 # Off by default; turning it on pulls in the network adapter crates
 # and exposes `LiveAttachRoot` / `LiveAttachError` from the lib.
 #
-# skeg-rigging-net-resp3 is a path dep because that sub-crate is not
-# yet on crates.io; once it lands the path override will drop.
+# skeg-rigging-net / skeg-rigging-net-resp3 are path deps because the
+# resp3 sub-crate is not yet on crates.io; once it lands, the path
+# overrides drop.
 live-attach = ["dep:skeg-rigging-net", "dep:skeg-rigging-net-resp3"]
 
 [dependencies]
@@ -36,15 +39,16 @@ skeg-rigging-skeg = { path = "../../../skeg-rigging/crates/skeg-rigging-skeg", v
 skeg-rigging-net = { path = "../../../skeg-rigging-net/crates/skeg-rigging-net", version = "0.1", optional = true }
 skeg-rigging-net-resp3 = { path = "../../../skeg-rigging-net/crates/skeg-rigging-net-resp3", optional = true }
 
-thiserror = { workspace = true }
+thiserror = "2"
 
 [dev-dependencies]
-tempfile = { workspace = true }
-bytes = { workspace = true }
-# RESP3 mock server lives in the live-attach test (gated by the
-# `live-attach` feature) and only loads when that feature is enabled.
+tempfile = "3"
+bytes = "1"
 skeg-resp3 = "0.1"
 skeg-rigging-net = { path = "../../../skeg-rigging-net/crates/skeg-rigging-net", version = "0.1" }
 
-[lints]
-workspace = true
+# Inlined from [workspace.lints] in the root (excluded crate cannot
+# use `workspace = true`).
+[lints.clippy]
+uninlined_format_args = "allow"
+manual_is_multiple_of = "allow"
