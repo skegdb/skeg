@@ -13,7 +13,11 @@
 //!   SKEG_PARETO_K         top-K             (default 10)
 
 #![deny(unsafe_code)]
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop
+)]
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
