@@ -544,8 +544,9 @@ pub fn tq2_adc_i8_neon(
     dim: usize,
 ) -> f32 {
     use std::arch::aarch64::{
-        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s8, vget_high_s16,
-        vget_low_s8, vget_low_s16, vld1q_f32, vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vqtbl1q_s8,
+        vaddq_f32, vaddvq_f32, vandq_u8, vcombine_u8, vcvtq_f32_s32, vdupq_n_f32, vdupq_n_u8,
+        vfmaq_f32, vget_high_s8, vget_high_s16, vget_low_s8, vget_low_s16, vld1_u8, vld1q_f32,
+        vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vqtbl1q_s8, vqtbl1q_u8, vshlq_u8,
     };
     let chunks = dim / 32;
     let mut tail_acc = 0.0f32;
@@ -573,31 +574,33 @@ pub fn tq2_adc_i8_neon(
         let mut acc5 = vdupq_n_f32(0.0);
         let mut acc6 = vdupq_n_f32(0.0);
         let mut acc7 = vdupq_n_f32(0.0);
+        // NEON-native unpack constants. The shift table holds per-lane
+        // right-shift amounts as negative i8 (vshlq_u8 with negative
+        // shifts performs right shifts). The byte-replicate tables
+        // (`rep_lo`, `rep_hi`) route each input byte to four
+        // consecutive output lanes so the per-lane shifts pull out
+        // the four 2-bit codes from each source byte in sequential
+        // coord order.
+        let mask03 = vdupq_n_u8(0x03);
+        let shifts =
+            vld1q_s8([0i8, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6].as_ptr());
+        let rep_lo_tbl = vld1q_u8([0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].as_ptr());
+        let rep_hi_tbl = vld1q_u8([4u8, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7].as_ptr());
         for chunk in 0..chunks {
             let off = chunk * 8;
             let q_base = chunk * 32;
-            // SWAR unpack: 8 bytes -> 32 codes (each 2-bit) -> two arrays
-            // of 16 lane indices, in sequential coord order.
-            let packed = u64::from_le_bytes(code[off..off + 8].try_into().unwrap());
-            // 4 stride extracts: b{j}[i] is the code at coord `i*4 + j`.
-            let b0 = (packed & 0x0303_0303_0303_0303).to_le_bytes();
-            let b1 = ((packed >> 2) & 0x0303_0303_0303_0303).to_le_bytes();
-            let b2 = ((packed >> 4) & 0x0303_0303_0303_0303).to_le_bytes();
-            let b3 = ((packed >> 6) & 0x0303_0303_0303_0303).to_le_bytes();
-            // First 16 coords: codes 0..15 in sequential order.
-            let indices_a: [u8; 16] = [
-                b0[0], b1[0], b2[0], b3[0], b0[1], b1[1], b2[1], b3[1], b0[2], b1[2], b2[2], b3[2],
-                b0[3], b1[3], b2[3], b3[3],
-            ];
-            // Second 16 coords: codes 16..31.
-            let indices_b: [u8; 16] = [
-                b0[4], b1[4], b2[4], b3[4], b0[5], b1[5], b2[5], b3[5], b0[6], b1[6], b2[6], b3[6],
-                b0[7], b1[7], b2[7], b3[7],
-            ];
+
+            // Load 8 packed bytes once, duplicate to 16 lanes so the
+            // table lookup can fan each byte out to four output lanes.
+            let bytes8 = vld1_u8(code.as_ptr().add(off));
+            let bytes16 = vcombine_u8(bytes8, bytes8);
+            let rep_a = vqtbl1q_u8(bytes16, rep_lo_tbl);
+            let rep_b = vqtbl1q_u8(bytes16, rep_hi_tbl);
+            let indices_a_v = vandq_u8(vshlq_u8(rep_a, shifts), mask03);
+            let indices_b_v = vandq_u8(vshlq_u8(rep_b, shifts), mask03);
 
             // First half: 16 lookups + 4 f32x4 FMAs.
-            let idx_a = vld1q_u8(indices_a.as_ptr());
-            let c_i8_a = vqtbl1q_s8(lut, idx_a);
+            let c_i8_a = vqtbl1q_s8(lut, indices_a_v);
             let low_i16_a = vmovl_s8(vget_low_s8(c_i8_a));
             let high_i16_a = vmovl_s8(vget_high_s8(c_i8_a));
             let c0a = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_a)));
@@ -614,8 +617,7 @@ pub fn tq2_adc_i8_neon(
             acc3 = vfmaq_f32(acc3, q3a, c3a);
 
             // Second half: another 16 lookups + 4 FMAs.
-            let idx_b = vld1q_u8(indices_b.as_ptr());
-            let c_i8_b = vqtbl1q_s8(lut, idx_b);
+            let c_i8_b = vqtbl1q_s8(lut, indices_b_v);
             let low_i16_b = vmovl_s8(vget_low_s8(c_i8_b));
             let high_i16_b = vmovl_s8(vget_high_s8(c_i8_b));
             let c0b = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_b)));
