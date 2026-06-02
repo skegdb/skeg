@@ -8,7 +8,7 @@
 
 Vector database and context layer for AI agents. Multi-tenant, RAM-frugal.
 
-> **Hardware target.** skeg was written and optimised for Apple Silicon (M-series). The benchmarks below are from an M1. Native validation and architecture-specific optimisation for x86_64 (Linux, server hardware) will follow as soon as we have the hardware to test on. The v0.1.0 release ships aarch64 binaries only (Apple Silicon, Linux ARM); the source builds on x86_64 but is not yet tuned for it.
+> **Hardware target.** skeg was written and optimised for Apple Silicon (M-series). The benchmarks below are from an M1; the full live dashboard is at [`skegdb.github.io/bench`](https://skegdb.github.io/bench/). Native validation and architecture-specific optimisation for x86_64 (Linux, server hardware) will follow as soon as we have the hardware to test on. The v0.1.0 release ships aarch64 binaries only (Apple Silicon, Linux ARM); the source builds on x86_64 but is not yet tuned for it.
 
 ## The point
 
@@ -160,16 +160,14 @@ Protocol documentation will be published in this repository shortly.
 
 - Native Linux validation. Linux is tested only through Docker.
 - The VSEARCH worker pool is opt-in via `--workers N`; the inline default is what produced the numbers in the table above.
-- Multi-tenant operations. The implementation is in the repository and tested, but is not released in v0.1.
+- Multi-tenant operations. Implemented and tested as the `skeg-tenant` and `skeg-server-tenant` crates (Apache-2.0, same as the engine); released in v0.3.
 - No GPU acceleration, no horizontal scaling across nodes, no hosted service.
 
 ## Roadmap
 
 The components listed below are functional in development and validated against the same test suite as the engine. They are not in v0.1 because they need the stabilisation and release work that accompanies a first public version. They will be released in the weeks and months following v0.1.
 
-- Multi-tenant operations: prefix routing, per-tenant isolation, and the `HELLO 3 AUTH` authentication path with argon2id are implemented and tested. They ship in the BUSL-licensed `skeg-server-tenant` wrapper (separate repository) and are not part of the Apache-2.0 v0.1.0 surface.
 - Companion repositories: Rust client, Python SDK, terminal dashboard, LlamaIndex and Ollama integrations, Gleam BEAM client. PyPI distribution for the Python SDK will follow.
-- The benchmark harness repository.
 - Native validation and architecture-specific tuning for x86_64 (Linux server hardware). The v0.1.0 binaries are aarch64 only; the SIMD path is NEON-only, the AVX2/AVX-512 equivalents need a machine to be written and benchmarked on.
 
 ## Documentation
@@ -180,6 +178,8 @@ The project blog at [amanitaproject.com](https://amanitaproject.com/) carries th
 - *Seven More Hypotheses, One That Survived.* The path to TurboQuant.
 - *The Substrate.* The vLog, the group commit, the Vamana index, and the memory budget.
 - *What Was Measured: The Numbers.* The full benchmark record across engines, scales, and tiers.
+
+Live benchmark dashboard with the latest measurements (engine x scale x tier matrix, p50/p99 latency, recall, RSS): [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
 
 Protocol and operational documentation will be added to this repository in the days following the release.
 

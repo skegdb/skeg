@@ -8,6 +8,21 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.2] - 2026-06-02
+
+### Fixed
+
+- **`release.yml`**: the publish-crates loop hard-coded the list of
+  crates and was missing `skeg-tenant` and `skeg-server-tenant`. They
+  shipped to GitHub Releases in v0.3.1 but never reached crates.io.
+  The loop is now extended to include them, and both crates are
+  bumped to 0.1.1 so the diff-based skip logic re-publishes them.
+
+### Versions bumped
+
+- `skeg-tenant` 0.1.0 -> 0.1.1
+- `skeg-server-tenant` 0.1.0 -> 0.1.1
+
 ## [0.3.1] - 2026-06-01
 
 ### Added
