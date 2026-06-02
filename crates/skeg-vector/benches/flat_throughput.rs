@@ -68,6 +68,8 @@ fn parse_tier(name: &str) -> Option<QuantKind> {
     match name {
         "int8" => Some(QuantKind::Int8),
         "pq128" => Some(QuantKind::Pq { m: 128, k: 256 }),
+        "pq64" => Some(QuantKind::Pq { m: 64, k: 256 }),
+        "pq32" => Some(QuantKind::Pq { m: 32, k: 256 }),
         "tq1" => Some(QuantKind::TurboQuant { bits: 1 }),
         "tq2" => Some(QuantKind::TurboQuant { bits: 2 }),
         "tq4" => Some(QuantKind::TurboQuant { bits: 4 }),
