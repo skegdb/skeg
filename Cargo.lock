@@ -156,6 +156,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dce859f0832a7d088c4f1119888ab94ef4b5d6795d1ce05afb7fe159d79f98"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -538,6 +540,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,6 +713,12 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plotters"
@@ -1055,7 +1073,7 @@ dependencies = [
  "crc32c",
  "parking_lot",
  "proptest",
- "skeg-platform",
+ "skeg-platform 0.1.3",
  "skeg-proto",
  "skeg-telemetry",
  "smallvec",
@@ -1067,12 +1085,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "skeg-multi-tenant"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "skeg-resp3 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "skeg-rigging",
+ "skeg-rigging-net",
+ "skeg-rigging-net-resp3",
+ "skeg-rigging-skeg",
+ "skeg-tenant",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "skeg-platform"
 version = "0.1.3"
 dependencies = [
  "libc",
  "memmap2",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "skeg-platform"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c91697adc382f2d5a7c667b0c8f7ea9064c7abb1b355e81138be80c77a807f"
+dependencies = [
+ "libc",
+ "memmap2",
  "thiserror",
  "tokio",
  "tracing",
@@ -1099,17 +1145,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "skeg-resp3"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a33b2f449dac5c3242b15ca7663dc7b64d0983768bf2a28c2cf5c2335ba1bfe"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
+name = "skeg-rigging"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
+name = "skeg-rigging-net"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "serde",
+ "serde_json",
+ "skeg-rigging",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
+name = "skeg-rigging-net-resp3"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "skeg-resp3 0.1.2",
+ "skeg-rigging",
+ "skeg-rigging-net",
+ "thiserror",
+]
+
+[[package]]
+name = "skeg-rigging-skeg"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "skeg-rigging",
+ "skeg-vector 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror",
+]
+
+[[package]]
 name = "skeg-server"
 version = "0.3.0"
 dependencies = [
  "bytes",
  "parking_lot",
  "skeg-core",
- "skeg-platform",
+ "skeg-platform 0.1.3",
  "skeg-proto",
- "skeg-resp3",
+ "skeg-resp3 0.1.2",
  "skeg-telemetry",
- "skeg-vector",
+ "skeg-vector 0.1.2",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
@@ -1125,10 +1229,10 @@ name = "skeg-server-tenant"
 version = "0.1.1"
 dependencies = [
  "parking_lot",
- "skeg-platform",
+ "skeg-platform 0.1.3",
  "skeg-server",
  "skeg-tenant",
- "skeg-vector",
+ "skeg-vector 0.1.2",
  "tikv-jemallocator",
  "tokio",
  "tracing",
@@ -1141,6 +1245,15 @@ version = "0.1.2"
 dependencies = [
  "criterion",
  "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "skeg-simd"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "969d35d7a62b7902b64e88cf7987a6433ceac5815e7e3c85a872b9f31b075d96"
+dependencies = [
  "thiserror",
 ]
 
@@ -1186,10 +1299,30 @@ dependencies = [
  "proptest",
  "rand",
  "rayon",
- "skeg-platform",
- "skeg-simd",
+ "skeg-platform 0.1.3",
+ "skeg-simd 0.1.2",
  "smallvec",
  "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "skeg-vector"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8f754c184ca8a5f019a4574669199ddd3b7ec8180d53313dacd54531bdbf120"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "fixedbitset",
+ "ordered-float",
+ "parking_lot",
+ "rand",
+ "rayon",
+ "skeg-platform 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "skeg-simd 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "smallvec",
  "thiserror",
  "tracing",
 ]
@@ -1806,3 +1939,31 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.0.16+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
