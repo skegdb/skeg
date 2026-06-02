@@ -11,6 +11,9 @@
 //! unsafe is allowed in this crate (NEON intrinsics + raw-pointer loads);
 //! every unsafe block documents the bounds invariant that makes it sound.
 
+pub mod block;
+pub use block::{BLOCK, build_tq4_lut_f32, interleave_tq4_codes, tq4_block32_score_scalar};
+
 // ── Scalar kernels (portable; also the reference for NEON equivalence) ────────
 
 /// Cosine similarity of two equal-length f32 slices. Result in `[-1.0, 1.0]`.
