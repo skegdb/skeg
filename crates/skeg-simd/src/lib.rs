@@ -344,8 +344,9 @@ pub fn tq4_adc_i8_neon(
     dim: usize,
 ) -> f32 {
     use std::arch::aarch64::{
-        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s8, vget_high_s16,
-        vget_low_s8, vget_low_s16, vld1q_f32, vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vqtbl1q_s8,
+        vaddq_f32, vaddvq_f32, vand_u8, vcombine_u8, vcvtq_f32_s32, vdup_n_u8, vdupq_n_f32,
+        vfmaq_f32, vget_high_s8, vget_high_s16, vget_low_s8, vget_low_s16, vld1_u8, vld1q_f32,
+        vld1q_s8, vmovl_s8, vmovl_s16, vqtbl1q_s8, vshr_n_u8, vzip1_u8, vzip2_u8,
     };
     let chunks = dim / 16;
     let mut tail_acc = 0.0f32;
@@ -366,58 +367,110 @@ pub fn tq4_adc_i8_neon(
     //   spec, so the 4-bit nibbles (0..15) need no validation.
     // - No aliasing: `code`, `q_rot`, `centroids_i8`, and the local
     //   `indices` buffer are distinct allocations.
+    // 2x unrolled hot loop: process 32 coords per outer iteration via
+    // two chunks. Reuses the LUT once, runs 8 independent f32x4
+    // accumulators so the ARM core can keep multiple FMAs and
+    // widen chains in flight simultaneously.
+    let pair_count = chunks / 2;
+    let tail_chunk = chunks % 2;
     let acc_total = unsafe {
         let lut = vld1q_s8(centroids_i8.as_ptr());
-        // Four independent accumulators to break the serial-FMA
-        // dependency chain (FMA latency ~4 cycles vs issue rate ~1).
-        // The i8_scale multiply is deferred to a single multiply on
-        // the horizontal sum at the end; float multiply distributes
-        // over scale so the result is identical (modulo IEEE rounding
-        // that the equivalence test tolerates within 1e-5).
         let mut acc0 = vdupq_n_f32(0.0);
         let mut acc1 = vdupq_n_f32(0.0);
         let mut acc2 = vdupq_n_f32(0.0);
         let mut acc3 = vdupq_n_f32(0.0);
-        for chunk in 0..chunks {
+        let mut acc4 = vdupq_n_f32(0.0);
+        let mut acc5 = vdupq_n_f32(0.0);
+        let mut acc6 = vdupq_n_f32(0.0);
+        let mut acc7 = vdupq_n_f32(0.0);
+        let nibble_mask = vdup_n_u8(0x0F);
+        for pair in 0..pair_count {
+            let off = pair * 16;
+            let q_base = pair * 32;
+            // First half (16 coords) - NEON-native nibble unpack:
+            //   load 8 packed bytes once,
+            //   low nibbles = bytes & 0x0F,
+            //   high nibbles = bytes >> 4,
+            //   interleave low/high to land 16 lane indices in coord order.
+            // Replaces a SWAR + stack roundtrip; saves ~6 cycles per
+            // chunk over the previous implementation.
+            let bytes_a = vld1_u8(code.as_ptr().add(off));
+            let low_a = vand_u8(bytes_a, nibble_mask);
+            let high_a = vshr_n_u8(bytes_a, 4);
+            let idx_lo_a = vzip1_u8(low_a, high_a);
+            let idx_hi_a = vzip2_u8(low_a, high_a);
+            let idx_a = vcombine_u8(idx_lo_a, idx_hi_a);
+            let centroids_a = vqtbl1q_s8(lut, idx_a);
+            let low_i16_a = vmovl_s8(vget_low_s8(centroids_a));
+            let high_i16_a = vmovl_s8(vget_high_s8(centroids_a));
+            let c0a = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_a)));
+            let c1a = vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16_a)));
+            let c2a = vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16_a)));
+            let c3a = vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16_a)));
+            let q0a = vld1q_f32(q_rot.as_ptr().add(q_base));
+            let q1a = vld1q_f32(q_rot.as_ptr().add(q_base + 4));
+            let q2a = vld1q_f32(q_rot.as_ptr().add(q_base + 8));
+            let q3a = vld1q_f32(q_rot.as_ptr().add(q_base + 12));
+
+            // Second half (next 16 coords) - same nibble-unpack trick.
+            let bytes_b = vld1_u8(code.as_ptr().add(off + 8));
+            let low_b = vand_u8(bytes_b, nibble_mask);
+            let high_b = vshr_n_u8(bytes_b, 4);
+            let idx_lo_b = vzip1_u8(low_b, high_b);
+            let idx_hi_b = vzip2_u8(low_b, high_b);
+            let idx_b = vcombine_u8(idx_lo_b, idx_hi_b);
+            let centroids_b = vqtbl1q_s8(lut, idx_b);
+            let low_i16_b = vmovl_s8(vget_low_s8(centroids_b));
+            let high_i16_b = vmovl_s8(vget_high_s8(centroids_b));
+            let c0b = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_b)));
+            let c1b = vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16_b)));
+            let c2b = vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16_b)));
+            let c3b = vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16_b)));
+            let q0b = vld1q_f32(q_rot.as_ptr().add(q_base + 16));
+            let q1b = vld1q_f32(q_rot.as_ptr().add(q_base + 20));
+            let q2b = vld1q_f32(q_rot.as_ptr().add(q_base + 24));
+            let q3b = vld1q_f32(q_rot.as_ptr().add(q_base + 28));
+
+            acc0 = vfmaq_f32(acc0, q0a, c0a);
+            acc1 = vfmaq_f32(acc1, q1a, c1a);
+            acc2 = vfmaq_f32(acc2, q2a, c2a);
+            acc3 = vfmaq_f32(acc3, q3a, c3a);
+            acc4 = vfmaq_f32(acc4, q0b, c0b);
+            acc5 = vfmaq_f32(acc5, q1b, c1b);
+            acc6 = vfmaq_f32(acc6, q2b, c2b);
+            acc7 = vfmaq_f32(acc7, q3b, c3b);
+        }
+        // Optional trailing single chunk when `chunks` is odd.
+        if tail_chunk == 1 {
+            let chunk = pair_count * 2;
             let off = chunk * 8;
             let q_base = chunk * 16;
-            // SWAR unpack: 8 bytes -> 16 lane indices in scratch.
-            let packed = u64::from_le_bytes(code[off..off + 8].try_into().unwrap());
-            let low = (packed & 0x0F0F_0F0F_0F0F_0F0F).to_le_bytes();
-            let high = ((packed >> 4) & 0x0F0F_0F0F_0F0F_0F0F).to_le_bytes();
-            let indices: [u8; 16] = [
-                low[0], high[0], low[1], high[1], low[2], high[2], low[3], high[3], low[4],
-                high[4], low[5], high[5], low[6], high[6], low[7], high[7],
-            ];
-            let idx_v = vld1q_u8(indices.as_ptr());
-
-            // Parallel lookup: 16 i8 centroid values, one per lane.
-            let centroids_i8x16 = vqtbl1q_s8(lut, idx_v);
-
-            // Widen i8x16 -> i16x8 + i16x8 -> i32x4 x 4 -> f32x4 x 4.
-            // Scale multiply is intentionally NOT applied here; deferred
-            // to the horizontal-sum step below.
-            let low_i16 = vmovl_s8(vget_low_s8(centroids_i8x16));
-            let high_i16 = vmovl_s8(vget_high_s8(centroids_i8x16));
+            let bytes = vld1_u8(code.as_ptr().add(off));
+            let low = vand_u8(bytes, nibble_mask);
+            let high = vshr_n_u8(bytes, 4);
+            let idx = vcombine_u8(vzip1_u8(low, high), vzip2_u8(low, high));
+            let centroids = vqtbl1q_s8(lut, idx);
+            let low_i16 = vmovl_s8(vget_low_s8(centroids));
+            let high_i16 = vmovl_s8(vget_high_s8(centroids));
             let c0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16)));
             let c1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16)));
             let c2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16)));
             let c3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16)));
-
             let q0 = vld1q_f32(q_rot.as_ptr().add(q_base));
             let q1 = vld1q_f32(q_rot.as_ptr().add(q_base + 4));
             let q2 = vld1q_f32(q_rot.as_ptr().add(q_base + 8));
             let q3 = vld1q_f32(q_rot.as_ptr().add(q_base + 12));
-
-            // Four parallel FMAs into four independent accumulators.
             acc0 = vfmaq_f32(acc0, q0, c0);
             acc1 = vfmaq_f32(acc1, q1, c1);
             acc2 = vfmaq_f32(acc2, q2, c2);
             acc3 = vfmaq_f32(acc3, q3, c3);
         }
-        // Pairwise reduce, then horizontal sum, then apply the
-        // deferred i8_scale once.
-        let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        // Tree reduce + horizontal sum + deferred scale.
+        let s01 = vaddq_f32(acc0, acc1);
+        let s23 = vaddq_f32(acc2, acc3);
+        let s45 = vaddq_f32(acc4, acc5);
+        let s67 = vaddq_f32(acc6, acc7);
+        let acc = vaddq_f32(vaddq_f32(s01, s23), vaddq_f32(s45, s67));
         vaddvq_f32(acc) * i8_scale
     };
     // Tail: dim not a multiple of 16. mxbai 1024 and MiniLM 384 both fit.
