@@ -17,7 +17,10 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::fs::File;
 use std::hint::black_box;
+use std::io::{self, Read};
+use std::path::Path;
 use std::time::Instant;
 
 use rand::Rng;
@@ -36,6 +39,92 @@ fn env_usize(k: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Minimal NumPy `.npy` v1/v2 reader for f32 little-endian arrays.
+/// The bench inputs are produced by the bench-compare embed scripts
+/// which always emit `<f4` in C order; the reader rejects anything
+/// else loudly so silent recall regressions never sneak through.
+fn load_npy_f32(path: &Path) -> io::Result<(Vec<f32>, Vec<usize>)> {
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 6];
+    f.read_exact(&mut magic)?;
+    if &magic != b"\x93NUMPY" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad npy magic"));
+    }
+    let mut ver = [0u8; 2];
+    f.read_exact(&mut ver)?;
+    let header_len = if ver[0] == 1 {
+        let mut buf = [0u8; 2];
+        f.read_exact(&mut buf)?;
+        u16::from_le_bytes(buf) as usize
+    } else {
+        let mut buf = [0u8; 4];
+        f.read_exact(&mut buf)?;
+        u32::from_le_bytes(buf) as usize
+    };
+    let mut header_buf = vec![0u8; header_len];
+    f.read_exact(&mut header_buf)?;
+    let header = String::from_utf8_lossy(&header_buf);
+    if !header.contains("'descr': '<f4'") && !header.contains("\"descr\": \"<f4\"") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "npy descr is not <f4",
+        ));
+    }
+    if header.contains("'fortran_order': True") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fortran-order npy not supported",
+        ));
+    }
+    let shape_start = header
+        .find("'shape':")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing shape in npy header"))?
+        + 8;
+    let after = &header[shape_start..];
+    let lp = after
+        .find('(')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad shape paren"))?
+        + 1;
+    let rp = after
+        .find(')')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad shape paren"))?;
+    let dims: Vec<usize> = after[lp..rp]
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let total: usize = dims.iter().product();
+    let mut byte_buf = vec![0u8; total * 4];
+    f.read_exact(&mut byte_buf)?;
+    let mut data = Vec::with_capacity(total);
+    for chunk in byte_buf.chunks_exact(4) {
+        data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok((data, dims))
+}
+
+/// Read corpus + queries from .npy paths and return as
+/// `Vec<Vec<f32>>` rows (so the rest of the bench keeps its existing
+/// shape). Truncates to the first `limit` rows when set.
+fn load_npy_rows(path: &Path, limit: Option<usize>) -> io::Result<Vec<Vec<f32>>> {
+    let (data, shape) = load_npy_f32(path)?;
+    if shape.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "npy must be 2-D (rows, dim)",
+        ));
+    }
+    let rows = shape[0];
+    let dim = shape[1];
+    let n = limit.map(|l| l.min(rows)).unwrap_or(rows);
+    let mut out = Vec::with_capacity(n);
+    for r in 0..n {
+        let start = r * dim;
+        let row: Vec<f32> = data[start..start + dim].to_vec();
+        out.push(row);
+    }
+    Ok(out)
 }
 
 fn synthetic_centroids() -> [f32; 16] {
@@ -297,21 +386,41 @@ fn rss_mib_codes_only(n: usize, dim: usize, kind: QuantKind, has_block_lut: bool
 
 fn main() {
     let n = env_usize("SKEG_PARETO_N", 50_000);
-    let dim = env_usize("SKEG_PARETO_DIM", 1024);
+    let dim_synth = env_usize("SKEG_PARETO_DIM", 1024);
     let n_queries = env_usize("SKEG_PARETO_QUERIES", 200);
     let k = env_usize("SKEG_PARETO_K", 10);
+    let corpus_path = std::env::var("SKEG_PARETO_CORPUS").ok();
+    let queries_path = std::env::var("SKEG_PARETO_QUERIES_NPY").ok();
+
+    let centroids = synthetic_centroids();
+
+    // Source: real .npy when both paths are set, synthetic otherwise.
+    let (corpus, queries, dim, source_label) =
+        if let (Some(cp), Some(qp)) = (corpus_path.as_ref(), queries_path.as_ref()) {
+            eprintln!("# loading real corpus {cp} (limit N={n})");
+            let c = load_npy_rows(Path::new(cp), Some(n)).expect("corpus npy");
+            eprintln!("# loading real queries {qp} (limit Q={n_queries})");
+            let q = load_npy_rows(Path::new(qp), Some(n_queries)).expect("queries npy");
+            let dim = c[0].len();
+            let label = format!("real:{cp}");
+            (c, q, dim, label)
+        } else {
+            let c = generate_normalised(n, dim_synth, 0xC0FFEE);
+            let q = generate_normalised(n_queries, dim_synth, 0xBEEF);
+            (c, q, dim_synth, "synthetic".to_owned())
+        };
 
     println!("# block kernel pareto: skeg-pq128 / skeg-tq4-row / skeg-tq4-block");
-    println!("# N={n} dim={dim} queries={n_queries} k={k}");
+    println!(
+        "# source={source_label} N={} dim={dim} queries={} k={k}",
+        corpus.len(),
+        queries.len()
+    );
     println!(
         "# host: target_os={} target_arch={}",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-
-    let centroids = synthetic_centroids();
-    let corpus = generate_normalised(n, dim, 0xC0FFEE);
-    let queries = generate_normalised(n_queries, dim, 0xBEEF);
 
     eprintln!("# computing ground truth (brute-force f32) ...");
     let truth = ground_truth(&corpus, &queries, k);
