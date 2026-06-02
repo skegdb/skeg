@@ -344,9 +344,8 @@ pub fn tq4_adc_i8_neon(
     dim: usize,
 ) -> f32 {
     use std::arch::aarch64::{
-        vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s8, vget_high_s16,
-        vget_low_s8, vget_low_s16, vld1q_f32, vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vmulq_f32,
-        vqtbl1q_s8,
+        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s8, vget_high_s16,
+        vget_low_s8, vget_low_s16, vld1q_f32, vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vqtbl1q_s8,
     };
     let chunks = dim / 16;
     let mut tail_acc = 0.0f32;
@@ -369,8 +368,16 @@ pub fn tq4_adc_i8_neon(
     //   `indices` buffer are distinct allocations.
     let acc_total = unsafe {
         let lut = vld1q_s8(centroids_i8.as_ptr());
-        let scale_v = vdupq_n_f32(i8_scale);
-        let mut acc = vdupq_n_f32(0.0);
+        // Four independent accumulators to break the serial-FMA
+        // dependency chain (FMA latency ~4 cycles vs issue rate ~1).
+        // The i8_scale multiply is deferred to a single multiply on
+        // the horizontal sum at the end; float multiply distributes
+        // over scale so the result is identical (modulo IEEE rounding
+        // that the equivalence test tolerates within 1e-5).
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
         for chunk in 0..chunks {
             let off = chunk * 8;
             let q_base = chunk * 16;
@@ -388,24 +395,30 @@ pub fn tq4_adc_i8_neon(
             let centroids_i8x16 = vqtbl1q_s8(lut, idx_v);
 
             // Widen i8x16 -> i16x8 + i16x8 -> i32x4 x 4 -> f32x4 x 4.
+            // Scale multiply is intentionally NOT applied here; deferred
+            // to the horizontal-sum step below.
             let low_i16 = vmovl_s8(vget_low_s8(centroids_i8x16));
             let high_i16 = vmovl_s8(vget_high_s8(centroids_i8x16));
-            let c0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16))), scale_v);
-            let c1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16))), scale_v);
-            let c2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16))), scale_v);
-            let c3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16))), scale_v);
+            let c0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16)));
+            let c1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16)));
+            let c2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16)));
+            let c3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16)));
 
             let q0 = vld1q_f32(q_rot.as_ptr().add(q_base));
             let q1 = vld1q_f32(q_rot.as_ptr().add(q_base + 4));
             let q2 = vld1q_f32(q_rot.as_ptr().add(q_base + 8));
             let q3 = vld1q_f32(q_rot.as_ptr().add(q_base + 12));
 
-            acc = vfmaq_f32(acc, q0, c0);
-            acc = vfmaq_f32(acc, q1, c1);
-            acc = vfmaq_f32(acc, q2, c2);
-            acc = vfmaq_f32(acc, q3, c3);
+            // Four parallel FMAs into four independent accumulators.
+            acc0 = vfmaq_f32(acc0, q0, c0);
+            acc1 = vfmaq_f32(acc1, q1, c1);
+            acc2 = vfmaq_f32(acc2, q2, c2);
+            acc3 = vfmaq_f32(acc3, q3, c3);
         }
-        vaddvq_f32(acc)
+        // Pairwise reduce, then horizontal sum, then apply the
+        // deferred i8_scale once.
+        let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        vaddvq_f32(acc) * i8_scale
     };
     // Tail: dim not a multiple of 16. mxbai 1024 and MiniLM 384 both fit.
     let tail_start = chunks * 16;
@@ -478,9 +491,8 @@ pub fn tq2_adc_i8_neon(
     dim: usize,
 ) -> f32 {
     use std::arch::aarch64::{
-        vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s8, vget_high_s16,
-        vget_low_s8, vget_low_s16, vld1q_f32, vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vmulq_f32,
-        vqtbl1q_s8,
+        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s8, vget_high_s16,
+        vget_low_s8, vget_low_s16, vld1q_f32, vld1q_s8, vld1q_u8, vmovl_s8, vmovl_s16, vqtbl1q_s8,
     };
     let chunks = dim / 32;
     let mut tail_acc = 0.0f32;
@@ -496,8 +508,18 @@ pub fn tq2_adc_i8_neon(
     //   exercised here but documented for correctness.
     let acc_total = unsafe {
         let lut = vld1q_s8(centroids_i8.as_ptr());
-        let scale_v = vdupq_n_f32(i8_scale);
-        let mut acc = vdupq_n_f32(0.0);
+        // Eight independent accumulators (4 per half-chunk). Same pattern
+        // as tq4: break the serial FMA dependency chain so the issue
+        // rate, not the FMA latency, bounds the loop. i8_scale is
+        // deferred to one multiply on the horizontal sum.
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let mut acc4 = vdupq_n_f32(0.0);
+        let mut acc5 = vdupq_n_f32(0.0);
+        let mut acc6 = vdupq_n_f32(0.0);
+        let mut acc7 = vdupq_n_f32(0.0);
         for chunk in 0..chunks {
             let off = chunk * 8;
             let q_base = chunk * 32;
@@ -525,38 +547,44 @@ pub fn tq2_adc_i8_neon(
             let c_i8_a = vqtbl1q_s8(lut, idx_a);
             let low_i16_a = vmovl_s8(vget_low_s8(c_i8_a));
             let high_i16_a = vmovl_s8(vget_high_s8(c_i8_a));
-            let c0a = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_a))), scale_v);
-            let c1a = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16_a))), scale_v);
-            let c2a = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16_a))), scale_v);
-            let c3a = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16_a))), scale_v);
+            let c0a = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_a)));
+            let c1a = vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16_a)));
+            let c2a = vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16_a)));
+            let c3a = vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16_a)));
             let q0a = vld1q_f32(q_rot.as_ptr().add(q_base));
             let q1a = vld1q_f32(q_rot.as_ptr().add(q_base + 4));
             let q2a = vld1q_f32(q_rot.as_ptr().add(q_base + 8));
             let q3a = vld1q_f32(q_rot.as_ptr().add(q_base + 12));
-            acc = vfmaq_f32(acc, q0a, c0a);
-            acc = vfmaq_f32(acc, q1a, c1a);
-            acc = vfmaq_f32(acc, q2a, c2a);
-            acc = vfmaq_f32(acc, q3a, c3a);
+            acc0 = vfmaq_f32(acc0, q0a, c0a);
+            acc1 = vfmaq_f32(acc1, q1a, c1a);
+            acc2 = vfmaq_f32(acc2, q2a, c2a);
+            acc3 = vfmaq_f32(acc3, q3a, c3a);
 
             // Second half: another 16 lookups + 4 FMAs.
             let idx_b = vld1q_u8(indices_b.as_ptr());
             let c_i8_b = vqtbl1q_s8(lut, idx_b);
             let low_i16_b = vmovl_s8(vget_low_s8(c_i8_b));
             let high_i16_b = vmovl_s8(vget_high_s8(c_i8_b));
-            let c0b = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_b))), scale_v);
-            let c1b = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16_b))), scale_v);
-            let c2b = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16_b))), scale_v);
-            let c3b = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16_b))), scale_v);
+            let c0b = vcvtq_f32_s32(vmovl_s16(vget_low_s16(low_i16_b)));
+            let c1b = vcvtq_f32_s32(vmovl_s16(vget_high_s16(low_i16_b)));
+            let c2b = vcvtq_f32_s32(vmovl_s16(vget_low_s16(high_i16_b)));
+            let c3b = vcvtq_f32_s32(vmovl_s16(vget_high_s16(high_i16_b)));
             let q0b = vld1q_f32(q_rot.as_ptr().add(q_base + 16));
             let q1b = vld1q_f32(q_rot.as_ptr().add(q_base + 20));
             let q2b = vld1q_f32(q_rot.as_ptr().add(q_base + 24));
             let q3b = vld1q_f32(q_rot.as_ptr().add(q_base + 28));
-            acc = vfmaq_f32(acc, q0b, c0b);
-            acc = vfmaq_f32(acc, q1b, c1b);
-            acc = vfmaq_f32(acc, q2b, c2b);
-            acc = vfmaq_f32(acc, q3b, c3b);
+            acc4 = vfmaq_f32(acc4, q0b, c0b);
+            acc5 = vfmaq_f32(acc5, q1b, c1b);
+            acc6 = vfmaq_f32(acc6, q2b, c2b);
+            acc7 = vfmaq_f32(acc7, q3b, c3b);
         }
-        vaddvq_f32(acc)
+        // Tree reduce then horizontal sum then deferred scale.
+        let s01 = vaddq_f32(acc0, acc1);
+        let s23 = vaddq_f32(acc2, acc3);
+        let s45 = vaddq_f32(acc4, acc5);
+        let s67 = vaddq_f32(acc6, acc7);
+        let acc = vaddq_f32(vaddq_f32(s01, s23), vaddq_f32(s45, s67));
+        vaddvq_f32(acc) * i8_scale
     };
     // Tail: dim not a multiple of 32. mxbai 1024 and MiniLM 384 both fit.
     let tail_start = chunks * 32;

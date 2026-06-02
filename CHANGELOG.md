@@ -8,6 +8,32 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.3] - 2026-06-02
+
+### Changed
+
+- **`skeg-simd::tq4_adc_i8_neon` and `tq2_adc_i8_neon`**: refactor the
+  TurboQuant ADC NEON kernels to use multiple independent f32x4
+  accumulators (4 for tq4, 8 for tq2) and defer the `i8_scale`
+  multiply until after the horizontal sum. Breaks the serial-FMA
+  dependency chain that previously throttled per-row throughput.
+
+  Measured on M1 Pro, 100k synthetic vectors, single-thread flat
+  scan via `cargo bench -p skeg-vector --bench flat_throughput`:
+
+  - tq2 at dim=1024: 32 QPS -> 55 QPS (+72%)
+  - tq2 at dim=1536: 21 QPS -> 38 QPS (+81%)
+  - tq4 at dim=1024: 32 QPS -> 43-53 QPS (+35-66%)
+  - tq4 at dim=1536: 21 QPS -> 35 QPS (+67%)
+
+  Result is bit-equivalent to the previous kernel within the
+  existing equivalence test tolerance (float multiply distributes
+  over the scale factor; per-test 1e-5 budget).
+
+### Versions bumped
+
+- `skeg-simd` 0.1.2 -> 0.1.3 (kernel refactor, behaviour unchanged)
+
 ## [0.3.2] - 2026-06-02
 
 ### Fixed
