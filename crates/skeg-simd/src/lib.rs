@@ -12,7 +12,13 @@
 //! every unsafe block documents the bounds invariant that makes it sound.
 
 pub mod block;
-pub use block::{BLOCK, build_tq4_lut_f32, interleave_tq4_codes, tq4_block32_score_scalar};
+pub use block::{
+    BLOCK, FLUSH_EVERY, build_tq4_lut_f32, interleave_tq4_codes, quantize_tq4_lut_u8,
+    tq4_block32_score_scalar, tq4_block32_score_u8_scalar,
+};
+
+#[cfg(target_arch = "aarch64")]
+pub use block::tq4_block32_score_u8_neon;
 
 // ── Scalar kernels (portable; also the reference for NEON equivalence) ────────
 
