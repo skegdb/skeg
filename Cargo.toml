@@ -8,13 +8,11 @@ members = [
     "crates/skeg-server",
     "crates/skeg-resp3",
     "crates/skeg-telemetry",
+    "crates/skeg-tenant",
+    "crates/skeg-server-tenant",
 ]
 # Fuzz targets live outside the workspace (own Cargo.toml).
-# skeg-tenant is excluded too: it ships under BUSL-1.1 from a separate
-# repository, and its source-tree presence here is for the optional
-# `tenant` feature in skeg-server only. It is not part of the Apache
-# engine workspace.
-exclude = ["fuzz", "crates/skeg-tenant"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

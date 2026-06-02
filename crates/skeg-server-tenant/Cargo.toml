@@ -1,0 +1,39 @@
+[package]
+name = "skeg-server-tenant"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Multi-tenant server binary: wraps skeg-server with the skeg-tenant backend"
+readme = "../../README.md"
+keywords = ["multi-tenant", "server", "skeg"]
+categories = ["database"]
+
+[lib]
+name = "skeg_server_tenant"
+path = "src/lib.rs"
+
+[[bin]]
+# End-user binary keeps the public name. The crate name is different
+# (skeg-server-tenant) so it does not clash with the OSS skeg-server on
+# crates.io.
+name = "skeg-server"
+path = "src/main.rs"
+
+[dependencies]
+skeg-server = { path = "../skeg-server", version = "0.3" }
+skeg-tenant = { path = "../skeg-tenant", version = "0.1" }
+skeg-vector = { path = "../skeg-vector", version = "0.1" }
+skeg-platform = { path = "../skeg-platform", version = "0.1" }
+
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tikv-jemallocator = { workspace = true }
+
+[lints]
+workspace = true

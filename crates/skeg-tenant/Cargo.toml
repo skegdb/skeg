@@ -1,9 +1,16 @@
 [package]
 name = "skeg-tenant"
 version = "0.1.0"
-edition = "2024"
-publish = false
-license = "BUSL-1.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Multi-tenant primitives for skeg (auth, tenant id, scoped keys, quota)"
+readme = "../../README.md"
+keywords = ["multi-tenant", "auth", "skeg"]
+categories = ["database", "authentication"]
 
 [lib]
 path = "src/lib.rs"
@@ -17,21 +24,23 @@ sha2 = "0.10"
 # Constant-time byte compare for token validation.
 subtle = "2.5"
 # Random nonce/salt material.
-rand = "0.9"
+rand = { workspace = true }
 
 # Persistence + IO
-bytes = "1"
-thiserror = "2"
-tracing = "0.1"
-parking_lot = "0.12"
-ahash = "0.8"
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+ahash = { workspace = true }
 
 # Encoding for persistent records
-crc32c = "0.6"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32c = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
-proptest = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
 
+[lints]
+workspace = true
