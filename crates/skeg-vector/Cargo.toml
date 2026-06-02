@@ -71,5 +71,9 @@ harness = false
 name = "tq_walk_gate"
 harness = false
 
+[[bench]]
+name = "flat_throughput"
+harness = false
+
 [lints]
 workspace = true
