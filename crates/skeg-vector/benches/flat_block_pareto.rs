@@ -16,7 +16,8 @@
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::needless_range_loop
+    clippy::needless_range_loop,
+    unused_imports
 )]
 
 use std::cmp::Ordering;
