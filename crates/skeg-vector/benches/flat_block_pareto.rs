@@ -160,6 +160,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot
 }
 
+#[cfg(target_arch = "aarch64")]
 fn nearest_centroid(v: f32, centroids: &[f32; 16]) -> u8 {
     let mut best = 0u8;
     let mut best_d = f32::INFINITY;
@@ -173,6 +174,7 @@ fn nearest_centroid(v: f32, centroids: &[f32; 16]) -> u8 {
     best
 }
 
+#[cfg(target_arch = "aarch64")]
 fn quantise_corpus_tq4(corpus: &[Vec<f32>], dim: usize, centroids: &[f32; 16]) -> Vec<Vec<u8>> {
     let n_groups = dim / 2;
     let mut rows = Vec::with_capacity(corpus.len());
