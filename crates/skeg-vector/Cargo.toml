@@ -30,6 +30,7 @@ tracing = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+libc = { workspace = true }
 
 [[bench]]
 name = "vamana"
@@ -73,6 +74,18 @@ harness = false
 
 [[bench]]
 name = "flat_throughput"
+harness = false
+
+[[bench]]
+name = "flat_block_throughput"
+harness = false
+
+[[bench]]
+name = "flat_block_pareto"
+harness = false
+
+[[bench]]
+name = "vamana_rerank_pipe"
 harness = false
 
 [lints]

@@ -893,8 +893,62 @@ impl QuantizedVectors {
         Ok(())
     }
 
-    /// The int8 scale, if this set is int8-quantized.
+    /// True when the underlying representation is `TurboQuant { bits = 4 }`
+    /// and therefore eligible for the block-32 SIMD scoring path.
     #[must_use]
+    pub fn supports_tq4_block(&self) -> bool {
+        matches!(self.repr, QuantRepr::TurboQuant { bits: 4, .. })
+    }
+
+    /// f32 Lloyd-Max centroids for the TurboQuant 4-bit codebook, if
+    /// the representation matches. Used by the block kernel's LUT
+    /// pre-compute step.
+    #[must_use]
+    pub fn tq4_centroids(&self) -> Option<&[f32]> {
+        match &self.repr {
+            QuantRepr::TurboQuant {
+                bits: 4, centroids, ..
+            } => Some(centroids.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Per-vector scales for the TurboQuant codebook. Used by the
+    /// block kernel after the inner-product proxy is reconstructed.
+    #[must_use]
+    pub fn tq4_scales(&self) -> Option<&[f32]> {
+        match &self.repr {
+            QuantRepr::TurboQuant {
+                bits: 4, scales, ..
+            } => Some(scales.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Row-major 4-bit codes (dim/2 bytes per vector). Caller is
+    /// responsible for interleaving them into the block layout via
+    /// `skeg_simd::interleave_tq4_codes` before scoring.
+    #[must_use]
+    pub fn tq4_codes(&self) -> Option<&[u8]> {
+        match &self.repr {
+            QuantRepr::TurboQuant { bits: 4, codes, .. } => Some(codes.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Apply the TurboQuant rotation to a unit-normalised query and
+    /// return the rotated f32 vector. Required by the block kernel
+    /// to build the per-query LUT.
+    #[must_use]
+    pub fn tq4_rotate_query(&self, unit_query: &[f32]) -> Option<Vec<f32>> {
+        match &self.repr {
+            QuantRepr::TurboQuant {
+                bits: 4, rotation, ..
+            } => Some(rotation.apply_alloc(unit_query)),
+            _ => None,
+        }
+    }
+
     pub fn int8_scale(&self) -> Option<f32> {
         match self.repr {
             QuantRepr::Int8 { scale, .. } => Some(scale),

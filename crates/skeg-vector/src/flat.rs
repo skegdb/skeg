@@ -41,6 +41,11 @@ pub struct FlatIndex {
     live_count: usize,
     /// Quantized scan form; `None` means dirty (rebuilt on next search).
     quant: Option<QuantizedVectors>,
+    /// Block-interleaved TurboQuant 4-bit codes, built lazily by
+    /// [`FlatIndex::search_block_tq4`] and reused across subsequent
+    /// queries. Invalidated alongside `quant` whenever the index
+    /// mutates.
+    block_codes_tq4: Option<Vec<u8>>,
 }
 
 impl FlatIndex {
@@ -61,6 +66,7 @@ impl FlatIndex {
             live: FixedBitSet::new(),
             live_count: 0,
             quant: None,
+            block_codes_tq4: None,
         }
     }
 
@@ -111,6 +117,7 @@ impl FlatIndex {
             self.live_count += 1;
         }
         self.quant = None; // f32 data changed: quantized form is now stale
+        self.block_codes_tq4 = None; // and the interleaved cache too
     }
 
     /// Tombstone the vector for `id`. Returns `true` if it was live.
@@ -200,6 +207,185 @@ impl FlatIndex {
     /// Exact cosine between `query` and the f32 vector stored at `row`.
     fn cosine(&self, query: &[f32], row: usize) -> f32 {
         cosine_f32(query, &self.f32_data[row * self.dim..(row + 1) * self.dim])
+    }
+
+    /// Search using the block-32 SIMD scoring path for TurboQuant
+    /// 4-bit. Returns the top-`k` `(id, cosine)` pairs after a
+    /// candidate-and-rerank pass: the block kernel preselects
+    /// `rerank_width(k)` candidates by their proxy score, then each
+    /// candidate is reranked with the exact f32 cosine against the
+    /// stored f32 vectors. Equivalent semantics to
+    /// [`search_quantized`](Self::search_quantized) for `bits = 4`,
+    /// just routed through the block-32 layout.
+    ///
+    /// Returns `None` (delegating to the row-major path is the
+    /// caller's responsibility) when the tier is not
+    /// `TurboQuant { bits = 4 }`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len() != dim`.
+    pub fn search_block_tq4(&mut self, query: &[f32], k: usize) -> Option<Vec<(u64, f32)>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        #[cfg(target_arch = "aarch64")]
+        use skeg_simd::tq4_block32_score_u8_neon;
+        #[cfg(not(target_arch = "aarch64"))]
+        use skeg_simd::tq4_block32_score_u8_scalar;
+        use skeg_simd::{
+            BLOCK as TQ4_BLOCK, build_tq4_lut_f32, interleave_tq4_codes, quantize_tq4_lut_u8,
+        };
+
+        assert_eq!(query.len(), self.dim, "query dim mismatch");
+        // Block path is TurboQuant-bits-4-only. Pre-empt the build
+        // call for the F32 tier, which would panic in
+        // `QuantizedVectors::build`.
+        if !matches!(self.kind, QuantKind::TurboQuant { bits: 4 }) {
+            return None;
+        }
+        if k == 0 || self.live_count == 0 {
+            return Some(Vec::new());
+        }
+
+        if self.quant.is_none() {
+            self.quant = Some(QuantizedVectors::build(&self.f32_data, self.dim, self.kind));
+        }
+        let quant = self.quant.as_ref().expect("quant just built");
+        if !quant.supports_tq4_block() {
+            return None;
+        }
+
+        // Lazy interleave: rebuild only after `insert` invalidates
+        // the cache. The block kernel iterates byte-group-major so
+        // every byte is touched exactly once per query - sequential
+        // memory pattern at minimal compute cost.
+        if self.block_codes_tq4.is_none() {
+            let n = quant.len();
+            let n_blocks = n / TQ4_BLOCK;
+            let n_groups = self.dim / 2;
+            let row_codes = quant.tq4_codes().expect("guarded above");
+            let mut blocks = vec![0u8; n_blocks * n_groups * TQ4_BLOCK];
+            for b in 0..n_blocks {
+                let row_refs: Vec<&[u8]> = (0..TQ4_BLOCK)
+                    .map(|v| {
+                        let row = b * TQ4_BLOCK + v;
+                        &row_codes[row * n_groups..(row + 1) * n_groups]
+                    })
+                    .collect();
+                let block_slice =
+                    &mut blocks[b * n_groups * TQ4_BLOCK..(b + 1) * n_groups * TQ4_BLOCK];
+                interleave_tq4_codes(&row_refs, self.dim, block_slice);
+            }
+            self.block_codes_tq4 = Some(blocks);
+        }
+        let blocks = self.block_codes_tq4.as_ref().expect("just built");
+        let n = quant.len();
+        let n_blocks = n / TQ4_BLOCK;
+        let n_groups = self.dim / 2;
+        let block_stride = n_groups * TQ4_BLOCK;
+
+        // Per-query LUT pre-compute: unit-normalise + rotate the
+        // query so the inner product over the rotated codes tracks
+        // cosine.
+        let mut unit = vec![0.0f32; self.dim];
+        let norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for (o, &x) in unit.iter_mut().zip(query) {
+                *o = x / norm;
+            }
+        }
+        let q_rot = quant.tq4_rotate_query(&unit).expect("guarded above");
+        let centroids_slice = quant.tq4_centroids().expect("guarded above");
+        let mut centroids: [f32; 16] = [0.0; 16];
+        centroids.copy_from_slice(&centroids_slice[..16]);
+        let scales = quant.tq4_scales().expect("guarded above");
+
+        let mut lut_f32 = vec![0.0f32; n_groups * 32];
+        let mut lut_u8 = vec![0u8; n_groups * 32];
+        build_tq4_lut_f32(&q_rot, &centroids, self.dim, &mut lut_f32);
+        let (inv_scale, bias_per_group) = quantize_tq4_lut_u8(&lut_f32, &mut lut_u8);
+
+        // Pre-select with the block kernel; the candidate pool size
+        // matches the row-major path's `rerank_width` so recall is
+        // comparable. Min-heap keyed on fixed-point score: `peek`
+        // returns the weakest kept candidate, replaced when a new
+        // candidate scores higher.
+        let rerank = rerank_width(k).min(n);
+        let mut cands: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::with_capacity(rerank + 1);
+        let scale_to_i64 = 1_000_000.0_f32;
+        let mut block_out = [0.0f32; TQ4_BLOCK];
+        let push_cand =
+            |cands: &mut BinaryHeap<Reverse<(i64, usize)>>, score_i64: i64, row: usize| {
+                let entry = Reverse((score_i64, row));
+                if cands.len() < rerank {
+                    cands.push(entry);
+                } else if let Some(Reverse((min_score, _))) = cands.peek()
+                    && score_i64 > *min_score
+                {
+                    cands.pop();
+                    cands.push(entry);
+                }
+            };
+        for b in 0..n_blocks {
+            let block_slice = &blocks[b * block_stride..(b + 1) * block_stride];
+            #[cfg(target_arch = "aarch64")]
+            tq4_block32_score_u8_neon(
+                block_slice,
+                &lut_u8,
+                inv_scale,
+                bias_per_group,
+                self.dim,
+                &mut block_out,
+            );
+            #[cfg(not(target_arch = "aarch64"))]
+            tq4_block32_score_u8_scalar(
+                block_slice,
+                &lut_u8,
+                inv_scale,
+                bias_per_group,
+                self.dim,
+                &mut block_out,
+            );
+            for lane in 0..TQ4_BLOCK {
+                let row = b * TQ4_BLOCK + lane;
+                if !self.live.contains(row) {
+                    continue;
+                }
+                let score = block_out[lane] * scales[row];
+                let score_i64 = (score * scale_to_i64) as i64;
+                push_cand(&mut cands, score_i64, row);
+            }
+        }
+        // Tail: rows in `[n_blocks * BLOCK, n)` scored via the
+        // existing row-major proxy so the candidate set covers the
+        // full corpus when N % 32 != 0.
+        let tail_start = n_blocks * TQ4_BLOCK;
+        if tail_start < n {
+            let code = quant.quantize_query(query);
+            for row in tail_start..n {
+                if !self.live.contains(row) {
+                    continue;
+                }
+                let proxy = quant.proxy(row, &code);
+                push_cand(&mut cands, i64::from(proxy), row);
+            }
+        }
+
+        // Rerank with exact f32 cosine against the source-of-truth
+        // vectors. Same pattern as the row-major search path.
+        let mut scored: Vec<(OrderedFloat<f32>, u64)> = cands
+            .into_iter()
+            .map(|Reverse((_, row))| (OrderedFloat(self.cosine(query, row)), self.ids[row]))
+            .collect();
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        scored.truncate(k);
+        Some(
+            scored
+                .into_iter()
+                .map(|(score, id)| (id, score.into_inner()))
+                .collect(),
+        )
     }
 
     /// The `k` live rows with the greatest `key`, returned best-first.
@@ -370,6 +556,58 @@ mod tests {
         }
         let recall = hits as f64 / total as f64;
         assert!(recall >= 0.99, "int8 recall@10 = {recall:.4}");
+    }
+
+    /// TurboQuant 4-bit block-32 path: same semantic guarantee as the
+    /// row-major search (exact-match query returns its own id at top-1)
+    /// and recall@10 stays >= 0.95 across a 256-vector corpus.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn tq4_block_search_recovers_exact_match_and_high_recall() {
+        let dim = 64;
+        let n = 256;
+        let vectors = random_vectors(n, dim, 4242);
+        let mut index = FlatIndex::new(dim, QuantKind::TurboQuant { bits: 4 });
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v);
+        }
+        for probe in [0usize, 33, 128, 200] {
+            let hits = index
+                .search_block_tq4(&vectors[probe], 5)
+                .expect("tq4 path available");
+            assert_eq!(hits[0].0, probe as u64, "block tq4 missed exact match");
+            assert!((hits[0].1 - 1.0).abs() < 1e-3, "cosine self {}", hits[0].1);
+        }
+        // recall@10 vs brute force across a query set.
+        let queries = random_vectors(20, dim, 8888);
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for q in &queries {
+            let want = brute_force(&vectors, q, 10);
+            let got: Vec<u64> = index
+                .search_block_tq4(q, 10)
+                .expect("tq4 path available")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            hits += got.iter().filter(|id| want.contains(id)).count();
+            total += want.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(recall >= 0.95, "tq4 block recall@10 = {recall:.4}");
+    }
+
+    /// `search_block_tq4` must refuse to handle non-TurboQuant tiers
+    /// (returns None so the caller falls back to row-major).
+    #[test]
+    fn tq4_block_returns_none_for_non_tq4_tier() {
+        let dim = 32;
+        let vectors = random_vectors(64, dim, 1);
+        let mut index = FlatIndex::new(dim, QuantKind::F32);
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v);
+        }
+        assert!(index.search_block_tq4(&vectors[0], 5).is_none());
     }
 
     /// Binary quantization is coarse but the exact-match vector still ranks
