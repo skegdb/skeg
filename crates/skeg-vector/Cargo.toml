@@ -1,6 +1,6 @@
 [package]
 name = "skeg-vector"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ keywords = ["vector-database", "ann", "vamana", "quantization", "skeg"]
 categories = ["database", "algorithms"]
 
 [dependencies]
-skeg-simd = { path = "../skeg-simd", version = "0.1.2" }
+skeg-simd = { path = "../skeg-simd", version = "0.1.4" }
 skeg-platform = { path = "../skeg-platform", version = "0.1.2" }
 parking_lot = { workspace = true }
 smallvec = { workspace = true }

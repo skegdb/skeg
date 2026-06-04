@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-simd"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "criterion",
  "proptest",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-vector"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "bytemuck",

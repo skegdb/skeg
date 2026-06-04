@@ -8,6 +8,54 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.4] - 2026-06-04
+
+### Added
+
+- **`skeg-simd` block-32 SIMD scoring for TurboQuant 4-bit codes.**
+  New public API: `build_tq4_lut_f32`, `interleave_tq4_codes`,
+  `quantize_tq4_lut_u8`, `tq4_block32_score_scalar`,
+  `tq4_block32_score_u8_scalar`, and (on aarch64)
+  `tq4_block32_score_u8_neon`. The block kernel scores 32 vectors in
+  parallel via `vqtbl1q_u8` lookups into a per-query u8 LUT with a
+  periodic widening flush to f32. Measured on M1 Pro, 100k synthetic
+  vectors, single-thread flat scan:
+
+  - dim=384: row 275 QPS -> block 1359 QPS (4.93x)
+  - dim=1024: row 107 QPS -> block 515 QPS (4.80x)
+  - dim=1536: row 73 QPS -> block 342 QPS (4.71x)
+
+- **`skeg-vector::FlatIndex::search_block_tq4`**: opt-in entry point
+  routing the flat scan through the block-32 kernel for the
+  `TurboQuant { bits: 4 }` tier. Returns `None` for other tiers so the
+  caller falls back to the row-major `search` path. Recall is
+  equivalent to row scoring (proptest verified, |delta| < 1e-3).
+
+- **`skeg-vector` pq32 / pq64 aliases**: cache-fit experiments for
+  PQ with smaller `m` values.
+
+- **Diagnostic benches**: `flat_block_throughput`,
+  `flat_block_pareto`, `vamana_rerank_pipe`.
+
+### Changed
+
+- **`skeg-simd::tq4_adc_i8_neon`**: further +100% via 8-accumulator
+  unroll + native nibble unpack (on top of v0.3.3's +35-66%). 32 coords
+  per outer iteration over 8 independent f32x4 accumulator chains,
+  replacing the SWAR+stack-roundtrip nibble unpack with a NEON-native
+  `vand_u8 + vshr_n_u8 + vzip1_u8 + vzip2_u8 + vcombine_u8` sequence
+  (~6 cycles/chunk saved). Bit-equivalent to the previous kernel within
+  the existing equivalence test tolerance.
+
+- **`skeg-simd::tq2_adc_i8_neon`**: +70-74% via the same NEON-native
+  nibble unpack pattern adapted to 2-bit codes.
+
+### Versions bumped
+
+- `skeg-simd` 0.1.3 -> 0.1.4 (added block-32 API; row kernels still
+  binary-compatible)
+- `skeg-vector` 0.1.2 -> 0.1.3 (added `FlatIndex::search_block_tq4`)
+
 ## [0.3.3] - 2026-06-02
 
 ### Changed
