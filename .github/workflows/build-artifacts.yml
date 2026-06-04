@@ -34,7 +34,7 @@ jobs:
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -63,7 +63,7 @@ jobs:
           shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
       - name: upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: |
