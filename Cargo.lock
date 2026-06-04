@@ -1181,6 +1181,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "fixedbitset",
+ "libc",
  "ordered-float",
  "parking_lot",
  "proptest",
