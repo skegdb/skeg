@@ -166,10 +166,7 @@ fn main() {
     let t_build = Instant::now();
     build_vectors_file(&path, n, dim, 0xC0FFEE_u64);
     eprintln!("# build took {:.2}s", t_build.elapsed().as_secs_f64());
-    let file = OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .expect("open ro");
+    let file = OpenOptions::new().read(true).open(&path).expect("open ro");
 
     let nocache = std::env::var("SKEG_PIPE_NOCACHE")
         .ok()
@@ -184,8 +181,15 @@ fn main() {
         // int arg by value and never reads memory through `file`.
         use std::os::fd::AsRawFd;
         let fd = file.as_raw_fd();
-        let ret = unsafe { libc::fcntl(fd, 48 /* F_NOCACHE */, 1) };
-        assert_eq!(ret, 0, "fcntl F_NOCACHE failed: {}", std::io::Error::last_os_error());
+        let ret = unsafe {
+            libc::fcntl(fd, 48 /* F_NOCACHE */, 1)
+        };
+        assert_eq!(
+            ret,
+            0,
+            "fcntl F_NOCACHE failed: {}",
+            std::io::Error::last_os_error()
+        );
         eprintln!("# F_NOCACHE active (cold-perpetual mode)");
     }
     #[cfg(not(target_os = "macos"))]
@@ -218,11 +222,8 @@ fn main() {
     println!("parallel,{n},{dim},{rerank},{par_q:.1},{par_r:.2},0");
     // Sleep windows that mimic the server's inter-query gap.
     for sleep_us in [500u64, 1500, 5000] {
-        let (par_q, par_r) =
-            run_parallel(&file, &q_meas, &cands_meas, dim, sleep_us);
-        println!(
-            "parallel,{n},{dim},{rerank},{par_q:.1},{par_r:.2},{sleep_us}"
-        );
+        let (par_q, par_r) = run_parallel(&file, &q_meas, &cands_meas, dim, sleep_us);
+        println!("parallel,{n},{dim},{rerank},{par_q:.1},{par_r:.2},{sleep_us}");
     }
     let speedup = seq_q / par_q;
     eprintln!(
