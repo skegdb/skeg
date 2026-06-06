@@ -254,6 +254,16 @@ async fn dispatch_command(
             kv_incrby_typed(&key, signed, shards, *tenant, tenant_backend).await
         }
         Command::Select { db } => kv_select_typed(db),
+        Command::SkegStats => skeg_stats(shards).await,
+        Command::SkegShards => skeg_shards(shards).await,
+        Command::SkegWhoami => skeg_whoami(*tenant, tenant_backend.is_some()),
+        Command::SkegAuth { args } => skeg_auth(&args),
+        Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
+        Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
+        Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
+        Command::SkegVset { args } => skeg_vset(&args, shards, *tenant).await,
+        Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
+        Command::SkegVsearch { args } => skeg_vsearch(&args, shards, *tenant).await,
         Command::Unknown { name, args } => {
             dispatch_unknown(
                 &name.to_ascii_uppercase(),

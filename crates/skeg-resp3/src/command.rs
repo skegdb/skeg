@@ -50,6 +50,38 @@ pub enum Command {
     /// a single logical DB; the parser captures the requested index
     /// so the dispatcher can decide whether to honour it.
     Select { db: i64 },
+
+    // ── SKEG.* admin namespace ──────────────────────────────────────
+    /// `SKEG.STATS` — cache + telemetry dump. No args.
+    SkegStats,
+    /// `SKEG.SHARDS` — per-shard metrics. No args.
+    SkegShards,
+    /// `SKEG.WHOAMI` — tenant identity bound to the connection.
+    SkegWhoami,
+    /// `SKEG.AUTH ...` — placeholder for future token-based auth. The
+    /// parser preserves the raw arguments so the dispatcher (which
+    /// currently emits a fixed `reserved` error) can evolve without a
+    /// re-parse pass.
+    SkegAuth { args: Vec<Bytes> },
+
+    // ── SKEG.* vector namespace ─────────────────────────────────────
+    /// `SKEG.VINDEX.LIST` — enumerate vindexes for the calling tenant.
+    SkegVindexList,
+    /// `SKEG.VINDEX.CREATE name dim kind backend`. The parser checks
+    /// arity (4 args) and forwards the raw bytes; inner argument
+    /// parsing (UTF-8 name, u32 dim, kind/backend label) stays in the
+    /// dispatcher because the error strings embed per-argument labels
+    /// the existing clients rely on.
+    SkegVindexCreate { args: Vec<Bytes> },
+    /// `SKEG.VINDEX.DROP name`. Arity 1; inner parsing in dispatcher.
+    SkegVindexDrop { args: Vec<Bytes> },
+    /// `SKEG.VSET name id vector`. Arity 3.
+    SkegVset { args: Vec<Bytes> },
+    /// `SKEG.VDEL name id`. Arity 2.
+    SkegVdel { args: Vec<Bytes> },
+    /// `SKEG.VSEARCH name k l_search vector`. Arity 4.
+    SkegVsearch { args: Vec<Bytes> },
+
     /// Any command that was syntactically a valid array of bulks but whose
     /// name we have not wired into a typed variant yet. The dispatch layer
     /// gets the original name and args verbatim.
@@ -108,6 +140,14 @@ pub enum CommandError {
     /// `INCRBY foo bar`: the delta is not a valid i64.
     #[error("value is not an integer or out of range")]
     NotAnInteger,
+    /// Wrong arity for a `SKEG.*` command whose error message names the
+    /// expected positional argument labels (e.g. `want name dim kind
+    /// backend`). Preserves the legacy server format byte-for-byte.
+    #[error("wrong number of arguments for '{command}'; want {want}")]
+    WrongAritySkeg {
+        command: &'static str,
+        want: &'static str,
+    },
 }
 
 /// Parse one wire frame into a `Command`.
@@ -127,7 +167,8 @@ pub fn parse_command(frame: Frame) -> Result<Command, CommandError> {
     };
     let name = command_name(name_raw)?;
     let args: Vec<Bytes> = iter.map(arg_as_bytes).collect::<Result<_, _>>()?;
-    match name.to_ascii_uppercase().as_str() {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
         "HELLO" => Ok(Command::Hello(parse_hello(args)?)),
         "PING" => Ok(Command::Ping(parse_ping(args)?)),
         "ECHO" => Ok(Command::Echo(parse_echo(args)?)),
@@ -142,7 +183,98 @@ pub fn parse_command(frame: Frame) -> Result<Command, CommandError> {
         "INCRBY" => parse_kv_incrby(args),
         "DECRBY" => parse_kv_decrby(args),
         "SELECT" => parse_kv_select(args),
+        s if s.starts_with("SKEG.") => parse_skeg(&upper["SKEG.".len()..], args, name),
         _ => Ok(Command::Unknown { name, args }),
+    }
+}
+
+fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command, CommandError> {
+    match verb {
+        "STATS" => {
+            if !args.is_empty() {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.STATS",
+                });
+            }
+            Ok(Command::SkegStats)
+        }
+        "SHARDS" => {
+            if !args.is_empty() {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.SHARDS",
+                });
+            }
+            Ok(Command::SkegShards)
+        }
+        "WHOAMI" => {
+            if !args.is_empty() {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.WHOAMI",
+                });
+            }
+            Ok(Command::SkegWhoami)
+        }
+        // Args preserved for forward-compat with the placeholder
+        // `SKEG.AUTH is reserved` handler.
+        "AUTH" => Ok(Command::SkegAuth { args }),
+        "VINDEX.LIST" => {
+            if !args.is_empty() {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.VINDEX.LIST",
+                });
+            }
+            Ok(Command::SkegVindexList)
+        }
+        "VINDEX.CREATE" => {
+            if args.len() != 4 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VINDEX.CREATE",
+                    want: "name dim kind backend",
+                });
+            }
+            Ok(Command::SkegVindexCreate { args })
+        }
+        "VINDEX.DROP" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.VINDEX.DROP",
+                });
+            }
+            Ok(Command::SkegVindexDrop { args })
+        }
+        "VSET" => {
+            if args.len() != 3 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VSET",
+                    want: "name id vector",
+                });
+            }
+            Ok(Command::SkegVset { args })
+        }
+        "VDEL" => {
+            if args.len() != 2 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VDEL",
+                    want: "name id",
+                });
+            }
+            Ok(Command::SkegVdel { args })
+        }
+        "VSEARCH" => {
+            if args.len() != 4 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VSEARCH",
+                    want: "name k l_search vector",
+                });
+            }
+            Ok(Command::SkegVsearch { args })
+        }
+        // Unknown SKEG.* verb: pass through so the dispatcher emits
+        // `ERR unknown command 'SKEG.<verb>'`.
+        _ => Ok(Command::Unknown {
+            name: raw_name,
+            args,
+        }),
     }
 }
 
@@ -849,5 +981,160 @@ mod tests {
                 "wrong number of arguments for 'GET'"
             );
         }
+    }
+
+    // ── SKEG.* typed parsing ─────────────────────────────────────
+
+    #[test]
+    fn skeg_stats_no_args() {
+        let cmd = parse_command(arr(&[b"SKEG.STATS"])).unwrap();
+        assert_eq!(cmd, Command::SkegStats);
+    }
+
+    #[test]
+    fn skeg_stats_with_args_errors() {
+        let err = parse_command(arr(&[b"SKEG.STATS", b"x"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'SKEG.STATS'");
+    }
+
+    #[test]
+    fn skeg_shards_no_args() {
+        let cmd = parse_command(arr(&[b"SKEG.SHARDS"])).unwrap();
+        assert_eq!(cmd, Command::SkegShards);
+    }
+
+    #[test]
+    fn skeg_whoami_no_args() {
+        let cmd = parse_command(arr(&[b"SKEG.WHOAMI"])).unwrap();
+        assert_eq!(cmd, Command::SkegWhoami);
+    }
+
+    #[test]
+    fn skeg_auth_preserves_args() {
+        let cmd = parse_command(arr(&[b"SKEG.AUTH", b"token-abc"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SkegAuth {
+                args: vec![Bytes::from_static(b"token-abc")]
+            }
+        );
+    }
+
+    #[test]
+    fn skeg_vindex_list_no_args() {
+        let cmd = parse_command(arr(&[b"SKEG.VINDEX.LIST"])).unwrap();
+        assert_eq!(cmd, Command::SkegVindexList);
+    }
+
+    #[test]
+    fn skeg_vindex_create_four_args() {
+        let cmd =
+            parse_command(arr(&[b"SKEG.VINDEX.CREATE", b"x", b"1024", b"int8", b"flat"])).unwrap();
+        let Command::SkegVindexCreate { args } = cmd else {
+            panic!("expected SkegVindexCreate");
+        };
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], Bytes::from_static(b"x"));
+        assert_eq!(args[3], Bytes::from_static(b"flat"));
+    }
+
+    #[test]
+    fn skeg_vindex_create_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.VINDEX.CREATE", b"x"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim kind backend"
+        );
+    }
+
+    #[test]
+    fn skeg_vindex_drop_one_arg() {
+        let cmd = parse_command(arr(&[b"SKEG.VINDEX.DROP", b"x"])).unwrap();
+        let Command::SkegVindexDrop { args } = cmd else {
+            panic!("expected SkegVindexDrop");
+        };
+        assert_eq!(args, vec![Bytes::from_static(b"x")]);
+    }
+
+    #[test]
+    fn skeg_vindex_drop_wrong_arity_error_string() {
+        // No `; want ...` suffix for VINDEX.DROP.
+        let err = parse_command(arr(&[b"SKEG.VINDEX.DROP"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'SKEG.VINDEX.DROP'");
+    }
+
+    #[test]
+    fn skeg_vset_three_args() {
+        let cmd = parse_command(arr(&[b"SKEG.VSET", b"x", b"42", &[0u8, 0, 0, 0]])).unwrap();
+        let Command::SkegVset { args } = cmd else {
+            panic!("expected SkegVset");
+        };
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn skeg_vset_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.VSET", b"x"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.VSET'; want name id vector"
+        );
+    }
+
+    #[test]
+    fn skeg_vdel_two_args() {
+        let cmd = parse_command(arr(&[b"SKEG.VDEL", b"x", b"42"])).unwrap();
+        let Command::SkegVdel { args } = cmd else {
+            panic!("expected SkegVdel");
+        };
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn skeg_vdel_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.VDEL", b"x"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.VDEL'; want name id"
+        );
+    }
+
+    #[test]
+    fn skeg_vsearch_four_args() {
+        let cmd =
+            parse_command(arr(&[b"SKEG.VSEARCH", b"x", b"10", b"300", &[0u8; 4]])).unwrap();
+        let Command::SkegVsearch { args } = cmd else {
+            panic!("expected SkegVsearch");
+        };
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn skeg_vsearch_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.VSEARCH", b"x"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector"
+        );
+    }
+
+    #[test]
+    fn unknown_skeg_verb_falls_through_to_unknown() {
+        // Verbs we have not typed yet must round-trip through Unknown
+        // so the dispatcher emits `ERR unknown command 'SKEG.FOO'`.
+        let cmd = parse_command(arr(&[b"SKEG.FOO", b"a"])).unwrap();
+        let Command::Unknown { name, args } = cmd else {
+            panic!("expected Unknown for SKEG.FOO");
+        };
+        assert_eq!(name, "SKEG.FOO");
+        assert_eq!(args, vec![Bytes::from_static(b"a")]);
+    }
+
+    #[test]
+    fn skeg_namespace_case_insensitive() {
+        let cmd = parse_command(arr(&[b"skeg.stats"])).unwrap();
+        assert_eq!(cmd, Command::SkegStats);
+        let cmd = parse_command(arr(&[b"Skeg.VindEx.List"])).unwrap();
+        assert_eq!(cmd, Command::SkegVindexList);
     }
 }
