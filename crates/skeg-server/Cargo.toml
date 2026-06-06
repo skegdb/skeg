@@ -42,9 +42,11 @@ tikv-jemallocator = { workspace = true }
 parking_lot = { workspace = true }
 
 [features]
-# Opt-in HTTP Prometheus exporter. Default off so the server binary
-# stays slim; pull in with `--features metrics-http` on the build.
-default = []
+# HTTP Prometheus exporter is on by default so the released binary
+# serves `/metrics` out of the box when `--metrics-port <PORT>` is
+# passed. Drop it with `--no-default-features`; the `--metrics-port`
+# flag stays parseable but logs a warning instead of binding.
+default = ["metrics-http"]
 metrics-http = ["skeg-telemetry/http"]
 
 [dev-dependencies]

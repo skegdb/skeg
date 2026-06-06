@@ -181,7 +181,11 @@ The project blog at [amanitaproject.com](https://amanitaproject.com/) carries th
 
 Live benchmark dashboard with the latest measurements (engine x scale x tier matrix, p50/p99 latency, recall, RSS): [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
 
-Protocol and operational documentation will be added to this repository in the days following the release.
+Operational guides live in this repository:
+
+- [`OBSERVABILITY.md`](OBSERVABILITY.md) — Prometheus exporter, scrape config, OTel collector integration, and the planned tracing roadmap.
+
+Protocol documentation will be added in the days following the release.
 
 ## Contributing
 

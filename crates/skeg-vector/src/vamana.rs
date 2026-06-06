@@ -1590,7 +1590,7 @@ impl DiskVamanaIndex {
             scored.push((OrderedFloat(cosine_f32(query, v)), id));
         }
 
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         scored.truncate(k);
         Ok(scored
             .into_iter()

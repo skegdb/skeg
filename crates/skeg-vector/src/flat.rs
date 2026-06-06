@@ -196,7 +196,7 @@ impl FlatIndex {
             .into_iter()
             .map(|(_, row)| (OrderedFloat(self.cosine(query, row)), self.ids[row]))
             .collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         scored.truncate(k);
         scored
             .into_iter()
@@ -378,7 +378,7 @@ impl FlatIndex {
             .into_iter()
             .map(|Reverse((_, row))| (OrderedFloat(self.cosine(query, row)), self.ids[row]))
             .collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         scored.truncate(k);
         Some(
             scored
@@ -406,6 +406,10 @@ impl FlatIndex {
             }
         }
         let mut out: Vec<(K, usize)> = heap.into_iter().map(|Reverse(pair)| pair).collect();
+        // `K` is generic and only `Ord`-bound; `sort_unstable_by_key`
+        // would require an extra `Copy` or `Clone` bound. Direct
+        // comparator is the cleanest option.
+        #[allow(clippy::unnecessary_sort_by)]
         out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         out
     }
@@ -439,7 +443,7 @@ mod tests {
             .enumerate()
             .map(|(i, v)| (OrderedFloat(cosine(query, v)), i as u64))
             .collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         scored.into_iter().take(k).map(|(_, id)| id).collect()
     }
 
