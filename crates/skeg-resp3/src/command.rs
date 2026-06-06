@@ -21,6 +21,35 @@ pub enum Command {
     Ping(Option<Bytes>),
     /// `ECHO msg` => bulk string reply identical to msg.
     Echo(Bytes),
+    /// `GET key` => bulk reply with the stored value or null if missing.
+    Get { key: Bytes },
+    /// `SET key value` => `+OK` reply. Per-call durability is the
+    /// server's default; future EX/PX/NX/XX options are not yet typed.
+    Set { key: Bytes, value: Bytes },
+    /// `DEL key [key ...]` => integer reply with the count of keys
+    /// that existed and were removed.
+    Del { keys: Vec<Bytes> },
+    /// `EXISTS key [key ...]` => integer reply with the count of
+    /// keys present.
+    Exists { keys: Vec<Bytes> },
+    /// `MGET key [key ...]` => array reply, one entry per key
+    /// (bulk or null).
+    Mget { keys: Vec<Bytes> },
+    /// `MSET key value [key value ...]` => `+OK` reply. The vec
+    /// holds `(key, value)` tuples; the parser enforces even arity.
+    Mset { pairs: Vec<(Bytes, Bytes)> },
+    /// `INCR key` => integer reply with the new value.
+    Incr { key: Bytes },
+    /// `DECR key` => integer reply with the new value.
+    Decr { key: Bytes },
+    /// `INCRBY key delta` => integer reply with the new value.
+    IncrBy { key: Bytes, delta: i64 },
+    /// `DECRBY key delta` => integer reply with the new value.
+    DecrBy { key: Bytes, delta: i64 },
+    /// `SELECT db` => `+OK` for `db == 0`, error otherwise. Skeg has
+    /// a single logical DB; the parser captures the requested index
+    /// so the dispatcher can decide whether to honour it.
+    Select { db: i64 },
     /// Any command that was syntactically a valid array of bulks but whose
     /// name we have not wired into a typed variant yet. The dispatch layer
     /// gets the original name and args verbatim.
@@ -65,6 +94,20 @@ pub enum CommandError {
     PingArity(usize),
     #[error("ECHO requires exactly 1 argument, got {0}")]
     EchoArity(usize),
+    /// Wrong arity for a KV command. The `command` field carries the
+    /// canonical name the server emits in its `ERR wrong number of
+    /// arguments for '<command>'` reply.
+    #[error("wrong number of arguments for '{command}'")]
+    WrongArity { command: &'static str },
+    /// `SELECT 1` (or any non-zero index): skeg has no DB number.
+    #[error("DB index out of range (skeg only supports DB 0)")]
+    SelectDbOutOfRange,
+    /// `SELECT abc`: the DB index is not a valid integer.
+    #[error("invalid DB index")]
+    SelectInvalidIndex,
+    /// `INCRBY foo bar`: the delta is not a valid i64.
+    #[error("value is not an integer or out of range")]
+    NotAnInteger,
 }
 
 /// Parse one wire frame into a `Command`.
@@ -88,8 +131,134 @@ pub fn parse_command(frame: Frame) -> Result<Command, CommandError> {
         "HELLO" => Ok(Command::Hello(parse_hello(args)?)),
         "PING" => Ok(Command::Ping(parse_ping(args)?)),
         "ECHO" => Ok(Command::Echo(parse_echo(args)?)),
+        "GET" => parse_kv_get(args),
+        "SET" => parse_kv_set(args),
+        "DEL" => parse_kv_del(args),
+        "EXISTS" => parse_kv_exists(args),
+        "MGET" => parse_kv_mget(args),
+        "MSET" => parse_kv_mset(args),
+        "INCR" => parse_kv_incr(args),
+        "DECR" => parse_kv_decr(args),
+        "INCRBY" => parse_kv_incrby(args),
+        "DECRBY" => parse_kv_decrby(args),
+        "SELECT" => parse_kv_select(args),
         _ => Ok(Command::Unknown { name, args }),
     }
+}
+
+fn parse_kv_get(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 1 {
+        return Err(CommandError::WrongArity { command: "GET" });
+    }
+    Ok(Command::Get {
+        key: args.swap_remove(0),
+    })
+}
+
+fn parse_kv_set(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 2 {
+        return Err(CommandError::WrongArity { command: "SET" });
+    }
+    let value = args.swap_remove(1);
+    let key = args.swap_remove(0);
+    Ok(Command::Set { key, value })
+}
+
+fn parse_kv_del(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.is_empty() {
+        return Err(CommandError::WrongArity { command: "DEL" });
+    }
+    Ok(Command::Del { keys: args })
+}
+
+fn parse_kv_exists(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.is_empty() {
+        return Err(CommandError::WrongArity { command: "EXISTS" });
+    }
+    Ok(Command::Exists { keys: args })
+}
+
+fn parse_kv_mget(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.is_empty() {
+        return Err(CommandError::WrongArity { command: "MGET" });
+    }
+    Ok(Command::Mget { keys: args })
+}
+
+fn parse_kv_mset(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.is_empty() || args.len() % 2 != 0 {
+        return Err(CommandError::WrongArity { command: "MSET" });
+    }
+    let mut iter = args.into_iter();
+    let mut pairs = Vec::with_capacity(iter.len() / 2);
+    while let Some(k) = iter.next() {
+        let v = iter.next().expect("even arity asserted above");
+        pairs.push((k, v));
+    }
+    Ok(Command::Mset { pairs })
+}
+
+fn parse_kv_incr(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 1 {
+        // The server formats arity errors for INCR and DECR with a
+        // shared label `INCR/DECR` for historical reasons; preserved
+        // byte-for-byte here.
+        return Err(CommandError::WrongArity {
+            command: "INCR/DECR",
+        });
+    }
+    Ok(Command::Incr {
+        key: args.swap_remove(0),
+    })
+}
+
+fn parse_kv_decr(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 1 {
+        return Err(CommandError::WrongArity {
+            command: "INCR/DECR",
+        });
+    }
+    Ok(Command::Decr {
+        key: args.swap_remove(0),
+    })
+}
+
+fn parse_kv_incrby(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 2 {
+        return Err(CommandError::WrongArity {
+            command: "INCRBY/DECRBY",
+        });
+    }
+    let delta = parse_i64(&args[1])?;
+    let key = args.swap_remove(0);
+    Ok(Command::IncrBy { key, delta })
+}
+
+fn parse_kv_decrby(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 2 {
+        return Err(CommandError::WrongArity {
+            command: "INCRBY/DECRBY",
+        });
+    }
+    let delta = parse_i64(&args[1])?;
+    let key = args.swap_remove(0);
+    Ok(Command::DecrBy { key, delta })
+}
+
+fn parse_kv_select(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 1 {
+        return Err(CommandError::WrongArity { command: "SELECT" });
+    }
+    let s = std::str::from_utf8(&args[0]).map_err(|_| CommandError::SelectInvalidIndex)?;
+    let db: i64 = s.parse().map_err(|_| CommandError::SelectInvalidIndex)?;
+    Ok(Command::Select { db })
+}
+
+fn parse_i64(b: &Bytes) -> Result<i64, CommandError> {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(CommandError::NotAnInteger)
 }
 
 fn parse_ping(mut args: Vec<Bytes>) -> Result<Option<Bytes>, CommandError> {
@@ -378,5 +547,307 @@ mod tests {
         ]);
         let cmd = parse_command(frame).unwrap();
         assert!(matches!(cmd, Command::Hello(a) if a.protover == Some(3)));
+    }
+
+    // ── KV typed parsing ─────────────────────────────────────────
+
+    #[test]
+    fn get_one_arg() {
+        let cmd = parse_command(arr(&[b"GET", b"foo"])).unwrap();
+        assert_eq!(cmd, Command::Get { key: Bytes::from_static(b"foo") });
+    }
+
+    #[test]
+    fn get_wrong_arity_renders_existing_error() {
+        let err = parse_command(arr(&[b"GET"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'GET'");
+        let err = parse_command(arr(&[b"GET", b"a", b"b"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'GET'");
+    }
+
+    #[test]
+    fn set_two_args() {
+        let cmd = parse_command(arr(&[b"SET", b"k", b"v"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+            }
+        );
+    }
+
+    #[test]
+    fn set_wrong_arity() {
+        let err = parse_command(arr(&[b"SET", b"k"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'SET'");
+    }
+
+    #[test]
+    fn del_one_or_more() {
+        let cmd = parse_command(arr(&[b"DEL", b"a"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Del { keys: vec![Bytes::from_static(b"a")] }
+        );
+        let cmd = parse_command(arr(&[b"DEL", b"a", b"b", b"c"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Del {
+                keys: vec![
+                    Bytes::from_static(b"a"),
+                    Bytes::from_static(b"b"),
+                    Bytes::from_static(b"c"),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn del_zero_args_errors() {
+        let err = parse_command(arr(&[b"DEL"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'DEL'");
+    }
+
+    #[test]
+    fn exists_one_or_more() {
+        let cmd = parse_command(arr(&[b"EXISTS", b"a", b"b"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Exists {
+                keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+            }
+        );
+    }
+
+    #[test]
+    fn mget_one_or_more() {
+        let cmd = parse_command(arr(&[b"MGET", b"a", b"b"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Mget {
+                keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+            }
+        );
+    }
+
+    #[test]
+    fn mset_pairs() {
+        let cmd = parse_command(arr(&[b"MSET", b"k1", b"v1", b"k2", b"v2"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Mset {
+                pairs: vec![
+                    (Bytes::from_static(b"k1"), Bytes::from_static(b"v1")),
+                    (Bytes::from_static(b"k2"), Bytes::from_static(b"v2")),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn mset_odd_arity_errors() {
+        let err = parse_command(arr(&[b"MSET", b"k", b"v", b"x"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'MSET'");
+        let err = parse_command(arr(&[b"MSET"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'MSET'");
+    }
+
+    #[test]
+    fn incr_decr_arity_error_string_matches_server() {
+        // Historical: the server emits 'INCR/DECR' shared label.
+        let err = parse_command(arr(&[b"INCR"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'INCR/DECR'");
+        let err = parse_command(arr(&[b"DECR", b"a", b"b"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'INCR/DECR'");
+    }
+
+    #[test]
+    fn incrby_parses_delta() {
+        let cmd = parse_command(arr(&[b"INCRBY", b"counter", b"7"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::IncrBy {
+                key: Bytes::from_static(b"counter"),
+                delta: 7,
+            }
+        );
+        let cmd = parse_command(arr(&[b"INCRBY", b"counter", b"-3"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::IncrBy {
+                key: Bytes::from_static(b"counter"),
+                delta: -3,
+            }
+        );
+    }
+
+    #[test]
+    fn incrby_non_integer_errors() {
+        let err = parse_command(arr(&[b"INCRBY", b"k", b"abc"])).unwrap_err();
+        assert_eq!(err.to_string(), "value is not an integer or out of range");
+    }
+
+    #[test]
+    fn incrby_decrby_arity_error() {
+        let err = parse_command(arr(&[b"INCRBY", b"k"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'INCRBY/DECRBY'");
+        let err = parse_command(arr(&[b"DECRBY", b"k"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'INCRBY/DECRBY'");
+    }
+
+    #[test]
+    fn select_zero_ok() {
+        let cmd = parse_command(arr(&[b"SELECT", b"0"])).unwrap();
+        assert_eq!(cmd, Command::Select { db: 0 });
+    }
+
+    #[test]
+    fn select_nonzero_typed_but_dispatcher_decides() {
+        // Parser accepts any valid integer; the dispatcher emits the
+        // "DB index out of range" error string when db != 0.
+        let cmd = parse_command(arr(&[b"SELECT", b"1"])).unwrap();
+        assert_eq!(cmd, Command::Select { db: 1 });
+    }
+
+    #[test]
+    fn select_invalid_index() {
+        let err = parse_command(arr(&[b"SELECT", b"abc"])).unwrap_err();
+        assert_eq!(err.to_string(), "invalid DB index");
+    }
+
+    #[test]
+    fn select_wrong_arity() {
+        let err = parse_command(arr(&[b"SELECT"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'SELECT'");
+        let err = parse_command(arr(&[b"SELECT", b"0", b"1"])).unwrap_err();
+        assert_eq!(err.to_string(), "wrong number of arguments for 'SELECT'");
+    }
+
+    #[test]
+    fn command_name_case_insensitive_for_kv() {
+        // Lowercase should match too (Redis convention).
+        let cmd = parse_command(arr(&[b"get", b"k"])).unwrap();
+        assert!(matches!(cmd, Command::Get { .. }));
+        let cmd = parse_command(arr(&[b"SeT", b"k", b"v"])).unwrap();
+        assert!(matches!(cmd, Command::Set { .. }));
+    }
+
+    proptest::proptest! {
+        /// G-1 equivalence: for any KV command frame built from random
+        /// byte arguments, the typed parser preserves every argument
+        /// byte-for-byte. Catches subtle gather/swap_remove mistakes
+        /// that would surface as silent data corruption.
+        #[test]
+        fn prop_get_preserves_key(key in proptest::collection::vec(proptest::num::u8::ANY, 0..256)) {
+            let key_b = Bytes::copy_from_slice(&key);
+            let frame = Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"GET")),
+                Frame::Bulk(key_b.clone()),
+            ]);
+            let Command::Get { key: got } = parse_command(frame).unwrap() else {
+                panic!("expected Get");
+            };
+            proptest::prop_assert_eq!(got, key_b);
+        }
+
+        #[test]
+        fn prop_set_preserves_kv(
+            key in proptest::collection::vec(proptest::num::u8::ANY, 0..256),
+            value in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
+        ) {
+            let key_b = Bytes::copy_from_slice(&key);
+            let val_b = Bytes::copy_from_slice(&value);
+            let frame = Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(key_b.clone()),
+                Frame::Bulk(val_b.clone()),
+            ]);
+            let Command::Set { key: gk, value: gv } = parse_command(frame).unwrap() else {
+                panic!("expected Set");
+            };
+            proptest::prop_assert_eq!(gk, key_b);
+            proptest::prop_assert_eq!(gv, val_b);
+        }
+
+        #[test]
+        fn prop_del_preserves_all_keys(
+            keys in proptest::collection::vec(
+                proptest::collection::vec(proptest::num::u8::ANY, 0..128),
+                1..16,
+            ),
+        ) {
+            let mut frame_items: Vec<Frame> = vec![Frame::Bulk(Bytes::from_static(b"DEL"))];
+            let expected: Vec<Bytes> = keys
+                .iter()
+                .map(|k| Bytes::copy_from_slice(k))
+                .collect();
+            for b in &expected {
+                frame_items.push(Frame::Bulk(b.clone()));
+            }
+            let Command::Del { keys: got } = parse_command(Frame::Array(frame_items)).unwrap() else {
+                panic!("expected Del");
+            };
+            proptest::prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn prop_mset_preserves_pair_order(
+            pairs in proptest::collection::vec(
+                (
+                    proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+                    proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+                ),
+                1..8,
+            ),
+        ) {
+            let mut frame_items: Vec<Frame> = vec![Frame::Bulk(Bytes::from_static(b"MSET"))];
+            let expected: Vec<(Bytes, Bytes)> = pairs
+                .iter()
+                .map(|(k, v)| (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)))
+                .collect();
+            for (k, v) in &expected {
+                frame_items.push(Frame::Bulk(k.clone()));
+                frame_items.push(Frame::Bulk(v.clone()));
+            }
+            let Command::Mset { pairs: got } = parse_command(Frame::Array(frame_items)).unwrap() else {
+                panic!("expected Mset");
+            };
+            proptest::prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn prop_incrby_roundtrips_any_i64(delta in proptest::num::i64::ANY) {
+            let s = delta.to_string();
+            let frame = Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"INCRBY")),
+                Frame::Bulk(Bytes::from_static(b"k")),
+                Frame::Bulk(Bytes::copy_from_slice(s.as_bytes())),
+            ]);
+            let Command::IncrBy { delta: got, .. } = parse_command(frame).unwrap() else {
+                panic!("expected IncrBy");
+            };
+            proptest::prop_assert_eq!(got, delta);
+        }
+
+        /// G-2 equivalence: every wrong-arity input emits the byte-uguale
+        /// string the server has been emitting since v0.1, regardless of
+        /// the arity offset.
+        #[test]
+        fn prop_wrong_arity_strings_stable(
+            extra in 0usize..32,
+        ) {
+            let too_many = 2 + extra;
+            // GET wants exactly 1.
+            let mut items = vec![Frame::Bulk(Bytes::from_static(b"GET"))];
+            for _ in 0..too_many {
+                items.push(Frame::Bulk(Bytes::from_static(b"x")));
+            }
+            let err = parse_command(Frame::Array(items)).unwrap_err();
+            proptest::prop_assert_eq!(
+                err.to_string(),
+                "wrong number of arguments for 'GET'"
+            );
+        }
     }
 }

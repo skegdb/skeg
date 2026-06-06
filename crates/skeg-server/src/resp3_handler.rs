@@ -231,6 +231,29 @@ async fn dispatch_command(
         }
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
+        Command::Get { key } => kv_get_typed(&key, shards, *tenant, tenant_backend).await,
+        Command::Set { key, value } => {
+            kv_set_typed(&key, &value, shards, *tenant, tenant_backend).await
+        }
+        Command::Del { keys } => kv_del_typed(&keys, shards, *tenant, tenant_backend).await,
+        Command::Exists { keys } => kv_exists_typed(&keys, shards, *tenant, tenant_backend).await,
+        Command::Mget { keys } => kv_mget_typed(&keys, shards, *tenant, tenant_backend).await,
+        Command::Mset { pairs } => kv_mset_typed(&pairs, shards, *tenant, tenant_backend).await,
+        Command::Incr { key } => kv_incr_typed(&key, 1, shards, *tenant, tenant_backend).await,
+        Command::Decr { key } => kv_incr_typed(&key, -1, shards, *tenant, tenant_backend).await,
+        Command::IncrBy { key, delta } => {
+            kv_incrby_typed(&key, delta, shards, *tenant, tenant_backend).await
+        }
+        Command::DecrBy { key, delta } => {
+            // DECRBY semantics: subtract delta. Negating without underflow
+            // check would silently wrap on i64::MIN; reject explicitly.
+            let signed = match delta.checked_neg() {
+                Some(v) => v,
+                None => return Frame::Error("ERR value out of range".into()),
+            };
+            kv_incrby_typed(&key, signed, shards, *tenant, tenant_backend).await
+        }
+        Command::Select { db } => kv_select_typed(db),
         Command::Unknown { name, args } => {
             dispatch_unknown(
                 &name.to_ascii_uppercase(),
@@ -613,6 +636,109 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
 fn shard_error(e: &crate::shard::ShardError) -> Frame {
     warn!("shard error: {e}");
     Frame::Error(format!("ERR {e}"))
+}
+
+// ── Typed handlers (Phase 2 wire-up of skeg-resp3 typed Commands) ────────
+//
+// These thin wrappers take args already parsed by `parse_command` and
+// delegate to the existing `kv_*` byte-slice handlers. Phase 4 will
+// fold the inner handlers and drop the wrappers; for now this keeps
+// the diff small and avoids churning the test surface.
+
+async fn kv_get_typed(
+    key: &Bytes,
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    kv_get(std::slice::from_ref(key), shards, tenant, ctx).await
+}
+
+async fn kv_set_typed(
+    key: &Bytes,
+    value: &Bytes,
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    let args = [key.clone(), value.clone()];
+    kv_set(&args, shards, tenant, ctx).await
+}
+
+async fn kv_del_typed(
+    keys: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    kv_del(keys, shards, tenant, ctx).await
+}
+
+async fn kv_exists_typed(
+    keys: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    kv_exists(keys, shards, tenant, ctx).await
+}
+
+async fn kv_mget_typed(
+    keys: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    kv_mget(keys, shards, tenant, ctx).await
+}
+
+async fn kv_mset_typed(
+    pairs: &[(Bytes, Bytes)],
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    let args: Vec<Bytes> = pairs
+        .iter()
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect();
+    kv_mset(&args, shards, tenant, ctx).await
+}
+
+async fn kv_incr_typed(
+    key: &Bytes,
+    sign: i64,
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    kv_incr_by(std::slice::from_ref(key), shards, sign, tenant, ctx).await
+}
+
+async fn kv_incrby_typed(
+    key: &Bytes,
+    delta: i64,
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    if anon_key_collides_with_tenant(tenant, key, ctx) {
+        return anon_forgery_error();
+    }
+    let signed = match delta.checked_mul(1) {
+        Some(v) => v,
+        None => return Frame::Error("ERR value out of range".into()),
+    };
+    let k = scope_key(tenant, key);
+    incr_apply(k.as_bytes(), signed, shards).await
+}
+
+fn kv_select_typed(db: i64) -> Frame {
+    if db == 0 {
+        Frame::ok()
+    } else {
+        Frame::Error("ERR DB index out of range (skeg only supports DB 0)".into())
+    }
 }
 
 async fn kv_get(
