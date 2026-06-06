@@ -22,34 +22,59 @@ pub enum Command {
     /// `ECHO msg` => bulk string reply identical to msg.
     Echo(Bytes),
     /// `GET key` => bulk reply with the stored value or null if missing.
-    Get { key: Bytes },
+    Get {
+        key: Bytes,
+    },
     /// `SET key value` => `+OK` reply. Per-call durability is the
     /// server's default; future EX/PX/NX/XX options are not yet typed.
-    Set { key: Bytes, value: Bytes },
+    Set {
+        key: Bytes,
+        value: Bytes,
+    },
     /// `DEL key [key ...]` => integer reply with the count of keys
     /// that existed and were removed.
-    Del { keys: Vec<Bytes> },
+    Del {
+        keys: Vec<Bytes>,
+    },
     /// `EXISTS key [key ...]` => integer reply with the count of
     /// keys present.
-    Exists { keys: Vec<Bytes> },
+    Exists {
+        keys: Vec<Bytes>,
+    },
     /// `MGET key [key ...]` => array reply, one entry per key
     /// (bulk or null).
-    Mget { keys: Vec<Bytes> },
+    Mget {
+        keys: Vec<Bytes>,
+    },
     /// `MSET key value [key value ...]` => `+OK` reply. The vec
     /// holds `(key, value)` tuples; the parser enforces even arity.
-    Mset { pairs: Vec<(Bytes, Bytes)> },
+    Mset {
+        pairs: Vec<(Bytes, Bytes)>,
+    },
     /// `INCR key` => integer reply with the new value.
-    Incr { key: Bytes },
+    Incr {
+        key: Bytes,
+    },
     /// `DECR key` => integer reply with the new value.
-    Decr { key: Bytes },
+    Decr {
+        key: Bytes,
+    },
     /// `INCRBY key delta` => integer reply with the new value.
-    IncrBy { key: Bytes, delta: i64 },
+    IncrBy {
+        key: Bytes,
+        delta: i64,
+    },
     /// `DECRBY key delta` => integer reply with the new value.
-    DecrBy { key: Bytes, delta: i64 },
+    DecrBy {
+        key: Bytes,
+        delta: i64,
+    },
     /// `SELECT db` => `+OK` for `db == 0`, error otherwise. Skeg has
     /// a single logical DB; the parser captures the requested index
     /// so the dispatcher can decide whether to honour it.
-    Select { db: i64 },
+    Select {
+        db: i64,
+    },
 
     // ── SKEG.* admin namespace ──────────────────────────────────────
     /// `SKEG.STATS` — cache + telemetry dump. No args.
@@ -62,7 +87,9 @@ pub enum Command {
     /// parser preserves the raw arguments so the dispatcher (which
     /// currently emits a fixed `reserved` error) can evolve without a
     /// re-parse pass.
-    SkegAuth { args: Vec<Bytes> },
+    SkegAuth {
+        args: Vec<Bytes>,
+    },
 
     // ── SKEG.* vector namespace ─────────────────────────────────────
     /// `SKEG.VINDEX.LIST` — enumerate vindexes for the calling tenant.
@@ -72,15 +99,25 @@ pub enum Command {
     /// parsing (UTF-8 name, u32 dim, kind/backend label) stays in the
     /// dispatcher because the error strings embed per-argument labels
     /// the existing clients rely on.
-    SkegVindexCreate { args: Vec<Bytes> },
+    SkegVindexCreate {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VINDEX.DROP name`. Arity 1; inner parsing in dispatcher.
-    SkegVindexDrop { args: Vec<Bytes> },
+    SkegVindexDrop {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VSET name id vector`. Arity 3.
-    SkegVset { args: Vec<Bytes> },
+    SkegVset {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VDEL name id`. Arity 2.
-    SkegVdel { args: Vec<Bytes> },
+    SkegVdel {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VSEARCH name k l_search vector`. Arity 4.
-    SkegVsearch { args: Vec<Bytes> },
+    SkegVsearch {
+        args: Vec<Bytes>,
+    },
 
     /// Any command that was syntactically a valid array of bulks but whose
     /// name we have not wired into a typed variant yet. The dispatch layer
@@ -686,7 +723,12 @@ mod tests {
     #[test]
     fn get_one_arg() {
         let cmd = parse_command(arr(&[b"GET", b"foo"])).unwrap();
-        assert_eq!(cmd, Command::Get { key: Bytes::from_static(b"foo") });
+        assert_eq!(
+            cmd,
+            Command::Get {
+                key: Bytes::from_static(b"foo")
+            }
+        );
     }
 
     #[test]
@@ -720,7 +762,9 @@ mod tests {
         let cmd = parse_command(arr(&[b"DEL", b"a"])).unwrap();
         assert_eq!(
             cmd,
-            Command::Del { keys: vec![Bytes::from_static(b"a")] }
+            Command::Del {
+                keys: vec![Bytes::from_static(b"a")]
+            }
         );
         let cmd = parse_command(arr(&[b"DEL", b"a", b"b", b"c"])).unwrap();
         assert_eq!(
@@ -823,9 +867,15 @@ mod tests {
     #[test]
     fn incrby_decrby_arity_error() {
         let err = parse_command(arr(&[b"INCRBY", b"k"])).unwrap_err();
-        assert_eq!(err.to_string(), "wrong number of arguments for 'INCRBY/DECRBY'");
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'INCRBY/DECRBY'"
+        );
         let err = parse_command(arr(&[b"DECRBY", b"k"])).unwrap_err();
-        assert_eq!(err.to_string(), "wrong number of arguments for 'INCRBY/DECRBY'");
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'INCRBY/DECRBY'"
+        );
     }
 
     #[test]
@@ -994,7 +1044,10 @@ mod tests {
     #[test]
     fn skeg_stats_with_args_errors() {
         let err = parse_command(arr(&[b"SKEG.STATS", b"x"])).unwrap_err();
-        assert_eq!(err.to_string(), "wrong number of arguments for 'SKEG.STATS'");
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.STATS'"
+        );
     }
 
     #[test]
@@ -1028,8 +1081,14 @@ mod tests {
 
     #[test]
     fn skeg_vindex_create_four_args() {
-        let cmd =
-            parse_command(arr(&[b"SKEG.VINDEX.CREATE", b"x", b"1024", b"int8", b"flat"])).unwrap();
+        let cmd = parse_command(arr(&[
+            b"SKEG.VINDEX.CREATE",
+            b"x",
+            b"1024",
+            b"int8",
+            b"flat",
+        ]))
+        .unwrap();
         let Command::SkegVindexCreate { args } = cmd else {
             panic!("expected SkegVindexCreate");
         };
@@ -1060,7 +1119,10 @@ mod tests {
     fn skeg_vindex_drop_wrong_arity_error_string() {
         // No `; want ...` suffix for VINDEX.DROP.
         let err = parse_command(arr(&[b"SKEG.VINDEX.DROP"])).unwrap_err();
-        assert_eq!(err.to_string(), "wrong number of arguments for 'SKEG.VINDEX.DROP'");
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.VINDEX.DROP'"
+        );
     }
 
     #[test]
@@ -1101,8 +1163,7 @@ mod tests {
 
     #[test]
     fn skeg_vsearch_four_args() {
-        let cmd =
-            parse_command(arr(&[b"SKEG.VSEARCH", b"x", b"10", b"300", &[0u8; 4]])).unwrap();
+        let cmd = parse_command(arr(&[b"SKEG.VSEARCH", b"x", b"10", b"300", &[0u8; 4]])).unwrap();
         let Command::SkegVsearch { args } = cmd else {
             panic!("expected SkegVsearch");
         };
