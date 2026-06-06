@@ -8,6 +8,46 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.5] - 2026-06-04
+
+### Added
+
+- **`skeg-resp3` typed `Command` variants** for the 21 KV and `SKEG.*`
+  verbs the server already exposed via the legacy untyped fallback. KV
+  (11): `GET`, `SET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `INCR`, `DECR`,
+  `INCRBY`, `DECRBY`, `SELECT`. `SKEG.*` (10): `STATS`, `SHARDS`,
+  `WHOAMI`, `AUTH`, `VINDEX.LIST`, `VINDEX.CREATE`, `VINDEX.DROP`,
+  `VSET`, `VDEL`, `VSEARCH`. The new `CommandError` variants
+  (`WrongArity`, `WrongAritySkeg`, `SelectDbOutOfRange`,
+  `SelectInvalidIndex`, `NotAnInteger`) render the same error strings
+  the server emitted byte-for-byte, so existing `redis-cli` scripts and
+  Redis client libraries that match on `ERR ...` text keep working.
+
+  Effect on consumers:
+
+  - `skeg-resp3` is now the source of truth for command arity + simple
+    arg parsing. Downstream crates (`skeg-server`, future
+    `skeg-client-rs` / `skeg-py`) get the same typed dispatch instead
+    of duplicating the validation logic.
+  - 180 unit tests in `skeg-resp3` (43 new typed-command tests + 5
+    proptests covering KV byte-preservation across random inputs).
+  - Verified end-to-end with `redis-cli` on the live binary: 14
+    commands round-trip with identical error strings.
+
+### Changed
+
+- **`skeg-server::resp3_handler` dispatches the new typed variants
+  directly**, bypassing the legacy `dispatch_unknown` for KV and
+  `SKEG.*`. The legacy untyped path is preserved for genuinely unknown
+  commands (`FOO bar` -> `ERR unknown command 'FOO'`).
+
+### Versions bumped
+
+- `skeg-resp3` 0.1.2 -> 0.1.3 (added public `Command` and
+  `CommandError` variants; backwards-compatible additive change)
+- `skeg-server` 0.3.0 -> 0.3.1 (depends on `skeg-resp3` 0.1.3; dispatch
+  rewired)
+
 ## [0.3.4] - 2026-06-04
 
 ### Added
