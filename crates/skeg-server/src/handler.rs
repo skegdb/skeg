@@ -246,8 +246,21 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                     "index name not utf-8",
                 ));
             };
+            let span = tracing::info_span!(
+                "vsearch",
+                protocol = "binary",
+                vindex = name,
+                k,
+                l_search,
+                vector_dim = query.len(),
+                hits = tracing::field::Empty,
+            );
+            let _guard = span.enter();
             match shards.vsearch(name, query, k as usize, l_search).await {
-                Ok(hits) => Some(encode_ok_vsearch(req_id, &hits)),
+                Ok(hits) => {
+                    span.record("hits", hits.len());
+                    Some(encode_ok_vsearch(req_id, &hits))
+                }
                 Err(e) => Some(shard_err_to_response(req_id, &e)),
             }
         }

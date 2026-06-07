@@ -102,20 +102,59 @@ service:
 The collector handles batching, retry, auth, and TLS. skeg stays in its
 lane (zero-overhead counters + Prometheus expose).
 
-## Tracing today
+## Tracing
 
 `skeg-server` uses the `tracing` crate. The default subscriber writes
 structured log lines to stdout; level is controlled by `RUST_LOG`
 (`RUST_LOG=info,skeg_server=debug` is a reasonable production setting).
-There is no distributed trace export yet.
+
+### OTLP span export
+
+When the binary is built with `--features tracing-otlp` (released
+binaries from v0.3.6 onwards include it by default) and the env var
+`SKEG_TRACE_OTLP_ENDPOINT` points at an OTLP/gRPC collector, spans flow
+to the collector in addition to stdout.
+
+```bash
+export SKEG_TRACE_OTLP_ENDPOINT=http://collector:4317
+export SKEG_TRACE_SAMPLE_RATE=1.0
+export SKEG_TRACE_RESOURCE_ATTRS="region=eu-west-1,host=skeg-01"
+skeg --mode serve --tier pq:128:256 --data-dir /var/skeg --addr :7379
+```
+
+| Env var                        | Meaning                                    | Default |
+|--------------------------------|--------------------------------------------|---------|
+| `SKEG_TRACE_OTLP_ENDPOINT`     | OTLP/gRPC URL. Unset = no export.          | unset   |
+| `SKEG_TRACE_SAMPLE_RATE`       | Head-based sampling [0.0, 1.0].            | `1.0`   |
+| `SKEG_TRACE_RESOURCE_ATTRS`    | `k1=v1,k2=v2` resource labels.             | unset   |
+
+Spans currently emitted by `VSEARCH`:
+
+- `vsearch` (parent): tenant, vindex, k, l_search, vector_dim, hits.
+
+Span hierarchy expands in subsequent releases (child spans for walk and
+rerank phases).
+
+### Overhead
+
+Microbenched on M1 Pro (`crates/skeg-server/benches/tracing_overhead.rs`):
+
+| Configuration             | ns / span | vs baseline |
+|---------------------------|-----------|-------------|
+| no subscriber             | 1.64      | 1.00x       |
+| subscriber + filter drops | 1.54      | 0.94x       |
+| subscriber + emit to sink | 1116      | 680x        |
+
+For VSEARCH (~1500 us per query) the overhead at full-trace
+visibility is around 0.07% — well inside the 5% gate defined in
+[`observability/PLAN.md`](https://github.com/skegdb/skeg-internal/blob/main/observability/PLAN.md).
 
 ## Roadmap
 
-Coming in v0.4.0:
+Coming next:
 
-- **OTLP span export.** Opt-in via `SKEG_TRACE_OTLP_ENDPOINT=https://collector:4317`,
-  with head-based sampling. Critical spans: `vsearch` (parent), `vsearch.walk`
-  (graph traversal), `vsearch.rerank` (disk reads + cosine).
+- **Child spans for VSEARCH internals** (walk traversal, rerank disk
+  reads + cosine) once skeg-vector grows a thin tracing entry point.
 - **Grafana dashboard refinements** with span exemplars linking the
   histogram buckets to individual traces.
 - **Per-tenant labels** when the multi-tenant server (`skeg-server-tenant`)

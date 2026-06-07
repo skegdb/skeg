@@ -487,6 +487,18 @@ async fn skeg_vdel(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
 
 /// `SKEG.VSEARCH name k l_search vector_bytes`. Returns an array of
 /// `k` pairs `[id (bulk u64-string), score (Double in RESP3 / Bulk in RESP2)]`.
+#[tracing::instrument(
+    name = "vsearch",
+    skip(args, shards),
+    fields(
+        tenant = %tenant,
+        vindex = tracing::field::Empty,
+        k = tracing::field::Empty,
+        l_search = tracing::field::Empty,
+        vector_dim = tracing::field::Empty,
+        hits = tracing::field::Empty,
+    ),
+)]
 async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
     if args.len() != 4 {
         return Frame::Error(
@@ -509,9 +521,15 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
         Ok(v) => v,
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
+    let span = tracing::Span::current();
+    span.record("vindex", raw_name);
+    span.record("k", k);
+    span.record("l_search", l_search);
+    span.record("vector_dim", query.len());
     let scoped = scoped_vindex_name(tenant, raw_name);
     match shards.vsearch(&scoped, query, k, l_search).await {
         Ok(hits) => {
+            span.record("hits", hits.len());
             let mut out = Vec::with_capacity(hits.len() * 2);
             for (id, score) in hits {
                 out.push(Frame::Bulk(Bytes::from(id.to_string())));

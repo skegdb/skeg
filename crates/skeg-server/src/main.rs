@@ -3,6 +3,8 @@
 use skeg_server::Server;
 use skeg_vector::QuantKind;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// jemalloc as the global allocator. The system allocator on macOS keeps
 /// freed pages mapped - they stay in RSS until memory pressure - so the
@@ -71,6 +73,33 @@ DOCS:     https://github.com/skegdb/skeg
 "
 );
 
+/// Build the tracing subscriber and (when the `tracing-otlp` feature
+/// is on AND `SKEG_TRACE_OTLP_ENDPOINT` is set) chain the OTLP span
+/// exporter on top. The fmt layer always emits to stdout via the env
+/// filter from `RUST_LOG`.
+fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    let env_filter = EnvFilter::from_default_env();
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    #[cfg(feature = "tracing-otlp")]
+    {
+        let otlp_layer = skeg_server::tracing_otlp::install()?;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(otlp_layer)
+            .init();
+    }
+    #[cfg(not(feature = "tracing-otlp"))]
+    {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+    }
+    Ok(())
+}
+
 /// Spawn the Prometheus exporter on `127.0.0.1:port`.
 ///
 /// Feature-gated: when the binary is built without `metrics-http`, the
@@ -114,9 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    init_tracing()?;
 
     let cfg = Config::parse(args.into_iter());
     if cfg.speed {
@@ -176,7 +203,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
     };
     tracing::info!("skeg listening on {}", server.local_addr()?);
-    server.run().await?;
+    let run_result = server.run().await;
+    #[cfg(feature = "tracing-otlp")]
+    skeg_server::tracing_otlp::shutdown();
+    run_result?;
     Ok(())
 }
 

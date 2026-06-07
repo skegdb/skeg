@@ -13,6 +13,8 @@
 
 use skeg_server::Server;
 use skeg_vector::QuantKind;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -59,6 +61,33 @@ DOCS:     https://github.com/skegdb/skeg
 "
 );
 
+/// Tracing init: fmt layer to stdout, plus an optional OTLP/gRPC layer
+/// when the `tracing-otlp` feature is on AND
+/// `SKEG_TRACE_OTLP_ENDPOINT` is set. Mirrors the wiring in the `skeg`
+/// binary so both listeners produce equivalent spans.
+fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    let env_filter = EnvFilter::from_default_env();
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    #[cfg(feature = "tracing-otlp")]
+    {
+        let otlp_layer = skeg_server::tracing_otlp::install()?;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(otlp_layer)
+            .init();
+    }
+    #[cfg(not(feature = "tracing-otlp"))]
+    {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -71,9 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    init_tracing()?;
 
     let cfg = Config::parse(args.into_iter());
     if cfg.speed {
@@ -124,7 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
     };
     tracing::info!("skeg-resp3 listening on {}", server.local_addr()?);
-    server.run_resp3().await?;
+    let run_result = server.run_resp3().await;
+    #[cfg(feature = "tracing-otlp")]
+    skeg_server::tracing_otlp::shutdown();
+    run_result?;
     Ok(())
 }
 
