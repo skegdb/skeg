@@ -152,9 +152,7 @@ fn main() {
     if gate_pass {
         eprintln!("# G-O3.1 PASS: fmt_off / baseline = {off_ratio:.3} (< 1.05)");
     } else {
-        eprintln!(
-            "# G-O3.1 FAIL: fmt_off / baseline = {off_ratio:.3} (>= 1.05) - investigate"
-        );
+        eprintln!("# G-O3.1 FAIL: fmt_off / baseline = {off_ratio:.3} (>= 1.05) - investigate");
         std::process::exit(1);
     }
 }

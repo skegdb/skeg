@@ -47,7 +47,8 @@ const ENV_RESOURCE_ATTRS: &str = "SKEG_TRACE_RESOURCE_ATTRS";
 /// be built (malformed endpoint, gRPC channel setup failure, etc).
 /// The caller propagates this to `main` so the binary refuses to start
 /// silently mis-configured.
-pub fn install<S>() -> Result<Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>, OtlpError>
+pub fn install<S>()
+-> Result<Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>, OtlpError>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
