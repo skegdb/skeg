@@ -8,6 +8,60 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.6] - 2026-06-07
+
+### Added
+
+- **Default-on Prometheus exporter.** The `metrics-http` cargo feature
+  is now part of `skeg-server`'s default set, so released binaries
+  serve `/metrics` out of the box when `--metrics-port <PORT>` is
+  passed. Drop it with `--no-default-features` to get a slim build;
+  the `--metrics-port` flag stays parseable and logs a warning when the
+  feature is off.
+
+- **OTLP/gRPC tracing exporter** (`tracing-otlp` feature, default-on).
+  When `SKEG_TRACE_OTLP_ENDPOINT=<url>` is set, spans flow to an
+  OpenTelemetry collector through a `tracing-opentelemetry` bridge with
+  head-based sampling. Env knobs:
+
+  - `SKEG_TRACE_OTLP_ENDPOINT`: OTLP/gRPC URL (unset disables export).
+  - `SKEG_TRACE_SAMPLE_RATE`: `[0.0, 1.0]` head sampler, default `1.0`.
+  - `SKEG_TRACE_RESOURCE_ATTRS`: `k1=v1,k2=v2` resource labels.
+
+  Both binaries (`skeg`, `skeg-resp3`) install the layer; the exporter
+  is shut down cleanly on exit so in-flight spans flush.
+
+- **`vsearch` span** emitted from both protocol handlers (binary +
+  RESP3), with structured fields: tenant, vindex, k, l_search,
+  vector_dim, hits. Resource attributes include `service.name=skeg`
+  and `service.version=<crate version>`.
+
+- **Documentation and operator assets.** New `OBSERVABILITY.md` covers
+  the metric schema, a Prometheus scrape config, OTel collector
+  integration, and the tracing overhead numbers. `assets/grafana/`
+  ships an overview dashboard JSON, `prometheus.yml`, and a starter
+  `otel-collector-config.yaml`.
+
+- **Tracing overhead microbench** at
+  `crates/skeg-server/benches/tracing_overhead.rs`. Measured on M1 Pro:
+  1.54 ns/span with subscriber installed and filter dropping; 1116
+  ns/span when fully serialised. The G-O3.1 gate (under 5% relative to
+  the no-subscriber baseline) clears with a ~70x margin.
+
+### Changed
+
+- **`skeg-vector` sort sites** switched from `sort_unstable_by(|a, b|
+  b.0.cmp(&a.0))` to `sort_unstable_by_key(|x|
+  std::cmp::Reverse(x.0))` where the key type is `Copy`. Identical
+  ordering; quiets the new clippy 1.96 `unnecessary_sort_by` lint
+  without changing behaviour.
+
+### Versions bumped
+
+- `skeg-server` 0.3.1 -> 0.3.2 (new default features, span
+  instrumentation; depends on the same skeg-vector / skeg-resp3 as
+  v0.3.5)
+
 ## [0.3.5] - 2026-06-04
 
 ### Added
