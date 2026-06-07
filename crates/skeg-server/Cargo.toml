@@ -1,6 +1,6 @@
 [package]
 name = "skeg-server"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -40,16 +40,36 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tikv-jemallocator = { workspace = true }
 parking_lot = { workspace = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 
 [features]
-# Opt-in HTTP Prometheus exporter. Default off so the server binary
-# stays slim; pull in with `--features metrics-http` on the build.
-default = []
+# HTTP Prometheus exporter is on by default so the released binary
+# serves `/metrics` out of the box when `--metrics-port <PORT>` is
+# passed. Drop it with `--no-default-features`; the `--metrics-port`
+# flag stays parseable but logs a warning instead of binding.
+default = ["metrics-http", "tracing-otlp"]
 metrics-http = ["skeg-telemetry/http"]
+# OpenTelemetry tracing exporter. When this feature is on AND the env
+# var `SKEG_TRACE_OTLP_ENDPOINT` is set, spans flow to the configured
+# OTLP/gRPC collector. When the feature is off, the OTel crates are
+# not linked.
+tracing-otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "tracing_overhead"
+harness = false
 
 [lints]
 workspace = true

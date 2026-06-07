@@ -1,0 +1,53 @@
+# Example OpenTelemetry Collector config that scrapes skeg's
+# Prometheus exporter and forwards as OTLP/HTTP.
+#
+# Usage:
+#   otelcol --config otel-collector-config.yaml
+#
+# See https://opentelemetry.io/docs/collector/configuration/ for the full
+# config reference.
+
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: skeg
+          scrape_interval: 15s
+          static_configs:
+            - targets:
+                - 'skeg-host:9090'
+              labels:
+                # Static labels added to every series. Override per
+                # deployment.
+                tier: pq128
+                environment: prod
+
+processors:
+  batch:
+    # Default 200ms; safe for skeg's metric cardinality.
+    timeout: 200ms
+
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 25
+
+exporters:
+  # Push to any OTLP/HTTP backend (Mimir, Grafana Cloud, Honeycomb,
+  # Lightstep, etc.). Replace the endpoint and auth.
+  otlphttp:
+    endpoint: https://your-backend.example.com/v1/metrics
+    headers:
+      authorization: Bearer ${env:OTEL_TOKEN}
+
+  # Local debug exporter — pretty-prints metrics to stdout. Comment out
+  # in production.
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp, debug]

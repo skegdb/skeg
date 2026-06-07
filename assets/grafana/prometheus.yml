@@ -1,0 +1,18 @@
+# Minimal Prometheus scrape config for skeg.
+#
+# Drop this into /etc/prometheus/prometheus.yml or merge the
+# `scrape_configs` block into an existing one. The job name `skeg`
+# matches the labels used by the dashboard JSON shipped alongside.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: skeg
+    static_configs:
+      - targets: ['skeg-host:9090']
+        labels:
+          # Adjust to match the tier flag you start skeg with.
+          tier: pq128
+          environment: prod

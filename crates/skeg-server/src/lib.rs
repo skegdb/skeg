@@ -14,6 +14,8 @@ pub mod handler;
 pub mod resp3_handler;
 pub mod shard;
 pub mod tenant;
+#[cfg(feature = "tracing-otlp")]
+pub mod tracing_otlp;
 
 use std::net::SocketAddr;
 use std::path::Path;
