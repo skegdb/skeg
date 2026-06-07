@@ -10,8 +10,6 @@
 //! traces. Default 1.0 (sample all). The sampler runs once at span
 //! creation, so the cost on non-sampled spans is one rng draw.
 
-#![cfg(feature = "tracing-otlp")]
-
 use std::str::FromStr;
 use std::sync::OnceLock;
 
