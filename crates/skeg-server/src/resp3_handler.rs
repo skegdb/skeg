@@ -234,9 +234,7 @@ async fn dispatch_command(
         Command::Get { key } => {
             kv_get(std::slice::from_ref(&key), shards, *tenant, tenant_backend).await
         }
-        Command::Set { key, value } => {
-            kv_set(&[key, value], shards, *tenant, tenant_backend).await
-        }
+        Command::Set { key, value } => kv_set(&[key, value], shards, *tenant, tenant_backend).await,
         Command::Del { keys } => kv_del(&keys, shards, *tenant, tenant_backend).await,
         Command::Exists { keys } => kv_exists(&keys, shards, *tenant, tenant_backend).await,
         Command::Mget { keys } => kv_mget(&keys, shards, *tenant, tenant_backend).await,
@@ -245,12 +243,28 @@ async fn dispatch_command(
             kv_mset(&args, shards, *tenant, tenant_backend).await
         }
         Command::Incr { key } => {
-            kv_incr_by(std::slice::from_ref(&key), shards, 1, *tenant, tenant_backend).await
+            kv_incr_by(
+                std::slice::from_ref(&key),
+                shards,
+                1,
+                *tenant,
+                tenant_backend,
+            )
+            .await
         }
         Command::Decr { key } => {
-            kv_incr_by(std::slice::from_ref(&key), shards, -1, *tenant, tenant_backend).await
+            kv_incr_by(
+                std::slice::from_ref(&key),
+                shards,
+                -1,
+                *tenant,
+                tenant_backend,
+            )
+            .await
         }
-        Command::IncrBy { key, delta } => kv_incrby_apply(&key, delta, shards, *tenant, tenant_backend).await,
+        Command::IncrBy { key, delta } => {
+            kv_incrby_apply(&key, delta, shards, *tenant, tenant_backend).await
+        }
         Command::DecrBy { key, delta } => {
             // DECRBY semantics: subtract delta. Negating without underflow
             // check would silently wrap on i64::MIN; reject explicitly.
@@ -297,7 +311,6 @@ async fn dispatch_unknown(
 ) -> Frame {
     Frame::Error(format!("ERR unknown command '{name}'"))
 }
-
 
 /// Parse a bulk-string argument as raw little-endian `f32` bytes.
 fn parse_vector(b: &Bytes) -> Result<Vec<f32>, &'static str> {
@@ -990,14 +1003,7 @@ mod tests {
         // and the dispatcher emits the legacy `ERR unknown command
         // 'SKEG.<verb>'` byte-for-byte.
         let (_dir, shards) = fresh_shards().await;
-        let resp = dispatch_unknown(
-            "SKEG.WHATEVER",
-            vec![],
-            &shards,
-            TenantId::ZERO,
-            None,
-        )
-        .await;
+        let resp = dispatch_unknown("SKEG.WHATEVER", vec![], &shards, TenantId::ZERO, None).await;
         assert!(matches!(resp, Frame::Error(ref e) if e.contains("'SKEG.WHATEVER'")));
     }
 
