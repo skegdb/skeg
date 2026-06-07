@@ -1564,25 +1564,55 @@ impl DiskVamanaIndex {
                 k: rerank,
                 window: 5,
             });
-            let list = greedy_search(
-                self.medoid,
+            let walk_span = tracing::info_span!(
+                "vsearch.walk",
                 list_size,
-                early,
-                |id| -(self.quant.proxy(id as usize, &code) as f32),
-                |id| self.nodes[id as usize].slice().iter().copied().collect(),
-                &mut visited,
-                &mut seen,
-                None,
+                rerank,
+                early = early.is_some(),
+                visited = tracing::field::Empty,
+                returned = tracing::field::Empty,
             );
+            let list = {
+                let _g = walk_span.enter();
+                let list = greedy_search(
+                    self.medoid,
+                    list_size,
+                    early,
+                    |id| -(self.quant.proxy(id as usize, &code) as f32),
+                    |id| self.nodes[id as usize].slice().iter().copied().collect(),
+                    &mut visited,
+                    &mut seen,
+                    None,
+                );
+                walk_span.record("visited", visited.iter().count());
+                walk_span.record("returned", list.iter().count());
+                list
+            };
+            let rerank_span = tracing::info_span!(
+                "vsearch.rerank",
+                candidates = tracing::field::Empty,
+                disk_reads = tracing::field::Empty,
+                skipped = tracing::field::Empty,
+            );
+            let _rg = rerank_span.enter();
+            let mut disk_reads: usize = 0;
+            let mut skipped: usize = 0;
+            let mut candidates: usize = 0;
             for (_, vec_id) in list.iter().take(rerank) {
+                candidates += 1;
                 let id = self.ids[vec_id as usize];
                 // Skip if tombstoned or superseded by a delta entry.
                 if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
+                    skipped += 1;
                     continue;
                 }
                 let v = self.read_vector(vec_id)?;
+                disk_reads += 1;
                 scored.push((OrderedFloat(cosine_f32(query, &v)), id));
             }
+            rerank_span.record("candidates", candidates);
+            rerank_span.record("disk_reads", disk_reads);
+            rerank_span.record("skipped", skipped);
         }
 
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
