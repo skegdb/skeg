@@ -8,6 +8,36 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.7] - 2026-06-08
+
+### Added
+
+- **Child spans inside `VSEARCH`.** `DiskVamanaIndex::search_with_l`
+  now emits `vsearch.walk` (fields: `list_size`, `rerank`, `early`,
+  `visited`, `returned`) and `vsearch.rerank` (fields: `candidates`,
+  `disk_reads`, `skipped`) nested under the `vsearch` parent the
+  handler creates. Traces shipped through the OTLP exporter carry the
+  full hierarchy without extra configuration.
+
+- **`compat-tests/redis_py_compat.py`** — end-to-end smoke against a
+  live `skeg-resp3` driven through `redis-py` 5+. Exercises every
+  typed command from v0.3.5, asserts byte-exact error strings, and
+  validates RESP2/RESP3 negotiation. Manual gate (not part of `cargo
+  test`); runs in ~3 seconds and exits non-zero on any divergence.
+
+### Changed
+
+- **`skeg-server::resp3_handler`** folds the v0.3.5 `_typed` wrapper
+  layer into the `dispatch_command` match arms and drops the legacy
+  `dispatch_unknown` / `dispatch_skeg` arms that the typed parse path
+  made unreachable. Net: about 190 lines removed, identical wire
+  behaviour preserved.
+
+### Versions bumped
+
+- `skeg-server` 0.3.2 -> 0.3.3 (handler simplification, span
+  hierarchy; no new public API surface)
+
 ## [0.3.6] - 2026-06-07
 
 ### Added
