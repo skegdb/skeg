@@ -231,18 +231,39 @@ async fn dispatch_command(
         }
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
-        Command::Get { key } => kv_get_typed(&key, shards, *tenant, tenant_backend).await,
-        Command::Set { key, value } => {
-            kv_set_typed(&key, &value, shards, *tenant, tenant_backend).await
+        Command::Get { key } => {
+            kv_get(std::slice::from_ref(&key), shards, *tenant, tenant_backend).await
         }
-        Command::Del { keys } => kv_del_typed(&keys, shards, *tenant, tenant_backend).await,
-        Command::Exists { keys } => kv_exists_typed(&keys, shards, *tenant, tenant_backend).await,
-        Command::Mget { keys } => kv_mget_typed(&keys, shards, *tenant, tenant_backend).await,
-        Command::Mset { pairs } => kv_mset_typed(&pairs, shards, *tenant, tenant_backend).await,
-        Command::Incr { key } => kv_incr_typed(&key, 1, shards, *tenant, tenant_backend).await,
-        Command::Decr { key } => kv_incr_typed(&key, -1, shards, *tenant, tenant_backend).await,
+        Command::Set { key, value } => kv_set(&[key, value], shards, *tenant, tenant_backend).await,
+        Command::Del { keys } => kv_del(&keys, shards, *tenant, tenant_backend).await,
+        Command::Exists { keys } => kv_exists(&keys, shards, *tenant, tenant_backend).await,
+        Command::Mget { keys } => kv_mget(&keys, shards, *tenant, tenant_backend).await,
+        Command::Mset { pairs } => {
+            let args: Vec<Bytes> = pairs.into_iter().flat_map(|(k, v)| [k, v]).collect();
+            kv_mset(&args, shards, *tenant, tenant_backend).await
+        }
+        Command::Incr { key } => {
+            kv_incr_by(
+                std::slice::from_ref(&key),
+                shards,
+                1,
+                *tenant,
+                tenant_backend,
+            )
+            .await
+        }
+        Command::Decr { key } => {
+            kv_incr_by(
+                std::slice::from_ref(&key),
+                shards,
+                -1,
+                *tenant,
+                tenant_backend,
+            )
+            .await
+        }
         Command::IncrBy { key, delta } => {
-            kv_incrby_typed(&key, delta, shards, *tenant, tenant_backend).await
+            kv_incrby_apply(&key, delta, shards, *tenant, tenant_backend).await
         }
         Command::DecrBy { key, delta } => {
             // DECRBY semantics: subtract delta. Negating without underflow
@@ -251,9 +272,9 @@ async fn dispatch_command(
                 Some(v) => v,
                 None => return Frame::Error("ERR value out of range".into()),
             };
-            kv_incrby_typed(&key, signed, shards, *tenant, tenant_backend).await
+            kv_incrby_apply(&key, signed, shards, *tenant, tenant_backend).await
         }
-        Command::Select { db } => kv_select_typed(db),
+        Command::Select { db } => kv_select_db(db),
         Command::SkegStats => skeg_stats(shards).await,
         Command::SkegShards => skeg_shards(shards).await,
         Command::SkegWhoami => skeg_whoami(*tenant, tenant_backend.is_some()),
@@ -277,55 +298,18 @@ async fn dispatch_command(
     }
 }
 
+/// Dispatcher for command names that did not parse into a typed
+/// `Command` variant. After phase 4 every KV / `SKEG.*` verb skeg
+/// supports flows through the typed path; this fallback only handles
+/// genuinely unknown command names and unknown `SKEG.*` verbs.
 async fn dispatch_unknown(
     name: &str,
-    args: Vec<Bytes>,
-    shards: &ShardSet,
-    tenant: TenantId,
-    tenant_backend: Option<&Arc<dyn TenantBackend>>,
+    _args: Vec<Bytes>,
+    _shards: &ShardSet,
+    _tenant: TenantId,
+    _tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
-    if let Some(rest) = name.strip_prefix("SKEG.") {
-        return dispatch_skeg(rest, args, shards, tenant, tenant_backend).await;
-    }
-    match name {
-        "GET" => kv_get(&args, shards, tenant, tenant_backend).await,
-        "SET" => kv_set(&args, shards, tenant, tenant_backend).await,
-        "DEL" => kv_del(&args, shards, tenant, tenant_backend).await,
-        "EXISTS" => kv_exists(&args, shards, tenant, tenant_backend).await,
-        "MGET" => kv_mget(&args, shards, tenant, tenant_backend).await,
-        "MSET" => kv_mset(&args, shards, tenant, tenant_backend).await,
-        "INCR" => kv_incr_by(&args, shards, 1, tenant, tenant_backend).await,
-        "DECR" => kv_incr_by(&args, shards, -1, tenant, tenant_backend).await,
-        "INCRBY" => kv_incrby_arg(&args, shards, 1, tenant, tenant_backend).await,
-        "DECRBY" => kv_incrby_arg(&args, shards, -1, tenant, tenant_backend).await,
-        "SELECT" => kv_select(&args),
-        other => Frame::Error(format!("ERR unknown command '{other}'")),
-    }
-}
-
-/// Dispatcher for the `SKEG.*` namespace. v0.1 exposes `STATS` and the
-/// tenant-aware `WHOAMI`. Vector ops (`SKEG.VSEARCH` etc.) land here in
-/// a follow-up.
-async fn dispatch_skeg(
-    verb: &str,
-    args: Vec<Bytes>,
-    shards: &ShardSet,
-    tenant: TenantId,
-    tenant_backend: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    match verb {
-        "STATS" => skeg_stats(shards).await,
-        "SHARDS" => skeg_shards(shards).await,
-        "WHOAMI" => skeg_whoami(tenant, tenant_backend.is_some()),
-        "AUTH" => skeg_auth(&args),
-        "VINDEX.LIST" => skeg_vindex_list(shards, tenant).await,
-        "VINDEX.CREATE" => skeg_vindex_create(&args, shards, tenant).await,
-        "VINDEX.DROP" => skeg_vindex_drop(&args, shards, tenant).await,
-        "VSET" => skeg_vset(&args, shards, tenant).await,
-        "VDEL" => skeg_vdel(&args, shards, tenant).await,
-        "VSEARCH" => skeg_vsearch(&args, shards, tenant).await,
-        other => Frame::Error(format!("ERR unknown command 'SKEG.{other}'")),
-    }
+    Frame::Error(format!("ERR unknown command '{name}'"))
 }
 
 /// Parse a bulk-string argument as raw little-endian `f32` bytes.
@@ -666,84 +650,11 @@ fn shard_error(e: &crate::shard::ShardError) -> Frame {
     Frame::Error(format!("ERR {e}"))
 }
 
-// ── Typed handlers (Phase 2 wire-up of skeg-resp3 typed Commands) ────────
-//
-// These thin wrappers take args already parsed by `parse_command` and
-// delegate to the existing `kv_*` byte-slice handlers. Phase 4 will
-// fold the inner handlers and drop the wrappers; for now this keeps
-// the diff small and avoids churning the test surface.
-
-async fn kv_get_typed(
-    key: &Bytes,
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    kv_get(std::slice::from_ref(key), shards, tenant, ctx).await
-}
-
-async fn kv_set_typed(
-    key: &Bytes,
-    value: &Bytes,
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    let args = [key.clone(), value.clone()];
-    kv_set(&args, shards, tenant, ctx).await
-}
-
-async fn kv_del_typed(
-    keys: &[Bytes],
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    kv_del(keys, shards, tenant, ctx).await
-}
-
-async fn kv_exists_typed(
-    keys: &[Bytes],
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    kv_exists(keys, shards, tenant, ctx).await
-}
-
-async fn kv_mget_typed(
-    keys: &[Bytes],
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    kv_mget(keys, shards, tenant, ctx).await
-}
-
-async fn kv_mset_typed(
-    pairs: &[(Bytes, Bytes)],
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    let args: Vec<Bytes> = pairs
-        .iter()
-        .flat_map(|(k, v)| [k.clone(), v.clone()])
-        .collect();
-    kv_mset(&args, shards, tenant, ctx).await
-}
-
-async fn kv_incr_typed(
-    key: &Bytes,
-    sign: i64,
-    shards: &ShardSet,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    kv_incr_by(std::slice::from_ref(key), shards, sign, tenant, ctx).await
-}
-
-async fn kv_incrby_typed(
+/// `INCRBY` / `DECRBY` body after the parser has unpacked the delta
+/// and the dispatcher has folded the sign for `DECRBY`. The legacy
+/// `kv_incrby_arg` path that re-parsed the integer is gone now that
+/// `skeg-resp3` carries the typed `delta: i64`.
+async fn kv_incrby_apply(
     key: &Bytes,
     delta: i64,
     shards: &ShardSet,
@@ -753,15 +664,12 @@ async fn kv_incrby_typed(
     if anon_key_collides_with_tenant(tenant, key, ctx) {
         return anon_forgery_error();
     }
-    let signed = match delta.checked_mul(1) {
-        Some(v) => v,
-        None => return Frame::Error("ERR value out of range".into()),
-    };
     let k = scope_key(tenant, key);
-    incr_apply(k.as_bytes(), signed, shards).await
+    incr_apply(k.as_bytes(), delta, shards).await
 }
 
-fn kv_select_typed(db: i64) -> Frame {
+/// `SELECT db`. Skeg has one logical DB; only index 0 succeeds.
+fn kv_select_db(db: i64) -> Frame {
     if db == 0 {
         Frame::ok()
     } else {
@@ -860,23 +768,6 @@ async fn kv_exists(
     Frame::Integer(count)
 }
 
-fn kv_select(args: &[Bytes]) -> Frame {
-    // SELECT 0 -> +OK (driver compat: some clients auto-issue it).
-    // SELECT N>0 -> -ERR. Skeg has no DB-number concept; SHELF is the
-    // namespace primitive (see resp3/design-protocol.md §5.6).
-    if args.len() != 1 {
-        return Frame::Error("ERR wrong number of arguments for 'SELECT'".into());
-    }
-    let s = std::str::from_utf8(&args[0])
-        .map_err(|_| ())
-        .and_then(|s| s.parse::<i64>().map_err(|_| ()));
-    match s {
-        Ok(0) => Frame::ok(),
-        Ok(_) => Frame::Error("ERR DB index out of range (skeg only supports DB 0)".into()),
-        Err(()) => Frame::Error("ERR invalid DB index".into()),
-    }
-}
-
 async fn kv_mget(
     args: &[Bytes],
     shards: &ShardSet,
@@ -945,34 +836,6 @@ async fn kv_incr_by(
     }
     let k = scope_key(tenant, &args[0]);
     incr_apply(k.as_bytes(), sign, shards).await
-}
-
-async fn kv_incrby_arg(
-    args: &[Bytes],
-    shards: &ShardSet,
-    sign: i64,
-    tenant: TenantId,
-    ctx: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
-    if args.len() != 2 {
-        return Frame::Error("ERR wrong number of arguments for 'INCRBY/DECRBY'".into());
-    }
-    if anon_key_collides_with_tenant(tenant, &args[0], ctx) {
-        return anon_forgery_error();
-    }
-    let delta: i64 = match std::str::from_utf8(&args[1])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) => n,
-        None => return Frame::Error("ERR value is not an integer or out of range".into()),
-    };
-    let signed = match delta.checked_mul(sign) {
-        Some(v) => v,
-        None => return Frame::Error("ERR value out of range".into()),
-    };
-    let k = scope_key(tenant, &args[0]);
-    incr_apply(k.as_bytes(), signed, shards).await
 }
 
 async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet) -> Frame {
@@ -1088,9 +951,10 @@ mod tests {
     #[tokio::test]
     async fn incrby_applies_signed_delta() {
         let (_dir, shards) = fresh_shards().await;
-        let r = kv_incrby_arg(&args(&["c", "42"]), &shards, 1, TenantId::ZERO, None).await;
+        let key = Bytes::from_static(b"c");
+        let r = kv_incrby_apply(&key, 42, &shards, TenantId::ZERO, None).await;
         assert!(matches!(r, Frame::Integer(42)));
-        let r = kv_incrby_arg(&args(&["c", "10"]), &shards, -1, TenantId::ZERO, None).await;
+        let r = kv_incrby_apply(&key, -10, &shards, TenantId::ZERO, None).await;
         assert!(matches!(r, Frame::Integer(32)));
     }
 
@@ -1135,8 +999,11 @@ mod tests {
 
     #[tokio::test]
     async fn skeg_namespace_rejects_unknown_verb() {
+        // Unknown `SKEG.*` verbs come through the parser as `Unknown`
+        // and the dispatcher emits the legacy `ERR unknown command
+        // 'SKEG.<verb>'` byte-for-byte.
         let (_dir, shards) = fresh_shards().await;
-        let resp = dispatch_skeg("WHATEVER", vec![], &shards, TenantId::ZERO, None).await;
+        let resp = dispatch_unknown("SKEG.WHATEVER", vec![], &shards, TenantId::ZERO, None).await;
         assert!(matches!(resp, Frame::Error(ref e) if e.contains("'SKEG.WHATEVER'")));
     }
 
