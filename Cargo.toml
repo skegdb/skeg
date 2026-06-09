@@ -10,13 +10,13 @@ members = [
     "crates/skeg-telemetry",
     "crates/skeg-tenant",
     "crates/skeg-server-tenant",
+    "crates/skeg-multi-tenant",
 ]
-# Fuzz targets live outside the workspace (own Cargo.toml).
-# skeg-multi-tenant is excluded: the `live-attach` feature pulls in
-# path deps to the sibling skeg-rigging-net repository, which is not
-# available in fresh checkouts (CI, cloners). Build it standalone:
-#   cargo build --manifest-path crates/skeg-multi-tenant/Cargo.toml
-exclude = ["fuzz", "crates/skeg-multi-tenant"]
+# Fuzz targets live outside the workspace (own Cargo.toml). The
+# `live-attach` feature of skeg-multi-tenant only resolves when the
+# sibling skeg-rigging-net repo is available; build the crate without
+# that feature in fresh checkouts.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
@@ -34,6 +34,12 @@ authors = ["skeg contributors"]
 description = "RAM-frugal KV + vector store for Personal AI inference machines"
 keywords = ["vector-database", "kv-store", "personal-ai", "vamana", "ann"]
 categories = ["database", "data-structures"]
+
+[workspace.lints.rust]
+# Allow muting lints that exist in newer rustc but not in MSRV
+# stable. Without this, CI rustc (older than the dev toolchain) errors
+# on the `clippy::manual_is_multiple_of` allow below as `unknown lint`.
+unknown_lints = "allow"
 
 [workspace.lints.clippy]
 # Two lints muted because their stable/unstable status flips across
