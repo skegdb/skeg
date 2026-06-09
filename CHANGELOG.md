@@ -8,6 +8,31 @@ This file tracks **only the engine** (this repository). Multi-tenant
 implementation details, auth store internals, and tenant API surface
 live in a separate (private) repo and are documented there.
 
+## [0.3.8] - 2026-06-09
+
+### Added
+
+- **`skeg-multi-tenant` first crates.io publish.** The crate moves
+  back into the engine workspace now that all of its sibling rigging
+  transports (notably `skeg-rigging-net-resp3`) are on the registry.
+  Path overrides on the rigging deps were dropped in favour of plain
+  version requirements so the local copy of `skeg-rigging` and the
+  one pulled in transitively by `skeg-rigging-net-resp3` resolve to a
+  single shared instance; without it the `live-attach` feature would
+  refuse to compile because `TenantId` would surface as two distinct
+  types.
+
+### Changed
+
+- **`Cargo.toml` workspace lint config** gains
+  `unknown_lints = "allow"` so the MSRV CI rustc no longer screams
+  when it meets the `clippy::manual_is_multiple_of` allow line we ship
+  for the dev toolchain.
+
+### Versions bumped
+
+- `skeg-multi-tenant` 0.1.0 (first publish)
+
 ## [0.3.7] - 2026-06-08
 
 ### Added
