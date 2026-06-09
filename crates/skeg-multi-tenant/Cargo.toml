@@ -1,15 +1,13 @@
 [package]
 name = "skeg-multi-tenant"
-# Concrete values, not `.workspace = true`: this crate is excluded
-# from the engine workspace (see root Cargo.toml) because the
-# `live-attach` feature pulls in path deps to a sibling repo that is
-# not always on disk. version / edition / rust-version track the
-# workspace; license matches the rest of the engine.
+# Concrete values, not `.workspace = true`: this crate sits inside the
+# engine workspace but its `live-attach` feature still depends on
+# sibling repos via path overrides during dev. The version / edition /
+# rust-version match the rest of the engine; license is identical.
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-publish = false
 authors = ["skeg contributors"]
 repository = "https://github.com/skegdb/skeg"
 homepage = "https://github.com/skegdb/skeg"
@@ -26,18 +24,18 @@ path = "src/lib.rs"
 # skeg-server-tenant over RESP3 instead of opening tenants on-disk.
 # Off by default; turning it on pulls in the network adapter crates
 # and exposes `LiveAttachRoot` / `LiveAttachError` from the lib.
-#
-# skeg-rigging-net / skeg-rigging-net-resp3 are path deps because the
-# resp3 sub-crate is not yet on crates.io; once it lands, the path
-# overrides drop.
 live-attach = ["dep:skeg-rigging-net", "dep:skeg-rigging-net-resp3"]
 
 [dependencies]
 skeg-tenant = { path = "../skeg-tenant", version = "0.1" }
-skeg-rigging = { path = "../../../skeg-rigging/crates/skeg-rigging", version = "0.1" }
-skeg-rigging-skeg = { path = "../../../skeg-rigging/crates/skeg-rigging-skeg", version = "0.1" }
-skeg-rigging-net = { path = "../../../skeg-rigging-net/crates/skeg-rigging-net", version = "0.1", optional = true }
-skeg-rigging-net-resp3 = { path = "../../../skeg-rigging-net/crates/skeg-rigging-net-resp3", optional = true }
+# skeg-rigging and friends come from crates.io so a single resolved
+# instance is shared with skeg-rigging-net-resp3's transitive view of
+# it. Use `[patch.crates-io]` in a local workspace overlay if you need
+# to iterate on these crates against an unreleased version.
+skeg-rigging = "0.1.1"
+skeg-rigging-skeg = "0.1.1"
+skeg-rigging-net = { version = "0.1", optional = true }
+skeg-rigging-net-resp3 = { version = "0.1", optional = true }
 
 thiserror = "2"
 
@@ -45,10 +43,7 @@ thiserror = "2"
 tempfile = "3"
 bytes = "1"
 skeg-resp3 = "0.1"
-skeg-rigging-net = { path = "../../../skeg-rigging-net/crates/skeg-rigging-net", version = "0.1" }
+skeg-rigging-net = "0.1"
 
-# Inlined from [workspace.lints] in the root (excluded crate cannot
-# use `workspace = true`).
-[lints.clippy]
-uninlined_format_args = "allow"
-manual_is_multiple_of = "allow"
+[lints]
+workspace = true
