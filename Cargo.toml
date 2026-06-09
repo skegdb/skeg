@@ -35,6 +35,12 @@ description = "RAM-frugal KV + vector store for Personal AI inference machines"
 keywords = ["vector-database", "kv-store", "personal-ai", "vamana", "ann"]
 categories = ["database", "data-structures"]
 
+[workspace.lints.rust]
+# Allow muting lints that exist in newer rustc but not in MSRV
+# stable. Without this, CI rustc (older than the dev toolchain) errors
+# on the `clippy::manual_is_multiple_of` allow below as `unknown lint`.
+unknown_lints = "allow"
+
 [workspace.lints.clippy]
 # Two lints muted because their stable/unstable status flips across
 # the MSRV (1.88) and the toolchain newer contributors use. Keeping
