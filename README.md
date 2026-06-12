@@ -184,10 +184,6 @@ Command form: `SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the 
 
 ## Roadmap
 
-In development, validated against the same test suite as the engine. Released as the stabilisation work lands.
-
-- **Companion repositories.** Rust client, Python SDK, terminal dashboard, LlamaIndex and Ollama integrations, Gleam BEAM client. PyPI distribution for the Python SDK will follow.
-
 Being explored, with no promised landing date. Direction depends on what shows up in real workloads and which constraint turns out to bite first.
 
 - x86_64 native tuning (AVX2 / AVX-512 SIMD paths) for Linux server hardware.
