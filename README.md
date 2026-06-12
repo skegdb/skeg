@@ -49,14 +49,6 @@ skeg is the storage layer for AI agents that run on the same hardware as the mod
 
 The server speaks two protocols. A native binary protocol on port 7379 for clients that want the lowest overhead. RESP3 on port 6379 for compatibility with existing Redis tooling. Both protocols expose the same operations.
 
-## Why it works
-
-The architecture is the answer to a single constraint: the resident set of the index must hold while the model owns the rest of the memory.
-
-The index lives on the SSD. The Vamana graph is walked on disk, with a small in-memory cache for the hot pages. Five tiers of vector quantization (`int8`, Product Quantization at 128×256, and TurboQuant at 1, 2, and 4 bits per coordinate) let you trade memory against precision. Re-ranking against full-precision vectors held on disk recovers the accuracy lost to quantization. The cache is S3-FIFO, bounded by a byte budget you configure, and gives evicted pages back to the operating system through jemalloc decay timers.
-
-The substrate, the design decisions, and the eleven falsifications that produced this architecture are documented in [the series on the project blog](https://amanitaproject.com/).
-
 ## What skeg is not
 
 skeg is not the lowest-latency single-query engine; Qdrant is comparable on p99. A single shard saturates around 640 QPS, and past that you need multiple processes, not more cores. It is younger in production than Qdrant or Chroma. Where it wins is the regime it was built for: laptops, DGX Spark, edge boxes, anywhere RAM is contested.
@@ -64,8 +56,6 @@ skeg is not the lowest-latency single-query engine; Qdrant is comparable on p99.
 For the full picture across engines, scales, and tiers, see the live dashboard: [`skegdb.github.io/bench`](https://skegdb.github.io/bench/). The isolated (non-co-resident) comparison at 500K is skeg-pq128 at ~228 MiB / recall@10 0.9994 against 2.3–3.0 GiB for the HNSW engines.
 
 ## Install
-
-Four install paths. The Homebrew tap and the pre-built tarballs ship aarch64 binaries (Apple Silicon, Linux ARM); `cargo install` and the source build work on any host with a Rust toolchain; the Docker image bundles both servers.
 
 ### Homebrew (macOS and Linux ARM)
 
@@ -76,7 +66,19 @@ brew install skeg
 
 The formula installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd service definition.
 
-### Pre-built tarball
+### From crates.io
+
+```sh
+cargo install skeg-server
+```
+
+This compiles from source on the host machine and installs `skeg` and `skeg-resp3` into `$CARGO_HOME/bin`. Requires a Rust toolchain (MSRV 1.88).
+
+<!-- markdownlint-disable MD033 -->
+<details>
+<summary>Other install methods (tarball, source, Docker) and the published crate list</summary>
+
+#### Pre-built tarball
 
 ```sh
 TARGET=aarch64-apple-darwin   # or aarch64-unknown-linux-gnu
@@ -88,17 +90,7 @@ tar -xzf skeg.tar.gz
 
 SHA256 checksums are published alongside each tarball at the same URL with a `.sha256` suffix. Pin a specific version from the [releases page](https://github.com/skegdb/skeg/releases).
 
-### From crates.io
-
-```sh
-cargo install skeg-server
-```
-
-This compiles from source on the host machine and installs `skeg` and `skeg-resp3` into `$CARGO_HOME/bin`. Requires a Rust toolchain (MSRV 1.88).
-
-The published library crates are `skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`, `skeg-resp3`, `skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant`. Network adapters live in the [`skeg-rigging`](https://github.com/skegdb/skeg-rigging) and [`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net) repos.
-
-### From source
+#### From source
 
 ```sh
 git clone https://github.com/skegdb/skeg
@@ -108,7 +100,7 @@ cargo build --release --bin skeg --bin skeg-resp3
 
 Requirements: Rust 1.88 or newer. The binaries are at `target/release/skeg` and `target/release/skeg-resp3`.
 
-### Docker
+#### Docker
 
 ```sh
 docker run -d --name skeg \
@@ -120,6 +112,13 @@ docker run -d --name skeg \
 The image bundles both `skeg` (native protocol, port 7379) and `skeg-resp3` (Redis-compat, port 6379). The default entrypoint is `skeg`; for the RESP3 surface override with `--entrypoint /usr/local/bin/skeg-resp3` and publish 6379 instead. Built for `linux/arm64`.
 
 For an Ollama companion setup with `docker compose`, see [`docker-compose.example.yml`](docker-compose.example.yml).
+
+#### Published library crates
+
+`skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`, `skeg-resp3`, `skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant`. Network adapters live in the [`skeg-rigging`](https://github.com/skegdb/skeg-rigging) and [`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net) repos.
+
+</details>
+<!-- markdownlint-enable MD033 -->
 
 ## Quickstart
 
@@ -161,7 +160,22 @@ OK
 ...
 ```
 
-Command form: `SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the per-index storage precision: `f32 | int8 | binary`. `backend` chooses in-RAM flat scan or on-disk Vamana: `flat | disk`. The server-wide quantizer tier (`int8`, `pq[:M:K]`, `tq1`, `tq2`, `tq4`) is selected via the `--tier` CLI flag at server start, not per-index. The vector payload in `SKEG.VSET` and `SKEG.VSEARCH` is a raw byte buffer on the native protocol, or a bulk string on RESP3.
+<!-- markdownlint-disable MD033 -->
+<details>
+<summary>Command reference</summary>
+
+`SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the per-index storage precision: `f32 | int8 | binary`. `backend` chooses in-RAM flat scan or on-disk Vamana: `flat | disk`. The server-wide quantizer tier (`int8`, `pq[:M:K]`, `tq1`, `tq2`, `tq4`) is selected via the `--tier` CLI flag at server start, not per-index. The vector payload in `SKEG.VSET` and `SKEG.VSEARCH` is a raw byte buffer on the native protocol, or a bulk string on RESP3.
+
+</details>
+<!-- markdownlint-enable MD033 -->
+
+## Why it works
+
+The architecture is the answer to a single constraint: the resident set of the index must hold while the model owns the rest of the memory.
+
+The index lives on the SSD. The Vamana graph is walked on disk, with a small in-memory cache for the hot pages. Five tiers of vector quantization (`int8`, Product Quantization at 128×256, and TurboQuant at 1, 2, and 4 bits per coordinate) let you trade memory against precision. Re-ranking against full-precision vectors held on disk recovers the accuracy lost to quantization. The cache is S3-FIFO, bounded by a byte budget you configure, and gives evicted pages back to the operating system through jemalloc decay timers.
+
+The substrate, the design decisions, and the eleven falsifications that produced this architecture are documented in [the series on the project blog](https://amanitaproject.com/).
 
 ## Status
 
@@ -182,25 +196,6 @@ Command form: `SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the 
 - No GPU acceleration, no horizontal scaling across nodes, no hosted service.
 - Native validation and architecture-specific tuning for x86_64 (Linux server hardware). Release binaries are aarch64 only; the SIMD path is NEON-only.
 
-## Roadmap
-
-Being explored, with no promised landing date. Direction depends on what shows up in real workloads and which constraint turns out to bite first.
-
-- x86_64 native tuning (AVX2 / AVX-512 SIMD paths) for Linux server hardware.
-- Child spans for the VSEARCH internals (walk, rerank) inside `skeg-vector`, exposed through the OTLP exporter.
-- Native OTel metrics export, in addition to the current Prometheus path.
-- GPU acceleration for the kernels, once the host environment makes it sensible.
-
-## Ecosystem
-
-skeg is the storage core. The companion crates ship as their own published libraries.
-
-- [hansa](https://crates.io/crates/hansa) and [hansa-cli](https://crates.io/crates/hansa-cli). Federation primitive: local AI agents form trust groups and query across each other's skeg instances.
-- [skeg-rigging](https://crates.io/crates/skeg-rigging). Public trait surface (`TenantWrite`, `Embed`) for plugging skeg into ingest and federation pipelines.
-- [skeg-rigging-skeg](https://crates.io/crates/skeg-rigging-skeg). The local DiskVamana backend implementation of those traits.
-- [skeg-rigging-net](https://crates.io/crates/skeg-rigging-net), [-http](https://crates.io/crates/skeg-rigging-net-http), and [-resp3](https://crates.io/crates/skeg-rigging-net-resp3). Network adapters that federate against a remote skeg server through HTTP or RESP3.
-- [skeg-rigging-ingest](https://crates.io/crates/skeg-rigging-ingest). Reusable text-to-embeddings-to-tenant pipeline: walk a tree, chunk, embed via Ollama, write through any `TenantWrite`. The `watch` feature enables live re-ingest.
-
 ## Documentation
 
 The project blog at [amanitaproject.com](https://amanitaproject.com/) carries the long-form design and benchmark documentation:
@@ -215,6 +210,19 @@ Operational guides live in this repository:
 - [`OBSERVABILITY.md`](OBSERVABILITY.md). Prometheus exporter, scrape config, OTel collector integration, tracing roadmap.
 
 Live benchmark dashboard with the latest measurements (engine × scale × tier matrix, p50/p99 latency, recall, RSS): [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
+
+## Ecosystem
+
+Federation (hansa) and ingest pipelines around the engine. See [`ECOSYSTEM.md`](ECOSYSTEM.md).
+
+## Roadmap
+
+Being explored, with no promised landing date. Direction depends on what shows up in real workloads and which constraint turns out to bite first.
+
+- x86_64 native tuning (AVX2 / AVX-512 SIMD paths) for Linux server hardware.
+- Child spans for the VSEARCH internals (walk, rerank) inside `skeg-vector`, exposed through the OTLP exporter.
+- Native OTel metrics export, in addition to the current Prometheus path.
+- GPU acceleration for the kernels, once the host environment makes it sensible.
 
 ## Contributing
 
