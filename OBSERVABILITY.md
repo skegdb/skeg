@@ -146,19 +146,7 @@ Microbenched on M1 Pro (`crates/skeg-server/benches/tracing_overhead.rs`):
 | subscriber + emit to sink | 1116      | 680x        |
 
 For VSEARCH (~1500 us per query) the overhead at full-trace
-visibility is around 0.07% — well inside the 5% gate defined in
-[`observability/PLAN.md`](https://github.com/skegdb/skeg-internal/blob/main/observability/PLAN.md).
-
-## Roadmap
-
-Coming next:
-
-- **Child spans for VSEARCH internals** (walk traversal, rerank disk
-  reads + cosine) once skeg-vector grows a thin tracing entry point.
-- **Grafana dashboard refinements** with span exemplars linking the
-  histogram buckets to individual traces.
-- **Per-tenant labels** when the multi-tenant server (`skeg-server-tenant`)
-  is wired against the metrics path.
+visibility is around 0.07%.
 
 ## Opting out
 
