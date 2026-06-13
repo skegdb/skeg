@@ -236,6 +236,12 @@ impl VLog {
     ///
     /// Returns an error on IO failure, CRC mismatch, or corrupt record.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_scoped(key, 0).await
+    }
+
+    /// GET a key, charging any read-path cache insert to `tenant`. Tenant `0` is
+    /// the unscoped default; reach this via [`VLog::tenant`] for a scoped view.
+    async fn get_scoped(&self, key: &[u8], tenant: u128) -> Result<Option<Bytes>> {
         if let Some(value) = self.inner.cache.borrow_mut().get(key) {
             return Ok(Some(value));
         }
@@ -260,7 +266,7 @@ impl VLog {
         self.inner
             .cache
             .borrow_mut()
-            .insert(key, value.clone(), value.len());
+            .insert_for(key, value.clone(), value.len(), tenant);
         Ok(Some(value))
     }
 
@@ -270,6 +276,18 @@ impl VLog {
     ///
     /// Returns an error on IO failure.
     pub async fn set(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
+        self.set_scoped(key, value, durability, 0).await
+    }
+
+    /// SET key = value, charging the write-through cache entry to `tenant`.
+    /// Tenant `0` is the unscoped default; reach this via [`VLog::tenant`].
+    async fn set_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+    ) -> Result<()> {
         let ts = self.next_ts();
         let (seg_id, offset, padded) = self
             .append_raw(key, value, RecordKind::Scalar, ts, durability)
@@ -290,10 +308,12 @@ impl VLog {
         };
         self.inner.index.borrow_mut().set(key.to_vec(), entry);
         // Write-through: a just-written key is likely to be read back hot.
-        self.inner
-            .cache
-            .borrow_mut()
-            .insert(key, Bytes::copy_from_slice(value), value.len());
+        self.inner.cache.borrow_mut().insert_for(
+            key,
+            Bytes::copy_from_slice(value),
+            value.len(),
+            tenant,
+        );
         Ok(())
     }
 
@@ -397,6 +417,24 @@ impl VLog {
         let active_size = self.inner.active.borrow().size;
         let sealed_count = segs.iter().filter(|s| s.id != active_id).count() as u64;
         sealed_count.saturating_mul(self.inner.max_seg_size) + active_size
+    }
+
+    /// Scope storage operations to `tenant` for per-tenant cache accounting.
+    ///
+    /// Returns a zero-cost [`TenantView`] (a `&VLog` plus the tenant id). Every
+    /// write/read through the view charges its cache residency to `tenant`,
+    /// instead of the unscoped default `0` used by the bare [`VLog`] methods.
+    /// This is the first-class scope on which per-tenant quota, eviction
+    /// fairness, and snapshots hang.
+    #[must_use]
+    pub fn tenant(&self, tenant: u128) -> TenantView<'_> {
+        TenantView { vlog: self, tenant }
+    }
+
+    /// Bytes of hot-key cache currently charged to `tenant` (0 if none).
+    #[must_use]
+    pub fn tenant_cache_bytes(&self, tenant: u128) -> usize {
+        self.inner.cache.borrow().charged_bytes(tenant)
     }
 
     /// Hot-key cache statistics: `(bytes_used, evictions, n_keys, byte_budget)`.
@@ -699,6 +737,69 @@ impl VLog {
     }
 }
 
+/// A [`VLog`] scoped to one tenant for per-tenant cache accounting.
+///
+/// Created by [`VLog::tenant`]. Zero-cost: a borrow of the `VLog` plus the
+/// tenant id. Operations delegate to the same private core the bare `VLog`
+/// methods use, so there is one implementation, not a parallel API. This is the
+/// extension point for per-tenant quota, eviction fairness, and snapshots.
+#[derive(Clone, Copy)]
+pub struct TenantView<'a> {
+    vlog: &'a VLog,
+    tenant: u128,
+}
+
+impl TenantView<'_> {
+    /// The tenant this view is scoped to.
+    #[must_use]
+    pub fn tenant_id(&self) -> u128 {
+        self.tenant
+    }
+
+    /// GET a key, charging any read-path cache insert to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.vlog.get_scoped(key, self.tenant).await
+    }
+
+    /// SET key = value, charging the write-through cache entry to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn set(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
+        self.vlog
+            .set_scoped(key, value, durability, self.tenant)
+            .await
+    }
+
+    /// DEL a key. Returns `true` if it existed. Cache release is self-attributed
+    /// from the evicted entry, so this needs no tenant argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn del(&self, key: &[u8], durability: Durability) -> Result<bool> {
+        self.vlog.del(key, durability).await
+    }
+
+    /// MGET keys, charging read-path cache inserts to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn mget(&self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.vlog.get_scoped(k, self.tenant).await?);
+        }
+        Ok(out)
+    }
+}
+
 /// RAII telemetry guard for [`VLog::compact_segment`]. Increments the
 /// `CompactionInProgress` + `VlogSegmentsCompacting` gauges on
 /// construction and decrements both on drop, so every return path
@@ -777,6 +878,95 @@ mod tests {
         assert_eq!(res[0].as_deref(), Some(b"1".as_slice()));
         assert!(res[1].is_none());
         assert_eq!(res[2].as_deref(), Some(b"2".as_slice()));
+    }
+
+    // ── P0a S2a: TenantView per-tenant cache attribution ──────────────────────
+
+    #[tokio::test]
+    async fn test_tenant_view_set_charges_tenant() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.tenant(7)
+            .set(b"k", b"val", Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(
+            v.tenant_cache_bytes(7) > 0,
+            "write-through must charge tenant 7"
+        );
+        assert_eq!(v.tenant_cache_bytes(0), 0, "tenant 0 must hold nothing");
+    }
+
+    #[tokio::test]
+    async fn test_bare_set_charges_tenant_zero() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.set(b"k", b"v", Durability::Kernel).await.unwrap();
+        assert!(v.tenant_cache_bytes(0) > 0, "bare set charges tenant 0");
+        assert_eq!(v.tenant_cache_bytes(7), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tenant_view_two_tenants_isolated_accounting() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.tenant(7)
+            .set(b"a", b"x", Durability::Kernel)
+            .await
+            .unwrap();
+        v.tenant(9)
+            .set(b"b", b"yy", Durability::Kernel)
+            .await
+            .unwrap();
+        let b7 = v.tenant_cache_bytes(7);
+        let b9 = v.tenant_cache_bytes(9);
+        assert!(b7 > 0 && b9 > 0);
+        assert!(b9 > b7, "tenant 9 wrote a larger value, charged more");
+        assert_eq!(v.tenant_cache_bytes(0), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tenant_view_del_releases_tenant() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.tenant(7)
+            .set(b"k", b"v", Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(v.tenant_cache_bytes(7) > 0);
+        assert!(v.tenant(7).del(b"k", Durability::Kernel).await.unwrap());
+        assert_eq!(
+            v.tenant_cache_bytes(7),
+            0,
+            "del releases the tenant's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tenant_view_read_path_charges_tenant() {
+        // After reopen the cache is cold; a get must charge the read value to the
+        // querying tenant, not tenant 0.
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.tenant(7)
+                .set(b"k", b"val", Durability::Kernel)
+                .await
+                .unwrap();
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(v.tenant_cache_bytes(7), 0, "cold cache after reopen");
+        assert_eq!(
+            v.tenant(7).get(b"k").await.unwrap().as_deref(),
+            Some(b"val".as_slice())
+        );
+        assert!(
+            v.tenant_cache_bytes(7) > 0,
+            "read-path cache insert must charge the querying tenant"
+        );
+        assert_eq!(v.tenant_cache_bytes(0), 0);
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ pub use cache::S3Fifo;
 pub use group_commit::Durability;
 pub use index::{Index, IndexEntry};
 pub use record::{Record, RecordKind};
-pub use vlog::VLog;
+pub use vlog::{TenantView, VLog};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
