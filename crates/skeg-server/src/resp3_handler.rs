@@ -60,6 +60,12 @@ impl ScopedKey {
         &self.bytes
     }
 
+    /// The owning tenant id as a `u128`, for per-tenant cache accounting. `0`
+    /// for the unscoped (anonymous) default, matching `VLog`'s tenant 0 path.
+    fn accounting_tenant(&self) -> u128 {
+        u128::from_le_bytes(*self.tenant.as_bytes())
+    }
+
     /// Cheap runtime check the prefix invariant still holds. Called at
     /// shard call sites; cost is a single byte-slice compare per op.
     fn assert_invariant(&self) {
@@ -665,7 +671,7 @@ async fn kv_incrby_apply(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, key);
-    incr_apply(k.as_bytes(), delta, shards).await
+    incr_apply(k.as_bytes(), delta, shards, k.accounting_tenant()).await
 }
 
 /// `SELECT db`. Skeg has one logical DB; only index 0 succeeds.
@@ -690,7 +696,7 @@ async fn kv_get(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
-    match shards.get(k.as_bytes()).await {
+    match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
         Ok(Some(v)) => Frame::Bulk(v),
         Ok(None) => Frame::Null,
         Err(e) => shard_error(&e),
@@ -710,7 +716,11 @@ async fn kv_set(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
-    match shards.set(k.as_bytes(), &args[1], DEFAULT_DURABILITY).await {
+    match shards
+        .tenant(k.accounting_tenant())
+        .set(k.as_bytes(), &args[1], DEFAULT_DURABILITY)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -759,7 +769,7 @@ async fn kv_exists(
     let mut count: i64 = 0;
     for key in args {
         let k = scope_key(tenant, key);
-        match shards.get(k.as_bytes()).await {
+        match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
             Ok(Some(_)) => count += 1,
             Ok(None) => {}
             Err(e) => return shard_error(&e),
@@ -785,7 +795,7 @@ async fn kv_mget(
     let mut out = Vec::with_capacity(args.len());
     for key in args {
         let k = scope_key(tenant, key);
-        match shards.get(k.as_bytes()).await {
+        match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
             Ok(Some(v)) => out.push(Frame::Bulk(v)),
             Ok(None) => out.push(Frame::Null),
             Err(e) => return shard_error(&e),
@@ -835,11 +845,12 @@ async fn kv_incr_by(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
-    incr_apply(k.as_bytes(), sign, shards).await
+    incr_apply(k.as_bytes(), sign, shards, k.accounting_tenant()).await
 }
 
-async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet) -> Frame {
-    let current: i64 = match shards.get(key).await {
+async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) -> Frame {
+    let store = shards.tenant(tenant);
+    let current: i64 = match store.get(key).await {
         Ok(Some(b)) => match std::str::from_utf8(&b).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
             None => return Frame::Error("ERR value is not an integer or out of range".into()),
@@ -852,7 +863,7 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet) -> Frame {
         None => return Frame::Error("ERR increment or decrement would overflow".into()),
     };
     let body = Bytes::from(new.to_string());
-    match shards.set(key, &body, DEFAULT_DURABILITY).await {
+    match store.set(key, &body, DEFAULT_DURABILITY).await {
         Ok(()) => Frame::Integer(new),
         Err(e) => shard_error(&e),
     }

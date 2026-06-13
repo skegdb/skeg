@@ -189,11 +189,15 @@ pub enum ShardError {
 // ── Channel protocol ──────────────────────────────────────────────────────────
 
 enum ShardReq {
-    Get(Bytes),
-    Set(Bytes, Bytes, Durability),
+    /// `(key, tenant)`: tenant `0` is the unscoped default.
+    Get(Bytes, u128),
+    /// `(key, value, durability, tenant)`.
+    Set(Bytes, Bytes, Durability, u128),
     Del(Bytes, Durability),
-    /// `(original_index, key)` pairs for a multi-get fragment.
-    MgetBatch(Vec<(usize, Bytes)>),
+    /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
+    MgetBatch(Vec<(usize, Bytes)>, u128),
+    /// Bytes of hot-key cache charged to a tenant on this shard.
+    TenantCacheBytes(u128),
     Stats,
     VindexCreate {
         name: String,
@@ -232,6 +236,8 @@ enum ShardResp {
     Value(Option<Bytes>),
     Done,
     Existed(bool),
+    /// Bytes of hot-key cache charged to a tenant on the answering shard.
+    CacheBytes(usize),
     MgetBatch(Vec<(usize, Option<Bytes>)>),
     /// `(cache_bytes, cache_evictions, n_keys, cache_budget)`.
     Stats(u64, u64, u64, u64),
@@ -503,7 +509,7 @@ fn is_mutation(req: &ShardReq) -> bool {
 fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
     use skeg_telemetry::Op;
     match req {
-        ShardReq::Get(_) | ShardReq::MgetBatch(_) => Some(Op::Get),
+        ShardReq::Get(..) | ShardReq::MgetBatch(..) => Some(Op::Get),
         ShardReq::Set(..) => Some(Op::Set),
         ShardReq::Del(..) => Some(Op::Del),
         ShardReq::Vset { .. } => Some(Op::VSet),
@@ -513,6 +519,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
+        | ShardReq::TenantCacheBytes(_)
         | ShardReq::Stats => None,
     }
 }
@@ -725,22 +732,28 @@ async fn process(
             }
         }
 
-        ShardReq::Get(key) => match vlog.get(&key).await {
+        ShardReq::Get(key, tenant) => match vlog.tenant(tenant).get(&key).await {
             Ok(v) => ShardResp::Value(v),
             Err(e) => ShardResp::Err(e.to_string()),
         },
-        ShardReq::Set(key, val, dur) => match vlog.set(&key, &val, dur).await {
-            Ok(()) => ShardResp::Done,
-            Err(e) => ShardResp::Err(e.to_string()),
-        },
+        ShardReq::Set(key, val, dur, tenant) => {
+            match vlog.tenant(tenant).set(&key, &val, dur).await {
+                Ok(()) => ShardResp::Done,
+                Err(e) => ShardResp::Err(e.to_string()),
+            }
+        }
         ShardReq::Del(key, dur) => match vlog.del(&key, dur).await {
             Ok(b) => ShardResp::Existed(b),
             Err(e) => ShardResp::Err(e.to_string()),
         },
-        ShardReq::MgetBatch(items) => {
+        ShardReq::TenantCacheBytes(tenant) => {
+            ShardResp::CacheBytes(vlog.tenant_cache_bytes(tenant))
+        }
+        ShardReq::MgetBatch(items, tenant) => {
+            let view = vlog.tenant(tenant);
             let mut out = Vec::with_capacity(items.len());
             for (idx, key) in items {
-                match vlog.get(&key).await {
+                match view.get(&key).await {
                     Ok(v) => out.push((idx, v)),
                     Err(e) => return ShardResp::Err(e.to_string()),
                 }
@@ -951,9 +964,13 @@ impl ShardSet {
     ///
     /// Returns an error if the shard is unavailable or storage fails.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, ShardError> {
+        self.get_scoped(key, 0).await
+    }
+
+    async fn get_scoped(&self, key: &[u8], tenant: u128) -> Result<Option<Bytes>, ShardError> {
         let shard = shard_for(key, self.inner.n);
         match self
-            .call(shard, ShardReq::Get(Bytes::copy_from_slice(key)))
+            .call(shard, ShardReq::Get(Bytes::copy_from_slice(key), tenant))
             .await?
         {
             ShardResp::Value(v) => Ok(v),
@@ -973,11 +990,22 @@ impl ShardSet {
         value: &[u8],
         durability: Durability,
     ) -> Result<(), ShardError> {
+        self.set_scoped(key, value, durability, 0).await
+    }
+
+    async fn set_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+    ) -> Result<(), ShardError> {
         let shard = shard_for(key, self.inner.n);
         let req = ShardReq::Set(
             Bytes::copy_from_slice(key),
             Bytes::copy_from_slice(value),
             durability,
+            tenant,
         );
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
@@ -1009,6 +1037,14 @@ impl ShardSet {
     ///
     /// Returns an error if any shard is unavailable or storage fails.
     pub async fn mget(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>, ShardError> {
+        self.mget_scoped(keys, 0).await
+    }
+
+    async fn mget_scoped(
+        &self,
+        keys: &[Bytes],
+        tenant: u128,
+    ) -> Result<Vec<Option<Bytes>>, ShardError> {
         let n = self.inner.n;
         let mut buckets: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); n];
         for (i, key) in keys.iter().enumerate() {
@@ -1024,7 +1060,7 @@ impl ShardSet {
             let (tx, rx) = oneshot::channel();
             self.inner.senders[shard]
                 .send(ShardMsg {
-                    req: ShardReq::MgetBatch(bucket),
+                    req: ShardReq::MgetBatch(bucket, tenant),
                     reply: tx,
                 })
                 .await
@@ -1045,6 +1081,36 @@ impl ShardSet {
             }
         }
         Ok(result)
+    }
+
+    /// Scope KV operations to `tenant` for per-tenant cache accounting.
+    ///
+    /// Mirrors [`skeg_core::VLog::tenant`] at the shard-set level: a zero-cost
+    /// view that routes every `get/set/mget` with the tenant id, so the shard's
+    /// `VLog` charges cache residency to `tenant` instead of the unscoped `0`.
+    #[must_use]
+    pub fn tenant(&self, tenant: u128) -> ShardTenantView<'_> {
+        ShardTenantView {
+            shards: self,
+            tenant,
+        }
+    }
+
+    /// Bytes of hot-key cache charged to `tenant`, summed across every shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable.
+    pub async fn tenant_cache_bytes(&self, tenant: u128) -> Result<usize, ShardError> {
+        let mut total = 0usize;
+        for shard in 0..self.inner.n {
+            match self.call(shard, ShardReq::TenantCacheBytes(tenant)).await? {
+                ShardResp::CacheBytes(b) => total += b,
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(total)
     }
 
     /// Aggregate cache statistics summed across every shard.
@@ -1326,6 +1392,53 @@ impl ShardSet {
     }
 }
 
+/// A [`ShardSet`] scoped to one tenant for per-tenant cache accounting.
+///
+/// Created by [`ShardSet::tenant`]. Zero-cost: a borrow of the `ShardSet` plus
+/// the tenant id. KV operations route with the tenant so each shard's `VLog`
+/// charges cache residency correctly. Mirrors `skeg_core::TenantView`.
+#[derive(Clone, Copy)]
+pub struct ShardTenantView<'a> {
+    shards: &'a ShardSet,
+    tenant: u128,
+}
+
+impl ShardTenantView<'_> {
+    /// GET a key, charging any read-path cache insert to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard is unavailable or storage fails.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, ShardError> {
+        self.shards.get_scoped(key, self.tenant).await
+    }
+
+    /// SET a key-value pair, charging the write-through entry to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard is unavailable or storage fails.
+    pub async fn set(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+    ) -> Result<(), ShardError> {
+        self.shards
+            .set_scoped(key, value, durability, self.tenant)
+            .await
+    }
+
+    /// MGET multiple keys, charging read-path cache inserts to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard is unavailable or storage fails.
+    pub async fn mget(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>, ShardError> {
+        self.shards.mget_scoped(keys, self.tenant).await
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1418,6 +1531,53 @@ mod tests {
             assert_eq!(in1, expect == 1, "key {key} shard-1 membership");
             assert!(in0 ^ in1, "key {key} must live in exactly one shard");
         }
+    }
+
+    #[tokio::test]
+    async fn test_shardset_tenant_isolated_accounting() {
+        // G-S2b-1: two tenants writing through the ShardSet have separate cache
+        // accounting; neither charges the anonymous tenant 0.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        shards
+            .tenant(7)
+            .set(b"ak", b"v", Durability::Kernel)
+            .await
+            .unwrap();
+        shards
+            .tenant(9)
+            .set(b"bk", b"vv", Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(
+            shards.tenant_cache_bytes(7).await.unwrap() > 0,
+            "tenant 7 charged"
+        );
+        assert!(
+            shards.tenant_cache_bytes(9).await.unwrap() > 0,
+            "tenant 9 charged"
+        );
+        assert_eq!(
+            shards.tenant_cache_bytes(0).await.unwrap(),
+            0,
+            "anon tenant uncharged"
+        );
+        assert_eq!(
+            shards.tenant(7).get(b"ak").await.unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shardset_bare_set_is_tenant_zero() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.set(b"k", b"v", Durability::Kernel).await.unwrap();
+        assert!(
+            shards.tenant_cache_bytes(0).await.unwrap() > 0,
+            "bare set charges tenant 0"
+        );
+        assert_eq!(shards.tenant_cache_bytes(7).await.unwrap(), 0);
     }
 
     #[tokio::test]
