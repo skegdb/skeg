@@ -43,5 +43,11 @@ skeg-platform = { path = "../skeg-platform", features = ["testing"] }
 name = "sharded_commit"
 harness = false
 
+# Pre-registered P0a gate G-P0a-2/3: per-tenant accounting must not regress the
+# single-tenant cache path. Custom main, wall-clock medians.
+[[bench]]
+name = "cache_tenant_accounting"
+harness = false
+
 [lints]
 workspace = true
