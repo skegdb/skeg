@@ -64,6 +64,9 @@ struct VLogInner {
     read_segments: RefCell<Vec<ReadSegment>>,
     index: RefCell<Index>,
     cache: RefCell<S3Fifo<Bytes>>,
+    /// Live on-disk bytes (padded record size) per tenant, for the disk quota.
+    /// The tenant is the key's 16-byte prefix; entries drop to absent at zero.
+    tenant_disk: RefCell<AHashMap<u128, u64>>,
     active: RefCell<ActiveState>,
     clock: Cell<u64>,
 }
@@ -72,6 +75,28 @@ struct VLogInner {
 #[derive(Clone)]
 pub struct VLog {
     inner: Rc<VLogInner>,
+}
+
+/// The tenant a key is charged to for the disk quota: its 16-byte prefix as a
+/// `u128` (little-endian). Scoped keys carry the tenant id as this prefix, so it
+/// matches the id used at write time. Keys shorter than 16 bytes (and unscoped
+/// tenant-0 keys) fall back to `0`; tenant 0 is unlimited, so the approximation
+/// is invisible to enforcement.
+fn tenant_from_key(key: &[u8]) -> u128 {
+    if key.len() >= 16 {
+        u128::from_le_bytes(key[..16].try_into().expect("checked >= 16"))
+    } else {
+        0
+    }
+}
+
+/// Rebuild the per-tenant live disk-byte counter from a recovered index.
+fn recover_tenant_disk(index: &Index) -> AHashMap<u128, u64> {
+    let mut m: AHashMap<u128, u64> = AHashMap::new();
+    for (key, entry) in index.iter() {
+        *m.entry(tenant_from_key(key)).or_insert(0) += u64::from(entry.size);
+    }
+    m
 }
 
 impl VLog {
@@ -211,6 +236,9 @@ impl VLog {
 
         let committer = GroupCommitter::start(active_file, active_size).await;
 
+        // Rebuild the per-tenant disk counter from the recovered live index.
+        let tenant_disk = recover_tenant_disk(&index);
+
         Ok(Self {
             inner: Rc::new(VLogInner {
                 dir: dir.to_owned(),
@@ -218,6 +246,7 @@ impl VLog {
                 read_segments: RefCell::new(read_segments),
                 index: RefCell::new(index),
                 cache: RefCell::new(S3Fifo::new(CACHE_BUDGET_BYTES)),
+                tenant_disk: RefCell::new(tenant_disk),
                 active: RefCell::new(ActiveState {
                     id: active_id,
                     size: active_size,
@@ -314,6 +343,16 @@ impl VLog {
             value.len(),
             tenant,
         );
+        // Disk quota: swap this key's old on-disk charge for the new one. The
+        // tenant is derived from the key prefix (not the cache `tenant` arg) so
+        // write-time and recovery-time attribution agree for scoped keys.
+        let old_disk = prev.map_or(0, |p| u64::from(p.size));
+        {
+            let dtenant = tenant_from_key(key);
+            let mut disk = self.inner.tenant_disk.borrow_mut();
+            let e = disk.entry(dtenant).or_insert(0);
+            *e = e.saturating_sub(old_disk) + u64::from(padded);
+        }
         Ok(())
     }
 
@@ -335,6 +374,17 @@ impl VLog {
 
         self.inner.index.borrow_mut().remove(key);
         self.inner.cache.borrow_mut().remove(key);
+        // Disk quota: release the deleted record's bytes, key-derived tenant.
+        {
+            let dtenant = tenant_from_key(key);
+            let mut disk = self.inner.tenant_disk.borrow_mut();
+            if let Some(e) = disk.get_mut(&dtenant) {
+                *e = e.saturating_sub(u64::from(prev.size));
+                if *e == 0 {
+                    disk.remove(&dtenant);
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -435,6 +485,17 @@ impl VLog {
     #[must_use]
     pub fn tenant_cache_bytes(&self, tenant: u128) -> usize {
         self.inner.cache.borrow().charged_bytes(tenant)
+    }
+
+    /// Live on-disk bytes (padded KV records) charged to `tenant` (0 if none).
+    #[must_use]
+    pub fn tenant_disk_bytes(&self, tenant: u128) -> u64 {
+        self.inner
+            .tenant_disk
+            .borrow()
+            .get(&tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Hot-key cache statistics: `(bytes_used, evictions, n_keys, byte_budget)`.
@@ -967,6 +1028,80 @@ mod tests {
             "read-path cache insert must charge the querying tenant"
         );
         assert_eq!(v.tenant_cache_bytes(0), 0);
+    }
+
+    // ── P0a S4a: per-tenant disk_bytes tracking ───────────────────────────────
+
+    /// A scoped key: tenant id (16B LE) prefix + raw key, matching how the
+    /// RESP3 handler scopes keys. `tenant_from_key` recovers the tenant.
+    fn scoped(tenant: u128, raw: &[u8]) -> Vec<u8> {
+        let mut k = tenant.to_le_bytes().to_vec();
+        k.extend_from_slice(raw);
+        k
+    }
+
+    #[tokio::test]
+    async fn test_disk_set_tracks_per_tenant() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let k = scoped(7, b"a");
+        v.set(&k, b"val", Durability::Kernel).await.unwrap();
+        assert_eq!(
+            v.tenant_disk_bytes(7),
+            padded_record_size(k.len(), 3) as u64
+        );
+        assert_eq!(v.tenant_disk_bytes(9), 0, "other tenant uncharged");
+    }
+
+    #[tokio::test]
+    async fn test_disk_overwrite_replaces_not_adds() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let k = scoped(7, b"a");
+        v.set(&k, b"x", Durability::Kernel).await.unwrap();
+        let small = v.tenant_disk_bytes(7);
+        let big = vec![0u8; 200];
+        v.set(&k, &big, Durability::Kernel).await.unwrap();
+        assert_eq!(
+            v.tenant_disk_bytes(7),
+            padded_record_size(k.len(), 200) as u64,
+            "overwrite replaces the charge, not adds"
+        );
+        assert!(v.tenant_disk_bytes(7) > small);
+    }
+
+    #[tokio::test]
+    async fn test_disk_del_releases() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let k = scoped(7, b"a");
+        v.set(&k, b"v", Durability::Kernel).await.unwrap();
+        assert!(v.tenant_disk_bytes(7) > 0);
+        assert!(v.del(&k, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(7), 0, "del releases disk bytes");
+    }
+
+    #[tokio::test]
+    async fn test_disk_recovered_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let k1 = scoped(7, b"a");
+        let k2 = scoped(7, b"b");
+        let total;
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(&k1, b"xx", Durability::Kernel).await.unwrap();
+            v.set(&k2, b"yyyy", Durability::Kernel).await.unwrap();
+            total = v.tenant_disk_bytes(7);
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert!(total > 0);
+        assert_eq!(
+            v.tenant_disk_bytes(7),
+            total,
+            "per-tenant disk rebuilt from the recovered index"
+        );
     }
 
     #[tokio::test]
