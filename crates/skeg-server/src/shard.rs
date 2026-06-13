@@ -136,6 +136,15 @@ impl VectorBackend {
         }
     }
 
+    /// True if `id` is currently stored (live). Cheap, in-memory; lets the
+    /// quota tell a new insert from an overwrite.
+    fn contains(&self, id: u64) -> bool {
+        match self {
+            VectorBackend::Flat(i) => i.contains(id),
+            VectorBackend::Disk(i) => i.contains(id),
+        }
+    }
+
     fn get(&self, id: u64) -> std::io::Result<Option<Vec<f32>>> {
         match self {
             VectorBackend::Flat(i) => Ok(i.get(id)),
@@ -207,6 +216,9 @@ enum ShardReq {
     },
     VindexDrop {
         name: String,
+        /// Owning tenant, so its vector quota is credited for the dropped
+        /// fragment. `0` for the unscoped default.
+        tenant: u128,
     },
     /// Enumerate VINDEXes known to this shard. Replicated across all
     /// shards so callers can ask any one shard.
@@ -215,6 +227,10 @@ enum ShardReq {
         name: String,
         id: u64,
         vector: Vec<f32>,
+        /// Owning tenant for vector-quota accounting (`0` = unscoped).
+        tenant: u128,
+        /// Tenant's max vectors, if any. `None` skips quota enforcement.
+        limit: Option<u64>,
     },
     Vget {
         name: String,
@@ -223,6 +239,8 @@ enum ShardReq {
     Vdel {
         name: String,
         id: u64,
+        /// Owning tenant, so its vector quota is credited on a real delete.
+        tenant: u128,
     },
     Vsearch {
         name: String,
@@ -370,6 +388,7 @@ fn run_shard(
     workers: usize,
     mmap_tier: bool,
     mmap_graph: bool,
+    quota: Arc<crate::quota::TenantVectorQuota>,
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
@@ -463,6 +482,7 @@ fn run_shard(
                     let vlog = vlog.clone();
                     let vindexes = vindexes.clone();
                     let dir = dir.clone();
+                    let quota = quota.clone();
                     let shard_id_u16 = shard_id as u16;
                     tokio::task::spawn_local(async move {
                         // Telemetry: classify the op, time the work, record.
@@ -471,7 +491,8 @@ fn run_shard(
                         let op_kind = telemetry_op(&msg.req);
                         let t0 = std::time::Instant::now();
                         let resp =
-                            process(&vlog, &vindexes, &dir, msg.req, read_only, workers).await;
+                            process(&vlog, &vindexes, &dir, msg.req, read_only, workers, &quota)
+                                .await;
                         if let Some(op) = op_kind {
                             skeg_telemetry::record_op(op, shard_id_u16, t0.elapsed());
                         }
@@ -531,6 +552,7 @@ async fn process(
     req: ShardReq,
     read_only: bool,
     workers: usize,
+    quota: &Arc<crate::quota::TenantVectorQuota>,
 ) -> ShardResp {
     if read_only && is_mutation(&req) {
         return ShardResp::Err("server is in serve mode (read-only)".to_owned());
@@ -634,7 +656,7 @@ async fn process(
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             ShardResp::VindexList(rows)
         }
-        ShardReq::VindexDrop { name } => {
+        ShardReq::VindexDrop { name, tenant } => {
             // Pop the entry from the outer map first; this prevents new ops
             // from observing it. In-flight ops on this vindex keep their
             // cloned `Arc` alive and finish their inner lock window before
@@ -644,8 +666,13 @@ async fn process(
             let removed = vindexes.write().remove(&name);
             match removed {
                 Some(arc) => {
-                    let was_disk = matches!(*arc.read(), VectorBackend::Disk(_));
+                    let guard = arc.read();
+                    let was_disk = matches!(*guard, VectorBackend::Disk(_));
+                    // Credit this fragment's vectors back to the tenant quota.
+                    let fragment = guard.len() as u64;
+                    drop(guard);
                     drop(arc);
+                    quota.sub(tenant, fragment);
                     if was_disk {
                         let _ = std::fs::remove_dir_all(dir.join(format!("vindex-{name}")));
                         persist_registry(dir, vindexes);
@@ -655,7 +682,13 @@ async fn process(
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
             }
         }
-        ShardReq::Vset { name, id, vector } => {
+        ShardReq::Vset {
+            name,
+            id,
+            vector,
+            tenant,
+            limit,
+        } => {
             // Outer read to look up the entry; clone the Arc and drop the
             // outer lock before taking the per-vindex write. This lets
             // another vindex's ops run in parallel with this one.
@@ -671,9 +704,25 @@ async fn process(
                             vector.len()
                         ))
                     } else {
+                        // Quota: only a NEW id consumes a slot. Reserve before
+                        // the insert (race-free under this write lock) so an
+                        // over-limit insert is rejected without storing; an
+                        // overwrite (was_new == false) never touches the quota.
+                        let was_new = !idx.contains(id);
+                        if was_new
+                            && let Some(max) = limit
+                            && quota.try_add(tenant, 1, max).is_err()
+                        {
+                            return ShardResp::Err("tenant vector quota exceeded".to_owned());
+                        }
                         match idx.insert(id, &vector) {
                             Ok(()) => ShardResp::Done,
-                            Err(e) => ShardResp::Err(format!("vset failed: {e}")),
+                            Err(e) => {
+                                if was_new && limit.is_some() {
+                                    quota.sub(tenant, 1); // roll back reservation
+                                }
+                                ShardResp::Err(format!("vset failed: {e}"))
+                            }
                         }
                     }
                 }
@@ -692,14 +741,19 @@ async fn process(
                 }
             }
         }
-        ShardReq::Vdel { name, id } => {
+        ShardReq::Vdel { name, id, tenant } => {
             let entry = vindexes.read().get(&name).cloned();
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
                     let mut idx = arc.write();
                     match idx.delete(id) {
-                        Ok(existed) => ShardResp::Existed(existed),
+                        Ok(existed) => {
+                            if existed {
+                                quota.sub(tenant, 1);
+                            }
+                            ShardResp::Existed(existed)
+                        }
                         Err(e) => ShardResp::Err(format!("vdel failed: {e}")),
                     }
                 }
@@ -789,6 +843,9 @@ struct ShardSetInner {
     senders: Vec<Sender<ShardMsg>>,
     handles: Vec<JoinHandle<()>>,
     n: usize,
+    /// Per-tenant vector counter, shared across shards and consulted on
+    /// VSET/VDEL/VINDEX.DROP to enforce `max_vectors`.
+    quota: Arc<crate::quota::TenantVectorQuota>,
 }
 
 impl Drop for ShardSetInner {
@@ -922,13 +979,19 @@ impl ShardSet {
         assert!(n_shards >= 1, "n_shards must be >= 1");
         let mut senders = Vec::with_capacity(n_shards);
         let mut handles = Vec::with_capacity(n_shards);
+        // One vector quota shared across all shards: a tenant's vectors are
+        // spread over shards by id, so the counter must aggregate cross-shard.
+        let quota = Arc::new(crate::quota::TenantVectorQuota::new());
         for id in 0..n_shards {
             let dir = base_dir.join(format!("shard-{id}"));
             let (tx, rx) = tokio::sync::mpsc::channel::<ShardMsg>(SHARD_INBOX_CAPACITY);
+            let quota = quota.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("skeg-shard-{id}"))
                 .spawn(move || {
-                    run_shard(id, dir, rx, read_only, tier, workers, mmap_tier, mmap_graph)
+                    run_shard(
+                        id, dir, rx, read_only, tier, workers, mmap_tier, mmap_graph, quota,
+                    )
                 })?;
             senders.push(tx);
             handles.push(handle);
@@ -938,6 +1001,7 @@ impl ShardSet {
                 senders,
                 handles,
                 n: n_shards,
+                quota,
             }),
         })
     }
@@ -1246,10 +1310,13 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index does not exist or a shard is unavailable.
-    pub async fn vindex_drop(&self, name: &str) -> Result<(), ShardError> {
+    pub async fn vindex_drop(&self, name: &str, tenant: u128) -> Result<(), ShardError> {
         let name = name.to_owned();
-        self.broadcast(|| ShardReq::VindexDrop { name: name.clone() })
-            .await
+        self.broadcast(|| ShardReq::VindexDrop {
+            name: name.clone(),
+            tenant,
+        })
+        .await
     }
 
     /// List every VINDEX. `(name, dim, kind_byte, backend_byte, n_vectors)`
@@ -1287,18 +1354,34 @@ impl ShardSet {
     ///
     /// Returns an error if the index is missing, the dim mismatches, or the
     /// shard is unavailable.
-    pub async fn vset(&self, name: &str, id: u64, vector: Vec<f32>) -> Result<(), ShardError> {
+    pub async fn vset(
+        &self,
+        name: &str,
+        id: u64,
+        vector: Vec<f32>,
+        tenant: u128,
+        limit: Option<u64>,
+    ) -> Result<(), ShardError> {
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
             name: name.to_owned(),
             id,
             vector,
+            tenant,
+            limit,
         };
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
+    }
+
+    /// Vectors currently reserved by `tenant` against its quota (0 if
+    /// untracked / unlimited). Read directly from the shared counter.
+    #[must_use]
+    pub fn tenant_vector_count(&self, tenant: u128) -> u64 {
+        self.inner.quota.count(tenant)
     }
 
     /// Fetch the stored f32 vector for `id` in `name`. Routes by `id`.
@@ -1324,11 +1407,12 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
-    pub async fn vdel(&self, name: &str, id: u64) -> Result<bool, ShardError> {
+    pub async fn vdel(&self, name: &str, id: u64, tenant: u128) -> Result<bool, ShardError> {
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vdel {
             name: name.to_owned(),
             id,
+            tenant,
         };
         match self.call(shard, req).await? {
             ShardResp::Existed(b) => Ok(b),
@@ -1581,6 +1665,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vector_quota_enforced_per_tenant() {
+        // G-S3b-1: a tenant at max_vectors is rejected on VSET; another tenant
+        // is unaffected; an overwrite never consumes quota; VDEL frees a slot.
+        // Indexes are tenant-scoped names, mirroring how the RESP3 handler
+        // scopes them, so ids never collide across tenants.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx7", 4, 0, 0).await.unwrap();
+        shards.vindex_create("idx9", 4, 0, 0).await.unwrap();
+        let v = vec![1.0f32, 0.0, 0.0, 0.0];
+        let lim = Some(2u64);
+
+        shards.vset("idx7", 1, v.clone(), 7, lim).await.unwrap();
+        shards.vset("idx7", 2, v.clone(), 7, lim).await.unwrap();
+        assert_eq!(shards.tenant_vector_count(7), 2);
+
+        // A third new id exceeds the limit -> rejected, count unchanged.
+        assert!(shards.vset("idx7", 3, v.clone(), 7, lim).await.is_err());
+        assert_eq!(
+            shards.tenant_vector_count(7),
+            2,
+            "rejected vset must not count"
+        );
+
+        // Overwriting an existing id is always allowed and free, even at the cap.
+        shards
+            .vset("idx7", 1, vec![0.0, 1.0, 0.0, 0.0], 7, lim)
+            .await
+            .unwrap();
+        assert_eq!(shards.tenant_vector_count(7), 2, "overwrite is free");
+
+        // A different tenant has its own independent budget.
+        shards.vset("idx9", 1, v.clone(), 9, Some(1)).await.unwrap();
+        assert_eq!(shards.tenant_vector_count(9), 1);
+        assert_eq!(shards.tenant_vector_count(7), 2, "tenant 9 did not touch 7");
+
+        // VDEL frees a slot for tenant 7, letting a new id back in.
+        assert!(shards.vdel("idx7", 2, 7).await.unwrap());
+        assert_eq!(shards.tenant_vector_count(7), 1);
+        shards.vset("idx7", 3, v.clone(), 7, lim).await.unwrap();
+        assert_eq!(shards.tenant_vector_count(7), 2);
+    }
+
+    #[tokio::test]
+    async fn test_vector_quota_untracked_without_limit() {
+        // G-S3-2: no limit -> no counting; single-tenant path pays nothing.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 4, 0, 0).await.unwrap();
+        let v = vec![1.0f32, 0.0, 0.0, 0.0];
+        for id in 0..50u64 {
+            shards.vset("idx", id, v.clone(), 0, None).await.unwrap();
+        }
+        assert_eq!(
+            shards.tenant_vector_count(0),
+            0,
+            "no limit means no quota tracking"
+        );
+    }
+
+    #[tokio::test]
     async fn test_mget_cross_shard() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 4).unwrap();
@@ -1712,7 +1857,10 @@ mod tests {
             // backend=1 -> disk Vamana.
             shards.vindex_create("persist", 64, 0, 1).await.unwrap();
             for id in 0u64..150 {
-                shards.vset("persist", id, tvec(id + 1)).await.unwrap();
+                shards
+                    .vset("persist", id, tvec(id + 1), 0, None)
+                    .await
+                    .unwrap();
             }
             // `shards` dropped here: worker threads flush and exit.
         }
@@ -1773,8 +1921,8 @@ mod tests {
         };
         for id in 0..n {
             let v = make_vec(id);
-            shards.vset("a", id, v.clone()).await.unwrap();
-            shards.vset("b", id, v).await.unwrap();
+            shards.vset("a", id, v.clone(), 0, None).await.unwrap();
+            shards.vset("b", id, v, 0, None).await.unwrap();
         }
 
         let query = make_vec(99_999);

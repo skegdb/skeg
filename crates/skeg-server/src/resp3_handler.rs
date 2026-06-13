@@ -288,7 +288,7 @@ async fn dispatch_command(
         Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
-        Command::SkegVset { args } => skeg_vset(&args, shards, *tenant).await,
+        Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegVsearch { args } => skeg_vsearch(&args, shards, *tenant).await,
         Command::Unknown { name, args } => {
@@ -412,6 +412,12 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
 }
 
 /// `SKEG.VINDEX.DROP name`. Name is scoped per tenant.
+/// The tenant id as the `u128` used for vector-quota accounting (`0` for the
+/// unscoped default).
+fn tenant_u128(tenant: TenantId) -> u128 {
+    u128::from_le_bytes(*tenant.as_bytes())
+}
+
 async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
     if args.len() != 1 {
         return Frame::Error("ERR wrong number of arguments for 'SKEG.VINDEX.DROP'".into());
@@ -421,7 +427,7 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
         Err(e) => return e,
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vindex_drop(&scoped).await {
+    match shards.vindex_drop(&scoped, tenant_u128(tenant)).await {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -429,7 +435,12 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
 
 /// `SKEG.VSET name id vector_bytes`. `vector_bytes` is a bulk string
 /// carrying raw little-endian `f32` values; its length must be `dim * 4`.
-async fn skeg_vset(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+async fn skeg_vset(
+    args: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
     if args.len() != 3 {
         return Frame::Error(
             "ERR wrong number of arguments for 'SKEG.VSET'; want name id vector".into(),
@@ -448,7 +459,13 @@ async fn skeg_vset(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vset(&scoped, id, vector).await {
+    // Limit comes from the pluggable backend; `None` (no backend / unlimited)
+    // skips quota enforcement entirely.
+    let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
+    match shards
+        .vset(&scoped, id, vector, tenant_u128(tenant), limit)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -468,7 +485,7 @@ async fn skeg_vdel(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
         Err(e) => return e,
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vdel(&scoped, id).await {
+    match shards.vdel(&scoped, id, tenant_u128(tenant)).await {
         Ok(true) => Frame::Integer(1),
         Ok(false) => Frame::Integer(0),
         Err(e) => shard_error(&e),

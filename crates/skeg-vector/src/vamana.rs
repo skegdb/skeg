@@ -1437,6 +1437,14 @@ impl DiskVamanaIndex {
             && (self.delta.contains_key(&id) || self.id_to_main_row.contains_key(&id))
     }
 
+    /// True if `id` is a live (non-tombstoned) vector in this index. Cheap,
+    /// in-memory; used by the server's per-tenant vector quota to tell an
+    /// insert from an overwrite without touching disk.
+    #[must_use]
+    pub fn contains(&self, id: u64) -> bool {
+        self.is_live(id)
+    }
+
     /// Insert or overwrite the vector for `id`. The vector lands in the in-RAM
     /// delta and is appended to the WAL; [`consolidate`](Self::consolidate)
     /// folds it into the graph.
