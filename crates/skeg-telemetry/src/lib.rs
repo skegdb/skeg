@@ -12,7 +12,7 @@
 //!
 //! When `http` is also enabled, [`http::serve_blocking`] runs a tiny
 //! HTTP server on a dedicated thread that serves `/metrics` in Prometheus
-//! text format. The server is purely a reader — it never writes through
+//! text format. The server is purely a reader - it never writes through
 //! the hot path.
 //!
 //! # Hot-path cost budget
@@ -286,13 +286,3 @@ impl Gauge {
         }
     }
 }
-
-/// Compile-time check: when neither feature is enabled the entire module
-/// is dead code from the caller's perspective, but the enum + signatures
-/// still compile so the consumer code does not need `#[cfg]` gates.
-#[allow(dead_code)]
-const _ASSERT_ZERO_COST: () = {
-    // If `record_op` ever stops being inline + side-effect-free with no
-    // features, this const will fail to evaluate due to the `let _` sinks
-    // being optimised out.
-};

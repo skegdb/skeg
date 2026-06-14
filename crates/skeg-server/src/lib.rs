@@ -11,6 +11,7 @@
 //! via [`Server::with_tenant_backend`].
 
 pub mod handler;
+pub mod quota;
 pub mod resp3_handler;
 pub mod shard;
 pub mod tenant;
@@ -25,10 +26,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use handler::handle_connection;
+pub use quota::{TenantLimits, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
 use skeg_vector::QuantKind;
-pub use tenant::{AnonymousPolicy, TenantBackend, TenantId};
+pub use tenant::{AnonymousPolicy, QuotaAdminError, TenantBackend, TenantId};
 
 pub struct Server {
     listener: TcpListener,

@@ -1,4 +1,4 @@
-//! M7 flat-scan vector search benchmarks.
+//! Flat-scan vector search benchmarks.
 //!
 //! Stressful by design: each case scans a large vector set per search, the
 //! inner loop of a flat VSEARCH. Throughput is reported in vectors scanned

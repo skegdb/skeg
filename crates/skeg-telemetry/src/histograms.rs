@@ -106,7 +106,7 @@ pub fn observe_us(op: Op, us: u64) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Read helpers (dumpers only — never hot path).
+// Read helpers (dumpers only - never hot path).
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Snapshot one bucket of one op.

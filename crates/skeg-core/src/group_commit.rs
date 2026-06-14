@@ -24,8 +24,7 @@ const TIMER_MICROS: u64 = 200;
 /// Durability requested for a write. Ordered weakest → strongest.
 ///
 /// AI workloads rarely need power-loss durability for every write (an embedding
-/// cache can be recomputed), so `Kernel` is the sensible default - see
-/// `design-write-perf.md` §2.
+/// cache can be recomputed), so `Kernel` is the sensible default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Durability {
     /// Ack once the record is in the OS write buffer. Survives a process
@@ -148,8 +147,8 @@ impl GroupCommitter {
 /// Single-file group committer: one background task per file, batches
 /// writes from every producer into one `sync_durable` per batch. Used
 /// directly on `PerFile` platforms and as the underlying implementation
-/// of the placeholder `DeviceGlobal` branch until M2 of the
-/// shared-committer workstream lands.
+/// of the placeholder `DeviceGlobal` branch until the device-global
+/// path of the shared-committer workstream lands.
 #[derive(Clone)]
 struct PerFileCommitter {
     tx: Arc<mpsc::UnboundedSender<Msg>>,
@@ -519,12 +518,12 @@ mod tests {
         );
     }
 
-    /// M1 dispatch smoke test: the façade builds on both
+    /// Dispatch smoke test: the façade builds on both
     /// `DurabilityModel::PerFile` and `DurabilityModel::DeviceGlobal`
-    /// and round-trips an append. Until M2 lands, both branches
-    /// delegate to `PerFileCommitter`, so behaviour is observationally
-    /// identical; this test pins that contract so the M2 rewire is
-    /// caught if it accidentally regresses the `PerFile` codepath.
+    /// and round-trips an append. Until the device-global path lands,
+    /// both branches delegate to `PerFileCommitter`, so behaviour is
+    /// observationally identical; this test pins that contract so the
+    /// rewire is caught if it accidentally regresses the `PerFile` codepath.
     #[tokio::test]
     async fn test_facade_dispatches_on_durability_model() {
         force_per_file();

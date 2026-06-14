@@ -3,14 +3,14 @@
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!
-//! The post-Q10 plan's Steps 4-5 (build M2 batch + nav graph, build M3
-//! parallel) promise a 20-30x build speedup. The build is *already* parallel
-//! (rayon). This harness measures, before committing weeks to M2/M3:
+//! A planned batch + nav-graph build plus a parallel build promise a 20-30x
+//! build speedup. The build is *already* parallel (rayon). This harness
+//! measures, before committing weeks to that work:
 //!   - thread scaling: build the same dataset at 1/2/4/8 threads -> is the
-//!     parallelism already efficient (M3), or is there contention to fix?
-//!   - phase split: greedy walk vs robust-prune vs back-edge (M2 targets the
-//!     walk - shared beam, nav graph - so its leverage depends on the walk's
-//!     share).
+//!     parallelism already efficient, or is there contention to fix?
+//!   - phase split: greedy walk vs robust-prune vs back-edge (the batch work
+//!     targets the walk - shared beam, nav graph - so its leverage depends on
+//!     the walk's share).
 //!   - the real build time at 1M.
 
 #![allow(clippy::cast_precision_loss)]

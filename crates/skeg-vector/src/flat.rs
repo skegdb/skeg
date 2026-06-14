@@ -1,4 +1,4 @@
-//! Flat-scan vector index: the M7 vector tier.
+//! Flat-scan vector index: the flat vector tier.
 //!
 //! A [`FlatIndex`] keeps every vector at full f32 precision (the source of
 //! truth, used for exact re-ranking) plus, for the int8 and binary kinds, a

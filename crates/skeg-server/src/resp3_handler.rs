@@ -7,7 +7,7 @@
 //! Mirrors the binary-protocol `handler.rs` but speaks Redis wire (RESP2/RESP3).
 //! New connections default to RESP2 until `HELLO 3` upgrades them.
 //!
-//! Wire commands supported in this iteration (M9 v0.1 KV subset):
+//! Wire commands supported in this iteration (the KV subset):
 //! - `HELLO [version [AUTH user pass] [SETNAME name]]` - protocol negotiation.
 //! - `PING [msg]` / `ECHO msg` - protocol-only.
 //! - `GET key` / `SET key value` / `DEL key [key ...]` / `EXISTS key [key ...]`.
@@ -58,6 +58,12 @@ struct ScopedKey {
 impl ScopedKey {
     fn as_bytes(&self) -> &Bytes {
         &self.bytes
+    }
+
+    /// The owning tenant id as a `u128`, for per-tenant cache accounting. `0`
+    /// for the unscoped (anonymous) default, matching `VLog`'s tenant 0 path.
+    fn accounting_tenant(&self) -> u128 {
+        u128::from_le_bytes(*self.tenant.as_bytes())
     }
 
     /// Cheap runtime check the prefix invariant still holds. Called at
@@ -282,8 +288,10 @@ async fn dispatch_command(
         Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
-        Command::SkegVset { args } => skeg_vset(&args, shards, *tenant).await,
+        Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
+        Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
+        Command::SkegQuotaGet { args } => skeg_quota_get(&args, *tenant, tenant_backend),
         Command::SkegVsearch { args } => skeg_vsearch(&args, shards, *tenant).await,
         Command::Unknown { name, args } => {
             dispatch_unknown(
@@ -406,6 +414,12 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
 }
 
 /// `SKEG.VINDEX.DROP name`. Name is scoped per tenant.
+/// The tenant id as the `u128` used for vector-quota accounting (`0` for the
+/// unscoped default).
+fn tenant_u128(tenant: TenantId) -> u128 {
+    u128::from_le_bytes(*tenant.as_bytes())
+}
+
 async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
     if args.len() != 1 {
         return Frame::Error("ERR wrong number of arguments for 'SKEG.VINDEX.DROP'".into());
@@ -415,7 +429,7 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
         Err(e) => return e,
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vindex_drop(&scoped).await {
+    match shards.vindex_drop(&scoped, tenant_u128(tenant)).await {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -423,7 +437,12 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
 
 /// `SKEG.VSET name id vector_bytes`. `vector_bytes` is a bulk string
 /// carrying raw little-endian `f32` values; its length must be `dim * 4`.
-async fn skeg_vset(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+async fn skeg_vset(
+    args: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
     if args.len() != 3 {
         return Frame::Error(
             "ERR wrong number of arguments for 'SKEG.VSET'; want name id vector".into(),
@@ -442,7 +461,13 @@ async fn skeg_vset(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vset(&scoped, id, vector).await {
+    // Limit comes from the pluggable backend; `None` (no backend / unlimited)
+    // skips quota enforcement entirely.
+    let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
+    match shards
+        .vset(&scoped, id, vector, tenant_u128(tenant), limit)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -462,11 +487,89 @@ async fn skeg_vdel(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
         Err(e) => return e,
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vdel(&scoped, id).await {
+    match shards.vdel(&scoped, id, tenant_u128(tenant)).await {
         Ok(true) => Frame::Integer(1),
         Ok(false) => Frame::Integer(0),
         Err(e) => shard_error(&e),
     }
+}
+
+/// Parse a quota limit field: `*` means unlimited (`None`), else a `u64`.
+fn parse_quota_limit(b: &Bytes) -> Result<Option<u64>, Frame> {
+    if b.as_ref() == b"*" {
+        return Ok(None);
+    }
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Frame::Error("ERR limit must be a non-negative integer or '*' for unlimited".into())
+        })
+}
+
+/// Admin-command preamble: require a backend, require the caller be an admin,
+/// then resolve the tenant-name arg to a tenant id.
+fn admin_target<'a>(
+    name_arg: &Bytes,
+    caller: TenantId,
+    ctx: Option<&'a Arc<dyn TenantBackend>>,
+) -> Result<(&'a Arc<dyn TenantBackend>, TenantId), Frame> {
+    let Some(backend) = ctx else {
+        return Err(Frame::Error(
+            "ERR multi-tenant backend not configured".into(),
+        ));
+    };
+    if !backend.is_admin(caller) {
+        return Err(Frame::Error("ERR admin privileges required".into()));
+    }
+    let name = parse_utf8_arg(name_arg, "tenant")?;
+    backend
+        .resolve_tenant(name)
+        .map(|target| (backend, target))
+        .ok_or_else(|| Frame::Error("ERR unknown tenant".into()))
+}
+
+/// `SKEG.QUOTA.SET tenant max_vectors max_disk_bytes`. Admin only: sets a
+/// target tenant's hard quotas. Each limit is a `u64` or `*` (unlimited).
+fn skeg_quota_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let max_vectors = match parse_quota_limit(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let max_disk_bytes = match parse_quota_limit(&args[2]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let limits = crate::quota::TenantLimits {
+        max_vectors,
+        max_disk_bytes,
+    };
+    match backend.set_limits(target, limits) {
+        Ok(()) => Frame::ok(),
+        Err(crate::tenant::QuotaAdminError::Unsupported) => {
+            Frame::Error("ERR backend does not support setting quotas".into())
+        }
+    }
+}
+
+/// `SKEG.QUOTA.GET tenant`. Admin only: returns `[max_vectors, max_disk_bytes]`
+/// as bulk strings, with `*` for an unlimited field.
+fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let limits = backend.limits(target);
+    let fmt = |o: Option<u64>| o.map_or_else(|| "*".to_string(), |v| v.to_string());
+    Frame::Array(vec![
+        Frame::Bulk(Bytes::from(fmt(limits.max_vectors))),
+        Frame::Bulk(Bytes::from(fmt(limits.max_disk_bytes))),
+    ])
 }
 
 /// `SKEG.VSEARCH name k l_search vector_bytes`. Returns an array of
@@ -665,7 +768,7 @@ async fn kv_incrby_apply(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, key);
-    incr_apply(k.as_bytes(), delta, shards).await
+    incr_apply(k.as_bytes(), delta, shards, k.accounting_tenant()).await
 }
 
 /// `SELECT db`. Skeg has one logical DB; only index 0 succeeds.
@@ -690,7 +793,7 @@ async fn kv_get(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
-    match shards.get(k.as_bytes()).await {
+    match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
         Ok(Some(v)) => Frame::Bulk(v),
         Ok(None) => Frame::Null,
         Err(e) => shard_error(&e),
@@ -710,7 +813,14 @@ async fn kv_set(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
-    match shards.set(k.as_bytes(), &args[1], DEFAULT_DURABILITY).await {
+    // Disk quota from the pluggable backend; `None` skips enforcement.
+    let disk_limit = ctx.and_then(|b| b.limits(tenant).max_disk_bytes);
+    match shards
+        .tenant(k.accounting_tenant())
+        .with_disk_limit(disk_limit)
+        .set(k.as_bytes(), &args[1], DEFAULT_DURABILITY)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -759,7 +869,7 @@ async fn kv_exists(
     let mut count: i64 = 0;
     for key in args {
         let k = scope_key(tenant, key);
-        match shards.get(k.as_bytes()).await {
+        match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
             Ok(Some(_)) => count += 1,
             Ok(None) => {}
             Err(e) => return shard_error(&e),
@@ -785,7 +895,7 @@ async fn kv_mget(
     let mut out = Vec::with_capacity(args.len());
     for key in args {
         let k = scope_key(tenant, key);
-        match shards.get(k.as_bytes()).await {
+        match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
             Ok(Some(v)) => out.push(Frame::Bulk(v)),
             Ok(None) => out.push(Frame::Null),
             Err(e) => return shard_error(&e),
@@ -835,11 +945,12 @@ async fn kv_incr_by(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
-    incr_apply(k.as_bytes(), sign, shards).await
+    incr_apply(k.as_bytes(), sign, shards, k.accounting_tenant()).await
 }
 
-async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet) -> Frame {
-    let current: i64 = match shards.get(key).await {
+async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) -> Frame {
+    let store = shards.tenant(tenant);
+    let current: i64 = match store.get(key).await {
         Ok(Some(b)) => match std::str::from_utf8(&b).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
             None => return Frame::Error("ERR value is not an integer or out of range".into()),
@@ -852,7 +963,7 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet) -> Frame {
         None => return Frame::Error("ERR increment or decrement would overflow".into()),
     };
     let body = Bytes::from(new.to_string());
-    match shards.set(key, &body, DEFAULT_DURABILITY).await {
+    match store.set(key, &body, DEFAULT_DURABILITY).await {
         Ok(()) => Frame::Integer(new),
         Err(e) => shard_error(&e),
     }

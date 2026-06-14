@@ -1,14 +1,14 @@
-//! Fase 0.d (ram-reduction) - skewness del visit count per nodo, gate hot/cold.
+//! Per-node visit-count skew, hot/cold tier gate.
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!
-//! design-hot-cold-tier.md: se il visit count dei nodi durante il greedy walk
-//! e' Pareto-like, un hot set in RAM (~5% nodi) + cold set su disco riduce il
-//! tier. Gate: top 5% dei nodi copre >= 50% delle visite. In piu' la
-//! validazione cross-query: l'hot set identificato su meta' query riconosce
-//! le visite dell'altra meta'?
+//! Hypothesis: if the per-node visit count during the greedy walk is
+//! Pareto-like, a hot set in RAM (~5% of nodes) + a cold set on disk shrinks
+//! the tier. Gate: the top 5% of nodes covers >= 50% of visits. Plus a
+//! cross-query validation: does the hot set identified on half the queries
+//! recognize the visits of the other half?
 //!
-//! Riusa `DiskVamanaIndex::search_node_trace`, le tracce di walk gia' esposte.
+//! Reuses `DiskVamanaIndex::search_node_trace`, the already-exposed walk traces.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -92,12 +92,12 @@ fn cdf_report(label: &str, n: usize, traces: &[Vec<u32>]) {
     let mut sorted = visit.clone();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
 
-    println!("\n== {label} (N={n}, {walks} query, walk avg {avg:.0} nodi) ==");
+    println!("\n== {label} (N={n}, {walks} queries, walk avg {avg:.0} nodes) ==");
     println!(
-        "  visite totali {total}  visitati {} nodi distinti",
+        "  total visits {total}  visited {} distinct nodes",
         visit.iter().filter(|&&v| v > 0).count()
     );
-    println!("  {:>10}{:>14}", "top nodi %", "copertura %");
+    println!("  {:>10}{:>14}", "top nodes %", "coverage %");
     let mut top5_cov = 0.0;
     for &pct in &[1.0f64, 5.0, 10.0, 25.0, 50.0] {
         let k = ((n as f64 * pct / 100.0).round() as usize).max(1);
@@ -107,18 +107,18 @@ fn cdf_report(label: &str, n: usize, traces: &[Vec<u32>]) {
         }
         println!("  {pct:>9.0}%{cov:>13.1}%");
     }
-    // gate (design-hot-cold-tier.md §3.4)
+    // gate
     let top1 = sorted[..(n / 100).max(1)].iter().sum::<u64>() as f64 / total as f64 * 100.0;
     let verdict = if top1 >= 30.0 {
-        "skewness ESTREMA -> hot/cold ideale"
+        "EXTREME skew -> hot/cold ideal"
     } else if top5_cov >= 50.0 {
-        "skewness FORTE -> hot/cold efficace"
+        "STRONG skew -> hot/cold effective"
     } else {
         let top10 = sorted[..(n / 10).max(1)].iter().sum::<u64>() as f64 / total as f64 * 100.0;
         if top10 >= 60.0 {
-            "skewness moderata -> hot/cold limitato"
+            "moderate skew -> hot/cold limited"
         } else {
-            "UNIFORME -> hot/cold morto"
+            "UNIFORM -> hot/cold dead"
         }
     };
     println!("  gate: {verdict}");
@@ -163,7 +163,7 @@ fn cross_query(label: &str, n: usize, traces: &[Vec<u32>]) {
     }
     let cov_a = a_in_hot as f64 / a_total.max(1) as f64 * 100.0;
     let cov_b = b_in_hot as f64 / b_total.max(1) as f64 * 100.0;
-    println!("  cross-query ({label}): hot set 5% su meta' A copre A {cov_a:.1}% / B {cov_b:.1}%");
+    println!("  cross-query ({label}): hot set 5% on half A covers A {cov_a:.1}% / B {cov_b:.1}%");
 }
 
 /// Build the graph, trace the walks, run the CDF + cross-query gate.
@@ -187,17 +187,17 @@ fn run(label: &str, corpus: Vec<f32>, n: usize, dim: usize, queries: &[f32], n_q
 }
 
 fn main() {
-    eprintln!("Fase 0.d - skewness del visit count, gate hot/cold\n");
+    eprintln!("Phase 0.d - visit count skew, hot/cold gate\n");
 
     // Real mxbai-embed-large 10K with real queries.
     if let (Some((corpus, n, dim)), Some((queries, n_q, q_dim))) =
         (load_npy(CORPUS_NPY), load_npy(QUERY_NPY))
     {
         if dim == q_dim {
-            run("mxbai reale 10K", corpus, n, dim, &queries, n_q);
+            run("mxbai real 10K", corpus, n, dim, &queries, n_q);
         }
     } else {
-        eprintln!("  (mxbai npy non trovato, salto il caso reale)");
+        eprintln!("  (mxbai npy not found, skipping the real case)");
     }
 
     // uniform-sphere at scale: the validated proxy for real embeddings.
@@ -206,7 +206,7 @@ fn main() {
     let corpus = uniform_sphere(n, dim, 7);
     let queries = uniform_sphere(200, dim, 99);
     run(
-        "uniform-sphere 100K (proxy a scala)",
+        "uniform-sphere 100K (real-scale proxy)",
         corpus,
         n,
         dim,

@@ -7,10 +7,9 @@
 //! index plus a bit shift. Memory: `N/8` bytes vs ~16 bytes per entry for
 //! AHashSet (at 1M nodes: 128 KiB vs ~16 MiB).
 //!
-//! Tier 1.a in `optimizations/PLAN.md`. The primitive gate (6.20x faster
-//! than AHashSet on the walk access pattern) and the integration gate
-//! (+6-8% QPS, -7-9% latency, recall identical on mxbai/MiniLM) are both
-//! green; see OBSERVATIONS.md "Tier 1.a - VisitedBitset".
+//! The primitive gate (6.20x faster than AHashSet on the walk access
+//! pattern) and the integration gate (+6-8% QPS, -7-9% latency, recall
+//! identical on mxbai/MiniLM) are both green.
 
 use crate::vamana::VecId;
 

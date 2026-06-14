@@ -51,8 +51,8 @@ const VAMANA_L_SEARCH: usize = 100;
 /// rather than linear (a fixed threshold would make bulk growth O(N^2)).
 const DISK_CONSOLIDATE_MIN: usize = 4096;
 
-/// A VINDEX is backed either by an in-RAM `FlatIndex` (M7) or by an on-disk
-/// Vamana graph (`DiskVamanaIndex`, M8) - f32 vectors on disk, graph + int8
+/// A VINDEX is backed either by an in-RAM `FlatIndex` or by an on-disk
+/// Vamana graph (`DiskVamanaIndex`) - f32 vectors on disk, graph + int8
 /// tier in RAM. The choice is made at `VINDEX CREATE`.
 enum VectorBackend {
     Flat(FlatIndex),
@@ -136,6 +136,15 @@ impl VectorBackend {
         }
     }
 
+    /// True if `id` is currently stored (live). Cheap, in-memory; lets the
+    /// quota tell a new insert from an overwrite.
+    fn contains(&self, id: u64) -> bool {
+        match self {
+            VectorBackend::Flat(i) => i.contains(id),
+            VectorBackend::Disk(i) => i.contains(id),
+        }
+    }
+
     fn get(&self, id: u64) -> std::io::Result<Option<Vec<f32>>> {
         match self {
             VectorBackend::Flat(i) => Ok(i.get(id)),
@@ -160,7 +169,7 @@ impl VectorBackend {
 /// Bounded inbox capacity per shard. A full inbox makes `send` await, which
 /// propagates backpressure up to the connection handler (it stops reading new
 /// frames) instead of letting queues grow without bound (OOM-safety, not
-/// latency - see OBSERVATIONS Q2/Q6).
+/// latency).
 const SHARD_INBOX_CAPACITY: usize = 4096;
 
 /// Maximum requests a shard processes concurrently. The inbox bounds the
@@ -189,11 +198,15 @@ pub enum ShardError {
 // ── Channel protocol ──────────────────────────────────────────────────────────
 
 enum ShardReq {
-    Get(Bytes),
-    Set(Bytes, Bytes, Durability),
+    /// `(key, tenant)`: tenant `0` is the unscoped default.
+    Get(Bytes, u128),
+    /// `(key, value, durability, tenant, disk_limit)`.
+    Set(Bytes, Bytes, Durability, u128, Option<u64>),
     Del(Bytes, Durability),
-    /// `(original_index, key)` pairs for a multi-get fragment.
-    MgetBatch(Vec<(usize, Bytes)>),
+    /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
+    MgetBatch(Vec<(usize, Bytes)>, u128),
+    /// Bytes of hot-key cache charged to a tenant on this shard.
+    TenantCacheBytes(u128),
     Stats,
     VindexCreate {
         name: String,
@@ -203,6 +216,9 @@ enum ShardReq {
     },
     VindexDrop {
         name: String,
+        /// Owning tenant, so its vector quota is credited for the dropped
+        /// fragment. `0` for the unscoped default.
+        tenant: u128,
     },
     /// Enumerate VINDEXes known to this shard. Replicated across all
     /// shards so callers can ask any one shard.
@@ -211,6 +227,10 @@ enum ShardReq {
         name: String,
         id: u64,
         vector: Vec<f32>,
+        /// Owning tenant for vector-quota accounting (`0` = unscoped).
+        tenant: u128,
+        /// Tenant's max vectors, if any. `None` skips quota enforcement.
+        limit: Option<u64>,
     },
     Vget {
         name: String,
@@ -219,6 +239,8 @@ enum ShardReq {
     Vdel {
         name: String,
         id: u64,
+        /// Owning tenant, so its vector quota is credited on a real delete.
+        tenant: u128,
     },
     Vsearch {
         name: String,
@@ -232,6 +254,8 @@ enum ShardResp {
     Value(Option<Bytes>),
     Done,
     Existed(bool),
+    /// Bytes of hot-key cache charged to a tenant on the answering shard.
+    CacheBytes(usize),
     MgetBatch(Vec<(usize, Option<Bytes>)>),
     /// `(cache_bytes, cache_evictions, n_keys, cache_budget)`.
     Stats(u64, u64, u64, u64),
@@ -249,7 +273,7 @@ struct ShardMsg {
     reply: oneshot::Sender<ShardResp>,
 }
 
-// ── VINDEX registry (Q10: disk-backed indexes survive a restart) ──────────────
+// ── VINDEX registry (disk-backed indexes survive a restart) ───────────────────
 //
 // Each shard records its disk-backed VINDEXes in `vindexes.registry`; on
 // startup it reopens them from their `vindex-<name>/` directories. Flat
@@ -353,7 +377,7 @@ fn recover_vindexes(
 //
 // With `read_only` set the shard rejects every mutation and skips background
 // compaction and snapshots: the `--mode serve` path over an offline-built
-// index (PLAN-POST-Q10 Step 1.5).
+// index.
 #[allow(clippy::needless_pass_by_value)]
 fn run_shard(
     shard_id: usize,
@@ -364,6 +388,8 @@ fn run_shard(
     workers: usize,
     mmap_tier: bool,
     mmap_graph: bool,
+    quota: Arc<crate::quota::TenantVectorQuota>,
+    disk_counter: skeg_core::SharedTenantDisk,
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
@@ -379,7 +405,7 @@ fn run_shard(
     };
 
     rt.block_on(async move {
-        let vlog = match VLog::open(&dir).await {
+        let vlog = match VLog::open_with_shared_disk(&dir, disk_counter).await {
             Ok(v) => v,
             Err(e) => {
                 error!("shard {shard_id}: VLog::open failed: {e}");
@@ -397,8 +423,8 @@ fn run_shard(
         // `!Send` (Rc-backed), so `spawn_local` is required.
         // Caps the number of request tasks running at once on this shard.
         let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_SHARD));
-        // Vector indexes: disk-backed ones are recovered from the registry
-        // (Q10); flat ones are in-RAM and start empty. Shared across the
+        // Vector indexes: disk-backed ones are recovered from the registry;
+        // flat ones are in-RAM and start empty. Shared across the
         // per-request tasks on this single-threaded LocalSet via Rc/RefCell.
         // `Arc<RwLock>` (instead of the previous `Rc<RefCell>`) so the
         // VindexSet is `Send + Sync`: an optional worker pool can dispatch
@@ -457,6 +483,7 @@ fn run_shard(
                     let vlog = vlog.clone();
                     let vindexes = vindexes.clone();
                     let dir = dir.clone();
+                    let quota = quota.clone();
                     let shard_id_u16 = shard_id as u16;
                     tokio::task::spawn_local(async move {
                         // Telemetry: classify the op, time the work, record.
@@ -465,7 +492,8 @@ fn run_shard(
                         let op_kind = telemetry_op(&msg.req);
                         let t0 = std::time::Instant::now();
                         let resp =
-                            process(&vlog, &vindexes, &dir, msg.req, read_only, workers).await;
+                            process(&vlog, &vindexes, &dir, msg.req, read_only, workers, &quota)
+                                .await;
                         if let Some(op) = op_kind {
                             skeg_telemetry::record_op(op, shard_id_u16, t0.elapsed());
                         }
@@ -503,7 +531,7 @@ fn is_mutation(req: &ShardReq) -> bool {
 fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
     use skeg_telemetry::Op;
     match req {
-        ShardReq::Get(_) | ShardReq::MgetBatch(_) => Some(Op::Get),
+        ShardReq::Get(..) | ShardReq::MgetBatch(..) => Some(Op::Get),
         ShardReq::Set(..) => Some(Op::Set),
         ShardReq::Del(..) => Some(Op::Del),
         ShardReq::Vset { .. } => Some(Op::VSet),
@@ -513,6 +541,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
+        | ShardReq::TenantCacheBytes(_)
         | ShardReq::Stats => None,
     }
 }
@@ -524,12 +553,12 @@ async fn process(
     req: ShardReq,
     read_only: bool,
     workers: usize,
+    quota: &Arc<crate::quota::TenantVectorQuota>,
 ) -> ShardResp {
     if read_only && is_mutation(&req) {
         return ShardResp::Err("server is in serve mode (read-only)".to_owned());
     }
-    // Optional worker-pool path for VSEARCH (Q11, Tier 2 of
-    // `optimizations/PLAN.md`): when `workers > 0` the search runs on a
+    // Optional worker-pool path for VSEARCH: when `workers > 0` the search runs on a
     // blocking thread so it does not stall queued KV ops on the shard
     // thread. KV ops always stay inline since they finish in microseconds.
     if workers > 0
@@ -627,7 +656,7 @@ async fn process(
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             ShardResp::VindexList(rows)
         }
-        ShardReq::VindexDrop { name } => {
+        ShardReq::VindexDrop { name, tenant } => {
             // Pop the entry from the outer map first; this prevents new ops
             // from observing it. In-flight ops on this vindex keep their
             // cloned `Arc` alive and finish their inner lock window before
@@ -637,8 +666,13 @@ async fn process(
             let removed = vindexes.write().remove(&name);
             match removed {
                 Some(arc) => {
-                    let was_disk = matches!(*arc.read(), VectorBackend::Disk(_));
+                    let guard = arc.read();
+                    let was_disk = matches!(*guard, VectorBackend::Disk(_));
+                    // Credit this fragment's vectors back to the tenant quota.
+                    let fragment = guard.len() as u64;
+                    drop(guard);
                     drop(arc);
+                    quota.sub(tenant, fragment);
                     if was_disk {
                         let _ = std::fs::remove_dir_all(dir.join(format!("vindex-{name}")));
                         persist_registry(dir, vindexes);
@@ -648,7 +682,13 @@ async fn process(
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
             }
         }
-        ShardReq::Vset { name, id, vector } => {
+        ShardReq::Vset {
+            name,
+            id,
+            vector,
+            tenant,
+            limit,
+        } => {
             // Outer read to look up the entry; clone the Arc and drop the
             // outer lock before taking the per-vindex write. This lets
             // another vindex's ops run in parallel with this one.
@@ -664,9 +704,25 @@ async fn process(
                             vector.len()
                         ))
                     } else {
+                        // Quota: only a NEW id consumes a slot. Reserve before
+                        // the insert (race-free under this write lock) so an
+                        // over-limit insert is rejected without storing; an
+                        // overwrite (was_new == false) never touches the quota.
+                        let was_new = !idx.contains(id);
+                        if was_new
+                            && let Some(max) = limit
+                            && quota.try_add(tenant, 1, max).is_err()
+                        {
+                            return ShardResp::Err("tenant vector quota exceeded".to_owned());
+                        }
                         match idx.insert(id, &vector) {
                             Ok(()) => ShardResp::Done,
-                            Err(e) => ShardResp::Err(format!("vset failed: {e}")),
+                            Err(e) => {
+                                if was_new && limit.is_some() {
+                                    quota.sub(tenant, 1); // roll back reservation
+                                }
+                                ShardResp::Err(format!("vset failed: {e}"))
+                            }
                         }
                     }
                 }
@@ -685,14 +741,19 @@ async fn process(
                 }
             }
         }
-        ShardReq::Vdel { name, id } => {
+        ShardReq::Vdel { name, id, tenant } => {
             let entry = vindexes.read().get(&name).cloned();
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
                     let mut idx = arc.write();
                     match idx.delete(id) {
-                        Ok(existed) => ShardResp::Existed(existed),
+                        Ok(existed) => {
+                            if existed {
+                                quota.sub(tenant, 1);
+                            }
+                            ShardResp::Existed(existed)
+                        }
                         Err(e) => ShardResp::Err(format!("vdel failed: {e}")),
                     }
                 }
@@ -725,22 +786,33 @@ async fn process(
             }
         }
 
-        ShardReq::Get(key) => match vlog.get(&key).await {
+        ShardReq::Get(key, tenant) => match vlog.tenant(tenant).get(&key).await {
             Ok(v) => ShardResp::Value(v),
             Err(e) => ShardResp::Err(e.to_string()),
         },
-        ShardReq::Set(key, val, dur) => match vlog.set(&key, &val, dur).await {
-            Ok(()) => ShardResp::Done,
-            Err(e) => ShardResp::Err(e.to_string()),
-        },
+        ShardReq::Set(key, val, dur, tenant, disk_limit) => {
+            match vlog
+                .tenant(tenant)
+                .with_disk_limit(disk_limit)
+                .set(&key, &val, dur)
+                .await
+            {
+                Ok(()) => ShardResp::Done,
+                Err(e) => ShardResp::Err(e.to_string()),
+            }
+        }
         ShardReq::Del(key, dur) => match vlog.del(&key, dur).await {
             Ok(b) => ShardResp::Existed(b),
             Err(e) => ShardResp::Err(e.to_string()),
         },
-        ShardReq::MgetBatch(items) => {
+        ShardReq::TenantCacheBytes(tenant) => {
+            ShardResp::CacheBytes(vlog.tenant_cache_bytes(tenant))
+        }
+        ShardReq::MgetBatch(items, tenant) => {
+            let view = vlog.tenant(tenant);
             let mut out = Vec::with_capacity(items.len());
             for (idx, key) in items {
-                match vlog.get(&key).await {
+                match view.get(&key).await {
                     Ok(v) => out.push((idx, v)),
                     Err(e) => return ShardResp::Err(e.to_string()),
                 }
@@ -776,6 +848,12 @@ struct ShardSetInner {
     senders: Vec<Sender<ShardMsg>>,
     handles: Vec<JoinHandle<()>>,
     n: usize,
+    /// Per-tenant vector counter, shared across shards and consulted on
+    /// VSET/VDEL/VINDEX.DROP to enforce `max_vectors`.
+    quota: Arc<crate::quota::TenantVectorQuota>,
+    /// Per-tenant live disk-byte counter, shared with every shard's `VLog` so
+    /// the `max_disk_bytes` quota is global per tenant.
+    disk_counter: skeg_core::SharedTenantDisk,
 }
 
 impl Drop for ShardSetInner {
@@ -909,13 +987,32 @@ impl ShardSet {
         assert!(n_shards >= 1, "n_shards must be >= 1");
         let mut senders = Vec::with_capacity(n_shards);
         let mut handles = Vec::with_capacity(n_shards);
+        // One vector quota shared across all shards: a tenant's vectors are
+        // spread over shards by id, so the counter must aggregate cross-shard.
+        let quota = Arc::new(crate::quota::TenantVectorQuota::new());
+        // One disk counter shared across all shards, so the disk quota is global
+        // per tenant (a tenant's keys spread over shards by hash).
+        let disk_counter = skeg_core::new_shared_disk();
         for id in 0..n_shards {
             let dir = base_dir.join(format!("shard-{id}"));
             let (tx, rx) = tokio::sync::mpsc::channel::<ShardMsg>(SHARD_INBOX_CAPACITY);
+            let quota = quota.clone();
+            let disk_counter = disk_counter.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("skeg-shard-{id}"))
                 .spawn(move || {
-                    run_shard(id, dir, rx, read_only, tier, workers, mmap_tier, mmap_graph)
+                    run_shard(
+                        id,
+                        dir,
+                        rx,
+                        read_only,
+                        tier,
+                        workers,
+                        mmap_tier,
+                        mmap_graph,
+                        quota,
+                        disk_counter,
+                    )
                 })?;
             senders.push(tx);
             handles.push(handle);
@@ -925,6 +1022,8 @@ impl ShardSet {
                 senders,
                 handles,
                 n: n_shards,
+                quota,
+                disk_counter,
             }),
         })
     }
@@ -951,9 +1050,13 @@ impl ShardSet {
     ///
     /// Returns an error if the shard is unavailable or storage fails.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, ShardError> {
+        self.get_scoped(key, 0).await
+    }
+
+    async fn get_scoped(&self, key: &[u8], tenant: u128) -> Result<Option<Bytes>, ShardError> {
         let shard = shard_for(key, self.inner.n);
         match self
-            .call(shard, ShardReq::Get(Bytes::copy_from_slice(key)))
+            .call(shard, ShardReq::Get(Bytes::copy_from_slice(key), tenant))
             .await?
         {
             ShardResp::Value(v) => Ok(v),
@@ -973,11 +1076,24 @@ impl ShardSet {
         value: &[u8],
         durability: Durability,
     ) -> Result<(), ShardError> {
+        self.set_scoped(key, value, durability, 0, None).await
+    }
+
+    async fn set_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<(), ShardError> {
         let shard = shard_for(key, self.inner.n);
         let req = ShardReq::Set(
             Bytes::copy_from_slice(key),
             Bytes::copy_from_slice(value),
             durability,
+            tenant,
+            disk_limit,
         );
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
@@ -1009,6 +1125,14 @@ impl ShardSet {
     ///
     /// Returns an error if any shard is unavailable or storage fails.
     pub async fn mget(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>, ShardError> {
+        self.mget_scoped(keys, 0).await
+    }
+
+    async fn mget_scoped(
+        &self,
+        keys: &[Bytes],
+        tenant: u128,
+    ) -> Result<Vec<Option<Bytes>>, ShardError> {
         let n = self.inner.n;
         let mut buckets: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); n];
         for (i, key) in keys.iter().enumerate() {
@@ -1024,7 +1148,7 @@ impl ShardSet {
             let (tx, rx) = oneshot::channel();
             self.inner.senders[shard]
                 .send(ShardMsg {
-                    req: ShardReq::MgetBatch(bucket),
+                    req: ShardReq::MgetBatch(bucket, tenant),
                     reply: tx,
                 })
                 .await
@@ -1045,6 +1169,37 @@ impl ShardSet {
             }
         }
         Ok(result)
+    }
+
+    /// Scope KV operations to `tenant` for per-tenant cache accounting.
+    ///
+    /// Mirrors [`skeg_core::VLog::tenant`] at the shard-set level: a zero-cost
+    /// view that routes every `get/set/mget` with the tenant id, so the shard's
+    /// `VLog` charges cache residency to `tenant` instead of the unscoped `0`.
+    #[must_use]
+    pub fn tenant(&self, tenant: u128) -> ShardTenantView<'_> {
+        ShardTenantView {
+            shards: self,
+            tenant,
+            disk_limit: None,
+        }
+    }
+
+    /// Bytes of hot-key cache charged to `tenant`, summed across every shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable.
+    pub async fn tenant_cache_bytes(&self, tenant: u128) -> Result<usize, ShardError> {
+        let mut total = 0usize;
+        for shard in 0..self.inner.n {
+            match self.call(shard, ShardReq::TenantCacheBytes(tenant)).await? {
+                ShardResp::CacheBytes(b) => total += b,
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(total)
     }
 
     /// Aggregate cache statistics summed across every shard.
@@ -1180,10 +1335,13 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index does not exist or a shard is unavailable.
-    pub async fn vindex_drop(&self, name: &str) -> Result<(), ShardError> {
+    pub async fn vindex_drop(&self, name: &str, tenant: u128) -> Result<(), ShardError> {
         let name = name.to_owned();
-        self.broadcast(|| ShardReq::VindexDrop { name: name.clone() })
-            .await
+        self.broadcast(|| ShardReq::VindexDrop {
+            name: name.clone(),
+            tenant,
+        })
+        .await
     }
 
     /// List every VINDEX. `(name, dim, kind_byte, backend_byte, n_vectors)`
@@ -1221,18 +1379,45 @@ impl ShardSet {
     ///
     /// Returns an error if the index is missing, the dim mismatches, or the
     /// shard is unavailable.
-    pub async fn vset(&self, name: &str, id: u64, vector: Vec<f32>) -> Result<(), ShardError> {
+    pub async fn vset(
+        &self,
+        name: &str,
+        id: u64,
+        vector: Vec<f32>,
+        tenant: u128,
+        limit: Option<u64>,
+    ) -> Result<(), ShardError> {
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
             name: name.to_owned(),
             id,
             vector,
+            tenant,
+            limit,
         };
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
+    }
+
+    /// Vectors currently reserved by `tenant` against its quota (0 if
+    /// untracked / unlimited). Read directly from the shared counter.
+    #[must_use]
+    pub fn tenant_vector_count(&self, tenant: u128) -> u64 {
+        self.inner.quota.count(tenant)
+    }
+
+    /// Live on-disk KV bytes charged to `tenant`, aggregated across shards.
+    #[must_use]
+    pub fn tenant_disk_bytes(&self, tenant: u128) -> u64 {
+        self.inner
+            .disk_counter
+            .lock()
+            .get(&tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Fetch the stored f32 vector for `id` in `name`. Routes by `id`.
@@ -1258,11 +1443,12 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
-    pub async fn vdel(&self, name: &str, id: u64) -> Result<bool, ShardError> {
+    pub async fn vdel(&self, name: &str, id: u64, tenant: u128) -> Result<bool, ShardError> {
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vdel {
             name: name.to_owned(),
             id,
+            tenant,
         };
         match self.call(shard, req).await? {
             ShardResp::Existed(b) => Ok(b),
@@ -1323,6 +1509,63 @@ impl ShardSet {
         merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
         Ok(merged)
+    }
+}
+
+/// A [`ShardSet`] scoped to one tenant for per-tenant cache accounting.
+///
+/// Created by [`ShardSet::tenant`]. Zero-cost: a borrow of the `ShardSet` plus
+/// the tenant id. KV operations route with the tenant so each shard's `VLog`
+/// charges cache residency correctly. Mirrors `skeg_core::TenantView`.
+#[derive(Clone, Copy)]
+pub struct ShardTenantView<'a> {
+    shards: &'a ShardSet,
+    tenant: u128,
+    /// Disk-quota limit applied on `set`. `None` skips enforcement.
+    disk_limit: Option<u64>,
+}
+
+impl ShardTenantView<'_> {
+    /// Apply a disk-quota limit on this view's `set`. An over-limit set is
+    /// rejected before anything is written.
+    #[must_use]
+    pub fn with_disk_limit(mut self, limit: Option<u64>) -> Self {
+        self.disk_limit = limit;
+        self
+    }
+
+    /// GET a key, charging any read-path cache insert to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard is unavailable or storage fails.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, ShardError> {
+        self.shards.get_scoped(key, self.tenant).await
+    }
+
+    /// SET a key-value pair, charging the write-through entry to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard is unavailable or storage fails.
+    pub async fn set(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+    ) -> Result<(), ShardError> {
+        self.shards
+            .set_scoped(key, value, durability, self.tenant, self.disk_limit)
+            .await
+    }
+
+    /// MGET multiple keys, charging read-path cache inserts to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard is unavailable or storage fails.
+    pub async fn mget(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>, ShardError> {
+        self.shards.mget_scoped(keys, self.tenant).await
     }
 }
 
@@ -1418,6 +1661,164 @@ mod tests {
             assert_eq!(in1, expect == 1, "key {key} shard-1 membership");
             assert!(in0 ^ in1, "key {key} must live in exactly one shard");
         }
+    }
+
+    #[tokio::test]
+    async fn test_shardset_tenant_isolated_accounting() {
+        // Two tenants writing through the ShardSet have separate cache
+        // accounting; neither charges the anonymous tenant 0.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        shards
+            .tenant(7)
+            .set(b"ak", b"v", Durability::Kernel)
+            .await
+            .unwrap();
+        shards
+            .tenant(9)
+            .set(b"bk", b"vv", Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(
+            shards.tenant_cache_bytes(7).await.unwrap() > 0,
+            "tenant 7 charged"
+        );
+        assert!(
+            shards.tenant_cache_bytes(9).await.unwrap() > 0,
+            "tenant 9 charged"
+        );
+        assert_eq!(
+            shards.tenant_cache_bytes(0).await.unwrap(),
+            0,
+            "anon tenant uncharged"
+        );
+        assert_eq!(
+            shards.tenant(7).get(b"ak").await.unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shardset_bare_set_is_tenant_zero() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.set(b"k", b"v", Durability::Kernel).await.unwrap();
+        assert!(
+            shards.tenant_cache_bytes(0).await.unwrap() > 0,
+            "bare set charges tenant 0"
+        );
+        assert_eq!(shards.tenant_cache_bytes(7).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_vector_quota_enforced_per_tenant() {
+        // A tenant at max_vectors is rejected on VSET; another tenant
+        // is unaffected; an overwrite never consumes quota; VDEL frees a slot.
+        // Indexes are tenant-scoped names, mirroring how the RESP3 handler
+        // scopes them, so ids never collide across tenants.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx7", 4, 0, 0).await.unwrap();
+        shards.vindex_create("idx9", 4, 0, 0).await.unwrap();
+        let v = vec![1.0f32, 0.0, 0.0, 0.0];
+        let lim = Some(2u64);
+
+        shards.vset("idx7", 1, v.clone(), 7, lim).await.unwrap();
+        shards.vset("idx7", 2, v.clone(), 7, lim).await.unwrap();
+        assert_eq!(shards.tenant_vector_count(7), 2);
+
+        // A third new id exceeds the limit -> rejected, count unchanged.
+        assert!(shards.vset("idx7", 3, v.clone(), 7, lim).await.is_err());
+        assert_eq!(
+            shards.tenant_vector_count(7),
+            2,
+            "rejected vset must not count"
+        );
+
+        // Overwriting an existing id is always allowed and free, even at the cap.
+        shards
+            .vset("idx7", 1, vec![0.0, 1.0, 0.0, 0.0], 7, lim)
+            .await
+            .unwrap();
+        assert_eq!(shards.tenant_vector_count(7), 2, "overwrite is free");
+
+        // A different tenant has its own independent budget.
+        shards.vset("idx9", 1, v.clone(), 9, Some(1)).await.unwrap();
+        assert_eq!(shards.tenant_vector_count(9), 1);
+        assert_eq!(shards.tenant_vector_count(7), 2, "tenant 9 did not touch 7");
+
+        // VDEL frees a slot for tenant 7, letting a new id back in.
+        assert!(shards.vdel("idx7", 2, 7).await.unwrap());
+        assert_eq!(shards.tenant_vector_count(7), 1);
+        shards.vset("idx7", 3, v.clone(), 7, lim).await.unwrap();
+        assert_eq!(shards.tenant_vector_count(7), 2);
+    }
+
+    /// A scoped key: 16-byte tenant prefix (LE) + raw, as the RESP3 handler
+    /// builds them. The vLog derives the disk tenant from this prefix.
+    fn scoped_key(tenant: u128, raw: &[u8]) -> Vec<u8> {
+        let mut k = tenant.to_le_bytes().to_vec();
+        k.extend_from_slice(raw);
+        k
+    }
+
+    #[tokio::test]
+    async fn test_disk_quota_global_per_tenant() {
+        // max_disk_bytes is enforced GLOBALLY per tenant across shards,
+        // not per shard. Each padded record here is 128 bytes; a 300-byte limit
+        // admits exactly 2, regardless of how the 5 keys hash across the shards.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        let lim = Some(300u64);
+        let v = b"v";
+        let mut ok = 0;
+        let mut rejected = 0;
+        for i in 0..5u8 {
+            let k = scoped_key(7, &[b'a' + i]);
+            match shards
+                .tenant(7)
+                .with_disk_limit(lim)
+                .set(&k, v, Durability::Kernel)
+                .await
+            {
+                Ok(()) => ok += 1,
+                Err(_) => rejected += 1,
+            }
+        }
+        assert_eq!(ok, 2, "global limit admits exactly 2 records across shards");
+        assert_eq!(rejected, 3);
+        assert!(shards.tenant_disk_bytes(7) <= 300);
+
+        // A different tenant has its own independent global budget.
+        let k9 = scoped_key(9, b"a");
+        shards
+            .tenant(9)
+            .with_disk_limit(lim)
+            .set(&k9, v, Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(shards.tenant_disk_bytes(9) > 0);
+        assert!(
+            shards.tenant_disk_bytes(7) <= 300,
+            "tenant 9 did not affect 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_quota_untracked_without_limit() {
+        // No limit -> no counting; single-tenant path pays nothing.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 4, 0, 0).await.unwrap();
+        let v = vec![1.0f32, 0.0, 0.0, 0.0];
+        for id in 0..50u64 {
+            shards.vset("idx", id, v.clone(), 0, None).await.unwrap();
+        }
+        assert_eq!(
+            shards.tenant_vector_count(0),
+            0,
+            "no limit means no quota tracking"
+        );
     }
 
     #[tokio::test]
@@ -1541,7 +1942,7 @@ mod tests {
             .collect()
     }
 
-    // Q10: a disk-backed VINDEX must survive a server restart - its files plus
+    // A disk-backed VINDEX must survive a server restart - its files plus
     // the registry plus the WAL recover the full live set.
     #[tokio::test]
     async fn test_vindex_disk_survives_restart() {
@@ -1552,7 +1953,10 @@ mod tests {
             // backend=1 -> disk Vamana.
             shards.vindex_create("persist", 64, 0, 1).await.unwrap();
             for id in 0u64..150 {
-                shards.vset("persist", id, tvec(id + 1)).await.unwrap();
+                shards
+                    .vset("persist", id, tvec(id + 1), 0, None)
+                    .await
+                    .unwrap();
             }
             // `shards` dropped here: worker threads flush and exit.
         }
@@ -1613,8 +2017,8 @@ mod tests {
         };
         for id in 0..n {
             let v = make_vec(id);
-            shards.vset("a", id, v.clone()).await.unwrap();
-            shards.vset("b", id, v).await.unwrap();
+            shards.vset("a", id, v.clone(), 0, None).await.unwrap();
+            shards.vset("b", id, v, 0, None).await.unwrap();
         }
 
         let query = make_vec(99_999);

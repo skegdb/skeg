@@ -15,7 +15,7 @@ pub use cache::S3Fifo;
 pub use group_commit::Durability;
 pub use index::{Index, IndexEntry};
 pub use record::{Record, RecordKind};
-pub use vlog::VLog;
+pub use vlog::{SharedTenantDisk, TenantView, VLog, new_shared_disk};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -33,4 +33,7 @@ pub enum Error {
 
     #[error("unknown record kind: {kind:#04x}")]
     UnknownKind { kind: u8 },
+
+    #[error("tenant disk quota exceeded")]
+    DiskQuota,
 }

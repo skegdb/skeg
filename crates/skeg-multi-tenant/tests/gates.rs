@@ -37,7 +37,7 @@ const GATE_OPEN_SCOPED_MS: u128 = 5;
 /// below 1 us.
 const GATE_SET_QUOTA_US: u128 = 1;
 
-/// `TenantQuota::quota` (read) + `current_usage` (read). Same shape —
+/// `TenantQuota::quota` (read) + `current_usage` (read). Same shape -
 /// two atomic loads each. Best-of-100 below 1 us.
 const GATE_READ_USAGE_US: u128 = 1;
 
@@ -191,7 +191,7 @@ fn gate_insert_rejected_under_threshold() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_root, handle) = build_handle(dir.path(), 0x44);
-    // Cap at 0 — every insert is rejected before the adapter sees it.
+    // Cap at 0 - every insert is rejected before the adapter sees it.
     handle
         .set_quota(Quota {
             max_records: Some(0),

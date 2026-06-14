@@ -18,7 +18,7 @@ use crate::shard::{ShardError, ShardSet};
 /// Durability applied to writes that do not request one explicitly.
 /// `Kernel` survives a process crash and kernel panic without paying the
 /// `F_FULLFSYNC` cost on every write - the right default for AI workloads
-/// (see `design-write-perf.md` §2.4).
+/// (see `design-write-perf.md`).
 const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 
 pub async fn handle_connection(mut stream: TcpStream, shards: ShardSet) {
@@ -167,7 +167,7 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                     "index name not utf-8",
                 ));
             };
-            match shards.vindex_drop(name).await {
+            match shards.vindex_drop(name, 0).await {
                 Ok(()) => Some(encode_ok(req_id)),
                 Err(e) => Some(shard_err_to_response(req_id, &e)),
             }
@@ -185,7 +185,7 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                     "index name not utf-8",
                 ));
             };
-            match shards.vset(name, id, vector).await {
+            match shards.vset(name, id, vector, 0, None).await {
                 Ok(()) => {
                     if frame.header.flags.contains(Flags::NO_REPLY) {
                         None
@@ -228,7 +228,7 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                     "index name not utf-8",
                 ));
             };
-            match shards.vdel(name, id).await {
+            match shards.vdel(name, id, 0).await {
                 Ok(existed) => Some(encode_ok_bool(req_id, existed)),
                 Err(e) => Some(shard_err_to_response(req_id, &e)),
             }

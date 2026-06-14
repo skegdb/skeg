@@ -1,13 +1,12 @@
-//! M8 chunk 1 - the Vamana graph index (DiskANN-style ANN).
+//! The Vamana graph index (DiskANN-style ANN).
 //!
 //! Vamana builds a single directed graph over `N` points where every node has
 //! at most `R` out-edges, navigable from one entry point (the medoid). It is
 //! the algorithmic core of the vector tier beyond flat scan; this chunk is the
 //! in-memory, single-threaded build + search. On-disk format, streaming
-//! insert, and parallel build come in later M8 chunks.
+//! insert, and parallel build come later.
 //!
-//! Reference: the `DiskANN` paper (Subramanya et al., 2019). See
-//! `design-vamana.md`.
+//! Reference: the `DiskANN` paper (Subramanya et al., 2019).
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -169,8 +168,8 @@ impl SearchList {
 
 // ── greedy search ─────────────────────────────────────────────────────────────
 
-/// Early-termination policy for the greedy walk (Tier 1.b in
-/// `optimizations/PLAN.md`). When the top-`k` of the search list does not
+/// Early-termination policy for the greedy walk. When the top-`k` of the
+/// search list does not
 /// change for `window` consecutive expansions, the walk stops short of
 /// `list_size`. The list-size cap stays as the hard upper bound; this only
 /// trims the tail when convergence has already happened.
@@ -258,7 +257,7 @@ fn top_k_signature(list: &SearchList, k: usize) -> u64 {
 /// If `trace` is `Some`, each node id is pushed to it in expansion order -
 /// the graph access sequence, used by the cache-locality analysis.
 ///
-/// Tier 1.a (primitive gate passed 6.20x vs AHashSet): `visited`/`seen` are
+/// Primitive gate passed 6.20x vs AHashSet: `visited`/`seen` are
 /// [`VisitedBitset`] - bit-packed `N/64` bytes. The walk's access pattern
 /// (~6400 test_and_set per query) is ~6x faster than AHashSet with mirrored
 /// semantics (insert -> test_and_set; `true` means "already present").
@@ -284,7 +283,7 @@ where
     list.insert(dist_to_query(entry), entry);
     seen.test_and_set(entry);
 
-    // Tier 1.b: track top-k signature stability across expansions.
+    // Early-termination: track top-k signature stability across expansions.
     let mut last_sig: u64 = 0;
     let mut stable_count: usize = 0;
 
@@ -473,11 +472,10 @@ pub fn reset_build_phase_times() {
 /// rayon task inserts so a rebuild does not allocate fresh sets and vectors
 /// per node. `rayon::for_each_init` hands one to each task. Every field is
 /// cleared at its point of use, so reuse is bit-identical to a fresh
-/// allocation - this is a pure allocation-churn optimisation (post-Q10
-/// Step 1, Consolidation Hygiene intervention A).
+/// allocation - this is a pure allocation-churn optimisation.
 ///
 /// It also carries per-worker phase timers, flushed to the global counters
-/// on drop (build profiling, post-Q10 build-optimization gate).
+/// on drop (build profiling, build-optimization gate).
 struct BuildScratch {
     /// Nodes expanded by the greedy walk - the candidate pool for pruning.
     visited: VisitedBitset,
@@ -518,8 +516,8 @@ impl Drop for BuildScratch {
 /// Insert one point concurrently: greedy-search for candidates, prune to the
 /// out-neighbour set, propagate back-edges. Each graph access takes a brief
 /// per-node lock; `robust_prune` touches only the (immutable) vectors. A
-/// greedy walk may see a slightly stale graph - accepted by the Vamana paper
-/// (design-vamana.md 9.3), it does not break the invariants.
+/// greedy walk may see a slightly stale graph - accepted by the Vamana paper,
+/// it does not break the invariants.
 ///
 /// `scratch` is reused across calls on the same worker; it is cleared as it
 /// is filled, so the result is identical to a fresh allocation per point.
@@ -968,8 +966,7 @@ fn read_u32(b: &[u8], at: usize) -> u32 {
 /// is the opt-in `--graph-mmap` path: hold the `graph.vmn` mmap and
 /// reinterpret the on-disk Node region as `&[Node]` via `bytemuck::cast_slice`
 /// (Node is `#[repr(C)]` + `Pod`, with file layout = in-memory layout). The
-/// OS page cache can then reclaim graph pages under memory pressure
-/// (Position 2.5 of the VeloANN paging discussion, OBSERVATIONS 2026-05-21).
+/// OS page cache can then reclaim graph pages under memory pressure.
 #[derive(Debug)]
 enum NodeBacking {
     Owned(Vec<Node>),
@@ -1069,8 +1066,7 @@ impl DiskVamanaIndex {
     /// codes are persisted to `tier.cache.bin` after build and the in-RAM
     /// `Vec<u8>` is replaced by a memory-mapped view of that file: the OS
     /// page cache decides which pages stay resident, freeing anonymous
-    /// memory under pressure (Position 2 of the VeloANN paging discussion,
-    /// OBSERVATIONS 2026-05-21). `int8` and `pq` tiers are unaffected by
+    /// memory under pressure. `int8` and `pq` tiers are unaffected by
     /// this flag for now; the experiment runs on TurboQuant only.
     ///
     /// # Errors
@@ -1098,8 +1094,7 @@ impl DiskVamanaIndex {
     /// dim=1024 vs ~26 MB tier).
     ///
     /// Combined with `mmap_tier`, the whole index becomes paginable under
-    /// pressure with zero penalty in steady state (Position 2.5,
-    /// OBSERVATIONS 2026-05-21).
+    /// pressure with zero penalty in steady state.
     ///
     /// # Errors
     ///
@@ -1247,8 +1242,8 @@ impl DiskVamanaIndex {
                 ));
             }
         };
-        // Position 2 (VeloANN paging experiment): TurboQuant tier only,
-        // opt-in. Persist the codes buffer to `tier.cache.bin` and swap
+        // TurboQuant tier only, opt-in. Persist the codes buffer to
+        // `tier.cache.bin` and swap
         // the in-RAM `Vec<u8>` for a `MappedFile`; the OS page cache then
         // decides which pages stay resident. Other tiers (int8, pq) keep
         // their `Vec<u8>` representation - the experiment runs on
@@ -1435,6 +1430,14 @@ impl DiskVamanaIndex {
     fn is_live(&self, id: u64) -> bool {
         !self.tombstones.contains(&id)
             && (self.delta.contains_key(&id) || self.id_to_main_row.contains_key(&id))
+    }
+
+    /// True if `id` is a live (non-tombstoned) vector in this index. Cheap,
+    /// in-memory; used by the server's per-tenant vector quota to tell an
+    /// insert from an overwrite without touching disk.
+    #[must_use]
+    pub fn contains(&self, id: u64) -> bool {
+        self.is_live(id)
     }
 
     /// Insert or overwrite the vector for `id`. The vector lands in the in-RAM
@@ -1631,7 +1634,7 @@ impl DiskVamanaIndex {
     /// Run the main-graph greedy walk for `query` and return the ordered
     /// sequence of graph node rows it expands - the on-disk access pattern a
     /// paged graph store would see. For cache-locality analysis (the gate
-    /// before Step 7, Paged Storage); not part of a normal search.
+    /// before paged storage); not part of a normal search.
     ///
     /// # Errors
     ///
@@ -1666,7 +1669,7 @@ impl DiskVamanaIndex {
     /// BFS node ordering from the medoid: `result[k]` is the original node row
     /// a page-aware layout would place at position `k`. Graph-adjacent nodes
     /// land at adjacent positions, so a paged store co-locates them. For the
-    /// Step 7 cache-locality reorder experiment; not used by a normal search.
+    /// cache-locality reorder experiment; not used by a normal search.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // node count is a u32
     pub fn bfs_order(&self) -> Vec<VecId> {

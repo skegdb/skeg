@@ -1,4 +1,4 @@
-//! F.41 release gates — live-attach open + concurrent throughput.
+//! F.41 release gates - live-attach open + concurrent throughput.
 //!
 //! Run with:
 //!   cargo test --release --test live_gates -p skeg-multi-tenant --features live-attach

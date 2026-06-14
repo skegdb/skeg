@@ -2,13 +2,15 @@
 
 //! Multi-tenant `skeg-server` binary.
 //!
-//! Wraps the OSS `skeg-server` engine with a `TenantBackend` backed by
-//! the BUSL `skeg-tenant` crate. End-user CLI surface is identical to
-//! the OSS binary plus two extra flags:
+//! Wraps the `skeg-server` engine with a `TenantBackend` backed by the
+//! `skeg-tenant` crate. The CLI surface is identical to the single-tenant
+//! binary plus two extra flags:
 //!
 //! - `--tenant-auth <path>` enables tenant resolution against an
 //!   `auth.kdb` on disk
 //! - `--tenant-strict` rejects anonymous HELLO 3 (no AUTH)
+//! - `--admin-tenant <name>` names the tenant allowed to run
+//!   `SKEG.QUOTA.SET/GET` (set per-tenant quotas at runtime)
 
 use skeg_server::Server;
 use skeg_vector::QuantKind;
@@ -84,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 path
             );
         }
-        let backend = AuthStoreBackend::open(path, cfg.tenant_strict)?;
+        let backend = AuthStoreBackend::open(path, cfg.tenant_strict, cfg.admin_tenant.as_deref())?;
         server.with_tenant_backend(backend)
     } else {
         server
@@ -125,6 +127,7 @@ struct Config {
     graph_mmap: bool,
     tenant_auth: Option<String>,
     tenant_strict: bool,
+    admin_tenant: Option<String>,
 }
 
 impl Config {
@@ -151,6 +154,7 @@ impl Config {
                 std::env::var("SKEG_TENANT_STRICT").as_deref(),
                 Ok("1") | Ok("true") | Ok("on")
             ),
+            admin_tenant: std::env::var("SKEG_ADMIN_TENANT").ok(),
         };
         let args: Vec<String> = args.collect();
         let mut i = 0;
@@ -199,6 +203,12 @@ impl Config {
                 "--tenant-strict" => {
                     cfg.tenant_strict = true;
                     i += 1;
+                }
+                "--admin-tenant" => {
+                    if let Some(v) = args.get(i + 1) {
+                        cfg.admin_tenant = Some(v.clone());
+                    }
+                    i += 2;
                 }
                 _ => i += 1,
             }

@@ -11,6 +11,7 @@ members = [
     "crates/skeg-tenant",
     "crates/skeg-server-tenant",
     "crates/skeg-multi-tenant",
+    "crates/repo-audit",
 ]
 # Fuzz targets live outside the workspace (own Cargo.toml). The
 # `live-attach` feature of skeg-multi-tenant only resolves when the

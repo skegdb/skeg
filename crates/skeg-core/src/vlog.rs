@@ -7,8 +7,10 @@
 //! flushed. Reads use seekless `pread` fronted by an S3-FIFO cache.
 //!
 //! A `VLog` is single-shard, single-thread: it is `Rc`-backed and accessed only
-//! from its owning shard's runtime. No locks; interior mutability via `RefCell`
-//! is sound because no borrow is ever held across an `.await`.
+//! from its owning shard's runtime. Interior mutability via `RefCell` is sound
+//! because no borrow is ever held across an `.await`. The one exception is the
+//! per-tenant disk counter, an `Arc<Mutex>` shared across shards so the disk
+//! quota is global per tenant; it is locked only for a single map op.
 //!
 //! ## Recovery ordering
 //!
@@ -24,6 +26,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use skeg_platform::PlatformFile;
 
 use crate::cache::S3Fifo;
@@ -64,14 +67,55 @@ struct VLogInner {
     read_segments: RefCell<Vec<ReadSegment>>,
     index: RefCell<Index>,
     cache: RefCell<S3Fifo<Bytes>>,
+    /// Live on-disk bytes (padded record size) per tenant, for the disk quota.
+    /// The tenant is the key's 16-byte prefix; entries drop to absent at zero.
+    ///
+    /// Shared across a shard set via `Arc<Mutex>` so the disk quota is GLOBAL per
+    /// tenant (a tenant's keys spread over shards by hash); the lock is held only
+    /// for a single map op, negligible against the append I/O around it. A
+    /// standalone `VLog` gets its own counter (single shard = already global).
+    tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     active: RefCell<ActiveState>,
     clock: Cell<u64>,
+}
+
+/// A per-tenant live-disk-byte counter shared across a shard set, so the disk
+/// quota is global per tenant. Create with [`new_shared_disk`].
+pub type SharedTenantDisk = Arc<Mutex<AHashMap<u128, u64>>>;
+
+/// A fresh, empty shared disk counter for a shard set.
+#[must_use]
+pub fn new_shared_disk() -> SharedTenantDisk {
+    Arc::new(Mutex::new(AHashMap::new()))
 }
 
 /// Value-log handle. Cheap to clone; clones share the same storage.
 #[derive(Clone)]
 pub struct VLog {
     inner: Rc<VLogInner>,
+}
+
+/// The tenant a key is charged to for the disk quota: its 16-byte prefix as a
+/// `u128` (little-endian). Scoped keys carry the tenant id as this prefix, so it
+/// matches the id used at write time. Keys shorter than 16 bytes (and unscoped
+/// tenant-0 keys) fall back to `0`; tenant 0 is unlimited, so the approximation
+/// is invisible to enforcement.
+fn tenant_from_key(key: &[u8]) -> u128 {
+    if key.len() >= 16 {
+        u128::from_le_bytes(key[..16].try_into().expect("checked >= 16"))
+    } else {
+        0
+    }
+}
+
+/// Add a recovered index's live disk bytes into the (possibly shared) per-tenant
+/// counter. Called once per shard at open, so a shared counter accumulates the
+/// whole shard set's totals.
+fn recover_tenant_disk(index: &Index, disk: &Mutex<AHashMap<u128, u64>>) {
+    let mut g = disk.lock();
+    for (key, entry) in index.iter() {
+        *g.entry(tenant_from_key(key)).or_insert(0) += u64::from(entry.size);
+    }
 }
 
 impl VLog {
@@ -84,7 +128,32 @@ impl VLog {
         Self::open_with_max_segment(dir, MAX_SEGMENT_SIZE).await
     }
 
-    /// Open with an explicit max segment size (used by tests to force rotation).
+    /// Open with the default segment size, sharing `tenant_disk` across a shard
+    /// set so the disk quota is global per tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn open_with_shared_disk(
+        dir: &Path,
+        tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
+    ) -> Result<Self> {
+        Self::open_shared(dir, MAX_SEGMENT_SIZE, tenant_disk).await
+    }
+
+    /// Open with an explicit max segment size, using a fresh (per-`VLog`) disk
+    /// counter. A standalone `VLog` is a single shard, so its counter is already
+    /// the global per-tenant total.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn open_with_max_segment(dir: &Path, max_seg_size: u64) -> Result<Self> {
+        Self::open_shared(dir, max_seg_size, Arc::new(Mutex::new(AHashMap::new()))).await
+    }
+
+    /// Open sharing `tenant_disk` across a shard set, so the disk quota is global
+    /// per tenant. Each shard adds its recovered live bytes into the shared map.
     ///
     /// `async` even though it does not await: it starts a [`GroupCommitter`],
     /// whose internal `tokio::spawn` requires an active runtime context.
@@ -97,7 +166,11 @@ impl VLog {
         clippy::unused_async,
         clippy::too_many_lines
     )]
-    pub async fn open_with_max_segment(dir: &Path, max_seg_size: u64) -> Result<Self> {
+    async fn open_shared(
+        dir: &Path,
+        max_seg_size: u64,
+        tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let seg_ids = list_segments(dir)?;
         let last_id = seg_ids.last().copied();
@@ -211,6 +284,9 @@ impl VLog {
 
         let committer = GroupCommitter::start(active_file, active_size).await;
 
+        // Add this shard's recovered live bytes into the (shared) disk counter.
+        recover_tenant_disk(&index, &tenant_disk);
+
         Ok(Self {
             inner: Rc::new(VLogInner {
                 dir: dir.to_owned(),
@@ -218,6 +294,7 @@ impl VLog {
                 read_segments: RefCell::new(read_segments),
                 index: RefCell::new(index),
                 cache: RefCell::new(S3Fifo::new(CACHE_BUDGET_BYTES)),
+                tenant_disk,
                 active: RefCell::new(ActiveState {
                     id: active_id,
                     size: active_size,
@@ -236,6 +313,12 @@ impl VLog {
     ///
     /// Returns an error on IO failure, CRC mismatch, or corrupt record.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_scoped(key, 0).await
+    }
+
+    /// GET a key, charging any read-path cache insert to `tenant`. Tenant `0` is
+    /// the unscoped default; reach this via [`VLog::tenant`] for a scoped view.
+    async fn get_scoped(&self, key: &[u8], tenant: u128) -> Result<Option<Bytes>> {
         if let Some(value) = self.inner.cache.borrow_mut().get(key) {
             return Ok(Some(value));
         }
@@ -260,7 +343,7 @@ impl VLog {
         self.inner
             .cache
             .borrow_mut()
-            .insert(key, value.clone(), value.len());
+            .insert_for(key, value.clone(), value.len(), tenant);
         Ok(Some(value))
     }
 
@@ -270,12 +353,44 @@ impl VLog {
     ///
     /// Returns an error on IO failure.
     pub async fn set(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
+        self.set_scoped(key, value, durability, 0, None).await
+    }
+
+    /// SET key = value, charging the write-through cache entry to `tenant` and
+    /// enforcing `disk_limit` (if any) against the key's tenant disk quota.
+    /// Tenant `0` is the unscoped default; reach this via [`VLog::tenant`].
+    ///
+    /// An over-limit set is rejected with [`Error::DiskQuota`] BEFORE anything
+    /// is written, so storage never crosses the limit.
+    async fn set_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<()> {
+        // Prior on-disk charge for this key, and the prospective new one. Both
+        // known without writing: enforce the disk quota first.
+        let prev = { self.inner.index.borrow().get(key).copied() };
+        let old_disk = prev.map_or(0, |p| u64::from(p.size));
+        let dtenant = tenant_from_key(key);
+        let new_disk = padded_record_size(key.len(), value.len()) as u64;
+        if let Some(limit) = disk_limit {
+            let projected = self
+                .tenant_disk_bytes(dtenant)
+                .saturating_sub(old_disk)
+                .saturating_add(new_disk);
+            if projected > limit {
+                return Err(Error::DiskQuota);
+            }
+        }
+
         let ts = self.next_ts();
         let (seg_id, offset, padded) = self
             .append_raw(key, value, RecordKind::Scalar, ts, durability)
             .await?;
 
-        let prev = { self.inner.index.borrow().get(key).copied() };
         if let Some(prev) = prev {
             self.dec_live(prev.segment_id, prev.size);
         }
@@ -290,10 +405,19 @@ impl VLog {
         };
         self.inner.index.borrow_mut().set(key.to_vec(), entry);
         // Write-through: a just-written key is likely to be read back hot.
-        self.inner
-            .cache
-            .borrow_mut()
-            .insert(key, Bytes::copy_from_slice(value), value.len());
+        self.inner.cache.borrow_mut().insert_for(
+            key,
+            Bytes::copy_from_slice(value),
+            value.len(),
+            tenant,
+        );
+        // Disk accounting: replace this key's old charge with the new one. The
+        // tenant is key-derived so write-time and recovery agree for scoped keys.
+        {
+            let mut disk = self.inner.tenant_disk.lock();
+            let e = disk.entry(dtenant).or_insert(0);
+            *e = e.saturating_sub(old_disk) + u64::from(padded);
+        }
         Ok(())
     }
 
@@ -315,6 +439,17 @@ impl VLog {
 
         self.inner.index.borrow_mut().remove(key);
         self.inner.cache.borrow_mut().remove(key);
+        // Disk quota: release the deleted record's bytes, key-derived tenant.
+        {
+            let dtenant = tenant_from_key(key);
+            let mut disk = self.inner.tenant_disk.lock();
+            if let Some(e) = disk.get_mut(&dtenant) {
+                *e = e.saturating_sub(u64::from(prev.size));
+                if *e == 0 {
+                    disk.remove(&dtenant);
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -397,6 +532,39 @@ impl VLog {
         let active_size = self.inner.active.borrow().size;
         let sealed_count = segs.iter().filter(|s| s.id != active_id).count() as u64;
         sealed_count.saturating_mul(self.inner.max_seg_size) + active_size
+    }
+
+    /// Scope storage operations to `tenant` for per-tenant cache accounting.
+    ///
+    /// Returns a zero-cost [`TenantView`] (a `&VLog` plus the tenant id). Every
+    /// write/read through the view charges its cache residency to `tenant`,
+    /// instead of the unscoped default `0` used by the bare [`VLog`] methods.
+    /// This is the first-class scope on which per-tenant quota, eviction
+    /// fairness, and snapshots hang.
+    #[must_use]
+    pub fn tenant(&self, tenant: u128) -> TenantView<'_> {
+        TenantView {
+            vlog: self,
+            tenant,
+            disk_limit: None,
+        }
+    }
+
+    /// Bytes of hot-key cache currently charged to `tenant` (0 if none).
+    #[must_use]
+    pub fn tenant_cache_bytes(&self, tenant: u128) -> usize {
+        self.inner.cache.borrow().charged_bytes(tenant)
+    }
+
+    /// Live on-disk bytes (padded KV records) charged to `tenant` (0 if none).
+    #[must_use]
+    pub fn tenant_disk_bytes(&self, tenant: u128) -> u64 {
+        self.inner
+            .tenant_disk
+            .lock()
+            .get(&tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Hot-key cache statistics: `(bytes_used, evictions, n_keys, byte_budget)`.
@@ -699,6 +867,73 @@ impl VLog {
     }
 }
 
+/// A [`VLog`] scoped to one tenant for per-tenant cache accounting.
+///
+/// Created by [`VLog::tenant`]. Zero-cost: a borrow of the `VLog` plus the
+/// tenant id. Operations delegate to the same private core the bare `VLog`
+/// methods use, so there is one implementation, not a parallel API. This is the
+/// extension point for per-tenant quota, eviction fairness, and snapshots.
+#[derive(Clone, Copy)]
+pub struct TenantView<'a> {
+    vlog: &'a VLog,
+    tenant: u128,
+    /// Disk-quota limit applied on `set`. `None` skips enforcement.
+    disk_limit: Option<u64>,
+}
+
+impl TenantView<'_> {
+    /// Apply a disk-quota limit on this view's `set`. An over-limit set is
+    /// rejected with [`Error::DiskQuota`] before anything is written.
+    #[must_use]
+    pub fn with_disk_limit(mut self, limit: Option<u64>) -> Self {
+        self.disk_limit = limit;
+        self
+    }
+
+    /// GET a key, charging any read-path cache insert to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.vlog.get_scoped(key, self.tenant).await
+    }
+
+    /// SET key = value, charging the write-through cache entry to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn set(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
+        self.vlog
+            .set_scoped(key, value, durability, self.tenant, self.disk_limit)
+            .await
+    }
+
+    /// DEL a key. Returns `true` if it existed. Cache release is self-attributed
+    /// from the evicted entry, so this needs no tenant argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn del(&self, key: &[u8], durability: Durability) -> Result<bool> {
+        self.vlog.del(key, durability).await
+    }
+
+    /// MGET keys, charging read-path cache inserts to this tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn mget(&self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.vlog.get_scoped(k, self.tenant).await?);
+        }
+        Ok(out)
+    }
+}
+
 /// RAII telemetry guard for [`VLog::compact_segment`]. Increments the
 /// `CompactionInProgress` + `VlogSegmentsCompacting` gauges on
 /// construction and decrements both on drop, so every return path
@@ -777,6 +1012,169 @@ mod tests {
         assert_eq!(res[0].as_deref(), Some(b"1".as_slice()));
         assert!(res[1].is_none());
         assert_eq!(res[2].as_deref(), Some(b"2".as_slice()));
+    }
+
+    // ── TenantView per-tenant cache attribution ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_tenant_view_set_charges_tenant() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.tenant(7)
+            .set(b"k", b"val", Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(
+            v.tenant_cache_bytes(7) > 0,
+            "write-through must charge tenant 7"
+        );
+        assert_eq!(v.tenant_cache_bytes(0), 0, "tenant 0 must hold nothing");
+    }
+
+    #[tokio::test]
+    async fn test_bare_set_charges_tenant_zero() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.set(b"k", b"v", Durability::Kernel).await.unwrap();
+        assert!(v.tenant_cache_bytes(0) > 0, "bare set charges tenant 0");
+        assert_eq!(v.tenant_cache_bytes(7), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tenant_view_two_tenants_isolated_accounting() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.tenant(7)
+            .set(b"a", b"x", Durability::Kernel)
+            .await
+            .unwrap();
+        v.tenant(9)
+            .set(b"b", b"yy", Durability::Kernel)
+            .await
+            .unwrap();
+        let b7 = v.tenant_cache_bytes(7);
+        let b9 = v.tenant_cache_bytes(9);
+        assert!(b7 > 0 && b9 > 0);
+        assert!(b9 > b7, "tenant 9 wrote a larger value, charged more");
+        assert_eq!(v.tenant_cache_bytes(0), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tenant_view_del_releases_tenant() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.tenant(7)
+            .set(b"k", b"v", Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(v.tenant_cache_bytes(7) > 0);
+        assert!(v.tenant(7).del(b"k", Durability::Kernel).await.unwrap());
+        assert_eq!(
+            v.tenant_cache_bytes(7),
+            0,
+            "del releases the tenant's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tenant_view_read_path_charges_tenant() {
+        // After reopen the cache is cold; a get must charge the read value to the
+        // querying tenant, not tenant 0.
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.tenant(7)
+                .set(b"k", b"val", Durability::Kernel)
+                .await
+                .unwrap();
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(v.tenant_cache_bytes(7), 0, "cold cache after reopen");
+        assert_eq!(
+            v.tenant(7).get(b"k").await.unwrap().as_deref(),
+            Some(b"val".as_slice())
+        );
+        assert!(
+            v.tenant_cache_bytes(7) > 0,
+            "read-path cache insert must charge the querying tenant"
+        );
+        assert_eq!(v.tenant_cache_bytes(0), 0);
+    }
+
+    // ── Per-tenant disk_bytes tracking ────────────────────────────────────────
+
+    /// A scoped key: tenant id (16B LE) prefix + raw key, matching how the
+    /// RESP3 handler scopes keys. `tenant_from_key` recovers the tenant.
+    fn scoped(tenant: u128, raw: &[u8]) -> Vec<u8> {
+        let mut k = tenant.to_le_bytes().to_vec();
+        k.extend_from_slice(raw);
+        k
+    }
+
+    #[tokio::test]
+    async fn test_disk_set_tracks_per_tenant() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let k = scoped(7, b"a");
+        v.set(&k, b"val", Durability::Kernel).await.unwrap();
+        assert_eq!(
+            v.tenant_disk_bytes(7),
+            padded_record_size(k.len(), 3) as u64
+        );
+        assert_eq!(v.tenant_disk_bytes(9), 0, "other tenant uncharged");
+    }
+
+    #[tokio::test]
+    async fn test_disk_overwrite_replaces_not_adds() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let k = scoped(7, b"a");
+        v.set(&k, b"x", Durability::Kernel).await.unwrap();
+        let small = v.tenant_disk_bytes(7);
+        let big = vec![0u8; 200];
+        v.set(&k, &big, Durability::Kernel).await.unwrap();
+        assert_eq!(
+            v.tenant_disk_bytes(7),
+            padded_record_size(k.len(), 200) as u64,
+            "overwrite replaces the charge, not adds"
+        );
+        assert!(v.tenant_disk_bytes(7) > small);
+    }
+
+    #[tokio::test]
+    async fn test_disk_del_releases() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let k = scoped(7, b"a");
+        v.set(&k, b"v", Durability::Kernel).await.unwrap();
+        assert!(v.tenant_disk_bytes(7) > 0);
+        assert!(v.del(&k, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(7), 0, "del releases disk bytes");
+    }
+
+    #[tokio::test]
+    async fn test_disk_recovered_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let k1 = scoped(7, b"a");
+        let k2 = scoped(7, b"b");
+        let total;
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(&k1, b"xx", Durability::Kernel).await.unwrap();
+            v.set(&k2, b"yyyy", Durability::Kernel).await.unwrap();
+            total = v.tenant_disk_bytes(7);
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert!(total > 0);
+        assert_eq!(
+            v.tenant_disk_bytes(7),
+            total,
+            "per-tenant disk rebuilt from the recovered index"
+        );
     }
 
     #[tokio::test]
@@ -915,7 +1313,7 @@ mod tests {
         assert_eq!(v.disk_reads(), 1, "warm hit must not touch disk");
     }
 
-    // ── M5: compaction ───────────────────────────────────────────────────────
+    // ── compaction ───────────────────────────────────────────────────────────
 
     /// Fill segment 0 with `n` keys, then rotate so segment 0 is sealed.
     async fn fill_and_rotate(v: &VLog, n: u64, prefix: &str) {
@@ -1115,7 +1513,7 @@ mod tests {
         }
     }
 
-    // ── M6: index snapshot ───────────────────────────────────────────────────
+    // ── index snapshot ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_snapshot_fast_recovery() {

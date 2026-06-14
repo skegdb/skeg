@@ -4,8 +4,7 @@
 //! pruning, the medoid scan. [`VectorSource`] lets the build draw those rows
 //! from either an owned `Vec<f32>` ([`InMemoryVectorSource`]) or a
 //! memory-mapped file ([`MmapVectorSource`]); the latter lets `skeg-tool`
-//! build an index without copying the whole dataset into the heap (post-Q10
-//! Step 2, Build Foundation).
+//! build an index without copying the whole dataset into the heap.
 
 use std::io;
 use std::path::Path;

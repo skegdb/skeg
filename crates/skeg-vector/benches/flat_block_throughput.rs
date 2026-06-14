@@ -1,8 +1,7 @@
 //! Block kernel throughput bench: measures `tq4_block32_score_u8_neon`
 //! against the existing row-major `tq4_adc_i8_neon` on identical
-//! corpora. Gates against the pre-registered targets in
-//! `skeg-internal/bench-compare/BLOCK-KERNEL-PLAN.md` (G-B1 0.5x
-//! turbovec, G-B2 0.7x turbovec).
+//! corpora. Gates against the pre-registered targets (0.5x turbovec
+//! and 0.7x turbovec).
 //!
 //! Same env-tunable shape as `flat_throughput.rs`:
 //!   SKEG_BLOCK_N         corpus size       (default 100000)

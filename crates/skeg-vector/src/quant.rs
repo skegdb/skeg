@@ -14,8 +14,7 @@ use skeg_simd::{dot_int8, hamming_binary, quantise_centroids_i8, tq2_adc_i8, tq4
 /// `Mapped` holds the same byte sequence as a memory-mapped file - the OS
 /// page cache decides which pages stay resident, so under memory pressure
 /// the tier pages can be reclaimed and re-read from disk, instead of being
-/// pushed to anonymous swap. Opt-in via `--tier-mmap` (Position 2 of the
-/// VeloANN paging discussion, OBSERVATIONS 2026-05-21).
+/// pushed to anonymous swap. Opt-in via `--tier-mmap`.
 #[derive(Debug)]
 pub(crate) enum CodeBacking {
     Owned(Vec<u8>),
@@ -833,8 +832,7 @@ impl QuantizedVectors {
     /// Persist the TurboQuant `codes` buffer to `path` and swap the in-RAM
     /// `Vec<u8>` for a memory-mapped view of the file. The OS page cache
     /// then decides which pages stay resident under memory pressure
-    /// instead of swapping anonymous memory (Position 2 of the VeloANN
-    /// paging discussion, OBSERVATIONS 2026-05-21).
+    /// instead of swapping anonymous memory.
     ///
     /// No-op (returns `Ok(())`) for non-TurboQuant tiers and for an empty
     /// TurboQuant set. Skips the write if the on-disk file is already

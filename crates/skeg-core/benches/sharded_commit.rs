@@ -1,8 +1,8 @@
-//! M4 perf gate for the shared-committer workstream.
+//! Perf gate for the shared-committer workstream.
 //!
 //! Drives 4 variants of {durability model × shard count} through the
 //! `GroupCommitter` façade and prints median wall-clock + ops/s for
-//! each. Gates (pre-registered in `shared-committer/DESIGN.md` §9 M4):
+//! each. Gates:
 //!
 //!   RECOVERY    (macOS): 4sh_devglobal / 1sh_perfile ≤ 1.5×
 //!   IMPROVEMENT (macOS): 4sh_perfile  / 4sh_devglobal ≥ 1.5×
@@ -124,7 +124,7 @@ fn main() {
     let cfg = Config::from_env();
     let tmp = TempDir::new().unwrap();
 
-    println!("=== M4 perf gate (shared-committer) ===");
+    println!("=== perf gate (shared-committer) ===");
     println!(
         "config: writes/shard={} bytes={} runs={} shards_big={}",
         cfg.writes_per_shard, cfg.record_bytes, cfg.runs, cfg.shards_big
@@ -204,9 +204,9 @@ fn main() {
     }
 
     if failures.is_empty() {
-        println!("M4 GATE: PASS");
+        println!("GATE: PASS");
     } else {
-        println!("M4 GATE: FAIL");
+        println!("GATE: FAIL");
         for f in &failures {
             println!("  - {f}");
         }

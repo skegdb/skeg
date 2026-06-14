@@ -4,7 +4,7 @@
 //! local directories backed by `skeg-rigging-skeg::Tenant`. In a
 //! cluster deployment that doesn't scale: every node needs the same
 //! disk view, durability is the user's problem, and there's no
-//! sharding. `LiveAttachRoot` is the opposite shape — every read
+//! sharding. `LiveAttachRoot` is the opposite shape - every read
 //! goes over RESP3 to a running `skeg-server-tenant` which owns the
 //! data and applies its own auth/quota/sharding.
 //!
@@ -72,7 +72,7 @@ impl LiveAttachRoot {
     /// already know the tenant id from its own context).
     ///
     /// The internal connection pool defaults to `max_idle = 4`,
-    /// `max_total = 16`, 60s idle timeout — same as
+    /// `max_total = 16`, 60s idle timeout - same as
     /// [`Resp3Pool::new`]. Use [`Self::with_pool`] for explicit
     /// pool config.
     pub fn new(endpoint: impl Into<String>, token_store: Arc<TokenStore>) -> Self {

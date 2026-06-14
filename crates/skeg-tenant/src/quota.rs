@@ -11,7 +11,6 @@
 //!
 //! Disk-byte accounting is deliberately omitted; the vLog append path
 //! is hot and we want a real load profile before paying for it.
-//! See FEATURES.md §multi-tenant for the rationale.
 //!
 //! The implementation is lock-free for reads and uses atomic CAS for
 //! updates. There is one `TenantQuota` per active tenant; the

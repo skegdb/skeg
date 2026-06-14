@@ -1,4 +1,4 @@
-//! G-O3.1 benchmark: per-span cost of the `vsearch` instrumentation
+//! Benchmark: per-span cost of the `vsearch` instrumentation
 //! the resp3 and binary handlers emit.
 //!
 //! Measures three configurations on the same synthetic loop:
@@ -15,7 +15,7 @@
 //! the same primitives plus a per-span clone into the batch queue.
 //!
 //! Gate: `fmt_only` adds < 5% wall time vs `no_tracing` on M-class
-//! hardware (G-O3.1 from observability/PLAN.md).
+//! hardware.
 //!
 //! Env knobs:
 //!   SKEG_TRACE_BENCH_ITERS   span ops per run (default 5_000_000)
@@ -144,15 +144,15 @@ fn main() {
         "# baseline {baseline_ns:.2} ns/span; fmt_off {fmt_off_ns:.2} ({off_ratio:.2}x); fmt_info {fmt_info_ns:.2} ({info_ratio:.2}x)"
     );
 
-    // G-O3.1 gate: the on-but-filtered path must stay within 5% of the
+    // Gate: the on-but-filtered path must stay within 5% of the
     // no-subscriber baseline. (We use fmt_off as the proxy because the
     // OTel bridge layer behaves the same way under a filter that drops
     // the span before it reaches the exporter.)
     let gate_pass = off_ratio < 1.05;
     if gate_pass {
-        eprintln!("# G-O3.1 PASS: fmt_off / baseline = {off_ratio:.3} (< 1.05)");
+        eprintln!("# gate PASS: fmt_off / baseline = {off_ratio:.3} (< 1.05)");
     } else {
-        eprintln!("# G-O3.1 FAIL: fmt_off / baseline = {off_ratio:.3} (>= 1.05) - investigate");
+        eprintln!("# gate FAIL: fmt_off / baseline = {off_ratio:.3} (>= 1.05) - investigate");
         std::process::exit(1);
     }
 }

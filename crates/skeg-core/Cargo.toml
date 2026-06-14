@@ -1,6 +1,6 @@
 [package]
 name = "skeg-core"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -35,12 +35,17 @@ tempfile = { workspace = true }
 # platform. Pulled only at test time; release builds do not see it.
 skeg-platform = { path = "../skeg-platform", features = ["testing"] }
 
-# Pre-registered M4 gate for the shared-committer workstream. Custom
-# main (`harness = false`) because criterion's iter_custom adds noise
-# on fsync-heavy benches where wall-clock medians are the figure of
-# merit, not statistical mean+CI.
+# Shared-committer commit-latency bench. Custom main (`harness = false`)
+# because criterion's iter_custom adds noise on fsync-heavy benches where
+# wall-clock medians are the figure of merit, not statistical mean+CI.
 [[bench]]
 name = "sharded_commit"
+harness = false
+
+# Per-tenant accounting must not regress the single-tenant cache path.
+# Custom main, wall-clock medians.
+[[bench]]
+name = "cache_tenant_accounting"
 harness = false
 
 [lints]

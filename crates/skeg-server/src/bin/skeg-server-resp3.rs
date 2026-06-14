@@ -7,9 +7,9 @@
 //! - Default address `127.0.0.1:6379` (Redis port), not `7379`.
 //! - `Server::run_resp3()` instead of `run()`.
 //!
-//! This binary ships single-tenant. The multi-tenant flavour lives in
-//! a separate crate (`skeg-server-tenant`) under the BUSL-1.1 tenant
-//! repository, which installs a `TenantBackend` on top of this engine.
+//! This binary ships single-tenant. The multi-tenant flavour lives in a
+//! separate crate (`skeg-server-tenant`), which installs a `TenantBackend`
+//! on top of this engine.
 
 use skeg_server::Server;
 use skeg_vector::QuantKind;

@@ -1,15 +1,15 @@
-//! Fase 0.a (ram-reduction) - degree histogram del grafo Vamana costruito.
+//! Degree histogram of the built Vamana graph.
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!
-//! Step 1 del piano pragmatico (compattazione layout grafo) e' "garantito" come
-//! meccanismo ma la sua magnitudo dipende dalla distribuzione reale dei degree.
-//! Il nodo attuale e' fixed-width: `degree: u32 + [VecId; 64]` = 260 byte,
-//! indipendente dal degree effettivo. Se la maggioranza dei nodi e' vicina a
-//! R=64 il packing rende poco; il risparmio vero viene dai neighbor a 24 bit.
+//! Compacting the graph layout is "guaranteed" as a mechanism, but its
+//! magnitude depends on the real degree distribution. The current node is
+//! fixed-width: `degree: u32 + [VecId; 64]` = 260 bytes, independent of the
+//! actual degree. If most nodes are close to R=64 the packing yields little;
+//! the real saving comes from 24-bit neighbor ids.
 //!
-//! Questa harness costruisce grafi (mxbai reale 10K + sintetico a varie scale),
-//! stampa l'istogramma dei degree e i byte/nodo dei layout alternativi.
+//! This harness builds graphs (real mxbai 10K + synthetic at various scales),
+//! prints the degree histogram and the bytes/node of alternative layouts.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -57,8 +57,7 @@ fn gaussian(rng: &mut StdRng) -> f32 {
 }
 
 /// `n` vectors uniform on the unit sphere - the validated proxy for real
-/// isotropic embeddings (Step 7: real mxbai behaves like uniform, not
-/// clustered).
+/// isotropic embeddings (real mxbai behaves like uniform, not clustered).
 fn uniform_sphere(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Vec::with_capacity(n * dim);
@@ -166,16 +165,16 @@ fn report(label: &str, index: &VamanaIndex) {
 }
 
 fn main() {
-    eprintln!("Fase 0.a - degree histogram + packed-layout byte models\n");
+    eprintln!("Phase 0.a - degree histogram + packed-layout byte models\n");
     let cfg = VamanaConfig::default();
 
     // Real mxbai-embed-large 10K.
     if let Some((corpus, n, dim)) = load_npy(CORPUS_NPY) {
         let ids: Vec<u64> = (0..n as u64).collect();
         let index = VamanaIndex::build(corpus, ids, dim, &cfg);
-        report("mxbai-embed-large reale 10K", &index);
+        report("mxbai-embed-large real 10K", &index);
     } else {
-        eprintln!("  (mxbai npy non trovato, salto il caso reale)");
+        eprintln!("  (mxbai npy not found, skipping the real case)");
     }
 
     // Two synthetic datasets at 100K. uniform-sphere is the validated proxy
@@ -187,17 +186,17 @@ fn main() {
 
     let index = VamanaIndex::build(uniform_sphere(n, dim, 7), ids.clone(), dim, &cfg);
     report(
-        &format!("uniform-sphere sintetico {n} (proxy reale a scala)"),
+        &format!("uniform-sphere synthetic {n} (real-scale proxy)"),
         &index,
     );
 
     let index = VamanaIndex::build(clustered(n, dim, 7), ids, dim, &cfg);
-    report(&format!("clustered sintetico {n} (contrasto)"), &index);
+    report(&format!("clustered synthetic {n} (contrast)"), &index);
 
     // Decisive control: does the mean degree saturate toward R as N grows?
     // mxbai-10K (mean 43) vs uniform-100K (mean 64) could be scale, not data
     // character. uniform-sphere at 10K/30K isolates the variable.
-    println!("\n== uniform-sphere: degree vs N (controllo scala) ==");
+    println!("\n== uniform-sphere: degree vs N (scale control) ==");
     println!(
         "  {:>10}{:>14}{:>10}{:>14}",
         "N", "mean degree", "at-R %", "CSR24 factor"

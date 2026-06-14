@@ -10,7 +10,7 @@
 //! evicts entries first, so `current_bytes` never crosses `budget_bytes`. A
 //! count-based budget cannot bound RAM when value sizes vary (an embedding is
 //! ~4 KB, a scalar a few bytes), which would break the project's RAM-frugal
-//! goal - see OBSERVATIONS Q7.
+//! goal.
 //!
 //! Three structures:
 //!   - **Small** (`small`, ~10% of the budget): newcomers; one-hit wonders die.
@@ -40,6 +40,11 @@ struct CacheEntry<V> {
     size: usize,
     freq: u8,
     in_small: bool,
+    /// Owning tenant, for per-tenant byte accounting. `0` is the single-tenant
+    /// (unscoped) default. A `u64` (low bits of the `u128` tenant id) so the
+    /// entry stays 8-aligned: a `u128` field would force 16-byte struct
+    /// alignment and roughly double `CacheEntry`, hurting eviction-walk locality.
+    tenant: u64,
 }
 
 /// S3-FIFO cache mapping key bytes -> value `V`, bounded by a byte budget.
@@ -49,6 +54,13 @@ pub struct S3Fifo<V> {
     main: VecDeque<Vec<u8>>,
     ghost: VecDeque<u64>,
     ghost_set: AHashSet<u64>,
+    /// Bytes charged to the unscoped default tenant `0`, kept inline so the
+    /// single-tenant path pays an integer add, not a `u128` hash + probe.
+    tenant0_bytes: usize,
+    /// Bytes charged per non-zero tenant. With `tenant0_bytes` it sums to
+    /// `total_bytes`; entries drop to absent (not zero) so the map tracks only
+    /// tenants with live cache residency.
+    per_tenant: AHashMap<u64, usize>,
     budget_bytes: usize,
     small_budget: usize,
     total_bytes: usize,
@@ -73,6 +85,8 @@ impl<V: Clone> S3Fifo<V> {
             main: VecDeque::new(),
             ghost: VecDeque::new(),
             ghost_set: AHashSet::new(),
+            tenant0_bytes: 0,
+            per_tenant: AHashMap::new(),
             budget_bytes,
             small_budget: (budget_bytes / 10).max(1),
             total_bytes: 0,
@@ -97,21 +111,34 @@ impl<V: Clone> S3Fifo<V> {
         }
     }
 
-    /// Insert or overwrite `key` -> `value`. `value_bytes` is the value's size,
-    /// charged (with the key and a fixed overhead) against the budget.
+    /// Insert or overwrite `key` -> `value` for the unscoped (single-tenant)
+    /// default tenant `0`. `value_bytes` is the value's size, charged (with the
+    /// key and a fixed overhead) against the budget.
     pub fn insert(&mut self, key: &[u8], value: V, value_bytes: usize) {
+        self.insert_for(key, value, value_bytes, 0);
+    }
+
+    /// Insert or overwrite `key` -> `value`, charging the bytes to `tenant` for
+    /// per-tenant accounting. Rewriting a key under a different tenant moves its
+    /// charged bytes from the old tenant to the new one.
+    pub fn insert_for(&mut self, key: &[u8], value: V, value_bytes: usize, tenant: u128) {
+        let tenant = tenant as u64;
         let entry_size = key.len() + value_bytes + ENTRY_OVERHEAD;
 
         if let Some(e) = self.map.get_mut(key) {
             // Overwrite in place; adjust the byte counters by the size delta.
             let old = e.size;
+            let old_tenant = e.tenant;
             let was_small = e.in_small;
             e.value = value;
             e.size = entry_size;
+            e.tenant = tenant;
             self.total_bytes = self.total_bytes + entry_size - old;
             if was_small {
                 self.small_bytes = self.small_bytes + entry_size - old;
             }
+            self.sub_tenant_bytes(old_tenant, old);
+            self.add_tenant_bytes(tenant, entry_size);
             return;
         }
 
@@ -135,9 +162,45 @@ impl<V: Clone> S3Fifo<V> {
                 size: entry_size,
                 freq: 0,
                 in_small,
+                tenant,
             },
         );
         self.total_bytes += entry_size;
+        self.add_tenant_bytes(tenant, entry_size);
+    }
+
+    /// Add `n` bytes to a tenant's charged total. Tenant `0` takes the inline
+    /// fast path; non-zero tenants hit the map.
+    fn add_tenant_bytes(&mut self, tenant: u64, n: usize) {
+        if tenant == 0 {
+            self.tenant0_bytes += n;
+        } else {
+            *self.per_tenant.entry(tenant).or_insert(0) += n;
+        }
+    }
+
+    /// Subtract `n` bytes from a tenant's charged total, dropping the map entry
+    /// when it reaches zero so the map tracks only tenants with live residency.
+    fn sub_tenant_bytes(&mut self, tenant: u64, n: usize) {
+        if tenant == 0 {
+            self.tenant0_bytes -= n;
+        } else if let Some(v) = self.per_tenant.get_mut(&tenant) {
+            *v -= n;
+            if *v == 0 {
+                self.per_tenant.remove(&tenant);
+            }
+        }
+    }
+
+    /// Bytes currently charged to `tenant` (0 if the tenant holds nothing).
+    #[must_use]
+    pub fn charged_bytes(&self, tenant: u128) -> usize {
+        let tenant = tenant as u64;
+        if tenant == 0 {
+            self.tenant0_bytes
+        } else {
+            self.per_tenant.get(&tenant).copied().unwrap_or(0)
+        }
     }
 
     /// Remove `key`. Returns `true` if it was cached.
@@ -149,6 +212,7 @@ impl<V: Clone> S3Fifo<V> {
             if e.in_small {
                 self.small_bytes -= e.size;
             }
+            self.sub_tenant_bytes(e.tenant, e.size);
             true
         } else {
             false
@@ -212,8 +276,8 @@ impl<V: Clone> S3Fifo<V> {
     /// Returns `true` if an entry was actually removed from the cache.
     fn evict_from_small(&mut self) -> bool {
         while let Some(key) = self.small.pop_front() {
-            let (freq, sz) = match self.map.get(&key) {
-                Some(e) => (e.freq, e.size),
+            let (freq, sz, tnt) = match self.map.get(&key) {
+                Some(e) => (e.freq, e.size, e.tenant),
                 None => continue, // stale (removed) - skip
             };
             if freq > 1 {
@@ -228,6 +292,7 @@ impl<V: Clone> S3Fifo<V> {
                 self.map.remove(&key);
                 self.total_bytes -= sz;
                 self.small_bytes -= sz;
+                self.sub_tenant_bytes(tnt, sz);
                 self.ghost_push(kh);
                 self.evictions += 1;
                 skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheEvictions);
@@ -240,8 +305,8 @@ impl<V: Clone> S3Fifo<V> {
     /// Evict from Main, giving touched entries a second chance.
     fn evict_from_main(&mut self) {
         while let Some(key) = self.main.pop_front() {
-            let (freq, sz) = match self.map.get(&key) {
-                Some(e) => (e.freq, e.size),
+            let (freq, sz, tnt) = match self.map.get(&key) {
+                Some(e) => (e.freq, e.size, e.tenant),
                 None => continue, // stale - skip
             };
             if freq > 0 {
@@ -252,6 +317,7 @@ impl<V: Clone> S3Fifo<V> {
             } else {
                 self.map.remove(&key);
                 self.total_bytes -= sz;
+                self.sub_tenant_bytes(tnt, sz);
                 self.evictions += 1;
                 skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheEvictions);
                 return;
@@ -485,5 +551,90 @@ mod tests {
             skewed > hr * 3.0,
             "skew {skewed:.3} should dominate uniform {hr:.3}"
         );
+    }
+
+    // ── Per-tenant byte accounting ────────────────────────────────────────────
+
+    // Charged size of one u32-valued entry with the given key.
+    fn entry_size(key: &[u8]) -> usize {
+        key.len() + 4 + ENTRY_OVERHEAD
+    }
+
+    #[test]
+    fn test_cache_entry_stays_compact() {
+        // The tenant tag is a u64, not u128, so the entry stays 8-aligned. A
+        // u128 would force 16-byte struct alignment and roughly double the
+        // entry, hurting eviction-walk locality (see the cache accounting bench).
+        assert!(
+            std::mem::size_of::<CacheEntry<u64>>() <= 32,
+            "CacheEntry grew to {} bytes; keep the tenant tag 8-aligned",
+            std::mem::size_of::<CacheEntry<u64>>()
+        );
+    }
+
+    #[test]
+    fn test_per_tenant_charged_bytes() {
+        let mut c: S3Fifo<u32> = S3Fifo::new(64 * KIB);
+        c.insert_for(b"a", 1, 4, 100);
+        c.insert_for(b"b", 2, 4, 100);
+        c.insert_for(b"c", 3, 4, 200);
+        assert_eq!(c.charged_bytes(100), entry_size(b"a") + entry_size(b"b"));
+        assert_eq!(c.charged_bytes(200), entry_size(b"c"));
+        assert_eq!(c.charged_bytes(999), 0, "unknown tenant charges nothing");
+        assert_eq!(
+            c.charged_bytes(100) + c.charged_bytes(200),
+            c.current_bytes()
+        );
+    }
+
+    #[test]
+    fn test_insert_defaults_tenant_zero() {
+        let mut c: S3Fifo<u32> = S3Fifo::new(4 * KIB);
+        c.insert(b"k", 1, 4);
+        assert_eq!(
+            c.charged_bytes(0),
+            c.current_bytes(),
+            "bare insert must charge tenant 0"
+        );
+    }
+
+    #[test]
+    fn test_per_tenant_invariant_under_eviction() {
+        // Invariant: sum over tenants == current_bytes, held through eviction.
+        let mut c: S3Fifo<u32> = S3Fifo::new(8 * KIB);
+        for i in 0u32..3000 {
+            let tenant = u128::from(i % 4);
+            c.insert_for(format!("key{i}").as_bytes(), i, 4, tenant);
+            let sum: usize = (0..4u128).map(|t| c.charged_bytes(t)).sum();
+            assert_eq!(
+                sum,
+                c.current_bytes(),
+                "per-tenant sum must equal total at insert {i}"
+            );
+        }
+        assert!(c.evictions() > 0, "inserting past budget must evict");
+    }
+
+    #[test]
+    fn test_per_tenant_remove_and_overwrite() {
+        let mut c: S3Fifo<u32> = S3Fifo::new(64 * KIB);
+        c.insert_for(b"k", 1, 4, 7);
+        let after = c.charged_bytes(7);
+        c.insert_for(b"k", 2, 4, 7); // same-size overwrite, same tenant
+        assert_eq!(c.charged_bytes(7), after, "same-size overwrite keeps bytes");
+        assert!(c.remove(b"k"));
+        assert_eq!(c.charged_bytes(7), 0, "remove releases per-tenant bytes");
+        assert_eq!(c.current_bytes(), 0);
+    }
+
+    #[test]
+    fn test_per_tenant_overwrite_reassigns_tenant() {
+        // A key rewritten under a different tenant moves its bytes across.
+        let mut c: S3Fifo<u32> = S3Fifo::new(64 * KIB);
+        c.insert_for(b"k", 1, 4, 7);
+        c.insert_for(b"k", 2, 4, 9);
+        assert_eq!(c.charged_bytes(7), 0, "old tenant released");
+        assert_eq!(c.charged_bytes(9), entry_size(b"k"), "new tenant charged");
+        assert_eq!(c.charged_bytes(9), c.current_bytes());
     }
 }

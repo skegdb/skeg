@@ -1,8 +1,8 @@
 //! Public extension points for an external multi-tenant layer.
 //!
 //! `skeg-server` ships single-tenant by default. A separate crate
-//! (typically `skeg-server-tenant` in the BUSL-1.1 tenant repo) can
-//! install an implementation of [`TenantBackend`] via
+//! (`skeg-server-tenant`) can install an implementation of
+//! [`TenantBackend`] via
 //! [`Server::with_tenant_backend`](crate::Server::with_tenant_backend),
 //! at which point the RESP3 handler honours `HELLO 3 AUTH` and scopes
 //! KV / vector ops per tenant.
@@ -84,4 +84,48 @@ pub trait TenantBackend: Send + Sync {
     fn anonymous_policy(&self) -> AnonymousPolicy {
         AnonymousPolicy::Lenient
     }
+
+    /// Hard resource limits for `id`. Default is unlimited, so existing
+    /// backends and single-tenant deployments are unaffected. The server
+    /// enforces these at admission (e.g. `max_vectors` on VSET).
+    fn limits(&self, id: TenantId) -> crate::quota::TenantLimits {
+        let _ = id;
+        crate::quota::TenantLimits::default()
+    }
+
+    /// True if `id` may run admin commands (`SKEG.QUOTA.SET/GET` on other
+    /// tenants). Default `false`: no tenant is an admin.
+    fn is_admin(&self, id: TenantId) -> bool {
+        let _ = id;
+        false
+    }
+
+    /// Resolve a tenant name to its id, if such a tenant exists. Used by the
+    /// admin quota commands, which target a tenant by name. Default `None`.
+    fn resolve_tenant(&self, name: &str) -> Option<TenantId> {
+        let _ = name;
+        None
+    }
+
+    /// Set hard limits for `id`. Default: unsupported (no writable store).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuotaAdminError`] if the backend cannot store limits.
+    fn set_limits(
+        &self,
+        id: TenantId,
+        limits: crate::quota::TenantLimits,
+    ) -> Result<(), QuotaAdminError> {
+        let _ = (id, limits);
+        Err(QuotaAdminError::Unsupported)
+    }
+}
+
+/// Why an admin quota write could not be applied. The dispatcher resolves the
+/// tenant before calling `set_limits`, so "unknown tenant" never reaches here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaAdminError {
+    /// The backend has no writable per-tenant limits store.
+    Unsupported,
 }
