@@ -1,8 +1,7 @@
 //! Multi-tenant wrapper for `skeg-server`.
 //!
-//! Implements [`skeg_server::TenantBackend`] on top of the BUSL-1.1
-//! `skeg-tenant` primitives. Distributed as a binary to clients who
-//! purchase a tenant license; not on crates.io.
+//! Implements [`skeg_server::TenantBackend`] on top of the `skeg-tenant`
+//! primitives (auth store, tenant ids, argon2 password hashing).
 
 #![deny(unsafe_code)]
 

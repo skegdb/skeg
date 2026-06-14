@@ -1,8 +1,8 @@
 //! Public extension points for an external multi-tenant layer.
 //!
 //! `skeg-server` ships single-tenant by default. A separate crate
-//! (typically `skeg-server-tenant` in the BUSL-1.1 tenant repo) can
-//! install an implementation of [`TenantBackend`] via
+//! (`skeg-server-tenant`) can install an implementation of
+//! [`TenantBackend`] via
 //! [`Server::with_tenant_backend`](crate::Server::with_tenant_backend),
 //! at which point the RESP3 handler honours `HELLO 3 AUTH` and scopes
 //! KV / vector ops per tenant.

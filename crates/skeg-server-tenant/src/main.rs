@@ -2,9 +2,9 @@
 
 //! Multi-tenant `skeg-server` binary.
 //!
-//! Wraps the OSS `skeg-server` engine with a `TenantBackend` backed by
-//! the BUSL `skeg-tenant` crate. End-user CLI surface is identical to
-//! the OSS binary plus two extra flags:
+//! Wraps the `skeg-server` engine with a `TenantBackend` backed by the
+//! `skeg-tenant` crate. The CLI surface is identical to the single-tenant
+//! binary plus two extra flags:
 //!
 //! - `--tenant-auth <path>` enables tenant resolution against an
 //!   `auth.kdb` on disk
