@@ -508,17 +508,31 @@ fn parse_quota_limit(b: &Bytes) -> Result<Option<u64>, Frame> {
         })
 }
 
+/// Admin-command preamble: require a backend, require the caller be an admin,
+/// then resolve the tenant-name arg to a tenant id.
+fn admin_target<'a>(
+    name_arg: &Bytes,
+    caller: TenantId,
+    ctx: Option<&'a Arc<dyn TenantBackend>>,
+) -> Result<(&'a Arc<dyn TenantBackend>, TenantId), Frame> {
+    let Some(backend) = ctx else {
+        return Err(Frame::Error("ERR multi-tenant backend not configured".into()));
+    };
+    if !backend.is_admin(caller) {
+        return Err(Frame::Error("ERR admin privileges required".into()));
+    }
+    let name = parse_utf8_arg(name_arg, "tenant")?;
+    backend
+        .resolve_tenant(name)
+        .map(|target| (backend, target))
+        .ok_or_else(|| Frame::Error("ERR unknown tenant".into()))
+}
+
 /// `SKEG.QUOTA.SET tenant max_vectors max_disk_bytes`. Admin only: sets a
 /// target tenant's hard quotas. Each limit is a `u64` or `*` (unlimited).
 fn skeg_quota_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
-    let Some(backend) = ctx else {
-        return Frame::Error("ERR multi-tenant backend not configured".into());
-    };
-    if !backend.is_admin(caller) {
-        return Frame::Error("ERR admin privileges required".into());
-    }
-    let name = match parse_utf8_arg(&args[0], "tenant") {
-        Ok(s) => s,
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
         Err(e) => return e,
     };
     let max_vectors = match parse_quota_limit(&args[1]) {
@@ -528,9 +542,6 @@ fn skeg_quota_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
     let max_disk_bytes = match parse_quota_limit(&args[2]) {
         Ok(v) => v,
         Err(e) => return e,
-    };
-    let Some(target) = backend.resolve_tenant(name) else {
-        return Frame::Error("ERR unknown tenant".into());
     };
     let limits = crate::quota::TenantLimits {
         max_vectors,
@@ -547,18 +558,9 @@ fn skeg_quota_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
 /// `SKEG.QUOTA.GET tenant`. Admin only: returns `[max_vectors, max_disk_bytes]`
 /// as bulk strings, with `*` for an unlimited field.
 fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
-    let Some(backend) = ctx else {
-        return Frame::Error("ERR multi-tenant backend not configured".into());
-    };
-    if !backend.is_admin(caller) {
-        return Frame::Error("ERR admin privileges required".into());
-    }
-    let name = match parse_utf8_arg(&args[0], "tenant") {
-        Ok(s) => s,
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
         Err(e) => return e,
-    };
-    let Some(target) = backend.resolve_tenant(name) else {
-        return Frame::Error("ERR unknown tenant".into());
     };
     let limits = backend.limits(target);
     let fmt = |o: Option<u64>| o.map_or_else(|| "*".to_string(), |v| v.to_string());
