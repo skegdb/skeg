@@ -119,6 +119,17 @@ pub enum Command {
         args: Vec<Bytes>,
     },
 
+    /// `SKEG.QUOTA.SET tenant max_vectors max_disk_bytes`. Arity 3. Admin
+    /// only; sets a tenant's hard quotas. Each limit is a u64, or `*` for
+    /// unlimited. Inner parsing in the dispatcher.
+    SkegQuotaSet {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.QUOTA.GET tenant`. Arity 1. Admin only; reads a tenant's quotas.
+    SkegQuotaGet {
+        args: Vec<Bytes>,
+    },
+
     /// Any command that was syntactically a valid array of bulks but whose
     /// name we have not wired into a typed variant yet. The dispatch layer
     /// gets the original name and args verbatim.
@@ -305,6 +316,24 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVsearch { args })
+        }
+        "QUOTA.SET" => {
+            if args.len() != 3 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.QUOTA.SET",
+                    want: "tenant max_vectors max_disk_bytes",
+                });
+            }
+            Ok(Command::SkegQuotaSet { args })
+        }
+        "QUOTA.GET" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.QUOTA.GET",
+                    want: "tenant",
+                });
+            }
+            Ok(Command::SkegQuotaGet { args })
         }
         // Unknown SKEG.* verb: pass through so the dispatcher emits
         // `ERR unknown command 'SKEG.<verb>'`.
@@ -916,7 +945,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// G-1 equivalence: for any KV command frame built from random
+        /// Equivalence: for any KV command frame built from random
         /// byte arguments, the typed parser preserves every argument
         /// byte-for-byte. Catches subtle gather/swap_remove mistakes
         /// that would surface as silent data corruption.
@@ -1012,7 +1041,7 @@ mod tests {
             proptest::prop_assert_eq!(got, delta);
         }
 
-        /// G-2 equivalence: every wrong-arity input emits the byte-uguale
+        /// Equivalence: every wrong-arity input emits the byte-identical
         /// string the server has been emitting since v0.1, regardless of
         /// the arity offset.
         #[test]
@@ -1140,6 +1169,34 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "wrong number of arguments for 'SKEG.VSET'; want name id vector"
+        );
+    }
+
+    #[test]
+    fn skeg_quota_set_three_args() {
+        let cmd = parse_command(arr(&[b"SKEG.QUOTA.SET", b"acme", b"1000", b"*"])).unwrap();
+        let Command::SkegQuotaSet { args } = cmd else {
+            panic!("expected SkegQuotaSet");
+        };
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn skeg_quota_get_one_arg() {
+        let cmd = parse_command(arr(&[b"SKEG.QUOTA.GET", b"acme"])).unwrap();
+        let Command::SkegQuotaGet { args } = cmd else {
+            panic!("expected SkegQuotaGet");
+        };
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn skeg_quota_set_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.QUOTA.SET", b"acme"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.QUOTA.SET'; \
+             want tenant max_vectors max_disk_bytes"
         );
     }
 

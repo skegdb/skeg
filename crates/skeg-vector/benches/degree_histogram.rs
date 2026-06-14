@@ -165,16 +165,16 @@ fn report(label: &str, index: &VamanaIndex) {
 }
 
 fn main() {
-    eprintln!("Fase 0.a - degree histogram + packed-layout byte models\n");
+    eprintln!("Phase 0.a - degree histogram + packed-layout byte models\n");
     let cfg = VamanaConfig::default();
 
     // Real mxbai-embed-large 10K.
     if let Some((corpus, n, dim)) = load_npy(CORPUS_NPY) {
         let ids: Vec<u64> = (0..n as u64).collect();
         let index = VamanaIndex::build(corpus, ids, dim, &cfg);
-        report("mxbai-embed-large reale 10K", &index);
+        report("mxbai-embed-large real 10K", &index);
     } else {
-        eprintln!("  (mxbai npy non trovato, salto il caso reale)");
+        eprintln!("  (mxbai npy not found, skipping the real case)");
     }
 
     // Two synthetic datasets at 100K. uniform-sphere is the validated proxy
@@ -186,17 +186,17 @@ fn main() {
 
     let index = VamanaIndex::build(uniform_sphere(n, dim, 7), ids.clone(), dim, &cfg);
     report(
-        &format!("uniform-sphere sintetico {n} (proxy reale a scala)"),
+        &format!("uniform-sphere synthetic {n} (real-scale proxy)"),
         &index,
     );
 
     let index = VamanaIndex::build(clustered(n, dim, 7), ids, dim, &cfg);
-    report(&format!("clustered sintetico {n} (contrasto)"), &index);
+    report(&format!("clustered synthetic {n} (contrast)"), &index);
 
     // Decisive control: does the mean degree saturate toward R as N grows?
     // mxbai-10K (mean 43) vs uniform-100K (mean 64) could be scale, not data
     // character. uniform-sphere at 10K/30K isolates the variable.
-    println!("\n== uniform-sphere: degree vs N (controllo scala) ==");
+    println!("\n== uniform-sphere: degree vs N (scale control) ==");
     println!(
         "  {:>10}{:>14}{:>10}{:>14}",
         "N", "mean degree", "at-R %", "CSR24 factor"

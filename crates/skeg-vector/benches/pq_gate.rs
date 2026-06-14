@@ -406,7 +406,7 @@ fn run(label: &str, corpus: &[f32], n: usize, dim: usize, queries: &[f32], n_q: 
 
     println!(
         "  {:>16}{:>10}{:>14}{:>16}",
-        "proxy del walk", "byte/vec", "recall@10", "overlap vs f32"
+        "walk proxy", "byte/vec", "recall@10", "overlap vs f32"
     );
     println!(
         "  {:>16}{:>10}{:>14.4}{:>16}",
@@ -463,16 +463,16 @@ fn run(label: &str, corpus: &[f32], n: usize, dim: usize, queries: &[f32], n_q: 
 }
 
 fn main() {
-    eprintln!("Fase 0.c - gate recall PQ come tier di navigazione\n");
-    println!("gate: PQ recall@10 entro ~1% del baseline int8 (su dati indicizzabili)");
+    eprintln!("Phase 0.c - PQ recall gate as a navigation tier\n");
+    println!("gate: PQ recall@10 within ~1% of the int8 baseline (on indexable data)");
 
-    // mxbai reale 10K - l'ancora reale originale (testo word-salad).
+    // real mxbai 10K - the original real anchor (word-salad text).
     if let (Some((corpus, n, dim)), Some((queries, n_q, q_dim))) =
         (load_npy(CORPUS_NPY), load_npy(QUERY_NPY))
     {
         assert_eq!(dim, q_dim, "dim mismatch corpus/query");
         run(
-            "mxbai reale 10K (testo word-salad)",
+            "mxbai real 10K (word-salad text)",
             &corpus,
             n,
             dim,
@@ -480,16 +480,16 @@ fn main() {
             n_q,
         );
     } else {
-        eprintln!("  mxbai 10K npy non trovato, salto");
+        eprintln!("  mxbai 10K npy not found, skipping");
     }
 
-    // Wikipedia reale 100K - l'ancora di scala su documenti reali.
+    // real Wikipedia 100K - the scaling anchor on real documents.
     if let (Some((corpus, n, dim)), Some((queries, n_q, q_dim))) =
         (load_npy(WIKI_CORPUS_NPY), load_npy(WIKI_QUERY_NPY))
     {
         assert_eq!(dim, q_dim, "dim mismatch corpus/query");
         run(
-            "Wikipedia reale 100K (documenti reali)",
+            "Wikipedia real 100K (real documents)",
             &corpus,
             n,
             dim,
@@ -497,12 +497,12 @@ fn main() {
             n_q,
         );
     } else {
-        eprintln!("  Wikipedia 100K npy non trovato, salto");
+        eprintln!("  Wikipedia 100K npy not found, skipping");
     }
 
-    // Sintetico a manifold (intrinsic dim 64): indicizzabile e isotropo,
-    // proxy realistico degli embedding. Scala 100K e 1M per la degradazione.
-    // Corpus e query condividono la stessa proiezione: stesso manifold.
+    // Synthetic manifold (intrinsic dim 64): indexable and isotropic, a
+    // realistic proxy for embeddings. Scales 100K and 1M for degradation.
+    // Corpus and queries share the same projection: same manifold.
     let dim = 1024;
     let d_in = 64;
     let proj = manifold_proj(dim, d_in, 7);
@@ -515,7 +515,7 @@ fn main() {
         let corpus = manifold_points(&proj, n, dim, d_in, 100);
         let queries = manifold_points(&proj, 200, dim, d_in, 999);
         run(
-            &format!("manifold d_in={d_in} sintetico {n}"),
+            &format!("manifold d_in={d_in} synthetic {n}"),
             &corpus,
             n,
             dim,

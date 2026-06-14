@@ -4,9 +4,35 @@ All notable changes to the engine are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-This file tracks **only the engine** (this repository). Multi-tenant
-implementation details, auth store internals, and tenant API surface
-live in a separate (private) repo and are documented there.
+This file tracks the engine and the multi-tenant server, both in this
+repository.
+
+## [Unreleased]
+
+### Added
+
+- **Per-tenant resource accounting and hard quotas.** The engine now
+  tracks, per tenant, the hot-key cache bytes and the live on-disk KV
+  bytes each tenant holds, and can enforce optional hard limits at
+  admission. `VLog` gains a `tenant(id)` view that scopes cache
+  residency and disk accounting to a tenant; the per-tenant disk total
+  is rebuilt from the index on restart. A `TenantBackend::limits(tenant)`
+  hook lets a deployment cap a tenant's vector count (`max_vectors`,
+  checked on `SKEG.VSET`) and its on-disk KV bytes (`max_disk_bytes`,
+  checked on `SET`); an over-limit write is rejected before anything is
+  stored. The vector quota is enforced under the index write lock so an
+  insert is counted exactly once and overwrites stay free; the disk
+  quota counter is shared across shards so the limit is global per
+  tenant. New public surface: `VLog::tenant`, `TenantView`,
+  `SharedTenantDisk`, `new_shared_disk` (skeg-core); `TenantLimits`,
+  `TenantVectorQuota` (skeg-server).
+
+### Changed
+
+- **Single-tenant and anonymous traffic is unchanged.** With no limit
+  configured nothing is counted and the write path is byte-identical to
+  before; the per-tenant accounting adds no measurable overhead on the
+  single-tenant path.
 
 ## [0.3.8] - 2026-06-09
 
