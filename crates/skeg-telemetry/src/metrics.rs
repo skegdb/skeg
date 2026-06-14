@@ -30,7 +30,7 @@ static GAUGES: [AtomicU64; Gauge::COUNT] = [const { AtomicU64::new(0) }; Gauge::
 /// Tick a per-op counter on the requesting shard.
 ///
 /// Cost: one `AtomicU64::fetch_add(1, Relaxed)`. On Apple Silicon that's
-/// ~1–2 ns on uncontended lines, with no fence (`Relaxed` is enough — we
+/// ~1–2 ns on uncontended lines, with no fence (`Relaxed` is enough - we
 /// never read a counter to make a decision on the hot path).
 #[inline(always)]
 pub fn tick_op(op: Op, shard_id: u16) {

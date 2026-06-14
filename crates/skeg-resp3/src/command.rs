@@ -77,13 +77,13 @@ pub enum Command {
     },
 
     // ── SKEG.* admin namespace ──────────────────────────────────────
-    /// `SKEG.STATS` — cache + telemetry dump. No args.
+    /// `SKEG.STATS` - cache + telemetry dump. No args.
     SkegStats,
-    /// `SKEG.SHARDS` — per-shard metrics. No args.
+    /// `SKEG.SHARDS` - per-shard metrics. No args.
     SkegShards,
-    /// `SKEG.WHOAMI` — tenant identity bound to the connection.
+    /// `SKEG.WHOAMI` - tenant identity bound to the connection.
     SkegWhoami,
-    /// `SKEG.AUTH ...` — placeholder for future token-based auth. The
+    /// `SKEG.AUTH ...` - placeholder for future token-based auth. The
     /// parser preserves the raw arguments so the dispatcher (which
     /// currently emits a fixed `reserved` error) can evolve without a
     /// re-parse pass.
@@ -92,7 +92,7 @@ pub enum Command {
     },
 
     // ── SKEG.* vector namespace ─────────────────────────────────────
-    /// `SKEG.VINDEX.LIST` — enumerate vindexes for the calling tenant.
+    /// `SKEG.VINDEX.LIST` - enumerate vindexes for the calling tenant.
     SkegVindexList,
     /// `SKEG.VINDEX.CREATE name dim kind backend`. The parser checks
     /// arity (4 args) and forwards the raw bytes; inner argument

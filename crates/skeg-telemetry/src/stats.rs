@@ -89,7 +89,7 @@ pub fn dump_text() -> String {
         let _ = writeln!(&mut out, "{} {}", g.name(), metrics::gauge(g));
     }
 
-    // Dynamic registry — downstream-registered metrics. Appended at the
+    // Dynamic registry - downstream-registered metrics. Appended at the
     // end so the engine's own schema is grep-stable across releases even
     // as consumers add their own counters.
     dynamic::dump_text(&mut out);

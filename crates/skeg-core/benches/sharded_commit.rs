@@ -124,7 +124,7 @@ fn main() {
     let cfg = Config::from_env();
     let tmp = TempDir::new().unwrap();
 
-    println!("=== M4 perf gate (shared-committer) ===");
+    println!("=== perf gate (shared-committer) ===");
     println!(
         "config: writes/shard={} bytes={} runs={} shards_big={}",
         cfg.writes_per_shard, cfg.record_bytes, cfg.runs, cfg.shards_big
@@ -204,9 +204,9 @@ fn main() {
     }
 
     if failures.is_empty() {
-        println!("M4 GATE: PASS");
+        println!("GATE: PASS");
     } else {
-        println!("M4 GATE: FAIL");
+        println!("GATE: FAIL");
         for f in &failures {
             println!("  - {f}");
         }

@@ -1,4 +1,4 @@
-//! Dynamic metric registry — extensibility without giving up zero overhead.
+//! Dynamic metric registry - extensibility without giving up zero overhead.
 //!
 //! The closed enums [`crate::Op`], [`crate::Counter`], [`crate::Gauge`] are
 //! great for the engine itself but they freeze the metric set at compile
@@ -14,12 +14,12 @@
 //! 2. [`register_counter`], [`register_histogram`], [`register_gauge`]
 //!    map a `&'static str` name to a slot index through a one-time
 //!    `Mutex<BTreeMap>` lookup. The returned handle is a `&'static`
-//!    reference into the static pool — the same kind of pointer the
+//!    reference into the static pool - the same kind of pointer the
 //!    closed-enum API uses internally.
 //! 3. The downstream caller is expected to cache the handle in an
 //!    `OnceLock` (or a static initialiser) so the hot path is one
 //!    `OnceLock::get()` branch + one `AtomicU64::fetch_add(_, Relaxed)`.
-//!    Total cost: ~2 ns — same order as the closed-enum path.
+//!    Total cost: ~2 ns - same order as the closed-enum path.
 //!
 //! Idempotency: repeated calls with the same name return the same slot,
 //! so `OnceLock::get_or_init(|| register_*(…))` patterns are safe even
@@ -68,7 +68,7 @@ static HIST_POOL: [DynHistogram; HIST_POOL_SIZE] = [const { DynHistogram::new() 
 
 static GAUGE_POOL: [AtomicU64; GAUGE_POOL_SIZE] = [const { AtomicU64::new(0) }; GAUGE_POOL_SIZE];
 
-/// Three independent registries — name → slot index. Iterated in
+/// Three independent registries - name → slot index. Iterated in
 /// sorted order by [`dump_text`], so `BTreeMap` (not `HashMap`) gives
 /// deterministic output for free.
 static COUNTER_REGISTRY: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
@@ -141,7 +141,7 @@ impl DynOp {
 ///
 /// The returned handle is `&'static [AtomicU64; MAX_SHARDS]`. The hot
 /// path is `handle[shard_id & (MAX_SHARDS - 1)].fetch_add(1, Relaxed)`.
-/// If you don't have a shard concept, pass `0` — the cost is the same.
+/// If you don't have a shard concept, pass `0` - the cost is the same.
 pub fn register_counter(name: &'static str) -> &'static CounterRow {
     let mut reg = COUNTER_REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
     let idx = match reg.get(name) {

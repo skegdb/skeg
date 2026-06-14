@@ -150,9 +150,9 @@ fn main() {
     // the span before it reaches the exporter.)
     let gate_pass = off_ratio < 1.05;
     if gate_pass {
-        eprintln!("# G-O3.1 PASS: fmt_off / baseline = {off_ratio:.3} (< 1.05)");
+        eprintln!("# gate PASS: fmt_off / baseline = {off_ratio:.3} (< 1.05)");
     } else {
-        eprintln!("# G-O3.1 FAIL: fmt_off / baseline = {off_ratio:.3} (>= 1.05) - investigate");
+        eprintln!("# gate FAIL: fmt_off / baseline = {off_ratio:.3} (>= 1.05) - investigate");
         std::process::exit(1);
     }
 }

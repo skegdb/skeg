@@ -12,7 +12,7 @@
 //!
 //! When `http` is also enabled, [`http::serve_blocking`] runs a tiny
 //! HTTP server on a dedicated thread that serves `/metrics` in Prometheus
-//! text format. The server is purely a reader — it never writes through
+//! text format. The server is purely a reader - it never writes through
 //! the hot path.
 //!
 //! # Hot-path cost budget

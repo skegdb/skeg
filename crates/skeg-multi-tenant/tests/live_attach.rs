@@ -128,7 +128,7 @@ fn dispatch(frame: Frame, records: &[MockRecord], expected_index: &str) -> Frame
             records.len()
         )))]),
         "SKEG.VSEARCH" => {
-            // args[0] is the index name — verify it matches expected.
+            // args[0] is the index name - verify it matches expected.
             let actual_index = match &args[0] {
                 Frame::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
                 _ => return Frame::Error("bad index arg".into()),
@@ -278,7 +278,7 @@ fn live_root_custom_index_name_is_used() {
     let tenant = root
         .open(SkegTenantId::from_bytes([0x55; 16]), DIM)
         .expect("open");
-    // Issue a query — mock verifies the index name matches.
+    // Issue a query - mock verifies the index name matches.
     let hits = tenant
         .query_filtered(&unit(0), 3, &|_m: &RecordMeta<'_>| true)
         .expect("query");
