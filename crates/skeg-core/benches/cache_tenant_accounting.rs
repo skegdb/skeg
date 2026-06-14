@@ -1,13 +1,14 @@
-//! P0a gate G-P0a-2 / G-P0a-3: per-tenant accounting must not regress the
-//! single-tenant cache path. SOL reference = the unmodified cache (run this same
-//! bench against the parent commit's `cache.rs` to get the baseline).
+//! Per-tenant byte accounting must not regress the single-tenant cache path.
+//! Reference = the unmodified cache (run this same bench against the parent
+//! commit's `cache.rs` to get the baseline).
 //!
 //! `harness = false`, custom main: we report median ns/op (wall-clock medians are
 //! the figure of merit, matching the `sharded_commit` bench convention), not a
 //! criterion mean+CI.
 //!
 //! Mono-tenant only: drives `insert`/`get`, which exist identically in baseline
-//! and S1, so the delta between the two builds is exactly the accounting overhead.
+//! and current code, so the delta between the two builds is exactly the
+//! accounting overhead.
 
 use std::time::Instant;
 
@@ -47,8 +48,8 @@ fn bench_insert(n: u64, capacity_entries: usize, rounds: usize) -> (f64, f64) {
     min_median(samples)
 }
 
-/// Lookups against a populated, fully-resident cache (get is unchanged by S1;
-/// this is a control that should show ~zero delta).
+/// Lookups against a populated, fully-resident cache (get is unchanged by the
+/// accounting; this is a control that should show ~zero delta).
 fn bench_get(n: u64, rounds: usize) -> (f64, f64) {
     let budget = (n as usize + 16) * ENTRY;
     let keys: Vec<[u8; 8]> = (0..n).map(u64::to_le_bytes).collect();

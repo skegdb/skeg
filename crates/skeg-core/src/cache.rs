@@ -553,7 +553,7 @@ mod tests {
         );
     }
 
-    // ── P0a S1: per-tenant byte accounting ────────────────────────────────────
+    // ── Per-tenant byte accounting ────────────────────────────────────────────
 
     // Charged size of one u32-valued entry with the given key.
     fn entry_size(key: &[u8]) -> usize {
@@ -564,7 +564,7 @@ mod tests {
     fn test_cache_entry_stays_compact() {
         // The tenant tag is a u64, not u128, so the entry stays 8-aligned. A
         // u128 would force 16-byte struct alignment and roughly double the
-        // entry, hurting eviction-walk locality (see P0a gate G-P0a-2 bench).
+        // entry, hurting eviction-walk locality (see the cache accounting bench).
         assert!(
             std::mem::size_of::<CacheEntry<u64>>() <= 32,
             "CacheEntry grew to {} bytes; keep the tenant tag 8-aligned",
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_per_tenant_invariant_under_eviction() {
-        // G-P0a-1: sum over tenants == current_bytes, held through eviction.
+        // Invariant: sum over tenants == current_bytes, held through eviction.
         let mut c: S3Fifo<u32> = S3Fifo::new(8 * KIB);
         for i in 0u32..3000 {
             let tenant = u128::from(i % 4);

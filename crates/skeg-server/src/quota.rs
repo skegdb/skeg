@@ -1,5 +1,5 @@
 //! Per-tenant resource limits and the server-side usage counters that enforce
-//! them. P0a S3: hard `n_vectors` quota with admission rejection.
+//! them. Hard `n_vectors` quota with admission rejection.
 //!
 //! The LIMITS come from the pluggable [`crate::tenant::TenantBackend`] (so the
 //! server stays decoupled from any concrete tenant store); the USAGE lives here,

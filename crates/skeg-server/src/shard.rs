@@ -1666,7 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shardset_tenant_isolated_accounting() {
-        // G-S2b-1: two tenants writing through the ShardSet have separate cache
+        // Two tenants writing through the ShardSet have separate cache
         // accounting; neither charges the anonymous tenant 0.
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 4).unwrap();
@@ -1713,7 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_quota_enforced_per_tenant() {
-        // G-S3b-1: a tenant at max_vectors is rejected on VSET; another tenant
+        // A tenant at max_vectors is rejected on VSET; another tenant
         // is unaffected; an overwrite never consumes quota; VDEL frees a slot.
         // Indexes are tenant-scoped names, mirroring how the RESP3 handler
         // scopes them, so ids never collide across tenants.
@@ -1765,7 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disk_quota_global_per_tenant() {
-        // G-S4b-1: max_disk_bytes is enforced GLOBALLY per tenant across shards,
+        // max_disk_bytes is enforced GLOBALLY per tenant across shards,
         // not per shard. Each padded record here is 128 bytes; a 300-byte limit
         // admits exactly 2, regardless of how the 5 keys hash across the shards.
         let dir = TempDir::new().unwrap();
@@ -1807,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_quota_untracked_without_limit() {
-        // G-S3-2: no limit -> no counting; single-tenant path pays nothing.
+        // No limit -> no counting; single-tenant path pays nothing.
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 4, 0, 0).await.unwrap();

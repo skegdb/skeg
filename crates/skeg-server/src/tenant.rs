@@ -87,7 +87,7 @@ pub trait TenantBackend: Send + Sync {
 
     /// Hard resource limits for `id`. Default is unlimited, so existing
     /// backends and single-tenant deployments are unaffected. The server
-    /// enforces these at admission (P0a S3: `max_vectors` on VSET).
+    /// enforces these at admission (e.g. `max_vectors` on VSET).
     fn limits(&self, id: TenantId) -> crate::quota::TenantLimits {
         let _ = id;
         crate::quota::TenantLimits::default()

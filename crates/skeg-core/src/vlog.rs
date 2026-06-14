@@ -166,7 +166,7 @@ impl VLog {
         clippy::unused_async,
         clippy::too_many_lines
     )]
-    pub async fn open_shared(
+    async fn open_shared(
         dir: &Path,
         max_seg_size: u64,
         tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
@@ -881,13 +881,7 @@ pub struct TenantView<'a> {
     disk_limit: Option<u64>,
 }
 
-impl<'a> TenantView<'a> {
-    /// The tenant this view is scoped to.
-    #[must_use]
-    pub fn tenant_id(&self) -> u128 {
-        self.tenant
-    }
-
+impl TenantView<'_> {
     /// Apply a disk-quota limit on this view's `set`. An over-limit set is
     /// rejected with [`Error::DiskQuota`] before anything is written.
     #[must_use]
@@ -1020,7 +1014,7 @@ mod tests {
         assert_eq!(res[2].as_deref(), Some(b"2".as_slice()));
     }
 
-    // ── P0a S2a: TenantView per-tenant cache attribution ──────────────────────
+    // ── TenantView per-tenant cache attribution ───────────────────────────────
 
     #[tokio::test]
     async fn test_tenant_view_set_charges_tenant() {
@@ -1109,7 +1103,7 @@ mod tests {
         assert_eq!(v.tenant_cache_bytes(0), 0);
     }
 
-    // ── P0a S4a: per-tenant disk_bytes tracking ───────────────────────────────
+    // ── Per-tenant disk_bytes tracking ────────────────────────────────────────
 
     /// A scoped key: tenant id (16B LE) prefix + raw key, matching how the
     /// RESP3 handler scopes keys. `tenant_from_key` recovers the tenant.
