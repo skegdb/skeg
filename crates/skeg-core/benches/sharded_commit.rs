@@ -1,8 +1,8 @@
-//! M4 perf gate for the shared-committer workstream.
+//! Perf gate for the shared-committer workstream.
 //!
 //! Drives 4 variants of {durability model × shard count} through the
 //! `GroupCommitter` façade and prints median wall-clock + ops/s for
-//! each. Gates (pre-registered in `shared-committer/DESIGN.md` §9 M4):
+//! each. Gates:
 //!
 //!   RECOVERY    (macOS): 4sh_devglobal / 1sh_perfile ≤ 1.5×
 //!   IMPROVEMENT (macOS): 4sh_perfile  / 4sh_devglobal ≥ 1.5×

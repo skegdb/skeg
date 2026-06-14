@@ -1,4 +1,4 @@
-//! M7 distance-kernel benchmarks.
+//! Distance-kernel benchmarks.
 //!
 //! Two layers:
 //!   `kernel/*`     single-call latency, scalar vs hand-rolled NEON kernel
@@ -157,7 +157,7 @@ fn bench_flat_scan(c: &mut Criterion) {
 //
 // A Vamana greedy walk touches ~1280 nodes scattered across the dataset - not
 // the sequential stream of a flat scan. This measures the per-distance cost
-// under that scattered access. It is the gate for the post-Q10 NEON-int8 /
+// under that scattered access. It is the gate for the NEON-int8 /
 // RaBitQ workaround: M1's int8 prefilter lost because the int8 kernel was no
 // faster than f32 cosine; before committing to RaBitQ this confirms the
 // Hamming kernel keeps its single-call speed in the walk's random-access

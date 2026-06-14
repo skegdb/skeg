@@ -10,7 +10,7 @@
 //! evicts entries first, so `current_bytes` never crosses `budget_bytes`. A
 //! count-based budget cannot bound RAM when value sizes vary (an embedding is
 //! ~4 KB, a scalar a few bytes), which would break the project's RAM-frugal
-//! goal - see OBSERVATIONS Q7.
+//! goal.
 //!
 //! Three structures:
 //!   - **Small** (`small`, ~10% of the budget): newcomers; one-hit wonders die.

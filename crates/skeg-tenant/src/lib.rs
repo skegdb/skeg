@@ -16,7 +16,7 @@
 //! The crate ships as an opt-in dependency. With no resolver wired in,
 //! every operation resolves to `TenantId::ZERO` and the binary behaves
 //! exactly like a single-tenant server. Wiring in one of the resolvers
-//! enables the soft-isolation path described in `FEATURES.md` §multi-tenant.
+//! enables the soft-isolation path for multi-tenant deployments.
 
 pub mod auth;
 pub mod id;

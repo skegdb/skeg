@@ -10,7 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// freed pages mapped - they stay in RSS until memory pressure - so the
 /// transient buffers a streaming-insert consolidation allocates never leave
 /// the process footprint. jemalloc returns decayed pages to the OS on a
-/// timer, which is the foundation of post-Q10 Step 1 (Consolidation Hygiene).
+/// timer, which is the foundation of consolidation hygiene.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -248,20 +248,19 @@ struct Config {
     /// 0.3-0.7% recall@10 for +40-60% QPS. Maps to `SKEG_SPEED=1` so
     /// skeg-vector picks it up at first search.
     speed: bool,
-    /// Opt-in VSEARCH worker pool (Q11, Tier 2 of `optimizations/PLAN.md`).
+    /// Opt-in VSEARCH worker pool.
     /// `0` = inline VSEARCH on the shard thread (default; matches the public
     /// bench numbers). `> 0` = dispatch VSEARCH to tokio's blocking pool so
     /// KV ops do not queue behind multi-ms searches. The integer value is
     /// informational today; a future dedicated pool will honour it.
     workers: usize,
-    /// Opt-in TurboQuant tier paging (Position 2 of the VeloANN paging
-    /// discussion, OBSERVATIONS 2026-05-21). When set, the TurboQuant
+    /// Opt-in TurboQuant tier paging. When set, the TurboQuant
     /// `codes` buffer is persisted to `tier.cache.bin` at open and
     /// memory-mapped: the OS page cache can reclaim tier pages under
     /// pressure instead of pushing anonymous memory to swap. `int8` and
     /// `pq` tiers are unaffected for now. Env var `SKEG_TIER_MMAP`.
     tier_mmap: bool,
-    /// Opt-in graph paging (Position 2.5). When set, `graph.vmn` is opened
+    /// Opt-in graph paging. When set, `graph.vmn` is opened
     /// as a `MappedFile` and the Node array is reinterpreted directly from
     /// the mmap'd bytes - no per-Node parsing into `Vec<Node>` at open,
     /// and OS page cache can reclaim graph pages under pressure. Combines

@@ -1,8 +1,7 @@
 //! Block-SIMD scoring for 4-bit TurboQuant codes.
 //!
-//! Step 1 of the block-kernel plan (`skeg-internal/bench-compare/
-//! BLOCK-KERNEL-PLAN.md`): scalar reference and codes-layout helpers,
-//! gated by an equivalence test against [`tq4_adc_i8_scalar`]. NEON
+//! First stage of the block-kernel work: scalar reference and codes-layout
+//! helpers, gated by an equivalence test against [`tq4_adc_i8_scalar`]. NEON
 //! implementation lands in a follow-up commit; this file documents
 //! the interleaved layout and the reference arithmetic so the NEON
 //! pass can be diffed against a working oracle.

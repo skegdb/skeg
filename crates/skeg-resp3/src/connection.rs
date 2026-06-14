@@ -6,9 +6,9 @@
 //! it folds a parsed `HelloArgs` into the state and returns the response
 //! frame the server should send back.
 //!
-//! Auth credentials in `HELLO ... AUTH user pass` are parsed but ignored in
-//! the pivot - design §5.7. When the v0.1 auth model lands (§7.2) it will
-//! be wired through here without changing the parsing layer.
+//! Auth credentials in `HELLO ... AUTH user pass` are parsed but ignored
+//! for now. When the auth model lands it will be wired through here without
+//! changing the parsing layer.
 
 use crate::command::HelloArgs;
 use crate::frame::Frame;
@@ -51,7 +51,7 @@ impl ConnectionState {
             self.name = Some(name.clone());
         }
         // Auth: parsed for parity with the spec, ignored here. Recording
-        // it now would lock in a schema before §7.2 picks an auth model.
+        // it now would lock in a schema before the auth model is chosen.
         let _ = args.auth.as_ref();
 
         let proto = if self.version.is_resp3() { 3 } else { 2 };
@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn hello_auth_ignored_for_now() {
-        // Parser accepts AUTH; state must NOT record credentials in pivot.
-        // NOTE: this locks in the §5.7 placeholder behaviour.
+        // Parser accepts AUTH; state must NOT record credentials for now.
+        // NOTE: this locks in the placeholder behaviour.
         // If this starts failing, AUTH model wiring likely landed and the
         // design docs must be updated in the same change.
         let mut s = ConnectionState::new(1);

@@ -51,8 +51,8 @@ const VAMANA_L_SEARCH: usize = 100;
 /// rather than linear (a fixed threshold would make bulk growth O(N^2)).
 const DISK_CONSOLIDATE_MIN: usize = 4096;
 
-/// A VINDEX is backed either by an in-RAM `FlatIndex` (M7) or by an on-disk
-/// Vamana graph (`DiskVamanaIndex`, M8) - f32 vectors on disk, graph + int8
+/// A VINDEX is backed either by an in-RAM `FlatIndex` or by an on-disk
+/// Vamana graph (`DiskVamanaIndex`) - f32 vectors on disk, graph + int8
 /// tier in RAM. The choice is made at `VINDEX CREATE`.
 enum VectorBackend {
     Flat(FlatIndex),
@@ -169,7 +169,7 @@ impl VectorBackend {
 /// Bounded inbox capacity per shard. A full inbox makes `send` await, which
 /// propagates backpressure up to the connection handler (it stops reading new
 /// frames) instead of letting queues grow without bound (OOM-safety, not
-/// latency - see OBSERVATIONS Q2/Q6).
+/// latency).
 const SHARD_INBOX_CAPACITY: usize = 4096;
 
 /// Maximum requests a shard processes concurrently. The inbox bounds the
@@ -273,7 +273,7 @@ struct ShardMsg {
     reply: oneshot::Sender<ShardResp>,
 }
 
-// ── VINDEX registry (Q10: disk-backed indexes survive a restart) ──────────────
+// ── VINDEX registry (disk-backed indexes survive a restart) ───────────────────
 //
 // Each shard records its disk-backed VINDEXes in `vindexes.registry`; on
 // startup it reopens them from their `vindex-<name>/` directories. Flat
@@ -377,7 +377,7 @@ fn recover_vindexes(
 //
 // With `read_only` set the shard rejects every mutation and skips background
 // compaction and snapshots: the `--mode serve` path over an offline-built
-// index (PLAN-POST-Q10 Step 1.5).
+// index.
 #[allow(clippy::needless_pass_by_value)]
 fn run_shard(
     shard_id: usize,
@@ -423,8 +423,8 @@ fn run_shard(
         // `!Send` (Rc-backed), so `spawn_local` is required.
         // Caps the number of request tasks running at once on this shard.
         let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_SHARD));
-        // Vector indexes: disk-backed ones are recovered from the registry
-        // (Q10); flat ones are in-RAM and start empty. Shared across the
+        // Vector indexes: disk-backed ones are recovered from the registry;
+        // flat ones are in-RAM and start empty. Shared across the
         // per-request tasks on this single-threaded LocalSet via Rc/RefCell.
         // `Arc<RwLock>` (instead of the previous `Rc<RefCell>`) so the
         // VindexSet is `Send + Sync`: an optional worker pool can dispatch
@@ -558,8 +558,7 @@ async fn process(
     if read_only && is_mutation(&req) {
         return ShardResp::Err("server is in serve mode (read-only)".to_owned());
     }
-    // Optional worker-pool path for VSEARCH (Q11, Tier 2 of
-    // `optimizations/PLAN.md`): when `workers > 0` the search runs on a
+    // Optional worker-pool path for VSEARCH: when `workers > 0` the search runs on a
     // blocking thread so it does not stall queued KV ops on the shard
     // thread. KV ops always stay inline since they finish in microseconds.
     if workers > 0
@@ -1943,7 +1942,7 @@ mod tests {
             .collect()
     }
 
-    // Q10: a disk-backed VINDEX must survive a server restart - its files plus
+    // A disk-backed VINDEX must survive a server restart - its files plus
     // the registry plus the WAL recover the full live set.
     #[tokio::test]
     async fn test_vindex_disk_survives_restart() {

@@ -1,14 +1,14 @@
-//! Fase 0.d (ram-reduction) - skewness del visit count per nodo, gate hot/cold.
+//! Per-node visit-count skew, hot/cold tier gate.
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!
-//! design-hot-cold-tier.md: se il visit count dei nodi durante il greedy walk
-//! e' Pareto-like, un hot set in RAM (~5% nodi) + cold set su disco riduce il
-//! tier. Gate: top 5% dei nodi copre >= 50% delle visite. In piu' la
-//! validazione cross-query: l'hot set identificato su meta' query riconosce
-//! le visite dell'altra meta'?
+//! Hypothesis: if the per-node visit count during the greedy walk is
+//! Pareto-like, a hot set in RAM (~5% of nodes) + a cold set on disk shrinks
+//! the tier. Gate: the top 5% of nodes covers >= 50% of visits. Plus a
+//! cross-query validation: does the hot set identified on half the queries
+//! recognize the visits of the other half?
 //!
-//! Riusa `DiskVamanaIndex::search_node_trace`, le tracce di walk gia' esposte.
+//! Reuses `DiskVamanaIndex::search_node_trace`, the already-exposed walk traces.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -107,7 +107,7 @@ fn cdf_report(label: &str, n: usize, traces: &[Vec<u32>]) {
         }
         println!("  {pct:>9.0}%{cov:>13.1}%");
     }
-    // gate (design-hot-cold-tier.md §3.4)
+    // gate
     let top1 = sorted[..(n / 100).max(1)].iter().sum::<u64>() as f64 / total as f64 * 100.0;
     let verdict = if top1 >= 30.0 {
         "skewness ESTREMA -> hot/cold ideale"

@@ -1,6 +1,6 @@
 //! Protocol version negotiated via HELLO.
 //!
-//! Per `resp3/design-protocol.md` §5.1: new connections default to RESP2.
+//! New connections default to RESP2.
 //! A client opts in to RESP3 by sending `HELLO 3`; the server then encodes
 //! responses with RESP3-only types (map, double, boolean, push, etc).
 

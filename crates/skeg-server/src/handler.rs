@@ -18,7 +18,7 @@ use crate::shard::{ShardError, ShardSet};
 /// Durability applied to writes that do not request one explicitly.
 /// `Kernel` survives a process crash and kernel panic without paying the
 /// `F_FULLFSYNC` cost on every write - the right default for AI workloads
-/// (see `design-write-perf.md` §2.4).
+/// (see `design-write-perf.md`).
 const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 
 pub async fn handle_connection(mut stream: TcpStream, shards: ShardSet) {

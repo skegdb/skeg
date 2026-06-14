@@ -1,22 +1,22 @@
-//! Fase 0.c (ram-reduction) - gate recall PQ come tier di navigazione.
+//! Recall gate for PQ as a navigation tier.
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!
-//! design-pq-tier.md: Product Quantization (codebook k-means, M sotto-vettori,
-//! K centroidi) come tier al posto dell'int8. 16x piu' piccolo. A differenza
-//! di RaBitQ/binary/4-bit (gia' falsificati) PQ e' data-dependent.
+//! Product Quantization (k-means codebook, M sub-vectors, K centroids) as a
+//! tier in place of int8: 16x smaller. Unlike RaBitQ/binary/4-bit (already
+//! falsified), PQ is data-dependent.
 //!
-//! Il gate critico: PQ non deve solo *rankare*, deve *navigare* il greedy
-//! walk del grafo - la barra che ha ucciso binary (0.748) e 4-bit (0.689).
-//! Il walk e' guidato dal proxy PQ, poi re-rank f32, recall@10 vs brute
-//! force. Confronto: f32 (soffitto) / int8 (baseline) / PQ.
+//! The critical gate: PQ must not only *rank*, it must *navigate* the graph's
+//! greedy walk - the bar that killed binary (0.748) and 4-bit (0.689). The walk
+//! is driven by the PQ proxy, then re-ranked in f32, recall@10 vs brute force.
+//! Comparison: f32 (ceiling) / int8 (baseline) / PQ.
 //!
-//! Dataset: mxbai reale 10K (ancora reale, il gate di design-pq-tier.md) +
-//! sintetico a manifold a 100K/1M per la degradazione di scala. uniform-sphere
-//! a 1024-dim NON e' usabile: a scala non e' indicizzabile (il soffitto f32
-//! stesso crolla), confonderebbe il gate.
+//! Dataset: real mxbai 10K (still real, the PQ tier's gate) + synthetic
+//! manifold at 100K/1M for scale degradation. A 1024-dim uniform-sphere is not
+//! usable: it is not indexable at scale (the f32 ceiling itself collapses),
+//! which would muddy the gate.
 //!
-//! Gate: recall@10 PQ >= 0.98 (relativo: PQ deve restare vicino a int8).
+//! Gate: PQ recall@10 >= 0.98 (relative: PQ must stay close to int8).
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 #![allow(clippy::needless_range_loop)]

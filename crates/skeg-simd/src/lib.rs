@@ -4,8 +4,8 @@
 //! dispatch to whichever kernel benchmarks fastest on the target: a hand-rolled
 //! NEON kernel for `cosine_f32` and `hamming_binary` on aarch64, and the
 //! portable scalar kernel for `dot_int8` (LLVM auto-vectorizes its
-//! multiply-accumulate better than baseline NEON without `dotprod`; see
-//! OBSERVATIONS.md M7). Each scalar kernel doubles as the reference oracle for
+//! multiply-accumulate better than baseline NEON without `dotprod`, as
+//! benchmarks confirmed). Each scalar kernel doubles as the reference oracle for
 //! its NEON counterpart.
 //!
 //! unsafe is allowed in this crate (NEON intrinsics + raw-pointer loads);
@@ -238,7 +238,7 @@ pub fn dot_int8(a: &[i8], b: &[i8]) -> i32 {
 }
 
 /// Hardware prefetch hint for the sparse access pattern of the Vamana greedy
-/// walk (Tier 1.d). Suggests the CPU pull the cache line containing `ptr`
+/// walk. Suggests the CPU pull the cache line containing `ptr`
 /// into L1 while it keeps working on something else - hides L2/RAM latency
 /// behind the SIMD compute of the current cosine.
 ///

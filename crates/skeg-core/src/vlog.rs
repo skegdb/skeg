@@ -1313,7 +1313,7 @@ mod tests {
         assert_eq!(v.disk_reads(), 1, "warm hit must not touch disk");
     }
 
-    // ── M5: compaction ───────────────────────────────────────────────────────
+    // ── compaction ───────────────────────────────────────────────────────────
 
     /// Fill segment 0 with `n` keys, then rotate so segment 0 is sealed.
     async fn fill_and_rotate(v: &VLog, n: u64, prefix: &str) {
@@ -1513,7 +1513,7 @@ mod tests {
         }
     }
 
-    // ── M6: index snapshot ───────────────────────────────────────────────────
+    // ── index snapshot ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_snapshot_fast_recovery() {

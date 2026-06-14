@@ -2,7 +2,7 @@
 
 //! TurboQuant Gate 1 - flat scan recall on wiki-100K, dual-distribution.
 //!
-//! Pre-registered (`turboquant/PLAN.md` §4):
+//! Pre-registered gate:
 //!   - hypothesis: TurboQuant 4-bit flat recall@10 >= 0.99 on wiki-100K
 //!   - protocol: brute-force ground truth, top-L candidates from TurboQuant
 //!     scan, re-rank with exact f32 cosine, recall@10

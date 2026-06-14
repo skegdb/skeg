@@ -2,7 +2,7 @@
 
 //! TurboQuant Gate 2 - walk proxy recall on DiskVamana, dual-distribution.
 //!
-//! Pre-registered (`turboquant/PLAN.md` §4):
+//! Pre-registered gate:
 //!   - hypothesis: TurboQuant 4-bit used as graph-walk tier preserves
 //!     recall@10 >= 0.95 (against f32 brute-force ground truth)
 //!   - protocol: build VamanaIndex on f32 corpus; for each query, run a

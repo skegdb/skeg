@@ -1,8 +1,8 @@
-//! Step 7 gate - graph-page cache locality of the Vamana greedy walk, and
-//! whether a BFS-from-medoid node reordering creates the locality paging
-//! needs. Run at N=100K so the cache can hold a query's working set (the
-//! 10K run was confounded: there a 10%-of-graph cache was smaller than one
-//! walk's working set - see OBSERVATIONS).
+//! Graph-page cache locality of the Vamana greedy walk, and whether a
+//! BFS-from-medoid node reordering creates the locality paging needs. Run at
+//! N=100K so the cache can hold a query's working set (the 10K run was
+//! confounded: there a 10%-of-graph cache was smaller than one walk's working
+//! set).
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!

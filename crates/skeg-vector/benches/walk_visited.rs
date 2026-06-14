@@ -1,4 +1,4 @@
-//! Tier 1.a primitive gate microbench: VisitedBitset vs AHashSet on the
+//! Primitive gate microbench: VisitedBitset vs AHashSet on the
 //! Vamana greedy walk access pattern.
 //!
 //! Simulated per-query pattern: ~100 expansions x ~64 neighbours = ~6400
@@ -11,8 +11,7 @@
 //! Measured 2026-05-21: bitset 3.90 us / 6400 ops vs hashset 24.19 us /
 //! 6400 ops = **6.20x** speedup; integration gate (skeg-pq128 100K,
 //! dual-distribution mxbai + MiniLM) passed at +6-8% QPS, -7-9% latency,
-//! recall identical. See OBSERVATIONS.md "Tier 1.a - VisitedBitset" and
-//! `optimizations/PLAN.md` §2.1.
+//! recall identical.
 
 use ahash::AHashSet;
 use criterion::{Criterion, criterion_group, criterion_main};

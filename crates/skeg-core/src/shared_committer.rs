@@ -6,8 +6,8 @@
 //! On a platform where `sync_durable` is a device-wide barrier (Apple
 //! Silicon `F_FULLFSYNC` is the reference case), letting every shard
 //! own its own committer means N concurrent fsync calls all hit the
-//! same hardware barrier and serialize. Slice A measured a regression
-//! going from 1 to 4 shards because of exactly this.
+//! same hardware barrier and serialize. Benchmarking measured a
+//! regression going from 1 to 4 shards because of exactly this.
 //!
 //! [`SharedCommitter`] is a single background task that:
 //! 1. Accepts append requests from every shard on the device.
@@ -86,9 +86,9 @@ enum Msg {
 }
 
 /// Process-wide handle. Cheap to clone, every clone shares the same
-/// background task. Today a single global instance; the design doc
-/// (§ 8 Q-A) leaves a hook for a per-device variant when skeg gains
-/// multi-disk support (T3).
+/// background task. Today a single global instance; the design
+/// leaves a hook for a per-device variant when skeg gains
+/// multi-disk support.
 #[derive(Clone)]
 pub struct SharedCommitter {
     tx: mpsc::Sender<Msg>,
@@ -518,10 +518,10 @@ mod tests {
         assert_eq!(file.sync_count(), 0);
     }
 
-    /// M4 correctness gate: 4 shards drive Power appends concurrently
+    /// Correctness gate: 4 shards drive Power appends concurrently
     /// through one SharedCommitter. After the dust settles every byte
     /// must land at the expected per-file offset. Pins the contract
-    /// the M4 perf bench is measuring against (no point recovering
+    /// the perf bench is measuring against (no point recovering
     /// throughput if data placement breaks under contention).
     #[tokio::test]
     async fn test_four_shards_parallel_power_writes_data_consistent() {
@@ -603,7 +603,7 @@ mod tests {
         );
     }
 
-    /// M5 crash-recovery gate. 100 deterministic iterations driven by
+    /// Crash-recovery gate. 100 deterministic iterations driven by
     /// a seeded xorshift PRNG: each iteration randomises
     /// (shards, writes-per-shard, record bytes), commits every write
     /// at `Durability::Power`, then *drops* every handle (committer

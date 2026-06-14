@@ -1,4 +1,4 @@
-//! G-P2 microbench: parallel pread + cosine rerank vs sequential.
+//! Microbench: parallel pread + cosine rerank vs sequential.
 //!
 //! Emulates the DiskVamanaIndex rerank step on a synthetic `vectors.bin`
 //! file. The corpus is generated once and written to a tempfile; the

@@ -9,7 +9,7 @@
 //!   serialized by the hardware, so the only way to scale write
 //!   throughput with shard count is to aggregate writes from every
 //!   shard into a single fsync. Apple Silicon `F_FULLFSYNC` is the
-//!   reference case (slice A measured a 0.37× regression going from
+//!   reference case (benchmarks measured a 0.37× regression going from
 //!   1 to 4 shards because each shard paid its own barrier).
 //! - [`DurabilityModel::PerFile`]: the durability call only flushes the
 //!   pages of the file descriptor it is called on. N file descriptors

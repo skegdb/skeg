@@ -7,7 +7,7 @@
 //! Mirrors the binary-protocol `handler.rs` but speaks Redis wire (RESP2/RESP3).
 //! New connections default to RESP2 until `HELLO 3` upgrades them.
 //!
-//! Wire commands supported in this iteration (M9 v0.1 KV subset):
+//! Wire commands supported in this iteration (the KV subset):
 //! - `HELLO [version [AUTH user pass] [SETNAME name]]` - protocol negotiation.
 //! - `PING [msg]` / `ECHO msg` - protocol-only.
 //! - `GET key` / `SET key value` / `DEL key [key ...]` / `EXISTS key [key ...]`.

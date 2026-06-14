@@ -1,4 +1,4 @@
-//! Slice D step 1: flat-scan throughput baseline on synthetic data.
+//! Flat-scan throughput baseline on synthetic data.
 //!
 //! Custom main (`harness = false`): prints CSV rows to stdout, one per
 //! (tier, dim, N, threading) cell. Comparison target: turbovec's
@@ -132,7 +132,7 @@ fn main() {
     let tier_names = env_list_string("SKEG_FLAT_TIERS", &["int8", "pq128", "tq2", "tq4", "f32"]);
     let warmup = env_usize("SKEG_FLAT_WARMUP", 32);
 
-    println!("# slice D step 1: flat-scan throughput, synthetic isotropic Gaussian");
+    println!("# flat-scan throughput, synthetic isotropic Gaussian");
     println!(
         "# config: N={n} dims={dims:?} k={k} threads={thread_settings:?} \
          tiers={tier_names:?} warmup={warmup} queries={n_queries}"

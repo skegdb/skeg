@@ -16,7 +16,7 @@
 //! | `=<n>` verbat | bulk string (3-char format tag dropped)     |
 //! | `(<digits>`   | bulk string                                 |
 //!
-//! Driven by `resp3/design-protocol.md` §4 (type table) and §5 (decisions).
+//! The type table and downgrade decisions follow the RESP3 protocol spec.
 
 use bytes::{BufMut, BytesMut};
 

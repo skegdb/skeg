@@ -1,4 +1,4 @@
-//! M8 - memory + performance of in-memory vs on-disk Vamana, measured at
+//! Memory + performance of in-memory vs on-disk Vamana, measured at
 //! 10K, 100K and 1M. Not a Criterion bench: a reporting harness
 //! (`harness = false`).
 //!
@@ -158,7 +158,7 @@ fn measure(
 }
 
 fn main() {
-    eprintln!("M8 Vamana - in-memory vs on-disk, dim={DIM}, k={K}");
+    eprintln!("Vamana - in-memory vs on-disk, dim={DIM}, k={K}");
     eprintln!("inmem/disk MiB = heap_bytes / resident_bytes; rss = process RSS via ps\n");
     println!(
         "{:>6} {:>9} {:>9} {:>11} {:>10} {:>8} {:>9} {:>9} {:>9} {:>9}",

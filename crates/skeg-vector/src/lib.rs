@@ -13,12 +13,12 @@
 
 //! `skeg-vector` - the vector tier.
 //!
-//! M7 ships the flat-scan tier: [`FlatIndex`] holds vectors at f32 precision
+//! The flat-scan tier: [`FlatIndex`] holds vectors at f32 precision
 //! and, for the int8 and binary kinds, a compact [`QuantizedVectors`] form
 //! that a brute-force scan walks fast. A search scans the quantized proxy for
 //! a candidate set, then re-ranks survivors with exact f32 cosine.
 //!
-//! M8 will add the Vamana graph on top of the same vector storage.
+//! The Vamana graph is layered on top of the same vector storage.
 
 mod flat;
 mod quant;

@@ -1,15 +1,15 @@
-//! Fase 0.a (ram-reduction) - degree histogram del grafo Vamana costruito.
+//! Degree histogram of the built Vamana graph.
 //!
 //! Not a Criterion bench: a reporting harness (`harness = false`).
 //!
-//! Step 1 del piano pragmatico (compattazione layout grafo) e' "garantito" come
-//! meccanismo ma la sua magnitudo dipende dalla distribuzione reale dei degree.
-//! Il nodo attuale e' fixed-width: `degree: u32 + [VecId; 64]` = 260 byte,
-//! indipendente dal degree effettivo. Se la maggioranza dei nodi e' vicina a
-//! R=64 il packing rende poco; il risparmio vero viene dai neighbor a 24 bit.
+//! Compacting the graph layout is "guaranteed" as a mechanism, but its
+//! magnitude depends on the real degree distribution. The current node is
+//! fixed-width: `degree: u32 + [VecId; 64]` = 260 bytes, independent of the
+//! actual degree. If most nodes are close to R=64 the packing yields little;
+//! the real saving comes from 24-bit neighbor ids.
 //!
-//! Questa harness costruisce grafi (mxbai reale 10K + sintetico a varie scale),
-//! stampa l'istogramma dei degree e i byte/nodo dei layout alternativi.
+//! This harness builds graphs (real mxbai 10K + synthetic at various scales),
+//! prints the degree histogram and the bytes/node of alternative layouts.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -57,8 +57,7 @@ fn gaussian(rng: &mut StdRng) -> f32 {
 }
 
 /// `n` vectors uniform on the unit sphere - the validated proxy for real
-/// isotropic embeddings (Step 7: real mxbai behaves like uniform, not
-/// clustered).
+/// isotropic embeddings (real mxbai behaves like uniform, not clustered).
 fn uniform_sphere(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Vec::with_capacity(n * dim);
