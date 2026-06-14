@@ -11,12 +11,13 @@ use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
-/// Hard limits for one tenant. `None` means unlimited. Extended in S4 with
-/// `max_disk_bytes`.
+/// Hard limits for one tenant. `None` on a field means unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TenantLimits {
     /// Maximum number of vectors the tenant may store. `None` = unlimited.
     pub max_vectors: Option<u64>,
+    /// Maximum live on-disk KV bytes for the tenant. `None` = unlimited.
+    pub max_disk_bytes: Option<u64>,
 }
 
 /// Admission rejected because it would exceed a tenant's quota.

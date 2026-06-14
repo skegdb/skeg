@@ -733,8 +733,11 @@ async fn kv_set(
         return anon_forgery_error();
     }
     let k = scope_key(tenant, &args[0]);
+    // Disk quota from the pluggable backend; `None` skips enforcement.
+    let disk_limit = ctx.and_then(|b| b.limits(tenant).max_disk_bytes);
     match shards
         .tenant(k.accounting_tenant())
+        .with_disk_limit(disk_limit)
         .set(k.as_bytes(), &args[1], DEFAULT_DURABILITY)
         .await
     {

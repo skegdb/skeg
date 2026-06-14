@@ -200,8 +200,8 @@ pub enum ShardError {
 enum ShardReq {
     /// `(key, tenant)`: tenant `0` is the unscoped default.
     Get(Bytes, u128),
-    /// `(key, value, durability, tenant)`.
-    Set(Bytes, Bytes, Durability, u128),
+    /// `(key, value, durability, tenant, disk_limit)`.
+    Set(Bytes, Bytes, Durability, u128, Option<u64>),
     Del(Bytes, Durability),
     /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
     MgetBatch(Vec<(usize, Bytes)>, u128),
@@ -389,6 +389,7 @@ fn run_shard(
     mmap_tier: bool,
     mmap_graph: bool,
     quota: Arc<crate::quota::TenantVectorQuota>,
+    disk_counter: skeg_core::SharedTenantDisk,
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
@@ -404,7 +405,7 @@ fn run_shard(
     };
 
     rt.block_on(async move {
-        let vlog = match VLog::open(&dir).await {
+        let vlog = match VLog::open_with_shared_disk(&dir, disk_counter).await {
             Ok(v) => v,
             Err(e) => {
                 error!("shard {shard_id}: VLog::open failed: {e}");
@@ -790,8 +791,13 @@ async fn process(
             Ok(v) => ShardResp::Value(v),
             Err(e) => ShardResp::Err(e.to_string()),
         },
-        ShardReq::Set(key, val, dur, tenant) => {
-            match vlog.tenant(tenant).set(&key, &val, dur).await {
+        ShardReq::Set(key, val, dur, tenant, disk_limit) => {
+            match vlog
+                .tenant(tenant)
+                .with_disk_limit(disk_limit)
+                .set(&key, &val, dur)
+                .await
+            {
                 Ok(()) => ShardResp::Done,
                 Err(e) => ShardResp::Err(e.to_string()),
             }
@@ -846,6 +852,9 @@ struct ShardSetInner {
     /// Per-tenant vector counter, shared across shards and consulted on
     /// VSET/VDEL/VINDEX.DROP to enforce `max_vectors`.
     quota: Arc<crate::quota::TenantVectorQuota>,
+    /// Per-tenant live disk-byte counter, shared with every shard's `VLog` so
+    /// the `max_disk_bytes` quota is global per tenant.
+    disk_counter: skeg_core::SharedTenantDisk,
 }
 
 impl Drop for ShardSetInner {
@@ -982,15 +991,28 @@ impl ShardSet {
         // One vector quota shared across all shards: a tenant's vectors are
         // spread over shards by id, so the counter must aggregate cross-shard.
         let quota = Arc::new(crate::quota::TenantVectorQuota::new());
+        // One disk counter shared across all shards, so the disk quota is global
+        // per tenant (a tenant's keys spread over shards by hash).
+        let disk_counter = skeg_core::new_shared_disk();
         for id in 0..n_shards {
             let dir = base_dir.join(format!("shard-{id}"));
             let (tx, rx) = tokio::sync::mpsc::channel::<ShardMsg>(SHARD_INBOX_CAPACITY);
             let quota = quota.clone();
+            let disk_counter = disk_counter.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("skeg-shard-{id}"))
                 .spawn(move || {
                     run_shard(
-                        id, dir, rx, read_only, tier, workers, mmap_tier, mmap_graph, quota,
+                        id,
+                        dir,
+                        rx,
+                        read_only,
+                        tier,
+                        workers,
+                        mmap_tier,
+                        mmap_graph,
+                        quota,
+                        disk_counter,
                     )
                 })?;
             senders.push(tx);
@@ -1002,6 +1024,7 @@ impl ShardSet {
                 handles,
                 n: n_shards,
                 quota,
+                disk_counter,
             }),
         })
     }
@@ -1054,7 +1077,7 @@ impl ShardSet {
         value: &[u8],
         durability: Durability,
     ) -> Result<(), ShardError> {
-        self.set_scoped(key, value, durability, 0).await
+        self.set_scoped(key, value, durability, 0, None).await
     }
 
     async fn set_scoped(
@@ -1063,6 +1086,7 @@ impl ShardSet {
         value: &[u8],
         durability: Durability,
         tenant: u128,
+        disk_limit: Option<u64>,
     ) -> Result<(), ShardError> {
         let shard = shard_for(key, self.inner.n);
         let req = ShardReq::Set(
@@ -1070,6 +1094,7 @@ impl ShardSet {
             Bytes::copy_from_slice(value),
             durability,
             tenant,
+            disk_limit,
         );
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
@@ -1157,6 +1182,7 @@ impl ShardSet {
         ShardTenantView {
             shards: self,
             tenant,
+            disk_limit: None,
         }
     }
 
@@ -1384,6 +1410,17 @@ impl ShardSet {
         self.inner.quota.count(tenant)
     }
 
+    /// Live on-disk KV bytes charged to `tenant`, aggregated across shards.
+    #[must_use]
+    pub fn tenant_disk_bytes(&self, tenant: u128) -> u64 {
+        self.inner
+            .disk_counter
+            .lock()
+            .get(&tenant)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Fetch the stored f32 vector for `id` in `name`. Routes by `id`.
     ///
     /// # Errors
@@ -1485,9 +1522,19 @@ impl ShardSet {
 pub struct ShardTenantView<'a> {
     shards: &'a ShardSet,
     tenant: u128,
+    /// Disk-quota limit applied on `set`. `None` skips enforcement.
+    disk_limit: Option<u64>,
 }
 
 impl ShardTenantView<'_> {
+    /// Apply a disk-quota limit on this view's `set`. An over-limit set is
+    /// rejected before anything is written.
+    #[must_use]
+    pub fn with_disk_limit(mut self, limit: Option<u64>) -> Self {
+        self.disk_limit = limit;
+        self
+    }
+
     /// GET a key, charging any read-path cache insert to this tenant.
     ///
     /// # Errors
@@ -1509,7 +1556,7 @@ impl ShardTenantView<'_> {
         durability: Durability,
     ) -> Result<(), ShardError> {
         self.shards
-            .set_scoped(key, value, durability, self.tenant)
+            .set_scoped(key, value, durability, self.tenant, self.disk_limit)
             .await
     }
 
@@ -1706,6 +1753,56 @@ mod tests {
         assert_eq!(shards.tenant_vector_count(7), 1);
         shards.vset("idx7", 3, v.clone(), 7, lim).await.unwrap();
         assert_eq!(shards.tenant_vector_count(7), 2);
+    }
+
+    /// A scoped key: 16-byte tenant prefix (LE) + raw, as the RESP3 handler
+    /// builds them. The vLog derives the disk tenant from this prefix.
+    fn scoped_key(tenant: u128, raw: &[u8]) -> Vec<u8> {
+        let mut k = tenant.to_le_bytes().to_vec();
+        k.extend_from_slice(raw);
+        k
+    }
+
+    #[tokio::test]
+    async fn test_disk_quota_global_per_tenant() {
+        // G-S4b-1: max_disk_bytes is enforced GLOBALLY per tenant across shards,
+        // not per shard. Each padded record here is 128 bytes; a 300-byte limit
+        // admits exactly 2, regardless of how the 5 keys hash across the shards.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        let lim = Some(300u64);
+        let v = b"v";
+        let mut ok = 0;
+        let mut rejected = 0;
+        for i in 0..5u8 {
+            let k = scoped_key(7, &[b'a' + i]);
+            match shards
+                .tenant(7)
+                .with_disk_limit(lim)
+                .set(&k, v, Durability::Kernel)
+                .await
+            {
+                Ok(()) => ok += 1,
+                Err(_) => rejected += 1,
+            }
+        }
+        assert_eq!(ok, 2, "global limit admits exactly 2 records across shards");
+        assert_eq!(rejected, 3);
+        assert!(shards.tenant_disk_bytes(7) <= 300);
+
+        // A different tenant has its own independent global budget.
+        let k9 = scoped_key(9, b"a");
+        shards
+            .tenant(9)
+            .with_disk_limit(lim)
+            .set(&k9, v, Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(shards.tenant_disk_bytes(9) > 0);
+        assert!(
+            shards.tenant_disk_bytes(7) <= 300,
+            "tenant 9 did not affect 7"
+        );
     }
 
     #[tokio::test]
