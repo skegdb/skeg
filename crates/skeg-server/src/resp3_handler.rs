@@ -541,9 +541,6 @@ fn skeg_quota_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
         Err(crate::tenant::QuotaAdminError::Unsupported) => {
             Frame::Error("ERR backend does not support setting quotas".into())
         }
-        Err(crate::tenant::QuotaAdminError::UnknownTenant) => {
-            Frame::Error("ERR unknown tenant".into())
-        }
     }
 }
 

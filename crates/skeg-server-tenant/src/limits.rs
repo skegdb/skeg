@@ -1,22 +1,17 @@
-//! Persisted per-tenant quota limits: a small sidecar next to `auth.kdb`.
+//! Persisted per-tenant quota limits: a small text sidecar next to `auth.kdb`.
 //!
-//! The engine enforces `max_vectors` and `max_disk_bytes` per tenant; this
-//! store is where an admin's `SKEG.QUOTA.SET` writes them so they survive a
-//! restart. Kept separate from `auth.kdb` so the security-critical auth format
-//! is untouched. Each field is `Option<u64>` (`None` = unlimited).
+//! One line per tenant: `<tenant-id-u128> <max_vectors|*> <max_disk_bytes|*>`.
+//! `*` means unlimited. Kept separate from `auth.kdb` so the security-critical
+//! auth format is untouched. Text so an operator can read/edit it.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"SKEGQUOT";
-const VERSION: u32 = 1;
-
 /// One tenant's limits: `(max_vectors, max_disk_bytes)`, `None` = unlimited.
 pub type Limits = (Option<u64>, Option<u64>);
 
-/// On-disk map of tenant id (16 bytes) to limits. Writes are atomic
-/// (temp file + rename).
+/// On-disk map of tenant id to limits. Writes are atomic (temp + rename).
 #[derive(Debug, Default)]
 pub struct LimitsStore {
     path: PathBuf,
@@ -24,23 +19,29 @@ pub struct LimitsStore {
 }
 
 impl LimitsStore {
-    /// Open the store at `path`, loading it if the file exists. A missing
-    /// file is an empty store (no limits configured yet).
+    /// Open the store at `path`. A missing file is an empty store.
     ///
     /// # Errors
     ///
-    /// Returns an IO error on read failure or a malformed file.
+    /// Returns an IO error on read failure or a malformed line.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut store = Self {
-            path: path.clone(),
-            by_tenant: HashMap::new(),
-        };
-        if path.exists() {
-            let bytes = std::fs::read(&path)?;
-            store.parse_into(&bytes)?;
+        let mut by_tenant = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let mut f = line.split_whitespace();
+                let (Some(t), Some(mv), Some(md), None) = (f.next(), f.next(), f.next(), f.next())
+                else {
+                    return Err(bad("malformed quota line"));
+                };
+                let tid = t
+                    .parse::<u128>()
+                    .map_err(|_| bad("bad tenant id"))?
+                    .to_le_bytes();
+                by_tenant.insert(tid, (parse_opt(mv)?, parse_opt(md)?));
+            }
         }
-        Ok(store)
+        Ok(Self { path, by_tenant })
     }
 
     /// Limits for `tenant` (both `None` if untracked).
@@ -56,64 +57,32 @@ impl LimitsStore {
     /// Returns an IO error if the file cannot be written.
     pub fn set(&mut self, tenant: [u8; 16], limits: Limits) -> io::Result<()> {
         self.by_tenant.insert(tenant, limits);
-        self.save()
-    }
-
-    fn save(&self) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(16 + self.by_tenant.len() * 34);
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&(self.by_tenant.len() as u32).to_le_bytes());
-        for (tid, (mv, md)) in &self.by_tenant {
-            buf.extend_from_slice(tid);
-            push_opt(&mut buf, *mv);
-            push_opt(&mut buf, *md);
-        }
+        let body: String = self
+            .by_tenant
+            .iter()
+            .map(|(t, (mv, md))| {
+                format!("{} {} {}\n", u128::from_le_bytes(*t), opt(*mv), opt(*md))
+            })
+            .collect();
         let tmp = self.path.with_extension("quotas.tmp");
-        std::fs::write(&tmp, &buf)?;
+        std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &self.path)
     }
-
-    fn parse_into(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed quota store");
-        if bytes.len() < 16 || &bytes[0..8] != MAGIC {
-            return Err(bad());
-        }
-        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != VERSION {
-            return Err(bad());
-        }
-        let n = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let mut off = 16usize;
-        for _ in 0..n {
-            if off + 16 + 18 > bytes.len() {
-                return Err(bad());
-            }
-            let mut tid = [0u8; 16];
-            tid.copy_from_slice(&bytes[off..off + 16]);
-            off += 16;
-            let mv = read_opt(&bytes[off..off + 9]);
-            off += 9;
-            let md = read_opt(&bytes[off..off + 9]);
-            off += 9;
-            self.by_tenant.insert(tid, (mv, md));
-        }
-        Ok(())
-    }
 }
 
-/// Encode an `Option<u64>` as a 1-byte present flag plus 8 LE bytes.
-fn push_opt(buf: &mut Vec<u8>, v: Option<u64>) {
-    buf.push(u8::from(v.is_some()));
-    buf.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
+fn bad(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
-/// Decode a 9-byte `[flag][u64 LE]` into an `Option<u64>`.
-fn read_opt(b: &[u8]) -> Option<u64> {
-    if b[0] == 0 {
-        None
-    } else {
-        Some(u64::from_le_bytes(b[1..9].try_into().unwrap()))
+fn opt(v: Option<u64>) -> String {
+    v.map_or_else(|| "*".to_string(), |x| x.to_string())
+}
+
+fn parse_opt(s: &str) -> io::Result<Option<u64>> {
+    if s == "*" {
+        return Ok(None);
     }
+    s.parse::<u64>().map(Some).map_err(|_| bad("bad limit"))
 }
 
 #[cfg(test)]

@@ -122,11 +122,10 @@ pub trait TenantBackend: Send + Sync {
     }
 }
 
-/// Why an admin quota write could not be applied.
+/// Why an admin quota write could not be applied. The dispatcher resolves the
+/// tenant before calling `set_limits`, so "unknown tenant" never reaches here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaAdminError {
     /// The backend has no writable per-tenant limits store.
     Unsupported,
-    /// The named tenant does not exist.
-    UnknownTenant,
 }
