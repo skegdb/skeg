@@ -92,4 +92,41 @@ pub trait TenantBackend: Send + Sync {
         let _ = id;
         crate::quota::TenantLimits::default()
     }
+
+    /// True if `id` may run admin commands (`SKEG.QUOTA.SET/GET` on other
+    /// tenants). Default `false`: no tenant is an admin.
+    fn is_admin(&self, id: TenantId) -> bool {
+        let _ = id;
+        false
+    }
+
+    /// Resolve a tenant name to its id, if such a tenant exists. Used by the
+    /// admin quota commands, which target a tenant by name. Default `None`.
+    fn resolve_tenant(&self, name: &str) -> Option<TenantId> {
+        let _ = name;
+        None
+    }
+
+    /// Set hard limits for `id`. Default: unsupported (no writable store).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuotaAdminError`] if the backend cannot store limits.
+    fn set_limits(
+        &self,
+        id: TenantId,
+        limits: crate::quota::TenantLimits,
+    ) -> Result<(), QuotaAdminError> {
+        let _ = (id, limits);
+        Err(QuotaAdminError::Unsupported)
+    }
+}
+
+/// Why an admin quota write could not be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaAdminError {
+    /// The backend has no writable per-tenant limits store.
+    Unsupported,
+    /// The named tenant does not exist.
+    UnknownTenant,
 }

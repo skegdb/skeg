@@ -30,7 +30,7 @@ pub use quota::{TenantLimits, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
 use skeg_vector::QuantKind;
-pub use tenant::{AnonymousPolicy, TenantBackend, TenantId};
+pub use tenant::{AnonymousPolicy, QuotaAdminError, TenantBackend, TenantId};
 
 pub struct Server {
     listener: TcpListener,
