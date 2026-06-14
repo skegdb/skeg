@@ -60,9 +60,7 @@ impl LimitsStore {
         let body: String = self
             .by_tenant
             .iter()
-            .map(|(t, (mv, md))| {
-                format!("{} {} {}\n", u128::from_le_bytes(*t), opt(*mv), opt(*md))
-            })
+            .map(|(t, (mv, md))| format!("{} {} {}\n", u128::from_le_bytes(*t), opt(*mv), opt(*md)))
             .collect();
         let tmp = self.path.with_extension("quotas.tmp");
         std::fs::write(&tmp, body)?;

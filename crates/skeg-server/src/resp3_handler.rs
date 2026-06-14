@@ -516,7 +516,9 @@ fn admin_target<'a>(
     ctx: Option<&'a Arc<dyn TenantBackend>>,
 ) -> Result<(&'a Arc<dyn TenantBackend>, TenantId), Frame> {
     let Some(backend) = ctx else {
-        return Err(Frame::Error("ERR multi-tenant backend not configured".into()));
+        return Err(Frame::Error(
+            "ERR multi-tenant backend not configured".into(),
+        ));
     };
     if !backend.is_admin(caller) {
         return Err(Frame::Error("ERR admin privileges required".into()));
