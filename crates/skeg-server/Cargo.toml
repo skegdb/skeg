@@ -28,7 +28,7 @@ path = "src/bin/skeg-server-resp3.rs"
 skeg-proto = { path = "../skeg-proto", version = "0.1" }
 skeg-core = { path = "../skeg-core", version = "0.3" }
 skeg-platform = { path = "../skeg-platform", version = "0.1" }
-skeg-vector = { path = "../skeg-vector", version = "0.1" }
+skeg-vector = { path = "../skeg-vector", version = "0.1.4" }
 skeg-resp3 = { path = "../skeg-resp3", version = "0.2" }
 skeg-telemetry = { path = "../skeg-telemetry", version = "0.2" }
 socket2 = "0.5"
