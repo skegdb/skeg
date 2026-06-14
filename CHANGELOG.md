@@ -7,7 +7,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
-## [Unreleased]
+## [0.4.0] - 2026-06-14
 
 ### Added
 
@@ -27,12 +27,31 @@ repository.
   `SharedTenantDisk`, `new_shared_disk` (skeg-core); `TenantLimits`,
   `TenantVectorQuota` (skeg-server).
 
+- **`SKEG.QUOTA.SET` / `SKEG.QUOTA.GET` admin commands.** An operator can
+  set a tenant's quotas at runtime over RESP3:
+  `SKEG.QUOTA.SET <tenant> <max_vectors> <max_disk_bytes>` (`*` = unlimited),
+  and read them back with `SKEG.QUOTA.GET <tenant>`. The commands require
+  an admin connection; the multi-tenant binary designates the admin tenant
+  with `--admin-tenant <name>` and persists the limits in a sidecar next to
+  `auth.kdb`, so they survive a restart.
+
 ### Changed
 
 - **Single-tenant and anonymous traffic is unchanged.** With no limit
   configured nothing is counted and the write path is byte-identical to
   before; the per-tenant accounting adds no measurable overhead on the
   single-tenant path.
+
+- **`skeg_core::Error` and `skeg_resp3::Command` gained variants**
+  (`Error::DiskQuota`; `Command::SkegQuotaSet` / `SkegQuotaGet`). Code that
+  matches these enums with a wildcard arm is unaffected; an exhaustive
+  match must add the new arms. This is why `skeg-core` and `skeg-resp3`
+  take a breaking version bump.
+
+### Versions bumped
+
+- `skeg-core` 0.3.0, `skeg-resp3` 0.2.0, `skeg-server` 0.4.0,
+  `skeg-server-tenant` 0.2.0, `skeg-vector` 0.1.4
 
 ## [0.3.8] - 2026-06-09
 
