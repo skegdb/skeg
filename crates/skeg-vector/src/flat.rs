@@ -154,6 +154,29 @@ impl FlatIndex {
         }
     }
 
+    /// Exact top-`k` `(id, cosine)` over just the given candidate `ids`, the
+    /// brute-force path a filtered search takes once a predicate has narrowed
+    /// the corpus to `ids`. Non-live or unknown ids are skipped. Full-precision
+    /// f32 cosine, so the result is exact, not an ANN approximation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not equal the index dimension.
+    #[must_use]
+    pub fn score_ids(&self, query: &[f32], ids: &[u64], k: usize) -> Vec<(u64, f32)> {
+        assert_eq!(query.len(), self.dim, "query dim mismatch");
+        let mut scored: Vec<(u64, f32)> = ids
+            .iter()
+            .filter_map(|&id| {
+                let &row = self.id_to_row.get(&id)?;
+                self.live.contains(row).then(|| (id, self.cosine(query, row)))
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(k);
+        scored
+    }
+
     /// Every live (non-tombstoned) vector id. Used to reclaim per-id sidecar
     /// state (e.g. payload blobs) when the whole index is dropped.
     #[must_use]

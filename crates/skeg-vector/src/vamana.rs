@@ -1458,6 +1458,26 @@ impl DiskVamanaIndex {
         out
     }
 
+    /// Exact top-`k` `(id, cosine)` over just the candidate `ids`, the
+    /// brute-force path a filtered search takes once a predicate has narrowed
+    /// the corpus. Full-precision f32 cosine (one disk read per main-resident
+    /// id), so the result is exact. Non-live or unknown ids are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading a stored vector fails.
+    pub fn score_ids(&self, query: &[f32], ids: &[u64], k: usize) -> io::Result<Vec<(u64, f32)>> {
+        let mut scored: Vec<(u64, f32)> = Vec::new();
+        for &id in ids {
+            if let Some(v) = self.get(id)? {
+                scored.push((id, cosine_f32(query, &v)));
+            }
+        }
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(k);
+        Ok(scored)
+    }
+
     /// Insert or overwrite the vector for `id`. The vector lands in the in-RAM
     /// delta and is appended to the WAL; [`consolidate`](Self::consolidate)
     /// folds it into the graph.

@@ -24,7 +24,7 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
 
-use crate::payload::{PayloadIndex, parse_fields};
+use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -179,6 +179,14 @@ impl VectorBackend {
         }
     }
 
+    /// Exact top-`k` over a filter's candidate ids (full-precision cosine).
+    fn score_ids(&self, query: &[f32], ids: &[u64], k: usize) -> std::io::Result<Vec<(u64, f32)>> {
+        match self {
+            VectorBackend::Flat(i) => Ok(i.score_ids(query, ids, k)),
+            VectorBackend::Disk(i) => i.score_ids(query, ids, k),
+        }
+    }
+
     fn search(
         &mut self,
         query: &[f32],
@@ -281,6 +289,9 @@ enum ShardReq {
         tenant: u128,
         /// When true, attach each hit's stored payload to the response.
         want_payload: bool,
+        /// Optional payload filter. When set, the search is the exact
+        /// brute-force over the matching id set instead of the ANN walk.
+        filter: Option<Filter>,
     },
 }
 
@@ -655,6 +666,7 @@ async fn process(
             l_search,
             tenant,
             want_payload,
+            filter,
         } = req
     {
         // Look up + clone the per-vindex Arc on the shard thread; the
@@ -676,9 +688,16 @@ async fn process(
                     query.len()
                 ));
             }
-            idx.backend
-                .search(&query, k, l_search)
-                .map_err(|e| format!("vsearch failed: {e}"))
+            if let Some(f) = &filter {
+                let s: Vec<u64> = f.evaluate(&idx.payload).into_iter().collect();
+                idx.backend
+                    .score_ids(&query, &s, k)
+                    .map_err(|e| format!("vsearch failed: {e}"))
+            } else {
+                idx.backend
+                    .search(&query, k, l_search)
+                    .map_err(|e| format!("vsearch failed: {e}"))
+            }
         });
         let hits = match join.await {
             Ok(Ok(hits)) => hits,
@@ -927,13 +946,14 @@ async fn process(
             l_search,
             tenant,
             want_payload,
+            filter,
         } => {
             let entry = vindexes.read().get(&name).cloned();
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
-                    // Run the walk under the lock, then drop the guard before
-                    // any payload `await`.
+                    // Run the walk (or filtered brute-force) under the lock,
+                    // then drop the guard before any payload `await`.
                     let search_result = {
                         let mut idx = arc.write();
                         if idx.backend.dim() != query.len() {
@@ -942,6 +962,13 @@ async fn process(
                                 idx.backend.dim(),
                                 query.len()
                             ))
+                        } else if let Some(f) = &filter {
+                            // Materialise the matching id set from the payload
+                            // index, then score exactly over just those ids.
+                            let s: Vec<u64> = f.evaluate(&idx.payload).into_iter().collect();
+                            idx.backend
+                                .score_ids(&query, &s, k)
+                                .map_err(|e| format!("vsearch failed: {e}"))
                         } else {
                             idx.backend
                                 .search(&query, k, l_search)
@@ -1654,6 +1681,7 @@ impl ShardSet {
         l_search: u32,
         tenant: u128,
         want_payload: bool,
+        filter: Option<Filter>,
     ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
         let mut pending = Vec::with_capacity(self.inner.n);
         for sender in &self.inner.senders {
@@ -1665,6 +1693,7 @@ impl ShardSet {
                 l_search,
                 tenant,
                 want_payload,
+                filter: filter.clone(),
             };
             sender
                 .send(ShardMsg { req, reply: tx })
@@ -1757,6 +1786,8 @@ impl ShardTenantView<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -2148,7 +2179,7 @@ mod tests {
         // Restart: a fresh ShardSet on the same dir recovers the disk VINDEX
         // from the registry + WAL.
         let shards = ShardSet::open(&base, 4).unwrap();
-        let hits = shards.vsearch("persist", tvec(89), 5, 0, 0, false).await.unwrap();
+        let hits = shards.vsearch("persist", tvec(89), 5, 0, 0, false, None).await.unwrap();
         assert_eq!(hits[0].0, 88, "disk VINDEX must be recovered after restart");
         // A flat VINDEX, by contrast, is in-RAM and would not survive - so the
         // recovered set contains exactly the disk-backed index.
@@ -2181,7 +2212,7 @@ mod tests {
 
         // WITHPAYLOAD: each id carries its exact blob.
         let hits = shards
-            .vsearch("idx", tvec(2), 10, 0, 0, true)
+            .vsearch("idx", tvec(2), 10, 0, 0, true, None)
             .await
             .unwrap();
         assert_eq!(payload_of(&hits, 1), Some(&empty[..]));
@@ -2190,7 +2221,7 @@ mod tests {
 
         // Without the flag: no payload attached at all.
         let plain = shards
-            .vsearch("idx", tvec(2), 10, 0, 0, false)
+            .vsearch("idx", tvec(2), 10, 0, 0, false, None)
             .await
             .unwrap();
         assert!(plain.iter().all(|h| h.2.is_none()));
@@ -2217,7 +2248,7 @@ mod tests {
         }
         let shards = ShardSet::open(&base, 2).unwrap();
         let hits = shards
-            .vsearch("persist", tvec(11), 10, 0, 0, true)
+            .vsearch("persist", tvec(11), 10, 0, 0, true, None)
             .await
             .unwrap();
         assert_eq!(payload_of(&hits, 10), Some(&b"keep"[..]));
@@ -2237,10 +2268,10 @@ mod tests {
             .await
             .unwrap();
 
-        let as7 = shards.vsearch("idx", tvec(2), 5, 0, 7, true).await.unwrap();
+        let as7 = shards.vsearch("idx", tvec(2), 5, 0, 7, true, None).await.unwrap();
         assert_eq!(payload_of(&as7, 1), Some(&b"tenant-7-secret"[..]));
 
-        let as9 = shards.vsearch("idx", tvec(2), 5, 0, 9, true).await.unwrap();
+        let as9 = shards.vsearch("idx", tvec(2), 5, 0, 9, true, None).await.unwrap();
         assert!(as9.iter().any(|h| h.0 == 1), "vector is shared at this layer");
         assert_eq!(payload_of(&as9, 1), None, "tenant 9 must not read tenant 7's payload");
     }
@@ -2261,8 +2292,91 @@ mod tests {
         // Recreate and re-insert the same id with NO payload.
         shards.vindex_create("idx", 64, 0, 0).await.unwrap();
         shards.vset("idx", 1, tvec(2), 0, None, None).await.unwrap();
-        let hits = shards.vsearch("idx", tvec(2), 5, 0, 0, true).await.unwrap();
+        let hits = shards.vsearch("idx", tvec(2), 5, 0, 0, true, None).await.unwrap();
         assert_eq!(payload_of(&hits, 1), None, "dropped payload must not resurface");
+    }
+
+    fn flt(s: &str) -> Option<crate::payload::Filter> {
+        Some(crate::payload::parse_filter(s).unwrap())
+    }
+
+    fn ids_of(hits: &[(u64, f32, Option<Bytes>)]) -> BTreeSet<u64> {
+        hits.iter().map(|h| h.0).collect()
+    }
+
+    // A FILTER returns the exact nearest among only the matching ids, not the
+    // global nearest minus non-matches. id 1 is the global nearest (the query is
+    // its own vector) but belongs to `bob`; a `user = alice` filter must return
+    // alice's vectors and exclude id 1 entirely.
+    #[tokio::test]
+    async fn test_filter_exact_over_subset() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        let set = |id: u64, who: &'static [u8]| {
+            let s = &shards;
+            async move {
+                s.vset("idx", id, tvec(id), 0, None, Some(Bytes::from_static(who)))
+                    .await
+                    .unwrap();
+            }
+        };
+        set(1, b"user=bob").await;
+        set(2, b"user=alice type=doc").await;
+        set(3, b"user=alice type=img").await;
+
+        // Query == id 1's vector, so id 1 is the global nearest.
+        let global = shards.vsearch("idx", tvec(1), 10, 0, 0, false, None).await.unwrap();
+        assert_eq!(ids_of(&global).iter().next(), Some(&1), "id 1 is global nearest");
+
+        // user = alice excludes id 1 (bob) and returns alice's two, exactly.
+        let alice = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("user = alice"))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&alice), BTreeSet::from([2, 3]));
+
+        // AND narrows further; an empty match yields zero hits.
+        let one = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("user = alice AND type = doc"))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&one), BTreeSet::from([2]));
+        let none = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("user = nobody"))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    // VDEL drops an id from the payload index, so a later filtered search no
+    // longer returns it; an overwrite VSET replaces the id's fields.
+    #[tokio::test]
+    async fn test_filter_index_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        shards
+            .vset("idx", 1, tvec(1), 0, None, Some(Bytes::from_static(b"k=a")))
+            .await
+            .unwrap();
+        shards
+            .vset("idx", 2, tvec(2), 0, None, Some(Bytes::from_static(b"k=a")))
+            .await
+            .unwrap();
+
+        // Overwrite id 2 to k=b: it leaves the k=a set.
+        shards
+            .vset("idx", 2, tvec(2), 0, None, Some(Bytes::from_static(b"k=b")))
+            .await
+            .unwrap();
+        let a = shards.vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a")).await.unwrap();
+        assert_eq!(ids_of(&a), BTreeSet::from([1]));
+
+        // VDEL id 1: the k=a set is now empty.
+        assert!(shards.vdel("idx", 1, 0).await.unwrap());
+        let a2 = shards.vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a")).await.unwrap();
+        assert!(a2.is_empty());
     }
 
     /// Two VSEARCH callers hitting **different** vindexes on the same
@@ -2326,12 +2440,12 @@ mod tests {
         let t = std::time::Instant::now();
         let h1 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s1.vsearch("a", q1.clone(), 10, 0, 0, false).await.unwrap();
+                let _ = s1.vsearch("a", q1.clone(), 10, 0, 0, false, None).await.unwrap();
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s2.vsearch("a", q2.clone(), 10, 0, 0, false).await.unwrap();
+                let _ = s2.vsearch("a", q2.clone(), 10, 0, 0, false, None).await.unwrap();
             }
         });
         h1.await.unwrap();
@@ -2346,12 +2460,12 @@ mod tests {
         let t = std::time::Instant::now();
         let h1 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s1.vsearch("a", q1.clone(), 10, 0, 0, false).await.unwrap();
+                let _ = s1.vsearch("a", q1.clone(), 10, 0, 0, false, None).await.unwrap();
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s2.vsearch("b", q2.clone(), 10, 0, 0, false).await.unwrap();
+                let _ = s2.vsearch("b", q2.clone(), 10, 0, 0, false, None).await.unwrap();
             }
         });
         h1.await.unwrap();

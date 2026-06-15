@@ -114,7 +114,8 @@ pub enum Command {
     SkegVdel {
         args: Vec<Bytes>,
     },
-    /// `SKEG.VSEARCH name k l_search vector [WITHPAYLOAD]`. Arity 4 or 5.
+    /// `SKEG.VSEARCH name k l_search vector [WITHPAYLOAD] [FILTER expr]`.
+    /// Arity 4 to 7; the handler validates the optional tail tokens.
     SkegVsearch {
         args: Vec<Bytes>,
     },
@@ -310,11 +311,13 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             Ok(Command::SkegVdel { args })
         }
         "VSEARCH" => {
-            // `name k l_search vector` or the same with a trailing WITHPAYLOAD.
-            if args.len() != 4 && args.len() != 5 {
+            // `name k l_search vector` plus optional trailing `WITHPAYLOAD`
+            // and/or `FILTER <expr>` (in either order); the handler validates
+            // the tail tokens.
+            if !(4..=7).contains(&args.len()) {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.VSEARCH",
-                    want: "name k l_search vector [WITHPAYLOAD]",
+                    want: "name k l_search vector [WITHPAYLOAD] [FILTER expr]",
                 });
             }
             Ok(Command::SkegVsearch { args })
@@ -1234,7 +1237,7 @@ mod tests {
         let err = parse_command(arr(&[b"SKEG.VSEARCH", b"x"])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector [WITHPAYLOAD]"
+            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector [WITHPAYLOAD] [FILTER expr]"
         );
     }
 

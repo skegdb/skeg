@@ -30,6 +30,7 @@ use skeg_resp3::{
     parse_command,
 };
 
+use crate::payload::parse_filter;
 use crate::shard::ShardSet;
 use crate::tenant::{AnonymousPolicy, TenantBackend, TenantId};
 
@@ -583,10 +584,10 @@ fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
     ),
 )]
 async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
-    if args.len() != 4 && args.len() != 5 {
+    if !(4..=7).contains(&args.len()) {
         return Frame::Error(
             "ERR wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector \
-             [WITHPAYLOAD]"
+             [WITHPAYLOAD] [FILTER expr]"
                 .into(),
         );
     }
@@ -606,15 +607,34 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
         Ok(v) => v,
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
-    // Optional trailing WITHPAYLOAD: attach each hit's stored blob.
-    let want_payload = if args.len() == 5 {
-        if !args[4].eq_ignore_ascii_case(b"WITHPAYLOAD") {
-            return Frame::Error("ERR SKEG.VSEARCH expected WITHPAYLOAD as the 5th argument".into());
+    // Optional tail: `WITHPAYLOAD` and/or `FILTER <expr>`, in either order.
+    let mut want_payload = false;
+    let mut filter = None;
+    let mut i = 4;
+    while i < args.len() {
+        if args[i].eq_ignore_ascii_case(b"WITHPAYLOAD") {
+            want_payload = true;
+            i += 1;
+        } else if args[i].eq_ignore_ascii_case(b"FILTER") {
+            let Some(expr) = args.get(i + 1) else {
+                return Frame::Error("ERR SKEG.VSEARCH FILTER needs an expression".into());
+            };
+            let expr = match parse_utf8_arg(expr, "filter") {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            match parse_filter(expr) {
+                Ok(f) => filter = Some(f),
+                Err(e) => return Frame::Error(format!("ERR bad FILTER: {e}")),
+            }
+            i += 2;
+        } else {
+            return Frame::Error(format!(
+                "ERR unexpected SKEG.VSEARCH argument; want WITHPAYLOAD or FILTER, got '{}'",
+                String::from_utf8_lossy(&args[i])
+            ));
         }
-        true
-    } else {
-        false
-    };
+    }
     let span = tracing::Span::current();
     span.record("vindex", raw_name);
     span.record("k", k);
@@ -622,7 +642,15 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
     span.record("vector_dim", query.len());
     let scoped = scoped_vindex_name(tenant, raw_name);
     match shards
-        .vsearch(&scoped, query, k, l_search, tenant_u128(tenant), want_payload)
+        .vsearch(
+            &scoped,
+            query,
+            k,
+            l_search,
+            tenant_u128(tenant),
+            want_payload,
+            filter,
+        )
         .await
     {
         Ok(hits) => {
@@ -1139,6 +1167,80 @@ mod tests {
         )
         .await;
         assert!(matches!(bad, Frame::Error(_)));
+    }
+
+    // End-to-end through the RESP3 handler: VSET ... PAYLOAD then
+    // VSEARCH ... FILTER returns only the matching ids (surface is callable).
+    #[tokio::test]
+    async fn vsearch_filter_selects_matching_ids() {
+        let (_dir, shards) = fresh_shards().await;
+        let t = TenantId::ZERO;
+        let created = skeg_vindex_create(&args(&["idx", "2", "f32", "flat"]), &shards, t).await;
+        assert!(matches!(created, Frame::Simple(ref s) if s == "OK"));
+
+        for (id, who) in [("1", "user=bob"), ("2", "user=alice"), ("3", "user=alice")] {
+            let set = skeg_vset(
+                &[
+                    Bytes::from_static(b"idx"),
+                    Bytes::copy_from_slice(id.as_bytes()),
+                    vec_arg(&[1.0, 0.0]),
+                    Bytes::from_static(b"PAYLOAD"),
+                    Bytes::copy_from_slice(who.as_bytes()),
+                ],
+                &shards,
+                t,
+                None,
+            )
+            .await;
+            assert!(matches!(set, Frame::Simple(ref s) if s == "OK"));
+        }
+
+        let resp = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"10"),
+                Bytes::from_static(b"0"),
+                vec_arg(&[1.0, 0.0]),
+                Bytes::from_static(b"FILTER"),
+                Bytes::from_static(b"user = alice"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        match resp {
+            // Two alice hits as [id, score] pairs; bob's id 1 excluded.
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 4);
+                let ids: Vec<&[u8]> = items
+                    .iter()
+                    .step_by(2)
+                    .map(|f| match f {
+                        Frame::Bulk(b) => &b[..],
+                        other => panic!("expected id bulk, got {other:?}"),
+                    })
+                    .collect();
+                assert!(ids.contains(&&b"2"[..]) && ids.contains(&&b"3"[..]));
+                assert!(!ids.contains(&&b"1"[..]), "bob's id 1 must be filtered out");
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+
+        // A malformed filter is a clean error, not a panic.
+        let bad = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"10"),
+                Bytes::from_static(b"0"),
+                vec_arg(&[1.0, 0.0]),
+                Bytes::from_static(b"FILTER"),
+                Bytes::from_static(b"user =="),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        assert!(matches!(bad, Frame::Error(ref e) if e.contains("bad FILTER")));
     }
 
     #[tokio::test]

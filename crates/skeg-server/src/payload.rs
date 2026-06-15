@@ -99,7 +99,7 @@ impl PayloadIndex {
 
 /// A filter over payload fields. MVP grammar: AND of equality / membership
 /// predicates. OR, NOT, and range predicates come later.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     Eq(String, Value),
     In(String, Vec<Value>),
