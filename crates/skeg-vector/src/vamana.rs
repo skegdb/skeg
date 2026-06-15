@@ -1660,8 +1660,10 @@ impl DiskVamanaIndex {
             } else {
                 base.max(k)
             };
+            // Re-rank budget: how many candidates get an exact f32 disk read.
+            // Bounded for both modes so latency tracks `k`, not `|S|`.
             let rerank = if filtered {
-                list_size
+                (k * 8).max(64)
             } else {
                 (k * 4).max(32).min(list_size)
             };
@@ -1704,55 +1706,78 @@ impl DiskVamanaIndex {
                     && !self.delta.contains_key(&id)
                     && matches.is_none_or(|m| m(id))
             };
-            let admit_ref: Option<&dyn Fn(VecId) -> bool> =
-                if filtered { Some(&admit) } else { None };
-            let list = {
-                let _g = walk_span.enter();
-                let list = greedy_search(
-                    &seed_rows,
-                    list_size,
-                    early,
-                    |id| -(self.quant.proxy(id as usize, &code) as f32),
-                    |id| self.nodes[id as usize].slice().iter().copied().collect(),
-                    admit_ref,
-                    &mut visited,
-                    &mut seen,
-                    None,
-                );
-                walk_span.record("visited", visited.iter().count());
-                walk_span.record("returned", list.iter().count());
-                list
+            let dist = |id: VecId| -(self.quant.proxy(id as usize, &code) as f32);
+            let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
+                self.nodes[id as usize].slice().iter().copied().collect()
             };
+            // Collect candidate rows. A plain search does one walk. A filtered
+            // search does TWO and unions them, because the two cover opposite
+            // metadata shapes:
+            //   - admit-gated (only matching nodes admitted): recovers clustered
+            //     matches a query-ranked frontier would evict;
+            //   - navigate-all then filter at rerank: recovers scattered matches
+            //     whose matching subgraph is disconnected, so admit-gating stalls.
+            let mut cand: Vec<(f32, VecId)> = Vec::new();
+            {
+                let _g = walk_span.enter();
+                if filtered {
+                    let la = greedy_search(
+                        &seed_rows, list_size, None, dist, nbrs, Some(&admit),
+                        &mut visited, &mut seen, None,
+                    );
+                    cand.extend(la.iter());
+                    let lb = greedy_search(
+                        &[self.medoid], list_size, None, dist, nbrs, None,
+                        &mut visited, &mut seen, None,
+                    );
+                    cand.extend(lb.iter());
+                } else {
+                    let l = greedy_search(
+                        &seed_rows, list_size, early, dist, nbrs, None,
+                        &mut visited, &mut seen, None,
+                    );
+                    cand.extend(l.iter());
+                }
+                walk_span.record("visited", visited.iter().count());
+                walk_span.record("returned", cand.len());
+            }
+            // Closest-by-proxy first, so the bounded re-rank reads the best
+            // matching candidates (and skips non-matching without a disk read).
+            cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             let rerank_span = tracing::info_span!(
                 "vsearch.rerank",
-                candidates = tracing::field::Empty,
+                candidates = cand.len(),
                 disk_reads = tracing::field::Empty,
                 skipped = tracing::field::Empty,
             );
             let _rg = rerank_span.enter();
             let mut disk_reads: usize = 0;
             let mut skipped: usize = 0;
-            let mut candidates: usize = 0;
-            for (_, vec_id) in list.iter().take(rerank) {
-                candidates += 1;
+            let mut reranked_ids: AHashSet<u64> = AHashSet::new();
+            for (_, vec_id) in cand {
+                if disk_reads >= rerank {
+                    break;
+                }
                 let id = self.ids[vec_id as usize];
-                // Skip if tombstoned or superseded by a delta entry.
                 if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
                     skipped += 1;
                     continue;
                 }
-                // Filtered walk: drop non-matching ids before the disk read.
+                // Drop non-matching ids (from the navigate-all walk) pre-read.
                 if let Some(m) = matches
                     && !m(id)
                 {
                     skipped += 1;
                     continue;
                 }
+                // Dedup: both walks can surface the same row.
+                if !reranked_ids.insert(id) {
+                    continue;
+                }
                 let v = self.read_vector(vec_id)?;
                 disk_reads += 1;
                 scored.push((OrderedFloat(cosine_f32(query, &v)), id));
             }
-            rerank_span.record("candidates", candidates);
             rerank_span.record("disk_reads", disk_reads);
             rerank_span.record("skipped", skipped);
         }
