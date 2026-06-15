@@ -34,6 +34,11 @@ const ENTRY_OVERHEAD: usize = 64;
 /// Ghost queue size, in fingerprints (8 bytes each -> ~512 KiB max).
 const GHOST_CAPACITY: usize = 1 << 16;
 
+/// Max consecutive under-share entries Main eviction will skip while looking for
+/// an over-share victim, before falling back to plain FIFO. Bounds the fairness
+/// cost per eviction and guarantees termination.
+const MAX_FAIR_SKIPS: u32 = 16;
+
 struct CacheEntry<V> {
     value: V,
     /// Bytes this entry charges against the budget.
@@ -195,12 +200,27 @@ impl<V: Clone> S3Fifo<V> {
     /// Bytes currently charged to `tenant` (0 if the tenant holds nothing).
     #[must_use]
     pub fn charged_bytes(&self, tenant: u128) -> usize {
-        let tenant = tenant as u64;
+        self.tenant_charged(tenant as u64)
+    }
+
+    /// Internal `u64`-keyed read used on the eviction hot path.
+    fn tenant_charged(&self, tenant: u64) -> usize {
         if tenant == 0 {
             self.tenant0_bytes
         } else {
             self.per_tenant.get(&tenant).copied().unwrap_or(0)
         }
+    }
+
+    /// Equal fair-share target per active tenant: `budget / active_tenants`.
+    fn share_target(&self) -> usize {
+        let active = self.per_tenant.len() + usize::from(self.tenant0_bytes > 0);
+        self.budget_bytes / active.max(1)
+    }
+
+    /// True if any tenant holds more than `target` (its fair share).
+    fn has_over_share(&self, target: usize) -> bool {
+        self.tenant0_bytes > target || self.per_tenant.values().any(|&b| b > target)
     }
 
     /// Remove `key`. Returns `true` if it was cached.
@@ -302,8 +322,19 @@ impl<V: Clone> S3Fifo<V> {
         false
     }
 
-    /// Evict from Main, giving touched entries a second chance.
+    /// Evict from Main, giving touched entries a second chance, and (under real
+    /// multi-tenancy) biasing the victim toward tenants over their fair share so
+    /// a greedy tenant cannot evict a small tenant's hot set.
     fn evict_from_main(&mut self) {
+        // Fairness engages only with >1 tenant AND when someone is over share;
+        // single-tenant short-circuits (`over_exists == false`) to plain S3-FIFO.
+        let (target, over_exists) = if self.per_tenant.is_empty() {
+            (0, false)
+        } else {
+            let t = self.share_target();
+            (t, self.has_over_share(t))
+        };
+        let mut skips = 0u32;
         while let Some(key) = self.main.pop_front() {
             let (freq, sz, tnt) = match self.map.get(&key) {
                 Some(e) => (e.freq, e.size, e.tenant),
@@ -314,14 +345,21 @@ impl<V: Clone> S3Fifo<V> {
                     e.freq -= 1;
                 }
                 self.main.push_back(key);
-            } else {
-                self.map.remove(&key);
-                self.total_bytes -= sz;
-                self.sub_tenant_bytes(tnt, sz);
-                self.evictions += 1;
-                skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheEvictions);
-                return;
+                continue;
             }
+            // freq == 0: eviction candidate. Spare an under-share tenant while an
+            // over-share one exists, up to MAX_FAIR_SKIPS, to hit the greedy one.
+            if over_exists && skips < MAX_FAIR_SKIPS && self.tenant_charged(tnt) <= target {
+                self.main.push_back(key);
+                skips += 1;
+                continue;
+            }
+            self.map.remove(&key);
+            self.total_bytes -= sz;
+            self.sub_tenant_bytes(tnt, sz);
+            self.evictions += 1;
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::CacheEvictions);
+            return;
         }
     }
 
@@ -636,5 +674,40 @@ mod tests {
         assert_eq!(c.charged_bytes(7), 0, "old tenant released");
         assert_eq!(c.charged_bytes(9), entry_size(b"k"), "new tenant charged");
         assert_eq!(c.charged_bytes(9), c.current_bytes());
+    }
+
+    #[test]
+    fn test_eviction_fairness_protects_small_tenant() {
+        // Noisy neighbor: tenant 7 keeps a tiny hot set; tenant 9 floods a large
+        // one. Both get promoted to Main. Fair eviction must keep tenant 7's set
+        // resident (it is far under its fair share) instead of letting tenant 9's
+        // flood evict it as plain FIFO would.
+        let entry = 8 + 8 + ENTRY_OVERHEAD; // 8-byte key + u64 value + overhead
+        let budget = 100 * entry;
+        let mut c: S3Fifo<u64> = S3Fifo::new(budget);
+
+        // Tenant 7: 5 keys, accessed repeatedly so they promote to Main.
+        let hot: Vec<[u8; 8]> = (0..5u64).map(|i| (1_000_000 + i).to_le_bytes()).collect();
+        for _ in 0..4 {
+            for k in &hot {
+                c.insert_for(k, 0, 8, 7);
+                let _ = c.get(k);
+                let _ = c.get(k);
+            }
+        }
+        // Tenant 9: flood 500 keys, each touched twice -> also promoted, competing
+        // in Main and forcing many evictions.
+        for i in 0..500u64 {
+            let k = i.to_le_bytes();
+            c.insert_for(&k, 0, 8, 9);
+            let _ = c.get(&k);
+            let _ = c.get(&k);
+        }
+
+        let survived = hot.iter().filter(|k| c.get(k.as_slice()).is_some()).count();
+        assert!(
+            survived >= 4,
+            "fair eviction must protect the small tenant's hot set: {survived}/5 survived"
+        );
     }
 }

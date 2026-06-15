@@ -7,6 +7,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.4.1] - 2026-06-15
+
+### Added
+
+- **Fair per-tenant cache eviction.** Per-tenant cache accounting already
+  shipped; eviction itself was tenant-blind, so under a noisy neighbour a
+  tenant with a large hot set could evict another tenant's small hot set in
+  FIFO order. The Main queue's victim selection is now share-aware: it
+  computes an equal share (`cache budget / active tenants`) once per
+  eviction and, when some tenant is over its share, briefly skips
+  under-share victims (bounded to 16 re-queues) to evict an over-share
+  tenant instead. The Small queue stays tenant-blind on purpose: it already
+  absorbs scan floods, so no fairness is needed there. A flooding tenant can
+  no longer starve a quiet tenant's working set out of the cache.
+
+### Changed
+
+- **Single-tenant and anonymous traffic is unchanged.** Fairness activates
+  only when more than one tenant is resident in a cache shard; with a single
+  tenant the eviction path is byte-identical to before and adds no
+  measurable overhead. The over-share scan is `O(active tenants)` once per
+  eviction but short-circuits on the first over-share tenant; a scaling
+  bench (1 to 10000 resident tenants) shows eviction cost stays flat.
+
+### Versions bumped
+
+- `skeg-core` 0.3.1, `skeg-server` 0.4.1
+
 ## [0.4.0] - 2026-06-14
 
 ### Added

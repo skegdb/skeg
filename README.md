@@ -184,9 +184,9 @@ The substrate, the design decisions, and the eleven falsifications that produced
 - KV operations on both protocols: `GET`, `SET`, `DEL`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXISTS`, `SELECT 0`.
 - Vector operations on both protocols: `SKEG.VINDEX.CREATE`, `SKEG.VINDEX.DROP`, `SKEG.VINDEX.LIST`, `SKEG.VSET`, `SKEG.VDEL`, `SKEG.VSEARCH`.
 - Admin / introspection: `SKEG.STATS`, `SKEG.SHARDS`, `SKEG.WHOAMI`, `HELLO 3 AUTH user pass` (argon2id).
-- Multi-tenant: prefix routing and per-tenant isolation. Shipped in the `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant` crates (Apache-2.0, same as the engine).
+- Multi-tenant: per-tenant isolation with hard quotas (`max_vectors`, `max_disk_bytes`), runtime admin commands (`SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`), and fair cache eviction so a noisy tenant cannot starve a quiet one. Shipped in the `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant` crates (Apache-2.0, same as the engine). See [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
 - Three durability tiers: relaxed (`sync_data`), kernel (`fsync`), and power-loss (`F_FULLFSYNC` on macOS).
-- Observability: Prometheus exporter on `--metrics-port` (default-on) and OTLP/gRPC tracing via `SKEG_TRACE_OTLP_ENDPOINT` (see [`OBSERVABILITY.md`](OBSERVABILITY.md)).
+- Observability: Prometheus exporter on `--metrics-port` (default-on) and OTLP/gRPC tracing via `SKEG_TRACE_OTLP_ENDPOINT` (see [`docs/observability.md`](docs/observability.md)).
 - Test suite covers the workspace with no clippy warnings under `cargo clippy --workspace --all-targets`.
 
 **Not yet.**
@@ -205,15 +205,17 @@ The project blog at [amanitaproject.com](https://amanitaproject.com/) carries th
 - *The Substrate.* The vLog, the group commit, the Vamana index, and the memory budget.
 - *What Was Measured: The Numbers.* The full benchmark record across engines, scales, and tiers.
 
-Operational guides live in this repository:
+Operational guides live in [`docs/`](docs/):
 
-- [`OBSERVABILITY.md`](OBSERVABILITY.md). Prometheus exporter, scrape config, OTel collector integration, tracing roadmap.
+- [`docs/multi-tenancy.md`](docs/multi-tenancy.md). Tenant binary, key scoping, per-tenant quotas, the `SKEG.QUOTA` admin commands, and fair cache eviction.
+- [`docs/observability.md`](docs/observability.md). Prometheus exporter, scrape config, OTel collector integration, tracing roadmap.
+- [`docs/ecosystem.md`](docs/ecosystem.md). Federation (hansa) and ingest pipelines around the engine.
 
 Live benchmark dashboard with the latest measurements (engine × scale × tier matrix, p50/p99 latency, recall, RSS): [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
 
 ## Ecosystem
 
-Federation (hansa) and ingest pipelines around the engine. See [`ECOSYSTEM.md`](ECOSYSTEM.md).
+Federation (hansa) and ingest pipelines around the engine. See [`docs/ecosystem.md`](docs/ecosystem.md).
 
 ## Roadmap
 
