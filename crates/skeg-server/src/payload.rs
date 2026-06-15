@@ -167,27 +167,50 @@ impl Filter {
             Filter::Range { field, lo, hi } => idx.range_ids(field, lo, hi),
             Filter::Exists(field) => idx.field_ids(field),
             Filter::And(parts) => {
-                // Intersect smallest-first so the running set only shrinks.
-                let mut sets: Vec<BTreeSet<u64>> = parts.iter().map(|p| p.evaluate(idx)).collect();
-                sets.sort_by_key(BTreeSet::len);
-                let mut iter = sets.into_iter();
-                let Some(mut acc) = iter.next() else {
-                    return BTreeSet::new();
+                // Split direct `NOT x` children from the rest: intersect the
+                // positives, then SUBTRACT each negated set (`acc \ B`). This
+                // turns `A AND NOT B` into a difference, never materialising a
+                // full universe-complement just to intersect it away.
+                let mut positives: Vec<&Filter> = Vec::new();
+                let mut negated: Vec<&Filter> = Vec::new();
+                for p in parts {
+                    match p {
+                        Filter::Not(inner) => negated.push(inner),
+                        other => positives.push(other),
+                    }
+                }
+                let mut acc: BTreeSet<u64> = if positives.is_empty() {
+                    // Only negations: start from the universe, then subtract.
+                    idx.all_ids().collect()
+                } else {
+                    // Intersect smallest-first so the running set only shrinks.
+                    let mut sets: Vec<BTreeSet<u64>> =
+                        positives.iter().map(|p| p.evaluate(idx)).collect();
+                    sets.sort_by_key(BTreeSet::len);
+                    let mut iter = sets.into_iter();
+                    let mut a = iter.next().unwrap();
+                    for s in iter {
+                        a = a.intersection(&s).copied().collect();
+                        if a.is_empty() {
+                            break;
+                        }
+                    }
+                    a
                 };
-                for s in iter {
-                    acc = acc.intersection(&s).copied().collect();
+                for neg in negated {
                     if acc.is_empty() {
                         break;
                     }
+                    let b = neg.evaluate(idx);
+                    acc.retain(|id| !b.contains(id));
                 }
                 acc
             }
             Filter::Or(parts) => parts.iter().flat_map(|p| p.evaluate(idx)).collect(),
             Filter::Not(inner) => {
-                // ponytail: materialises the whole indexed universe minus the
-                // excluded set, O(N). Fine for per-tenant indices. If a large
-                // shared index ever runs `A AND NOT B` hot, special-case `And`
-                // to compute `A \ B` instead of intersecting a full complement.
+                // A standalone `NOT` (top level, or inside `OR`) genuinely
+                // returns the universe minus the excluded set. `A AND NOT B`
+                // does NOT take this path: `And` subtracts instead (see above).
                 let excluded = inner.evaluate(idx);
                 idx.all_ids().filter(|id| !excluded.contains(id)).collect()
             }
@@ -510,7 +533,10 @@ mod tests {
         assert_eq!(eval("age BETWEEN 20 AND 40"), BTreeSet::from([1, 2]));
         assert_eq!(eval("u = a AND age >= 40"), BTreeSet::from([2]));
         assert_eq!(eval("u = b OR age < 40"), BTreeSet::from([1, 3]));
+        // A AND NOT B is the difference A \ B (no full complement built).
         assert_eq!(eval("u = a AND NOT age = 20"), BTreeSet::from([2]));
+        // Pure-negative AND starts from the universe {1,2,3,4} then subtracts.
+        assert_eq!(eval("NOT u = a AND NOT u = b"), BTreeSet::from([4]));
         assert_eq!(eval("age EXISTS"), BTreeSet::from([1, 2, 3]));
         assert_eq!(eval("NOT age EXISTS"), BTreeSet::from([4]));
         // NOT complements against the indexed universe {1,2,3,4}.
