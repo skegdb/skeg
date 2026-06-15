@@ -106,7 +106,7 @@ pub enum Command {
     SkegVindexDrop {
         args: Vec<Bytes>,
     },
-    /// `SKEG.VSET name id vector`. Arity 3.
+    /// `SKEG.VSET name id vector [PAYLOAD blob]`. Arity 3 or 5.
     SkegVset {
         args: Vec<Bytes>,
     },
@@ -114,7 +114,7 @@ pub enum Command {
     SkegVdel {
         args: Vec<Bytes>,
     },
-    /// `SKEG.VSEARCH name k l_search vector`. Arity 4.
+    /// `SKEG.VSEARCH name k l_search vector [WITHPAYLOAD]`. Arity 4 or 5.
     SkegVsearch {
         args: Vec<Bytes>,
     },
@@ -291,10 +291,11 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             Ok(Command::SkegVindexDrop { args })
         }
         "VSET" => {
-            if args.len() != 3 {
+            // `name id vector` or `name id vector PAYLOAD <blob>`.
+            if args.len() != 3 && args.len() != 5 {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.VSET",
-                    want: "name id vector",
+                    want: "name id vector [PAYLOAD blob]",
                 });
             }
             Ok(Command::SkegVset { args })
@@ -309,10 +310,11 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             Ok(Command::SkegVdel { args })
         }
         "VSEARCH" => {
-            if args.len() != 4 {
+            // `name k l_search vector` or the same with a trailing WITHPAYLOAD.
+            if args.len() != 4 && args.len() != 5 {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.VSEARCH",
-                    want: "name k l_search vector",
+                    want: "name k l_search vector [WITHPAYLOAD]",
                 });
             }
             Ok(Command::SkegVsearch { args })
@@ -1168,7 +1170,7 @@ mod tests {
         let err = parse_command(arr(&[b"SKEG.VSET", b"x"])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "wrong number of arguments for 'SKEG.VSET'; want name id vector"
+            "wrong number of arguments for 'SKEG.VSET'; want name id vector [PAYLOAD blob]"
         );
     }
 
@@ -1232,7 +1234,7 @@ mod tests {
         let err = parse_command(arr(&[b"SKEG.VSEARCH", b"x"])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector"
+            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector [WITHPAYLOAD]"
         );
     }
 

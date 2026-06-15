@@ -428,9 +428,10 @@ async fn skeg_vset(
     tenant: TenantId,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
-    if args.len() != 3 {
+    if args.len() != 3 && args.len() != 5 {
         return Frame::Error(
-            "ERR wrong number of arguments for 'SKEG.VSET'; want name id vector".into(),
+            "ERR wrong number of arguments for 'SKEG.VSET'; want name id vector [PAYLOAD blob]"
+                .into(),
         );
     }
     let raw_name = match parse_utf8_arg(&args[0], "name") {
@@ -445,12 +446,22 @@ async fn skeg_vset(
         Ok(v) => v,
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
+    // Optional `PAYLOAD <blob>`: an opaque byte buffer stored alongside the
+    // vector and returned by a WITHPAYLOAD search.
+    let payload = if args.len() == 5 {
+        if !args[3].eq_ignore_ascii_case(b"PAYLOAD") {
+            return Frame::Error("ERR SKEG.VSET expected PAYLOAD before the blob".into());
+        }
+        Some(args[4].to_vec())
+    } else {
+        None
+    };
     let scoped = scoped_vindex_name(tenant, raw_name);
     // Limit comes from the pluggable backend; `None` (no backend / unlimited)
     // skips quota enforcement entirely.
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
     match shards
-        .vset(&scoped, id, vector, tenant_u128(tenant), limit, None)
+        .vset(&scoped, id, vector, tenant_u128(tenant), limit, payload)
         .await
     {
         Ok(()) => Frame::ok(),
@@ -572,9 +583,11 @@ fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
     ),
 )]
 async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
-    if args.len() != 4 {
+    if args.len() != 4 && args.len() != 5 {
         return Frame::Error(
-            "ERR wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector".into(),
+            "ERR wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector \
+             [WITHPAYLOAD]"
+                .into(),
         );
     }
     let raw_name = match parse_utf8_arg(&args[0], "name") {
@@ -593,6 +606,15 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
         Ok(v) => v,
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
+    // Optional trailing WITHPAYLOAD: attach each hit's stored blob.
+    let want_payload = if args.len() == 5 {
+        if !args[4].eq_ignore_ascii_case(b"WITHPAYLOAD") {
+            return Frame::Error("ERR SKEG.VSEARCH expected WITHPAYLOAD as the 5th argument".into());
+        }
+        true
+    } else {
+        false
+    };
     let span = tracing::Span::current();
     span.record("vindex", raw_name);
     span.record("k", k);
@@ -600,15 +622,22 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
     span.record("vector_dim", query.len());
     let scoped = scoped_vindex_name(tenant, raw_name);
     match shards
-        .vsearch(&scoped, query, k, l_search, tenant_u128(tenant), false)
+        .vsearch(&scoped, query, k, l_search, tenant_u128(tenant), want_payload)
         .await
     {
         Ok(hits) => {
             span.record("hits", hits.len());
-            let mut out = Vec::with_capacity(hits.len() * 2);
-            for (id, score, _payload) in hits {
+            // Default: flat [id, score, ...] pairs (unchanged). WITHPAYLOAD:
+            // [id, score, payload, ...] triples, where payload is a bulk string
+            // (empty blobs included) or Null when the id has no stored payload.
+            let stride = if want_payload { 3 } else { 2 };
+            let mut out = Vec::with_capacity(hits.len() * stride);
+            for (id, score, payload) in hits {
                 out.push(Frame::Bulk(Bytes::from(id.to_string())));
                 out.push(Frame::Double(f64::from(score)));
+                if want_payload {
+                    out.push(payload.map_or(Frame::Null, |b| Frame::Bulk(Bytes::from(b))));
+                }
             }
             Frame::Array(out)
         }
@@ -1025,6 +1054,91 @@ mod tests {
         let (_dir, shards) = fresh_shards().await;
         let resp = kv_mset(&args(&["k1", "v1", "k2"]), &shards, TenantId::ZERO, None).await;
         assert!(matches!(resp, Frame::Error(ref e) if e.contains("wrong number")));
+    }
+
+    // Raw f32-LE bytes, the on-wire vector encoding parse_vector expects.
+    fn vec_arg(v: &[f32]) -> Bytes {
+        Bytes::from(v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())
+    }
+
+    // End-to-end through the RESP3 handlers: VSET ... PAYLOAD then
+    // VSEARCH ... WITHPAYLOAD returns the blob (the surface is callable, not
+    // just documented). Also covers the keyword-typo rejection.
+    #[tokio::test]
+    async fn vset_payload_then_vsearch_withpayload() {
+        let (_dir, shards) = fresh_shards().await;
+        let t = TenantId::ZERO;
+        let q = vec_arg(&[1.0, 0.0]);
+
+        let created = skeg_vindex_create(&args(&["idx", "2", "f32", "flat"]), &shards, t).await;
+        assert!(matches!(created, Frame::Simple(ref s) if s == "OK"));
+
+        let set = skeg_vset(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"1"),
+                q.clone(),
+                Bytes::from_static(b"PAYLOAD"),
+                Bytes::from_static(b"hello"),
+            ],
+            &shards,
+            t,
+            None,
+        )
+        .await;
+        assert!(matches!(set, Frame::Simple(ref s) if s == "OK"));
+
+        let resp = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"5"),
+                Bytes::from_static(b"0"),
+                q.clone(),
+                Bytes::from_static(b"WITHPAYLOAD"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        match resp {
+            // One hit, encoded as an [id, score, payload] triple.
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], Frame::Bulk(ref b) if &b[..] == b"1"));
+                assert!(matches!(items[1], Frame::Double(_)));
+                assert!(matches!(items[2], Frame::Bulk(ref b) if &b[..] == b"hello"));
+            }
+            other => panic!("expected Array triple, got {other:?}"),
+        }
+
+        // Without WITHPAYLOAD: flat [id, score] pair, no payload slot.
+        let plain = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"5"),
+                Bytes::from_static(b"0"),
+                q.clone(),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        assert!(matches!(plain, Frame::Array(ref items) if items.len() == 2));
+
+        // A mistyped trailing keyword is rejected, not silently ignored.
+        let bad = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"5"),
+                Bytes::from_static(b"0"),
+                q,
+                Bytes::from_static(b"NOPE"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        assert!(matches!(bad, Frame::Error(_)));
     }
 
     #[tokio::test]
