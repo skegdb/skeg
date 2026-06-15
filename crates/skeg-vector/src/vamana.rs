@@ -1711,12 +1711,16 @@ impl DiskVamanaIndex {
                 self.nodes[id as usize].slice().iter().copied().collect()
             };
             // Collect candidate rows. A plain search does one walk. A filtered
-            // search does TWO and unions them, because the two cover opposite
-            // metadata shapes:
+            // search always does two and unions them, because the two cover
+            // opposite metadata shapes and neither alone is robust:
             //   - admit-gated (only matching nodes admitted): recovers clustered
             //     matches a query-ranked frontier would evict;
             //   - navigate-all then filter at rerank: recovers scattered matches
-            //     whose matching subgraph is disconnected, so admit-gating stalls.
+            //     near the query that the admit subgraph never reaches.
+            // An adaptive "skip the second walk when the first looks full" was
+            // tried and rejected: at ~5% scattered the admit walk fills the
+            // frontier yet misses the near-query matches, so recall collapsed
+            // (0.98 -> 0.65 on the 500k bench). Both walks are cheap; run both.
             let mut cand: Vec<(f32, VecId)> = Vec::new();
             {
                 let _g = walk_span.enter();
