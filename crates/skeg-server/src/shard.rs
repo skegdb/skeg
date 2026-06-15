@@ -390,6 +390,36 @@ async fn ensure_payload_loaded(
     Ok(())
 }
 
+/// Run a VSEARCH against one vindex: exact brute-force over a filter's matching
+/// ids, or the ANN walk when there is no filter. Shared by the inline and
+/// worker-pool paths; the caller holds the vindex write lock.
+fn search_vindex(
+    idx: &mut Vindex,
+    name: &str,
+    query: &[f32],
+    k: usize,
+    l_search: u32,
+    filter: &Option<Filter>,
+) -> Result<Vec<(u64, f32)>, String> {
+    if idx.backend.dim() != query.len() {
+        return Err(format!(
+            "vindex '{name}' dim {} but query has {}",
+            idx.backend.dim(),
+            query.len()
+        ));
+    }
+    if let Some(f) = filter {
+        let s: Vec<u64> = f.evaluate(&idx.payload).into_iter().collect();
+        idx.backend
+            .score_ids(query, &s, k)
+            .map_err(|e| format!("vsearch failed: {e}"))
+    } else {
+        idx.backend
+            .search(query, k, l_search)
+            .map_err(|e| format!("vsearch failed: {e}"))
+    }
+}
+
 /// Attach each hit's stored payload when `want_payload`, else leave it `None`.
 /// Shared by the inline and worker-pool VSEARCH paths. Payloads ride as `Bytes`
 /// (refcounted vLog reads) so no blob is copied on the way to the response.
@@ -737,24 +767,7 @@ async fn process(
             let Some(arc) = entry else {
                 return Err(format!("vindex '{walk_name}' not found"));
             };
-            let mut idx = arc.write();
-            if idx.backend.dim() != query.len() {
-                return Err(format!(
-                    "vindex '{walk_name}' dim {} but query has {}",
-                    idx.backend.dim(),
-                    query.len()
-                ));
-            }
-            if let Some(f) = &filter {
-                let s: Vec<u64> = f.evaluate(&idx.payload).into_iter().collect();
-                idx.backend
-                    .score_ids(&query, &s, k)
-                    .map_err(|e| format!("vsearch failed: {e}"))
-            } else {
-                idx.backend
-                    .search(&query, k, l_search)
-                    .map_err(|e| format!("vsearch failed: {e}"))
-            }
+            search_vindex(&mut arc.write(), &walk_name, &query, k, l_search, &filter)
         });
         let hits = match join.await {
             Ok(Ok(hits)) => hits,
@@ -1018,27 +1031,8 @@ async fn process(
                     }
                     // Run the walk (or filtered brute-force) under the lock,
                     // then drop the guard before any payload `await`.
-                    let search_result = {
-                        let mut idx = arc.write();
-                        if idx.backend.dim() != query.len() {
-                            Err(format!(
-                                "vindex '{name}' dim {} but query has {}",
-                                idx.backend.dim(),
-                                query.len()
-                            ))
-                        } else if let Some(f) = &filter {
-                            // Materialise the matching id set from the payload
-                            // index, then score exactly over just those ids.
-                            let s: Vec<u64> = f.evaluate(&idx.payload).into_iter().collect();
-                            idx.backend
-                                .score_ids(&query, &s, k)
-                                .map_err(|e| format!("vsearch failed: {e}"))
-                        } else {
-                            idx.backend
-                                .search(&query, k, l_search)
-                                .map_err(|e| format!("vsearch failed: {e}"))
-                        }
-                    };
+                    let search_result =
+                        search_vindex(&mut arc.write(), &name, &query, k, l_search, &filter);
                     match search_result {
                         Err(e) => ShardResp::Err(e),
                         Ok(hits) => {
