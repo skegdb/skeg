@@ -46,6 +46,11 @@ use xxhash_rust::xxh3::xxh3_64;
 struct Vindex {
     backend: VectorBackend,
     payload: PayloadIndex,
+    /// True once the payload index reflects all stored blobs. A freshly created
+    /// vindex starts loaded (VSETs fill the index directly); a recovered one
+    /// starts unloaded and is rebuilt from the blobs on the first filtered
+    /// search (see `ensure_payload_loaded`).
+    payload_loaded: bool,
 }
 
 impl Vindex {
@@ -53,6 +58,16 @@ impl Vindex {
         Self {
             backend,
             payload: PayloadIndex::default(),
+            payload_loaded: true,
+        }
+    }
+
+    /// A vindex reopened from disk: its payload index is empty and must be
+    /// rebuilt from the stored blobs before a filtered search can use it.
+    fn recovered(backend: VectorBackend) -> Self {
+        Self {
+            payload_loaded: false,
+            ..Self::new(backend)
         }
     }
 }
@@ -341,6 +356,40 @@ fn payload_key(tenant: u128, name: &str, id: u64) -> Vec<u8> {
     k
 }
 
+/// Rebuild a recovered vindex's payload index from its stored blobs, once, the
+/// first time a filtered search needs it. Idempotent and tenant-scoped: the
+/// query's tenant locates the blobs (a real vindex is single-tenant). Runs the
+/// blob reads outside the lock, then populates under it.
+async fn ensure_payload_loaded(
+    vlog: &VLog,
+    arc: &VectorEntry,
+    tenant: u128,
+    name: &str,
+) -> Result<(), String> {
+    if arc.read().payload_loaded {
+        return Ok(());
+    }
+    let ids = arc.read().backend.live_ids();
+    let mut parsed = Vec::with_capacity(ids.len());
+    for id in ids {
+        let key = payload_key(tenant, name, id);
+        match vlog.tenant(tenant).get(&key).await {
+            Ok(Some(blob)) => parsed.push((id, parse_fields(&blob))),
+            Ok(None) => {}
+            Err(e) => return Err(format!("payload index rebuild failed: {e}")),
+        }
+    }
+    let mut g = arc.write();
+    // Re-check under the write lock: another task may have loaded it meanwhile.
+    if !g.payload_loaded {
+        for (id, fields) in parsed {
+            g.payload.upsert(id, fields);
+        }
+        g.payload_loaded = true;
+    }
+    Ok(())
+}
+
 /// Attach each hit's stored payload when `want_payload`, else leave it `None`.
 /// Shared by the inline and worker-pool VSEARCH paths. Payloads ride as `Bytes`
 /// (refcounted vLog reads) so no blob is copied on the way to the response.
@@ -458,7 +507,7 @@ fn recover_vindexes(
             Ok(idx) => {
                 set.insert(
                     name,
-                    Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(idx)))),
+                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx)))),
                 );
             }
             Err(e) => error!("shard {shard_id}: recovering vindex '{name}' failed: {e}"),
@@ -675,6 +724,14 @@ async fn process(
         // parallel on the blocking pool (the previous design serialised
         // them on the outer RwLock).
         let entry = vindexes.read().get(&name).cloned();
+        // A filter reads the payload index; rebuild it from blobs first (async,
+        // before the blocking walk) if this vindex was just recovered from disk.
+        if filter.is_some()
+            && let Some(arc) = &entry
+            && let Err(e) = ensure_payload_loaded(vlog, arc, tenant, &name).await
+        {
+            return ShardResp::Err(e);
+        }
         let walk_name = name.clone();
         let join = tokio::task::spawn_blocking(move || -> Result<Vec<(u64, f32)>, String> {
             let Some(arc) = entry else {
@@ -952,6 +1009,13 @@ async fn process(
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
+                    // A filter reads the payload index; rebuild it from blobs
+                    // first if this vindex was just recovered from disk.
+                    if filter.is_some()
+                        && let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &name).await
+                    {
+                        return ShardResp::Err(e);
+                    }
                     // Run the walk (or filtered brute-force) under the lock,
                     // then drop the guard before any payload `await`.
                     let search_result = {
@@ -2377,6 +2441,32 @@ mod tests {
         assert!(shards.vdel("idx", 1, 0).await.unwrap());
         let a2 = shards.vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a")).await.unwrap();
         assert!(a2.is_empty());
+    }
+
+    // After a restart the payload index is rebuilt from the stored blobs on the
+    // first filtered search, so a FILTER returns the same ids as before.
+    #[tokio::test]
+    async fn test_filter_index_rebuilt_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_owned();
+        {
+            let shards = ShardSet::open(&base, 2).unwrap();
+            shards.vindex_create("persist", 64, 0, 1).await.unwrap(); // disk
+            for id in 1u64..=4 {
+                let who: &[u8] = if id % 2 == 0 { b"user=alice" } else { b"user=bob" };
+                shards
+                    .vset("persist", id, tvec(id), 0, None, Some(Bytes::from(who.to_vec())))
+                    .await
+                    .unwrap();
+            }
+        }
+        // Restart: the payload index starts empty and is rebuilt on first use.
+        let shards = ShardSet::open(&base, 2).unwrap();
+        let alice = shards
+            .vsearch("persist", tvec(2), 10, 0, 0, false, flt("user = alice"))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&alice), BTreeSet::from([2, 4]));
     }
 
     /// Two VSEARCH callers hitting **different** vindexes on the same
