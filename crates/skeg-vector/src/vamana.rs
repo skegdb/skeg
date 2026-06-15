@@ -1714,6 +1714,23 @@ impl DiskVamanaIndex {
             let mut cand: Vec<(f32, VecId)> = Vec::new();
             {
                 let _g = walk_span.enter();
+                // One walk over the shared scratch bitsets; `FnMut` so a filtered
+                // search can run it twice (admit-gated, then navigate-all).
+                let mut walk = |seeds: &[VecId],
+                                admit: Option<&dyn Fn(VecId) -> bool>,
+                                early: Option<EarlyTerm>| {
+                    greedy_search(
+                        seeds,
+                        list_size,
+                        early,
+                        dist,
+                        nbrs,
+                        admit,
+                        &mut visited,
+                        &mut seen,
+                        None,
+                    )
+                };
                 if filtered {
                     // Admit only live matching rows into the list, so the walk
                     // explores the matching subgraph and a far cluster is not
@@ -1724,43 +1741,10 @@ impl DiskVamanaIndex {
                             && !self.delta.contains_key(&id)
                             && matches.is_none_or(|m| m(id))
                     };
-                    let la = greedy_search(
-                        &seed_rows,
-                        list_size,
-                        None,
-                        dist,
-                        nbrs,
-                        Some(&admit),
-                        &mut visited,
-                        &mut seen,
-                        None,
-                    );
-                    cand.extend(la.iter());
-                    let lb = greedy_search(
-                        &[self.medoid],
-                        list_size,
-                        None,
-                        dist,
-                        nbrs,
-                        None,
-                        &mut visited,
-                        &mut seen,
-                        None,
-                    );
-                    cand.extend(lb.iter());
+                    cand.extend(walk(&seed_rows, Some(&admit), None).iter());
+                    cand.extend(walk(&[self.medoid], None, None).iter());
                 } else {
-                    let l = greedy_search(
-                        &seed_rows,
-                        list_size,
-                        early,
-                        dist,
-                        nbrs,
-                        None,
-                        &mut visited,
-                        &mut seen,
-                        None,
-                    );
-                    cand.extend(l.iter());
+                    cand.extend(walk(&seed_rows, None, early).iter());
                 }
                 walk_span.record("visited", visited.iter().count());
                 walk_span.record("returned", cand.len());

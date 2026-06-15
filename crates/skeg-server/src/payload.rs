@@ -184,6 +184,10 @@ impl Filter {
             }
             Filter::Or(parts) => parts.iter().flat_map(|p| p.evaluate(idx)).collect(),
             Filter::Not(inner) => {
+                // ponytail: materialises the whole indexed universe minus the
+                // excluded set, O(N). Fine for per-tenant indices. If a large
+                // shared index ever runs `A AND NOT B` hot, special-case `And`
+                // to compute `A \ B` instead of intersecting a full complement.
                 let excluded = inner.evaluate(idx);
                 idx.all_ids().filter(|id| !excluded.contains(id)).collect()
             }
