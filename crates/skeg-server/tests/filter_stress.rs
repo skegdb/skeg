@@ -165,6 +165,34 @@ fn filter_grammar_stress_on_real_embeddings() {
     }
     println!("payload index built\n");
 
+    // Plain (no-filter) baseline: confirms the filtered-search work did not
+    // regress ordinary nearest-neighbour search. Ground truth is the exact
+    // top-K over the whole corpus.
+    {
+        let all: BTreeSet<u64> = (0..n as u64).collect();
+        let (mut recall, mut lat) = (0.0f64, Duration::ZERO);
+        for qi in 0..q_used {
+            let q = row(&queries, qi);
+            let want = exact_over(&corpus, q, &all);
+            let t = Instant::now();
+            let got: Vec<u64> = disk
+                .search(q, K)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            lat += t.elapsed();
+            let hit = got.iter().filter(|id| want.contains(id)).count();
+            recall += hit as f64 / K as f64;
+        }
+        println!(
+            "{:42} |S|={n:7} path=plain recall@10={:.3} lat/q={:?}",
+            "(no filter)",
+            recall / q_used as f64,
+            lat / q_used as u32,
+        );
+    }
+
     let filters = [
         "cat = c0",                                // clustered equality
         "user = u7",                               // scattered, selective -> exact
