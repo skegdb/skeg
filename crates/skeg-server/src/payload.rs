@@ -328,10 +328,26 @@ fn parse_predicate(toks: &[String], i: &mut usize) -> Result<Filter, String> {
     *i += 1;
     match op.as_str() {
         "=" => Ok(Filter::Eq(field, take_value(toks, i, "a value")?)),
-        ">=" => Ok(range(field, Bound::Included(take_value(toks, i, "a value")?), Bound::Unbounded)),
-        ">" => Ok(range(field, Bound::Excluded(take_value(toks, i, "a value")?), Bound::Unbounded)),
-        "<=" => Ok(range(field, Bound::Unbounded, Bound::Included(take_value(toks, i, "a value")?))),
-        "<" => Ok(range(field, Bound::Unbounded, Bound::Excluded(take_value(toks, i, "a value")?))),
+        ">=" => Ok(range(
+            field,
+            Bound::Included(take_value(toks, i, "a value")?),
+            Bound::Unbounded,
+        )),
+        ">" => Ok(range(
+            field,
+            Bound::Excluded(take_value(toks, i, "a value")?),
+            Bound::Unbounded,
+        )),
+        "<=" => Ok(range(
+            field,
+            Bound::Unbounded,
+            Bound::Included(take_value(toks, i, "a value")?),
+        )),
+        "<" => Ok(range(
+            field,
+            Bound::Unbounded,
+            Bound::Excluded(take_value(toks, i, "a value")?),
+        )),
         _ if is_keyword(&op, "EXISTS") => Ok(Filter::Exists(field)),
         _ if is_keyword(&op, "IN") => parse_in(field, toks, i),
         _ if is_keyword(&op, "BETWEEN") => {
@@ -404,7 +420,10 @@ mod tests {
             Some(&BTreeSet::from([1, 2]))
         );
         idx.upsert(1, vec![("user".into(), kw("carol"))]);
-        assert_eq!(idx.postings("user", &kw("alice")), Some(&BTreeSet::from([2])));
+        assert_eq!(
+            idx.postings("user", &kw("alice")),
+            Some(&BTreeSet::from([2]))
+        );
         idx.remove(3);
         assert_eq!(idx.postings("user", &kw("bob")), None);
     }
@@ -465,9 +484,18 @@ mod tests {
     #[test]
     fn evaluate_all_predicates() {
         let mut idx = PayloadIndex::default();
-        idx.upsert(1, vec![("u".into(), kw("a")), ("age".into(), Value::Int(20))]);
-        idx.upsert(2, vec![("u".into(), kw("a")), ("age".into(), Value::Int(40))]);
-        idx.upsert(3, vec![("u".into(), kw("b")), ("age".into(), Value::Int(60))]);
+        idx.upsert(
+            1,
+            vec![("u".into(), kw("a")), ("age".into(), Value::Int(20))],
+        );
+        idx.upsert(
+            2,
+            vec![("u".into(), kw("a")), ("age".into(), Value::Int(40))],
+        );
+        idx.upsert(
+            3,
+            vec![("u".into(), kw("b")), ("age".into(), Value::Int(60))],
+        );
         idx.upsert(4, vec![("u".into(), kw("c"))]); // no `age` field
 
         let eval = |s: &str| parse_filter(s).unwrap().evaluate(&idx);

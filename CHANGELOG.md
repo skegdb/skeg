@@ -7,6 +7,50 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.5.0] - unreleased
+
+### Added
+
+- **Filtered vector search.** A vector can carry an optional payload, and a
+  search can restrict its results to vectors whose payload matches a filter.
+  `SKEG.VSET <name> <id> <vector> [PAYLOAD <blob>]` stores an opaque blob beside
+  the vector (in the KV vLog under a reserved, tenant-scoped key, so the
+  quantized graph stays dense). `SKEG.VSEARCH <name> <k> <l_search> <query>
+  [WITHPAYLOAD] [FILTER <expr>]` returns the blob with each hit (`WITHPAYLOAD`)
+  and/or applies a payload filter (`FILTER`). The blob's `key=value` fields are
+  parsed into a per-index payload index; the filter grammar supports `field =
+  value`, `field IN (...)`, the ranges `>= > <= < BETWEEN a AND b`, `field
+  EXISTS`, and `AND` / `OR` / `NOT` with parentheses. A field repeated in a
+  payload is multi-valued (matches any of its values).
+
+- **Adaptive filtered-search planner.** A selective filter (small matching set)
+  is scored exactly over just the matching vectors. A broad filter runs a
+  filtered graph search: two complementary walks merged (one that explores only
+  the matching subgraph, one that navigates the whole graph and filters at
+  re-rank), so recall holds whether the matching vectors cluster together (real
+  metadata) or scatter. Validated on real 1024-dim embeddings at 100k and 500k:
+  recall@10 0.98 to 1.00 across selectivities and metadata shapes, at query time
+  with no extra build cost. The payload index is rebuilt from the stored blobs
+  on the first filtered search after a restart.
+
+### Changed
+
+- **Plain (non-filtered) search and writes are unchanged.** A VSET without
+  `PAYLOAD` does no extra work; a VSEARCH without `FILTER`/`WITHPAYLOAD` takes
+  the existing path byte-for-byte. The native binary protocol stays
+  payload/filter-free; RESP3 is the surface for the new feature.
+
+- **`ShardSet::vset` / `ShardSet::vsearch` gained parameters** (payload, the
+  tenant, `want_payload`, and an optional filter), and `skeg-vector` gained
+  `DiskVamanaIndex::search_filtered` / `score_ids` / `live_ids`. Library code on
+  these APIs must update its call sites, which is why `skeg-server` takes a minor
+  version bump.
+
+### Versions to bump (at release)
+
+- `skeg-vector` 0.1.5, `skeg-resp3` 0.2.1, `skeg-server` 0.5.0,
+  `skeg-server-tenant` 0.2.1
+
 ## [0.4.1] - 2026-06-15
 
 ### Added

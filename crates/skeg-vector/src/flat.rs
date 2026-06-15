@@ -169,7 +169,9 @@ impl FlatIndex {
             .iter()
             .filter_map(|&id| {
                 let &row = self.id_to_row.get(&id)?;
-                self.live.contains(row).then(|| (id, self.cosine(query, row)))
+                self.live
+                    .contains(row)
+                    .then(|| (id, self.cosine(query, row)))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));

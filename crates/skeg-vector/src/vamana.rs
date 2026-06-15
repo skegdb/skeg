@@ -1725,19 +1725,40 @@ impl DiskVamanaIndex {
                             && matches.is_none_or(|m| m(id))
                     };
                     let la = greedy_search(
-                        &seed_rows, list_size, None, dist, nbrs, Some(&admit),
-                        &mut visited, &mut seen, None,
+                        &seed_rows,
+                        list_size,
+                        None,
+                        dist,
+                        nbrs,
+                        Some(&admit),
+                        &mut visited,
+                        &mut seen,
+                        None,
                     );
                     cand.extend(la.iter());
                     let lb = greedy_search(
-                        &[self.medoid], list_size, None, dist, nbrs, None,
-                        &mut visited, &mut seen, None,
+                        &[self.medoid],
+                        list_size,
+                        None,
+                        dist,
+                        nbrs,
+                        None,
+                        &mut visited,
+                        &mut seen,
+                        None,
                     );
                     cand.extend(lb.iter());
                 } else {
                     let l = greedy_search(
-                        &seed_rows, list_size, early, dist, nbrs, None,
-                        &mut visited, &mut seen, None,
+                        &seed_rows,
+                        list_size,
+                        early,
+                        dist,
+                        nbrs,
+                        None,
+                        &mut visited,
+                        &mut seen,
+                        None,
                     );
                     cand.extend(l.iter());
                 }
@@ -2141,7 +2162,10 @@ mod tests {
 
         let matches = |id: u64| id % 2 == 0; // even ids, ~50% selectivity
         // A handful of matching ids spread across the set, used as walk seeds.
-        let seeds: Vec<u64> = (0..n as u64).filter(|&id| matches(id)).step_by(64).collect();
+        let seeds: Vec<u64> = (0..n as u64)
+            .filter(|&id| matches(id))
+            .step_by(64)
+            .collect();
         let mut rng = StdRng::seed_from_u64(777);
         let mut hits = 0;
         let mut total = 0;

@@ -2031,12 +2031,23 @@ mod tests {
         let v = vec![1.0f32, 0.0, 0.0, 0.0];
         let lim = Some(2u64);
 
-        shards.vset("idx7", 1, v.clone(), 7, lim, None).await.unwrap();
-        shards.vset("idx7", 2, v.clone(), 7, lim, None).await.unwrap();
+        shards
+            .vset("idx7", 1, v.clone(), 7, lim, None)
+            .await
+            .unwrap();
+        shards
+            .vset("idx7", 2, v.clone(), 7, lim, None)
+            .await
+            .unwrap();
         assert_eq!(shards.tenant_vector_count(7), 2);
 
         // A third new id exceeds the limit -> rejected, count unchanged.
-        assert!(shards.vset("idx7", 3, v.clone(), 7, lim, None).await.is_err());
+        assert!(
+            shards
+                .vset("idx7", 3, v.clone(), 7, lim, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             shards.tenant_vector_count(7),
             2,
@@ -2051,14 +2062,20 @@ mod tests {
         assert_eq!(shards.tenant_vector_count(7), 2, "overwrite is free");
 
         // A different tenant has its own independent budget.
-        shards.vset("idx9", 1, v.clone(), 9, Some(1), None).await.unwrap();
+        shards
+            .vset("idx9", 1, v.clone(), 9, Some(1), None)
+            .await
+            .unwrap();
         assert_eq!(shards.tenant_vector_count(9), 1);
         assert_eq!(shards.tenant_vector_count(7), 2, "tenant 9 did not touch 7");
 
         // VDEL frees a slot for tenant 7, letting a new id back in.
         assert!(shards.vdel("idx7", 2, 7).await.unwrap());
         assert_eq!(shards.tenant_vector_count(7), 1);
-        shards.vset("idx7", 3, v.clone(), 7, lim, None).await.unwrap();
+        shards
+            .vset("idx7", 3, v.clone(), 7, lim, None)
+            .await
+            .unwrap();
         assert_eq!(shards.tenant_vector_count(7), 2);
     }
 
@@ -2120,7 +2137,10 @@ mod tests {
         shards.vindex_create("idx", 4, 0, 0).await.unwrap();
         let v = vec![1.0f32, 0.0, 0.0, 0.0];
         for id in 0..50u64 {
-            shards.vset("idx", id, v.clone(), 0, None, None).await.unwrap();
+            shards
+                .vset("idx", id, v.clone(), 0, None, None)
+                .await
+                .unwrap();
         }
         assert_eq!(
             shards.tenant_vector_count(0),
@@ -2272,7 +2292,10 @@ mod tests {
         // Restart: a fresh ShardSet on the same dir recovers the disk VINDEX
         // from the registry + WAL.
         let shards = ShardSet::open(&base, 4).unwrap();
-        let hits = shards.vsearch("persist", tvec(89), 5, 0, 0, false, None).await.unwrap();
+        let hits = shards
+            .vsearch("persist", tvec(89), 5, 0, 0, false, None)
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, 88, "disk VINDEX must be recovered after restart");
         // A flat VINDEX, by contrast, is in-RAM and would not survive - so the
         // recovered set contains exactly the disk-backed index.
@@ -2298,7 +2321,14 @@ mod tests {
         let large: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         for (id, blob) in [(1u64, &empty), (2, &binary), (3, &large)] {
             shards
-                .vset("idx", id, tvec(id + 1), 0, None, Some(Bytes::from(blob.clone())))
+                .vset(
+                    "idx",
+                    id,
+                    tvec(id + 1),
+                    0,
+                    None,
+                    Some(Bytes::from(blob.clone())),
+                )
                 .await
                 .unwrap();
         }
@@ -2330,11 +2360,25 @@ mod tests {
             let shards = ShardSet::open(&base, 2).unwrap();
             shards.vindex_create("persist", 64, 0, 1).await.unwrap(); // disk
             shards
-                .vset("persist", 10, tvec(11), 0, None, Some(Bytes::from_static(b"keep")))
+                .vset(
+                    "persist",
+                    10,
+                    tvec(11),
+                    0,
+                    None,
+                    Some(Bytes::from_static(b"keep")),
+                )
                 .await
                 .unwrap();
             shards
-                .vset("persist", 20, tvec(21), 0, None, Some(Bytes::from_static(b"gone")))
+                .vset(
+                    "persist",
+                    20,
+                    tvec(21),
+                    0,
+                    None,
+                    Some(Bytes::from_static(b"gone")),
+                )
                 .await
                 .unwrap();
             assert!(shards.vdel("persist", 20, 0).await.unwrap());
@@ -2357,16 +2401,36 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 64, 0, 0).await.unwrap();
         shards
-            .vset("idx", 1, tvec(2), 7, None, Some(Bytes::from_static(b"tenant-7-secret")))
+            .vset(
+                "idx",
+                1,
+                tvec(2),
+                7,
+                None,
+                Some(Bytes::from_static(b"tenant-7-secret")),
+            )
             .await
             .unwrap();
 
-        let as7 = shards.vsearch("idx", tvec(2), 5, 0, 7, true, None).await.unwrap();
+        let as7 = shards
+            .vsearch("idx", tvec(2), 5, 0, 7, true, None)
+            .await
+            .unwrap();
         assert_eq!(payload_of(&as7, 1), Some(&b"tenant-7-secret"[..]));
 
-        let as9 = shards.vsearch("idx", tvec(2), 5, 0, 9, true, None).await.unwrap();
-        assert!(as9.iter().any(|h| h.0 == 1), "vector is shared at this layer");
-        assert_eq!(payload_of(&as9, 1), None, "tenant 9 must not read tenant 7's payload");
+        let as9 = shards
+            .vsearch("idx", tvec(2), 5, 0, 9, true, None)
+            .await
+            .unwrap();
+        assert!(
+            as9.iter().any(|h| h.0 == 1),
+            "vector is shared at this layer"
+        );
+        assert_eq!(
+            payload_of(&as9, 1),
+            None,
+            "tenant 9 must not read tenant 7's payload"
+        );
     }
 
     // Dropping an index reclaims its payload blobs, so a recreated index
@@ -2377,7 +2441,14 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 64, 0, 0).await.unwrap();
         shards
-            .vset("idx", 1, tvec(2), 0, None, Some(Bytes::from_static(b"stale")))
+            .vset(
+                "idx",
+                1,
+                tvec(2),
+                0,
+                None,
+                Some(Bytes::from_static(b"stale")),
+            )
             .await
             .unwrap();
         shards.vindex_drop("idx", 0).await.unwrap();
@@ -2385,8 +2456,15 @@ mod tests {
         // Recreate and re-insert the same id with NO payload.
         shards.vindex_create("idx", 64, 0, 0).await.unwrap();
         shards.vset("idx", 1, tvec(2), 0, None, None).await.unwrap();
-        let hits = shards.vsearch("idx", tvec(2), 5, 0, 0, true, None).await.unwrap();
-        assert_eq!(payload_of(&hits, 1), None, "dropped payload must not resurface");
+        let hits = shards
+            .vsearch("idx", tvec(2), 5, 0, 0, true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            payload_of(&hits, 1),
+            None,
+            "dropped payload must not resurface"
+        );
     }
 
     fn flt(s: &str) -> Option<crate::payload::Filter> {
@@ -2419,8 +2497,15 @@ mod tests {
         set(3, b"user=alice type=img").await;
 
         // Query == id 1's vector, so id 1 is the global nearest.
-        let global = shards.vsearch("idx", tvec(1), 10, 0, 0, false, None).await.unwrap();
-        assert_eq!(ids_of(&global).iter().next(), Some(&1), "id 1 is global nearest");
+        let global = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&global).iter().next(),
+            Some(&1),
+            "id 1 is global nearest"
+        );
 
         // user = alice excludes id 1 (bob) and returns alice's two, exactly.
         let alice = shards
@@ -2431,7 +2516,15 @@ mod tests {
 
         // AND narrows further; an empty match yields zero hits.
         let one = shards
-            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("user = alice AND type = doc"))
+            .vsearch(
+                "idx",
+                tvec(1),
+                10,
+                0,
+                0,
+                false,
+                flt("user = alice AND type = doc"),
+            )
             .await
             .unwrap();
         assert_eq!(ids_of(&one), BTreeSet::from([2]));
@@ -2463,12 +2556,18 @@ mod tests {
             .vset("idx", 2, tvec(2), 0, None, Some(Bytes::from_static(b"k=b")))
             .await
             .unwrap();
-        let a = shards.vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a")).await.unwrap();
+        let a = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a"))
+            .await
+            .unwrap();
         assert_eq!(ids_of(&a), BTreeSet::from([1]));
 
         // VDEL id 1: the k=a set is now empty.
         assert!(shards.vdel("idx", 1, 0).await.unwrap());
-        let a2 = shards.vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a")).await.unwrap();
+        let a2 = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a"))
+            .await
+            .unwrap();
         assert!(a2.is_empty());
     }
 
@@ -2482,9 +2581,20 @@ mod tests {
             let shards = ShardSet::open(&base, 2).unwrap();
             shards.vindex_create("persist", 64, 0, 1).await.unwrap(); // disk
             for id in 1u64..=4 {
-                let who: &[u8] = if id % 2 == 0 { b"user=alice" } else { b"user=bob" };
+                let who: &[u8] = if id % 2 == 0 {
+                    b"user=alice"
+                } else {
+                    b"user=bob"
+                };
                 shards
-                    .vset("persist", id, tvec(id), 0, None, Some(Bytes::from(who.to_vec())))
+                    .vset(
+                        "persist",
+                        id,
+                        tvec(id),
+                        0,
+                        None,
+                        Some(Bytes::from(who.to_vec())),
+                    )
                     .await
                     .unwrap();
             }
@@ -2544,7 +2654,10 @@ mod tests {
         };
         for id in 0..n {
             let v = make_vec(id);
-            shards.vset("a", id, v.clone(), 0, None, None).await.unwrap();
+            shards
+                .vset("a", id, v.clone(), 0, None, None)
+                .await
+                .unwrap();
             shards.vset("b", id, v, 0, None, None).await.unwrap();
         }
 
@@ -2559,12 +2672,18 @@ mod tests {
         let t = std::time::Instant::now();
         let h1 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s1.vsearch("a", q1.clone(), 10, 0, 0, false, None).await.unwrap();
+                let _ = s1
+                    .vsearch("a", q1.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s2.vsearch("a", q2.clone(), 10, 0, 0, false, None).await.unwrap();
+                let _ = s2
+                    .vsearch("a", q2.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         h1.await.unwrap();
@@ -2579,12 +2698,18 @@ mod tests {
         let t = std::time::Instant::now();
         let h1 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s1.vsearch("a", q1.clone(), 10, 0, 0, false, None).await.unwrap();
+                let _ = s1
+                    .vsearch("a", q1.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s2.vsearch("b", q2.clone(), 10, 0, 0, false, None).await.unwrap();
+                let _ = s2
+                    .vsearch("b", q2.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         h1.await.unwrap();

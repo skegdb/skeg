@@ -258,7 +258,10 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
             let _guard = span.enter();
             // Native wire stays payload-less in P1a; drop the (always-None)
             // blob and encode (id, score) pairs as before.
-            match shards.vsearch(name, query, k as usize, l_search, 0, false, None).await {
+            match shards
+                .vsearch(name, query, k as usize, l_search, 0, false, None)
+                .await
+            {
                 Ok(hits) => {
                     span.record("hits", hits.len());
                     let pairs: Vec<(u64, f32)> =

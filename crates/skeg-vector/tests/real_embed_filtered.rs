@@ -107,7 +107,12 @@ fn seeds_of(s: &[u64]) -> Vec<u64> {
 }
 
 /// Run the planner's exact-vs-walk choice for one query and time it.
-fn planner_search(disk: &DiskVamanaIndex, q: &[f32], m: &dyn Fn(u64) -> bool, s: &[u64]) -> (Vec<u64>, Duration) {
+fn planner_search(
+    disk: &DiskVamanaIndex,
+    q: &[f32],
+    m: &dyn Fn(u64) -> bool,
+    s: &[u64],
+) -> (Vec<u64>, Duration) {
     let t = Instant::now();
     let got: Vec<u64> = if s.len() > FILTER_EXACT_MAX {
         disk.search_filtered(q, K, 0, m, &seeds_of(s)).unwrap()
@@ -124,7 +129,10 @@ fn planner_search(disk: &DiskVamanaIndex, q: &[f32], m: &dyn Fn(u64) -> bool, s:
 #[ignore = "needs SKEG_CORPUS/SKEG_QUERIES (or SKEG_EMBED_DIR) with mxbai embeddings"]
 fn filtered_search_quality_on_real_embeddings() {
     let (corpus_path, queries_path) = match std::env::var("SKEG_CORPUS") {
-        Ok(c) => (c, std::env::var("SKEG_QUERIES").expect("set SKEG_QUERIES too")),
+        Ok(c) => (
+            c,
+            std::env::var("SKEG_QUERIES").expect("set SKEG_QUERIES too"),
+        ),
         Err(_) => {
             let Ok(d) = std::env::var("SKEG_EMBED_DIR") else {
                 eprintln!("set SKEG_CORPUS+SKEG_QUERIES or SKEG_EMBED_DIR; skipping");
@@ -165,9 +173,16 @@ fn filtered_search_quality_on_real_embeddings() {
     for &c in &[2usize, 5, 20, 100] {
         let labels = anchor_labels(&corpus, n, c);
         let lab = labels.clone();
-        run_scheme(&disk, &corpus, n, &queries, q_used, c, "anchor", &move |i, _| {
-            lab[i as usize] == 0
-        });
+        run_scheme(
+            &disk,
+            &corpus,
+            n,
+            &queries,
+            q_used,
+            c,
+            "anchor",
+            &move |i, _| lab[i as usize] == 0,
+        );
     }
 }
 

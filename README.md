@@ -164,7 +164,9 @@ OK
 <details>
 <summary>Command reference</summary>
 
-`SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the per-index storage precision: `f32 | int8 | binary`. `backend` chooses in-RAM flat scan or on-disk Vamana: `flat | disk`. The server-wide quantizer tier (`int8`, `pq[:M:K]`, `tq1`, `tq2`, `tq4`) is selected via the `--tier` CLI flag at server start, not per-index. The vector payload in `SKEG.VSET` and `SKEG.VSEARCH` is a raw byte buffer on the native protocol, or a bulk string on RESP3.
+`SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the per-index storage precision: `f32 | int8 | binary`. `backend` chooses in-RAM flat scan or on-disk Vamana: `flat | disk`. The server-wide quantizer tier (`int8`, `pq[:M:K]`, `tq1`, `tq2`, `tq4`) is selected via the `--tier` CLI flag at server start, not per-index. The vector in `SKEG.VSET` and `SKEG.VSEARCH` is a raw byte buffer on the native protocol, or a bulk string on RESP3.
+
+Filtered search (RESP3): `SKEG.VSET <name> <id> <vector> [PAYLOAD <blob>]` attaches an optional payload of `key=value` fields; `SKEG.VSEARCH <name> <k> <l_search> <query> [WITHPAYLOAD] [FILTER <expr>]` returns the blob per hit (`WITHPAYLOAD`) and/or restricts results to payloads matching `<expr>`. The filter grammar covers `=`, `IN (...)`, the ranges `>= > <= < BETWEEN a AND b`, `EXISTS`, and `AND` / `OR` / `NOT` with parentheses. See [`docs/filtered-search.md`](docs/filtered-search.md).
 
 </details>
 <!-- markdownlint-enable MD033 -->
@@ -183,6 +185,7 @@ The substrate, the design decisions, and the eleven falsifications that produced
 
 - KV operations on both protocols: `GET`, `SET`, `DEL`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXISTS`, `SELECT 0`.
 - Vector operations on both protocols: `SKEG.VINDEX.CREATE`, `SKEG.VINDEX.DROP`, `SKEG.VINDEX.LIST`, `SKEG.VSET`, `SKEG.VDEL`, `SKEG.VSEARCH`.
+- Filtered vector search (RESP3): per-vector payloads (`VSET ... PAYLOAD`) and metadata filters (`VSEARCH ... FILTER`) with equality, `IN`, ranges, `EXISTS`, and `AND`/`OR`/`NOT`. Selective filters score exactly; broad filters use a filtered graph walk, so recall holds for clustered or scattered metadata. See [`docs/filtered-search.md`](docs/filtered-search.md).
 - Admin / introspection: `SKEG.STATS`, `SKEG.SHARDS`, `SKEG.WHOAMI`, `HELLO 3 AUTH user pass` (argon2id).
 - Multi-tenant: per-tenant isolation with hard quotas (`max_vectors`, `max_disk_bytes`), runtime admin commands (`SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`), and fair cache eviction so a noisy tenant cannot starve a quiet one. Shipped in the `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant` crates (Apache-2.0, same as the engine). See [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
 - Three durability tiers: relaxed (`sync_data`), kernel (`fsync`), and power-loss (`F_FULLFSYNC` on macOS).
@@ -207,6 +210,7 @@ The project blog at [amanitaproject.com](https://amanitaproject.com/) carries th
 
 Operational guides live in [`docs/`](docs/):
 
+- [`docs/filtered-search.md`](docs/filtered-search.md). Payloads, the filter grammar, and how the planner serves selective vs broad filters.
 - [`docs/multi-tenancy.md`](docs/multi-tenancy.md). Tenant binary, key scoping, per-tenant quotas, the `SKEG.QUOTA` admin commands, and fair cache eviction.
 - [`docs/observability.md`](docs/observability.md). Prometheus exporter, scrape config, OTel collector integration, tracing roadmap.
 - [`docs/ecosystem.md`](docs/ecosystem.md). Federation (hansa) and ingest pipelines around the engine.
