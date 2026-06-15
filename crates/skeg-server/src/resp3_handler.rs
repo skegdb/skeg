@@ -63,7 +63,7 @@ impl ScopedKey {
     /// The owning tenant id as a `u128`, for per-tenant cache accounting. `0`
     /// for the unscoped (anonymous) default, matching `VLog`'s tenant 0 path.
     fn accounting_tenant(&self) -> u128 {
-        u128::from_le_bytes(*self.tenant.as_bytes())
+        tenant_u128(self.tenant)
     }
 
     /// Cheap runtime check the prefix invariant still holds. Called at
@@ -293,16 +293,7 @@ async fn dispatch_command(
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
         Command::SkegQuotaGet { args } => skeg_quota_get(&args, *tenant, tenant_backend),
         Command::SkegVsearch { args } => skeg_vsearch(&args, shards, *tenant).await,
-        Command::Unknown { name, args } => {
-            dispatch_unknown(
-                &name.to_ascii_uppercase(),
-                args,
-                shards,
-                *tenant,
-                tenant_backend,
-            )
-            .await
-        }
+        Command::Unknown { name, .. } => unknown_command(&name.to_ascii_uppercase()),
     }
 }
 
@@ -310,13 +301,7 @@ async fn dispatch_command(
 /// `Command` variant. After phase 4 every KV / `SKEG.*` verb skeg
 /// supports flows through the typed path; this fallback only handles
 /// genuinely unknown command names and unknown `SKEG.*` verbs.
-async fn dispatch_unknown(
-    name: &str,
-    _args: Vec<Bytes>,
-    _shards: &ShardSet,
-    _tenant: TenantId,
-    _tenant_backend: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
+fn unknown_command(name: &str) -> Frame {
     Frame::Error(format!("ERR unknown command '{name}'"))
 }
 
@@ -1108,13 +1093,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn skeg_namespace_rejects_unknown_verb() {
-        // Unknown `SKEG.*` verbs come through the parser as `Unknown`
-        // and the dispatcher emits the legacy `ERR unknown command
-        // 'SKEG.<verb>'` byte-for-byte.
-        let (_dir, shards) = fresh_shards().await;
-        let resp = dispatch_unknown("SKEG.WHATEVER", vec![], &shards, TenantId::ZERO, None).await;
+    #[test]
+    fn skeg_namespace_rejects_unknown_verb() {
+        // Unknown `SKEG.*` verbs come through the parser as `Unknown` and the
+        // dispatcher emits the legacy `ERR unknown command 'SKEG.<verb>'`.
+        let resp = unknown_command("SKEG.WHATEVER");
         assert!(matches!(resp, Frame::Error(ref e) if e.contains("'SKEG.WHATEVER'")));
     }
 
