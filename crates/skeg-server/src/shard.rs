@@ -2117,9 +2117,9 @@ mod tests {
         hits.iter().find(|h| h.0 == id).and_then(|h| h.2.as_ref())
     }
 
-    // G-PA-1: a payload stored with VSET comes back byte-identical with a
-    // WITHPAYLOAD search, for empty, binary-with-NUL, and large (>4KB) blobs.
-    // G-PA-3 corollary: without WITHPAYLOAD no payload is attached.
+    // A payload stored with VSET comes back byte-identical with a WITHPAYLOAD
+    // search, for empty, binary-with-NUL, and large (>4KB) blobs. Without
+    // WITHPAYLOAD no payload is attached.
     #[tokio::test]
     async fn test_payload_round_trip() {
         let dir = TempDir::new().unwrap();
@@ -2153,8 +2153,8 @@ mod tests {
         assert!(plain.iter().all(|h| h.2.is_none()));
     }
 
-    // G-PA-2: payloads survive a restart (disk index + vLog replay), and a
-    // VDEL before the restart removes the blob for good.
+    // Payloads survive a restart (disk index + vLog replay), and a VDEL before
+    // the restart removes the blob for good.
     #[tokio::test]
     async fn test_payload_survives_restart() {
         let dir = TempDir::new().unwrap();
@@ -2182,8 +2182,8 @@ mod tests {
         assert!(hits.iter().all(|h| h.0 != 20));
     }
 
-    // G-PA-4: a payload is scoped to its tenant. The vector index is shared at
-    // this layer, so tenant 9 still sees id 1, but reads no payload for it.
+    // A payload is scoped to its tenant. The vector index is shared at this
+    // layer, so tenant 9 still sees id 1, but reads no payload for it.
     #[tokio::test]
     async fn test_payload_tenant_isolation() {
         let dir = TempDir::new().unwrap();
@@ -2202,8 +2202,8 @@ mod tests {
         assert_eq!(payload_of(&as9, 1), None, "tenant 9 must not read tenant 7's payload");
     }
 
-    // G-PA-5: dropping an index reclaims its payload blobs, so a recreated
-    // index reusing the same name and id does not resurface a stale payload.
+    // Dropping an index reclaims its payload blobs, so a recreated index
+    // reusing the same name and id does not resurface a stale payload.
     #[tokio::test]
     async fn test_payload_dropped_with_index() {
         let dir = TempDir::new().unwrap();
