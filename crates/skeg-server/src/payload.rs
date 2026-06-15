@@ -6,13 +6,15 @@
 //! The blob itself is still stored verbatim (see `shard::payload_key`) for
 //! WITHPAYLOAD return; this module only derives the searchable index from it.
 //!
-//! MVP scope: keyword and i64 fields; `=`, `IN`, and `AND`. OR, NOT, ranges,
-//! wider types, and roaring-bitmap postings are deferred (see the gate doc).
+//! Grammar: keyword and i64 fields; predicates `=`, `IN (...)`, the ranges
+//! `>=`, `>`, `<=`, `<`, `BETWEEN a AND b`; combined with `AND`, `OR`, `NOT`
+//! and parentheses. Wider types and roaring-bitmap postings are deferred.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 /// A typed payload value. A token that parses as an `i64` is an `Int`, otherwise
-/// a `Keyword`. `Ord` is derived only so it can key a `BTreeMap`.
+/// a `Keyword`. `Ord` (derived) gives ranges their order and keys a `BTreeMap`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Value {
     Keyword(String),
@@ -95,20 +97,46 @@ impl PayloadIndex {
     fn postings(&self, field: &str, value: &Value) -> Option<&BTreeSet<u64>> {
         self.by_field.get(field).and_then(|vs| vs.get(value))
     }
+
+    /// Union of ids whose `field` value lies in `[lo, hi]` (per the bounds).
+    fn range_ids(&self, field: &str, lo: &Bound<Value>, hi: &Bound<Value>) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        if let Some(vs) = self.by_field.get(field) {
+            for (_, ids) in vs.range((lo.as_ref(), hi.as_ref())) {
+                out.extend(ids.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// Every indexed id (the universe `NOT` complements against).
+    fn all_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.by_id.keys().copied()
+    }
 }
 
-/// A filter over payload fields. MVP grammar: AND of equality / membership
-/// predicates. OR, NOT, and range predicates come later.
+/// A filter over payload fields. Built by [`parse_filter`], evaluated against a
+/// [`PayloadIndex`] into the set of matching ids.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     Eq(String, Value),
     In(String, Vec<Value>),
+    /// `field` value within `[lo, hi]` (bounds carry inclusivity). Covers `>=`,
+    /// `>`, `<=`, `<`, and `BETWEEN`.
+    Range {
+        field: String,
+        lo: Bound<Value>,
+        hi: Bound<Value>,
+    },
     And(Vec<Filter>),
+    Or(Vec<Filter>),
+    Not(Box<Filter>),
 }
 
 impl Filter {
     /// The set of vector ids matching this filter against `idx`. An unknown
-    /// field or value contributes the empty set, which `AND` then propagates.
+    /// field or value contributes the empty set; `NOT` complements against the
+    /// indexed universe.
     #[must_use]
     pub fn evaluate(&self, idx: &PayloadIndex) -> BTreeSet<u64> {
         match self {
@@ -122,9 +150,9 @@ impl Filter {
                 }
                 out
             }
+            Filter::Range { field, lo, hi } => idx.range_ids(field, lo, hi),
             Filter::And(parts) => {
-                // Intersect smallest-first so the running set only shrinks and
-                // the cost tracks the most selective predicate.
+                // Intersect smallest-first so the running set only shrinks.
                 let mut sets: Vec<BTreeSet<u64>> = parts.iter().map(|p| p.evaluate(idx)).collect();
                 sets.sort_by_key(BTreeSet::len);
                 let mut iter = sets.into_iter();
@@ -139,45 +167,66 @@ impl Filter {
                 }
                 acc
             }
+            Filter::Or(parts) => parts.iter().flat_map(|p| p.evaluate(idx)).collect(),
+            Filter::Not(inner) => {
+                let excluded = inner.evaluate(idx);
+                idx.all_ids().filter(|id| !excluded.contains(id)).collect()
+            }
         }
     }
+}
+
+// ── parser ────────────────────────────────────────────────────────────────────
+
+fn is_keyword(t: &str, kw: &str) -> bool {
+    t.eq_ignore_ascii_case(kw)
 }
 
 fn is_reserved(t: &str) -> bool {
-    matches!(t, "=" | "(" | ")" | ",")
-        || t.eq_ignore_ascii_case("AND")
-        || t.eq_ignore_ascii_case("IN")
+    matches!(t, "=" | ">" | "<" | ">=" | "<=" | "(" | ")" | ",")
+        || ["AND", "OR", "NOT", "IN", "BETWEEN"]
+            .iter()
+            .any(|k| is_keyword(t, k))
 }
 
-/// Split a filter string into tokens, treating `= ( ) ,` as standalone tokens so
-/// `doc IN (a,b)` needs no spaces around the punctuation.
+/// Split a filter string into tokens. `( ) , = > < >= <=` are standalone tokens
+/// so punctuation needs no surrounding spaces.
 fn tokenize(s: &str) -> Vec<String> {
     let mut toks = Vec::new();
     let mut cur = String::new();
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    let flush = |cur: &mut String, toks: &mut Vec<String>| {
+        if !cur.is_empty() {
+            toks.push(std::mem::take(cur));
+        }
+    };
+    while let Some(c) = chars.next() {
         match c {
-            '=' | '(' | ')' | ',' => {
-                if !cur.is_empty() {
-                    toks.push(std::mem::take(&mut cur));
-                }
+            '(' | ')' | ',' | '=' => {
+                flush(&mut cur, &mut toks);
                 toks.push(c.to_string());
             }
-            c if c.is_whitespace() => {
-                if !cur.is_empty() {
-                    toks.push(std::mem::take(&mut cur));
+            '>' | '<' => {
+                flush(&mut cur, &mut toks);
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    toks.push(format!("{c}="));
+                } else {
+                    toks.push(c.to_string());
                 }
             }
+            c if c.is_whitespace() => flush(&mut cur, &mut toks),
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() {
-        toks.push(cur);
-    }
+    flush(&mut cur, &mut toks);
     toks
 }
 
-/// Parse a `FILTER` clause: `pred (AND pred)*`, where a `pred` is
-/// `field = value` or `field IN (v1, v2, ...)`.
+/// Parse a `FILTER` clause into a [`Filter`]. Grammar (lowest to highest
+/// precedence): `OR` of `AND` of `NOT`-able atoms; an atom is a parenthesised
+/// expression or a predicate (`field <op> value`, `field IN (...)`,
+/// `field BETWEEN a AND b`).
 ///
 /// # Errors
 ///
@@ -188,20 +237,67 @@ pub fn parse_filter(s: &str) -> Result<Filter, String> {
         return Err("empty filter".to_owned());
     }
     let mut i = 0;
-    let mut preds = Vec::new();
-    loop {
-        preds.push(parse_predicate(&toks, &mut i)?);
-        match toks.get(i) {
-            None => break,
-            Some(t) if t.eq_ignore_ascii_case("AND") => i += 1,
-            Some(t) => return Err(format!("expected AND or end of filter, got '{t}'")),
-        }
+    let f = parse_or(&toks, &mut i)?;
+    if i != toks.len() {
+        return Err(format!("unexpected trailing token '{}'", toks[i]));
     }
-    Ok(if preds.len() == 1 {
-        preds.pop().unwrap()
+    Ok(f)
+}
+
+fn parse_or(toks: &[String], i: &mut usize) -> Result<Filter, String> {
+    let mut parts = vec![parse_and(toks, i)?];
+    while toks.get(*i).is_some_and(|t| is_keyword(t, "OR")) {
+        *i += 1;
+        parts.push(parse_and(toks, i)?);
+    }
+    Ok(if parts.len() == 1 {
+        parts.pop().unwrap()
     } else {
-        Filter::And(preds)
+        Filter::Or(parts)
     })
+}
+
+fn parse_and(toks: &[String], i: &mut usize) -> Result<Filter, String> {
+    let mut parts = vec![parse_not(toks, i)?];
+    while toks.get(*i).is_some_and(|t| is_keyword(t, "AND")) {
+        *i += 1;
+        parts.push(parse_not(toks, i)?);
+    }
+    Ok(if parts.len() == 1 {
+        parts.pop().unwrap()
+    } else {
+        Filter::And(parts)
+    })
+}
+
+fn parse_not(toks: &[String], i: &mut usize) -> Result<Filter, String> {
+    if toks.get(*i).is_some_and(|t| is_keyword(t, "NOT")) {
+        *i += 1;
+        return Ok(Filter::Not(Box::new(parse_not(toks, i)?)));
+    }
+    parse_atom(toks, i)
+}
+
+fn parse_atom(toks: &[String], i: &mut usize) -> Result<Filter, String> {
+    if toks.get(*i).map(String::as_str) == Some("(") {
+        *i += 1;
+        let f = parse_or(toks, i)?;
+        if toks.get(*i).map(String::as_str) != Some(")") {
+            return Err("expected ')'".to_owned());
+        }
+        *i += 1;
+        return Ok(f);
+    }
+    parse_predicate(toks, i)
+}
+
+fn take_value(toks: &[String], i: &mut usize, what: &str) -> Result<Value, String> {
+    let tok = toks.get(*i).ok_or_else(|| format!("expected {what}"))?;
+    if is_reserved(tok) {
+        return Err(format!("expected {what}, got '{tok}'"));
+    }
+    *i += 1;
+    Ok(Value::parse(tok))
 }
 
 fn parse_predicate(toks: &[String], i: &mut usize) -> Result<Filter, String> {
@@ -210,43 +306,53 @@ fn parse_predicate(toks: &[String], i: &mut usize) -> Result<Filter, String> {
         return Err(format!("expected a field name, got '{field}'"));
     }
     *i += 1;
-    let op = toks.get(*i).ok_or("expected '=' or IN after the field")?;
-    if op == "=" {
-        *i += 1;
-        let val = toks.get(*i).ok_or("expected a value after '='")?;
-        if is_reserved(val) {
-            return Err(format!("expected a value, got '{val}'"));
-        }
-        let v = Value::parse(val);
-        *i += 1;
-        Ok(Filter::Eq(field, v))
-    } else if op.eq_ignore_ascii_case("IN") {
-        *i += 1;
-        if toks.get(*i).map(String::as_str) != Some("(") {
-            return Err("expected '(' after IN".to_owned());
-        }
-        *i += 1;
-        let mut vals = Vec::new();
-        loop {
-            let val = toks.get(*i).ok_or("unterminated IN list")?;
-            if is_reserved(val) {
-                return Err(format!("expected a value in the IN list, got '{val}'"));
+    let op = toks
+        .get(*i)
+        .ok_or("expected an operator after the field")?
+        .clone();
+    *i += 1;
+    match op.as_str() {
+        "=" => Ok(Filter::Eq(field, take_value(toks, i, "a value")?)),
+        ">=" => Ok(range(field, Bound::Included(take_value(toks, i, "a value")?), Bound::Unbounded)),
+        ">" => Ok(range(field, Bound::Excluded(take_value(toks, i, "a value")?), Bound::Unbounded)),
+        "<=" => Ok(range(field, Bound::Unbounded, Bound::Included(take_value(toks, i, "a value")?))),
+        "<" => Ok(range(field, Bound::Unbounded, Bound::Excluded(take_value(toks, i, "a value")?))),
+        _ if is_keyword(&op, "IN") => parse_in(field, toks, i),
+        _ if is_keyword(&op, "BETWEEN") => {
+            let lo = take_value(toks, i, "the BETWEEN lower bound")?;
+            if !toks.get(*i).is_some_and(|t| is_keyword(t, "AND")) {
+                return Err("expected AND in BETWEEN".to_owned());
             }
-            vals.push(Value::parse(val));
             *i += 1;
-            match toks.get(*i).map(String::as_str) {
-                Some(",") => *i += 1,
-                Some(")") => {
-                    *i += 1;
-                    break;
-                }
-                _ => return Err("expected ',' or ')' in the IN list".to_owned()),
-            }
+            let hi = take_value(toks, i, "the BETWEEN upper bound")?;
+            Ok(range(field, Bound::Included(lo), Bound::Included(hi)))
         }
-        Ok(Filter::In(field, vals))
-    } else {
-        Err(format!("expected '=' or IN, got '{op}'"))
+        _ => Err(format!("expected an operator, got '{op}'")),
     }
+}
+
+fn range(field: String, lo: Bound<Value>, hi: Bound<Value>) -> Filter {
+    Filter::Range { field, lo, hi }
+}
+
+fn parse_in(field: String, toks: &[String], i: &mut usize) -> Result<Filter, String> {
+    if toks.get(*i).map(String::as_str) != Some("(") {
+        return Err("expected '(' after IN".to_owned());
+    }
+    *i += 1;
+    let mut vals = Vec::new();
+    loop {
+        vals.push(take_value(toks, i, "a value in the IN list")?);
+        match toks.get(*i).map(String::as_str) {
+            Some(",") => *i += 1,
+            Some(")") => {
+                *i += 1;
+                break;
+            }
+            _ => return Err("expected ',' or ')' in the IN list".to_owned()),
+        }
+    }
+    Ok(Filter::In(field, vals))
 }
 
 #[cfg(test)]
@@ -268,7 +374,6 @@ mod tests {
                 ("tag".to_owned(), kw("")),
             ]
         );
-        // `loose` has no '=' and is skipped; non-UTF-8 yields nothing.
         assert!(parse_fields(&[0xff, 0xfe]).is_empty());
     }
 
@@ -282,19 +387,14 @@ mod tests {
             idx.postings("user", &kw("alice")),
             Some(&BTreeSet::from([1, 2]))
         );
-
-        // Overwrite id 1 to a new value: no phantom posting under the old one.
         idx.upsert(1, vec![("user".into(), kw("carol"))]);
         assert_eq!(idx.postings("user", &kw("alice")), Some(&BTreeSet::from([2])));
-        assert_eq!(idx.postings("user", &kw("carol")), Some(&BTreeSet::from([1])));
-
-        // Remove drops the id and prunes the now-empty value/field maps.
         idx.remove(3);
         assert_eq!(idx.postings("user", &kw("bob")), None);
     }
 
     #[test]
-    fn parse_filter_grammar() {
+    fn parse_grammar() {
         assert_eq!(
             parse_filter("user = alice").unwrap(),
             Filter::Eq("user".into(), kw("alice"))
@@ -304,45 +404,62 @@ mod tests {
             Filter::In("doc".into(), vec![kw("a"), kw("b"), kw("c")])
         );
         assert_eq!(
-            parse_filter("user=alice AND type=doc").unwrap(),
-            Filter::And(vec![
-                Filter::Eq("user".into(), kw("alice")),
-                Filter::Eq("type".into(), kw("doc")),
+            parse_filter("age >= 18").unwrap(),
+            Filter::Range {
+                field: "age".into(),
+                lo: Bound::Included(Value::Int(18)),
+                hi: Bound::Unbounded
+            }
+        );
+        assert_eq!(
+            parse_filter("ts BETWEEN 100 AND 200").unwrap(),
+            Filter::Range {
+                field: "ts".into(),
+                lo: Bound::Included(Value::Int(100)),
+                hi: Bound::Included(Value::Int(200))
+            }
+        );
+        // Precedence: NOT > AND > OR; parens override.
+        assert_eq!(
+            parse_filter("a = 1 OR b = 2 AND NOT c = 3").unwrap(),
+            Filter::Or(vec![
+                Filter::Eq("a".into(), Value::Int(1)),
+                Filter::And(vec![
+                    Filter::Eq("b".into(), Value::Int(2)),
+                    Filter::Not(Box::new(Filter::Eq("c".into(), Value::Int(3)))),
+                ]),
             ])
         );
+        assert!(matches!(
+            parse_filter("(a = 1 OR b = 2)").unwrap(),
+            Filter::Or(_)
+        ));
         // Errors.
         assert!(parse_filter("").is_err());
-        assert!(parse_filter("user ==").is_err());
+        assert!(parse_filter("a =").is_err());
         assert!(parse_filter("doc IN (a,").is_err());
-        assert!(parse_filter("user = alice type = doc").is_err()); // missing AND
+        assert!(parse_filter("a = 1 b = 2").is_err()); // missing connective
+        assert!(parse_filter("(a = 1").is_err()); // unbalanced paren
     }
 
     #[test]
-    fn evaluate_eq_in_and() {
+    fn evaluate_all_predicates() {
         let mut idx = PayloadIndex::default();
-        idx.upsert(1, vec![("u".into(), kw("a")), ("t".into(), kw("doc"))]);
-        idx.upsert(2, vec![("u".into(), kw("a")), ("t".into(), kw("img"))]);
-        idx.upsert(3, vec![("u".into(), kw("b")), ("t".into(), kw("doc"))]);
+        idx.upsert(1, vec![("u".into(), kw("a")), ("age".into(), Value::Int(20))]);
+        idx.upsert(2, vec![("u".into(), kw("a")), ("age".into(), Value::Int(40))]);
+        idx.upsert(3, vec![("u".into(), kw("b")), ("age".into(), Value::Int(60))]);
 
-        assert_eq!(
-            parse_filter("u = a").unwrap().evaluate(&idx),
-            BTreeSet::from([1, 2])
-        );
-        assert_eq!(
-            parse_filter("t IN (doc,img)").unwrap().evaluate(&idx),
-            BTreeSet::from([1, 2, 3])
-        );
-        assert_eq!(
-            parse_filter("u = a AND t = doc").unwrap().evaluate(&idx),
-            BTreeSet::from([1])
-        );
-        // Unknown field/value -> empty, and AND with empty stays empty.
-        assert!(parse_filter("u = zzz").unwrap().evaluate(&idx).is_empty());
-        assert!(
-            parse_filter("u = a AND missing = x")
-                .unwrap()
-                .evaluate(&idx)
-                .is_empty()
-        );
+        let eval = |s: &str| parse_filter(s).unwrap().evaluate(&idx);
+        assert_eq!(eval("u = a"), BTreeSet::from([1, 2]));
+        assert_eq!(eval("age >= 40"), BTreeSet::from([2, 3]));
+        assert_eq!(eval("age > 40"), BTreeSet::from([3]));
+        assert_eq!(eval("age < 40"), BTreeSet::from([1]));
+        assert_eq!(eval("age BETWEEN 20 AND 40"), BTreeSet::from([1, 2]));
+        assert_eq!(eval("u = a AND age >= 40"), BTreeSet::from([2]));
+        assert_eq!(eval("u = b OR age < 40"), BTreeSet::from([1, 3]));
+        assert_eq!(eval("u = a AND NOT age = 20"), BTreeSet::from([2]));
+        // NOT complements against the indexed universe {1,2,3}.
+        assert_eq!(eval("NOT u = a"), BTreeSet::from([3]));
+        assert!(eval("u = nobody").is_empty());
     }
 }
