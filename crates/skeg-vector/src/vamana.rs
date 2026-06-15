@@ -1696,16 +1696,6 @@ impl DiskVamanaIndex {
                     seed_rows.push(r);
                 }
             }
-            // For a filtered walk, admit only live matching rows into the list:
-            // the walk then explores the matching subgraph and a far cluster is
-            // not evicted by near non-matching nodes. `None` for a plain search
-            // leaves the walk byte-identical to before.
-            let admit = |row: VecId| -> bool {
-                let id = self.ids[row as usize];
-                !self.tombstones.contains(&id)
-                    && !self.delta.contains_key(&id)
-                    && matches.is_none_or(|m| m(id))
-            };
             let dist = |id: VecId| -(self.quant.proxy(id as usize, &code) as f32);
             let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
                 self.nodes[id as usize].slice().iter().copied().collect()
@@ -1725,6 +1715,15 @@ impl DiskVamanaIndex {
             {
                 let _g = walk_span.enter();
                 if filtered {
+                    // Admit only live matching rows into the list, so the walk
+                    // explores the matching subgraph and a far cluster is not
+                    // evicted by near non-matching nodes.
+                    let admit = |row: VecId| -> bool {
+                        let id = self.ids[row as usize];
+                        !self.tombstones.contains(&id)
+                            && !self.delta.contains_key(&id)
+                            && matches.is_none_or(|m| m(id))
+                    };
                     let la = greedy_search(
                         &seed_rows, list_size, None, dist, nbrs, Some(&admit),
                         &mut visited, &mut seen, None,
