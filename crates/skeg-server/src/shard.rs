@@ -224,7 +224,12 @@ impl VectorBackend {
                 i.score_ids(query, &ids, k)
             }
             VectorBackend::Disk(i) => {
-                i.search_filtered(query, k, l_search as usize, &|id| s.contains(&id))
+                // Seed the walk from a spread of matching ids so it can reach a
+                // cluster that sits away from the query (multi-seed).
+                const SEEDS: usize = 32;
+                let step = (s.len() / SEEDS).max(1);
+                let seeds: Vec<u64> = s.iter().copied().step_by(step).take(SEEDS).collect();
+                i.search_filtered(query, k, l_search as usize, &|id| s.contains(&id), &seeds)
             }
         }
     }

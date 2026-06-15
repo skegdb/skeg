@@ -263,11 +263,12 @@ fn top_k_signature(list: &SearchList, k: usize) -> u64 {
 /// semantics (insert -> test_and_set; `true` means "already present").
 #[allow(clippy::too_many_arguments)] // 8 args is the price of generic closures + scratch buffers
 fn greedy_search<D, N>(
-    entry: VecId,
+    seeds: &[VecId],
     list_size: usize,
     early_term: Option<EarlyTerm>,
     dist_to_query: D,
     neighbors: N,
+    admit: Option<&dyn Fn(VecId) -> bool>,
     visited: &mut VisitedBitset,
     seen: &mut VisitedBitset,
     mut trace: Option<&mut Vec<VecId>>,
@@ -280,8 +281,20 @@ where
     visited.clear();
     seen.clear();
 
-    list.insert(dist_to_query(entry), entry);
-    seen.test_and_set(entry);
+    // Seed the frontier from every entry point. A plain search passes one
+    // (the medoid); a filtered search passes points drawn from the matching set
+    // so the walk starts inside the matching region, not only at the centre.
+    //
+    // `admit` (filtered search only) gates which nodes may enter the list: only
+    // matching nodes are kept and expanded, so the walk explores the matching
+    // subgraph and a far matching cluster is not evicted by near non-matching
+    // nodes. Edges are still followed through `neighbors`; non-matching nodes
+    // are simply never admitted as candidates.
+    for &s in seeds {
+        if !seen.test_and_set(s) && admit.is_none_or(|a| a(s)) {
+            list.insert(dist_to_query(s), s);
+        }
+    }
 
     // Early-termination: track top-k signature stability across expansions.
     let mut last_sig: u64 = 0;
@@ -298,7 +311,9 @@ where
             if seen.test_and_set(nbr) {
                 continue;
             }
-            list.insert(dist_to_query(nbr), nbr);
+            if admit.is_none_or(|a| a(nbr)) {
+                list.insert(dist_to_query(nbr), nbr);
+            }
         }
         if let Some(et) = early_term {
             let sig = top_k_signature(&list, et.k);
@@ -535,11 +550,12 @@ fn insert_point_concurrent(
     let p_vec = source.row(p);
     let t_walk = Instant::now();
     greedy_search(
-        medoid,
+        &[medoid],
         l_build,
         None, // build: never early-terminate (full candidate pool for prune)
         |id| dist(p_vec, source.row(id)),
         |id| locked_neighbors(graph, id),
+        None, // build: no filter admission
         &mut scratch.visited,
         &mut scratch.seen,
         None,
@@ -845,11 +861,12 @@ impl VamanaIndex {
             window: 5,
         });
         let list = greedy_search(
-            self.medoid,
+            &[self.medoid],
             list_size,
             early,
             |id| dist(query, self.vectors.row(id)),
             |id| self.nodes[id as usize].slice().iter().copied().collect(),
+            None, // in-RAM search: no filter admission
             &mut visited,
             &mut seen,
             None,
@@ -1579,13 +1596,15 @@ impl DiskVamanaIndex {
         k: usize,
         l_search: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, None)
+        self.search_inner(query, k, l_search, None, &[])
     }
 
     /// Filtered search: only ids for which `matches` returns true enter the
     /// result. Oversamples the frontier and reranks all of it so enough matching
-    /// candidates survive the post-filter. Intended for low-selectivity filters;
-    /// the planner routes selective filters to exact scoring (`score_ids`).
+    /// candidates survive the post-filter. `seeds` are external ids drawn from
+    /// the matching set; the walk also starts from them (mapped to graph rows)
+    /// so it begins inside the matching region rather than only at the medoid -
+    /// the fix for filters whose matches cluster away from the query.
     ///
     /// # Errors
     ///
@@ -1600,8 +1619,9 @@ impl DiskVamanaIndex {
         k: usize,
         l_search: usize,
         matches: &dyn Fn(u64) -> bool,
+        seeds: &[u64],
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, Some(matches))
+        self.search_inner(query, k, l_search, Some(matches), seeds)
     }
 
     /// Shared search core. `matches == None` is the plain ANN search; `Some`
@@ -1613,6 +1633,7 @@ impl DiskVamanaIndex {
         k: usize,
         l_search: usize,
         matches: Option<&dyn Fn(u64) -> bool>,
+        seeds: &[u64],
     ) -> io::Result<Vec<(u64, f32)>> {
         /// Frontier blow-up for a filtered walk, so the post-filter still leaves
         /// enough matching candidates. Capped at the main graph size.
@@ -1662,14 +1683,38 @@ impl DiskVamanaIndex {
                 visited = tracing::field::Empty,
                 returned = tracing::field::Empty,
             );
+            // Multi-seed: the medoid plus, for a filtered walk, the matching
+            // seed ids mapped to live graph rows. Starting inside the matching
+            // region lets the walk reach a cluster that sits away from the query.
+            let mut seed_rows: Vec<VecId> = vec![self.medoid];
+            for &id in seeds {
+                if let Some(&r) = self.id_to_main_row.get(&id)
+                    && !self.tombstones.contains(&id)
+                {
+                    seed_rows.push(r);
+                }
+            }
+            // For a filtered walk, admit only live matching rows into the list:
+            // the walk then explores the matching subgraph and a far cluster is
+            // not evicted by near non-matching nodes. `None` for a plain search
+            // leaves the walk byte-identical to before.
+            let admit = |row: VecId| -> bool {
+                let id = self.ids[row as usize];
+                !self.tombstones.contains(&id)
+                    && !self.delta.contains_key(&id)
+                    && matches.is_none_or(|m| m(id))
+            };
+            let admit_ref: Option<&dyn Fn(VecId) -> bool> =
+                if filtered { Some(&admit) } else { None };
             let list = {
                 let _g = walk_span.enter();
                 let list = greedy_search(
-                    self.medoid,
+                    &seed_rows,
                     list_size,
                     early,
                     |id| -(self.quant.proxy(id as usize, &code) as f32),
                     |id| self.nodes[id as usize].slice().iter().copied().collect(),
+                    admit_ref,
                     &mut visited,
                     &mut seen,
                     None,
@@ -1749,11 +1794,12 @@ impl DiskVamanaIndex {
             let mut visited = VisitedBitset::new(self.main_n as usize);
             let mut seen = VisitedBitset::new(self.main_n as usize);
             greedy_search(
-                self.medoid,
+                &[self.medoid],
                 self.l_search,
                 None, // trace: want the full walk, no early termination
                 |id| -(self.quant.proxy(id as usize, &code) as f32),
                 |id| self.nodes[id as usize].slice().iter().copied().collect(),
+                None, // trace: no filter admission
                 &mut visited,
                 &mut seen,
                 Some(&mut trace),
@@ -1974,11 +2020,12 @@ mod tests {
         let mut visited = VisitedBitset::new(n);
         let mut seen = VisitedBitset::new(n);
         let list = greedy_search(
-            0,
+            &[0],
             50,
             None,
             |id| dist(&query, row(&vectors, id, dim)),
             |id| nodes[id as usize].slice().iter().copied().collect(),
+            None,
             &mut visited,
             &mut seen,
             None,
@@ -2065,6 +2112,8 @@ mod tests {
         let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
 
         let matches = |id: u64| id % 2 == 0; // even ids, ~50% selectivity
+        // A handful of matching ids spread across the set, used as walk seeds.
+        let seeds: Vec<u64> = (0..n as u64).filter(|&id| matches(id)).step_by(64).collect();
         let mut rng = StdRng::seed_from_u64(777);
         let mut hits = 0;
         let mut total = 0;
@@ -2079,7 +2128,7 @@ mod tests {
             let want: Vec<u64> = scored.iter().take(10).map(|&(_, id)| id).collect();
 
             let got: Vec<u64> = disk
-                .search_filtered(&query, 10, 0, &matches)
+                .search_filtered(&query, 10, 0, &matches, &seeds)
                 .unwrap()
                 .into_iter()
                 .map(|(id, _)| id)
