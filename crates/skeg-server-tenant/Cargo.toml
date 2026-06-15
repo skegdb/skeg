@@ -26,7 +26,7 @@ path = "src/main.rs"
 [dependencies]
 skeg-server = { path = "../skeg-server", version = "0.4" }
 skeg-tenant = { path = "../skeg-tenant", version = "0.1" }
-skeg-vector = { path = "../skeg-vector", version = "0.1" }
+skeg-vector = { path = "../skeg-vector", version = "0.1.4" }
 skeg-platform = { path = "../skeg-platform", version = "0.1" }
 
 tokio = { workspace = true }
