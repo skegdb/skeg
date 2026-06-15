@@ -7,8 +7,9 @@
 //! WITHPAYLOAD return; this module only derives the searchable index from it.
 //!
 //! Grammar: keyword and i64 fields; predicates `=`, `IN (...)`, the ranges
-//! `>=`, `>`, `<=`, `<`, `BETWEEN a AND b`; combined with `AND`, `OR`, `NOT`
-//! and parentheses. Wider types and roaring-bitmap postings are deferred.
+//! `>=`, `>`, `<=`, `<`, `BETWEEN a AND b`, and `field EXISTS`; combined with
+//! `AND`, `OR`, `NOT` and parentheses. Wider types (f64) and roaring-bitmap
+//! postings are deferred.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -98,6 +99,17 @@ impl PayloadIndex {
         self.by_field.get(field).and_then(|vs| vs.get(value))
     }
 
+    /// Every id that has any value for `field` (the `EXISTS` predicate).
+    fn field_ids(&self, field: &str) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        if let Some(vs) = self.by_field.get(field) {
+            for ids in vs.values() {
+                out.extend(ids.iter().copied());
+            }
+        }
+        out
+    }
+
     /// Union of ids whose `field` value lies in `[lo, hi]` (per the bounds).
     fn range_ids(&self, field: &str, lo: &Bound<Value>, hi: &Bound<Value>) -> BTreeSet<u64> {
         let mut out = BTreeSet::new();
@@ -128,6 +140,8 @@ pub enum Filter {
         lo: Bound<Value>,
         hi: Bound<Value>,
     },
+    /// `field EXISTS`: the id has any value for `field`.
+    Exists(String),
     And(Vec<Filter>),
     Or(Vec<Filter>),
     Not(Box<Filter>),
@@ -151,6 +165,7 @@ impl Filter {
                 out
             }
             Filter::Range { field, lo, hi } => idx.range_ids(field, lo, hi),
+            Filter::Exists(field) => idx.field_ids(field),
             Filter::And(parts) => {
                 // Intersect smallest-first so the running set only shrinks.
                 let mut sets: Vec<BTreeSet<u64>> = parts.iter().map(|p| p.evaluate(idx)).collect();
@@ -184,7 +199,7 @@ fn is_keyword(t: &str, kw: &str) -> bool {
 
 fn is_reserved(t: &str) -> bool {
     matches!(t, "=" | ">" | "<" | ">=" | "<=" | "(" | ")" | ",")
-        || ["AND", "OR", "NOT", "IN", "BETWEEN"]
+        || ["AND", "OR", "NOT", "IN", "BETWEEN", "EXISTS"]
             .iter()
             .any(|k| is_keyword(t, k))
 }
@@ -317,6 +332,7 @@ fn parse_predicate(toks: &[String], i: &mut usize) -> Result<Filter, String> {
         ">" => Ok(range(field, Bound::Excluded(take_value(toks, i, "a value")?), Bound::Unbounded)),
         "<=" => Ok(range(field, Bound::Unbounded, Bound::Included(take_value(toks, i, "a value")?))),
         "<" => Ok(range(field, Bound::Unbounded, Bound::Excluded(take_value(toks, i, "a value")?))),
+        _ if is_keyword(&op, "EXISTS") => Ok(Filter::Exists(field)),
         _ if is_keyword(&op, "IN") => parse_in(field, toks, i),
         _ if is_keyword(&op, "BETWEEN") => {
             let lo = take_value(toks, i, "the BETWEEN lower bound")?;
@@ -434,6 +450,10 @@ mod tests {
             parse_filter("(a = 1 OR b = 2)").unwrap(),
             Filter::Or(_)
         ));
+        assert_eq!(
+            parse_filter("source EXISTS").unwrap(),
+            Filter::Exists("source".into())
+        );
         // Errors.
         assert!(parse_filter("").is_err());
         assert!(parse_filter("a =").is_err());
@@ -448,6 +468,7 @@ mod tests {
         idx.upsert(1, vec![("u".into(), kw("a")), ("age".into(), Value::Int(20))]);
         idx.upsert(2, vec![("u".into(), kw("a")), ("age".into(), Value::Int(40))]);
         idx.upsert(3, vec![("u".into(), kw("b")), ("age".into(), Value::Int(60))]);
+        idx.upsert(4, vec![("u".into(), kw("c"))]); // no `age` field
 
         let eval = |s: &str| parse_filter(s).unwrap().evaluate(&idx);
         assert_eq!(eval("u = a"), BTreeSet::from([1, 2]));
@@ -458,8 +479,10 @@ mod tests {
         assert_eq!(eval("u = a AND age >= 40"), BTreeSet::from([2]));
         assert_eq!(eval("u = b OR age < 40"), BTreeSet::from([1, 3]));
         assert_eq!(eval("u = a AND NOT age = 20"), BTreeSet::from([2]));
-        // NOT complements against the indexed universe {1,2,3}.
-        assert_eq!(eval("NOT u = a"), BTreeSet::from([3]));
+        assert_eq!(eval("age EXISTS"), BTreeSet::from([1, 2, 3]));
+        assert_eq!(eval("NOT age EXISTS"), BTreeSet::from([4]));
+        // NOT complements against the indexed universe {1,2,3,4}.
+        assert_eq!(eval("NOT u = a"), BTreeSet::from([3, 4]));
         assert!(eval("u = nobody").is_empty());
     }
 }
