@@ -48,5 +48,10 @@ harness = false
 name = "cache_tenant_accounting"
 harness = false
 
+# Does fair eviction's over-share scan bottleneck as resident tenants grow?
+[[bench]]
+name = "cache_eviction_scaling"
+harness = false
+
 [lints]
 workspace = true
