@@ -154,6 +154,18 @@ impl FlatIndex {
         }
     }
 
+    /// Every live (non-tombstoned) vector id. Used to reclaim per-id sidecar
+    /// state (e.g. payload blobs) when the whole index is dropped.
+    #[must_use]
+    pub fn live_ids(&self) -> Vec<u64> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|&(row, _)| self.live.contains(row))
+            .map(|(_, &id)| id)
+            .collect()
+    }
+
     /// Top-`k` `(id, cosine)` matches for `query`, highest cosine first.
     ///
     /// # Panics

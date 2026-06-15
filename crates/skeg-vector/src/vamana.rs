@@ -1440,6 +1440,24 @@ impl DiskVamanaIndex {
         self.is_live(id)
     }
 
+    /// Every live (non-tombstoned) vector id: main ids plus streaming-delta
+    /// ids, minus tombstones. Used to reclaim per-id sidecar state (e.g.
+    /// payload blobs) when the whole index is dropped. In-memory, no disk read.
+    #[must_use]
+    pub fn live_ids(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .ids
+            .iter()
+            .copied()
+            .chain(self.delta.keys().copied())
+            .filter(|id| !self.tombstones.contains(id))
+            .collect();
+        // A delta overwrite of a main id appears in both sources; dedup.
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Insert or overwrite the vector for `id`. The vector lands in the in-RAM
     /// delta and is appended to the WAL; [`consolidate`](Self::consolidate)
     /// folds it into the graph.

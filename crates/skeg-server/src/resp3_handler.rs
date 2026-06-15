@@ -450,7 +450,7 @@ async fn skeg_vset(
     // skips quota enforcement entirely.
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
     match shards
-        .vset(&scoped, id, vector, tenant_u128(tenant), limit)
+        .vset(&scoped, id, vector, tenant_u128(tenant), limit, None)
         .await
     {
         Ok(()) => Frame::ok(),
@@ -599,11 +599,14 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
     span.record("l_search", l_search);
     span.record("vector_dim", query.len());
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vsearch(&scoped, query, k, l_search).await {
+    match shards
+        .vsearch(&scoped, query, k, l_search, tenant_u128(tenant), false)
+        .await
+    {
         Ok(hits) => {
             span.record("hits", hits.len());
             let mut out = Vec::with_capacity(hits.len() * 2);
-            for (id, score) in hits {
+            for (id, score, _payload) in hits {
                 out.push(Frame::Bulk(Bytes::from(id.to_string())));
                 out.push(Frame::Double(f64::from(score)));
             }
