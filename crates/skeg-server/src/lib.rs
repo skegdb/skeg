@@ -11,6 +11,7 @@
 //! via [`Server::with_tenant_backend`].
 
 pub mod handler;
+pub mod payload;
 pub mod quota;
 pub mod resp3_handler;
 pub mod shard;
