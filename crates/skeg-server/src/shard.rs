@@ -24,6 +24,8 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
 
+use std::collections::BTreeSet;
+
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -194,11 +196,36 @@ impl VectorBackend {
         }
     }
 
-    /// Exact top-`k` over a filter's candidate ids (full-precision cosine).
-    fn score_ids(&self, query: &[f32], ids: &[u64], k: usize) -> std::io::Result<Vec<(u64, f32)>> {
+    /// Top-`k` for a payload filter whose matching id set is `s`. The planner's
+    /// choice between exact scan and the filtered ANN walk:
+    /// - flat is already brute-force, so an exact scan over `s` is always best;
+    /// - on disk, a selective filter (small `s`) scans `s` exactly, while a
+    ///   low-selectivity filter (large `s`) takes the filtered walk, which visits
+    ///   far fewer nodes than `|s|` disk reads.
+    ///
+    /// `FILTER_EXACT_MAX` is a heuristic crossover, to be tuned by a bench.
+    fn filtered_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: u32,
+        s: &BTreeSet<u64>,
+    ) -> std::io::Result<Vec<(u64, f32)>> {
+        // ponytail: crossover guessed, not yet measured. Tune via a selectivity
+        // bench; raise if the walk wins below this, lower if not.
+        const FILTER_EXACT_MAX: usize = 2048;
         match self {
-            VectorBackend::Flat(i) => Ok(i.score_ids(query, ids, k)),
-            VectorBackend::Disk(i) => i.score_ids(query, ids, k),
+            VectorBackend::Flat(i) => {
+                let ids: Vec<u64> = s.iter().copied().collect();
+                Ok(i.score_ids(query, &ids, k))
+            }
+            VectorBackend::Disk(i) if s.len() <= FILTER_EXACT_MAX => {
+                let ids: Vec<u64> = s.iter().copied().collect();
+                i.score_ids(query, &ids, k)
+            }
+            VectorBackend::Disk(i) => {
+                i.search_filtered(query, k, l_search as usize, &|id| s.contains(&id))
+            }
         }
     }
 
@@ -409,9 +436,9 @@ fn search_vindex(
         ));
     }
     if let Some(f) = filter {
-        let s: Vec<u64> = f.evaluate(&idx.payload).into_iter().collect();
+        let s = f.evaluate(&idx.payload);
         idx.backend
-            .score_ids(query, &s, k)
+            .filtered_search(query, k, l_search, &s)
             .map_err(|e| format!("vsearch failed: {e}"))
     } else {
         idx.backend

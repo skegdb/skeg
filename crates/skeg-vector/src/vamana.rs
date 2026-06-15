@@ -1573,14 +1573,52 @@ impl DiskVamanaIndex {
     /// # Panics
     ///
     /// Panics if `query.len()` does not equal the index dimension.
-    #[allow(clippy::cast_precision_loss)] // proxy is an ordering key, exact value irrelevant
     pub fn search_with_l(
         &self,
         query: &[f32],
         k: usize,
         l_search: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
+        self.search_inner(query, k, l_search, None)
+    }
+
+    /// Filtered search: only ids for which `matches` returns true enter the
+    /// result. Oversamples the frontier and reranks all of it so enough matching
+    /// candidates survive the post-filter. Intended for low-selectivity filters;
+    /// the planner routes selective filters to exact scoring (`score_ids`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a re-rank read from `vectors.bin` fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not equal the index dimension.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: usize,
+        matches: &dyn Fn(u64) -> bool,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        self.search_inner(query, k, l_search, Some(matches))
+    }
+
+    /// Shared search core. `matches == None` is the plain ANN search; `Some`
+    /// keeps only matching ids, walking an oversampled, fully-reranked frontier.
+    #[allow(clippy::cast_precision_loss)] // proxy is an ordering key, exact value irrelevant
+    fn search_inner(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: usize,
+        matches: Option<&dyn Fn(u64) -> bool>,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        /// Frontier blow-up for a filtered walk, so the post-filter still leaves
+        /// enough matching candidates. Capped at the main graph size.
+        const FILTER_OVERSAMPLE: usize = 4;
         assert_eq!(query.len(), self.dim, "query dim mismatch");
+        let filtered = matches.is_some();
         if self.live_count == 0 || k == 0 {
             return Ok(Vec::new());
         }
@@ -1594,14 +1632,25 @@ impl DiskVamanaIndex {
             } else {
                 l_search
             };
-            let list_size = base.max(k);
-            let rerank = (k * 4).max(32).min(list_size);
+            // A filtered walk oversamples the frontier and reranks all of it so
+            // enough matching candidates survive the post-filter.
+            let list_size = if filtered {
+                (base.max(k) * FILTER_OVERSAMPLE).min(self.main_n as usize)
+            } else {
+                base.max(k)
+            };
+            let rerank = if filtered {
+                list_size
+            } else {
+                (k * 4).max(32).min(list_size)
+            };
             let mut visited = VisitedBitset::new(self.main_n as usize);
             let mut seen = VisitedBitset::new(self.main_n as usize);
             // Early-term signature tracks the re-rank candidate pool (top-rerank),
             // not just top-k: the graph walk feeds the re-rank, and stability of
             // the wider pool is what guarantees the final top-k is unchanged.
-            let early = speed_enabled().then_some(EarlyTerm {
+            // Early-term could stop before enough matches are found; off when filtered.
+            let early = (!filtered && speed_enabled()).then_some(EarlyTerm {
                 k: rerank,
                 window: 5,
             });
@@ -1647,6 +1696,13 @@ impl DiskVamanaIndex {
                     skipped += 1;
                     continue;
                 }
+                // Filtered walk: drop non-matching ids before the disk read.
+                if let Some(m) = matches
+                    && !m(id)
+                {
+                    skipped += 1;
+                    continue;
+                }
                 let v = self.read_vector(vec_id)?;
                 disk_reads += 1;
                 scored.push((OrderedFloat(cosine_f32(query, &v)), id));
@@ -1658,7 +1714,9 @@ impl DiskVamanaIndex {
 
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
         for (&id, v) in &self.delta {
-            scored.push((OrderedFloat(cosine_f32(query, v)), id));
+            if matches.is_none_or(|m| m(id)) {
+                scored.push((OrderedFloat(cosine_f32(query, v)), id));
+            }
         }
 
         scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
@@ -1989,6 +2047,54 @@ mod tests {
         assert!(
             recall >= 0.95,
             "on-disk Vamana recall@10 = {recall:.4} (target >= 0.95)"
+        );
+    }
+
+    // Filtered walk recall: against the exact top-10 over the matching subset
+    // (the ground truth), the oversampled filtered walk recovers >= 0.90 at a
+    // low-selectivity (~50%) filter, and never returns a non-matching id.
+    #[test]
+    fn disk_filtered_search_recall() {
+        let dim = 64;
+        let n = 1000;
+        let vectors = random_vectors(n, dim, 42);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let index = VamanaIndex::build(vectors.clone(), ids, dim, &VamanaConfig::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        index.save(tmp.path()).unwrap();
+        let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+
+        let matches = |id: u64| id % 2 == 0; // even ids, ~50% selectivity
+        let mut rng = StdRng::seed_from_u64(777);
+        let mut hits = 0;
+        let mut total = 0;
+        for _ in 0..50 {
+            let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+            // Ground truth: exact top-10 cosine over just the matching ids.
+            let mut scored: Vec<(f32, u64)> = (0..n as u64)
+                .filter(|&id| matches(id))
+                .map(|id| (cosine_f32(&query, row(&vectors, id as u32, dim)), id))
+                .collect();
+            scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            let want: Vec<u64> = scored.iter().take(10).map(|&(_, id)| id).collect();
+
+            let got: Vec<u64> = disk
+                .search_filtered(&query, 10, 0, &matches)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                got.iter().all(|&id| matches(id)),
+                "filtered walk returned a non-matching id"
+            );
+            hits += got.iter().filter(|id| want.contains(id)).count();
+            total += want.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.90,
+            "filtered walk recall@10 = {recall:.4} (target >= 0.90)"
         );
     }
 
