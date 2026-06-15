@@ -211,9 +211,12 @@ impl VectorBackend {
         l_search: u32,
         s: &BTreeSet<u64>,
     ) -> std::io::Result<Vec<(u64, f32)>> {
-        // ponytail: crossover guessed, not yet measured. Tune via a selectivity
-        // bench; raise if the walk wins below this, lower if not.
-        const FILTER_EXACT_MAX: usize = 2048;
+        // Crossover from the real-embedding selectivity bench (100k/500k mxbai):
+        // the two-walk is robust for broad filters (|S| above this), while a
+        // selective filter is cheaper and always exact via score_ids. Set so a
+        // sparse, selective filter (where the walk's recall dips) is scored
+        // exactly; the exact cost stays bounded (~1.5us/vector).
+        const FILTER_EXACT_MAX: usize = 16_384;
         match self {
             VectorBackend::Flat(i) => {
                 let ids: Vec<u64> = s.iter().copied().collect();

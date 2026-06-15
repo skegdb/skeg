@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use skeg_vector::{DiskVamanaIndex, VamanaConfig, VamanaIndex};
 
 /// Mirrors the server planner's crossover (`shard::VectorBackend::filtered_search`).
-const FILTER_EXACT_MAX: usize = 2048;
+const FILTER_EXACT_MAX: usize = 16_384;
 const DIM: usize = 1024;
 const K: usize = 10;
 const MAX_QUERIES: usize = 50;
@@ -139,7 +139,11 @@ fn filtered_search_quality_on_real_embeddings() {
     let (corpus, n, cols) = load_npy(Path::new(&corpus_path));
     let (queries, nq, _) = load_npy(Path::new(&queries_path));
     assert_eq!(cols, DIM);
-    println!("corpus={n} queries={nq} dim={DIM}");
+    let q_cap: usize = std::env::var("SKEG_BENCH_QUERIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_QUERIES);
+    println!("corpus={n} queries={nq} dim={DIM} q_cap={q_cap}");
 
     let t0 = Instant::now();
     let ids: Vec<u64> = (0..n as u64).collect();
@@ -149,7 +153,7 @@ fn filtered_search_quality_on_real_embeddings() {
     let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
     drop(index);
     println!("index built+opened in {:?}\n", t0.elapsed());
-    let q_used = nq.min(MAX_QUERIES);
+    let q_used = nq.min(q_cap);
 
     for &c in &[2usize, 5, 20, 100] {
         // Uncorrelated labels: id % c.
