@@ -23,6 +23,8 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
+
+use crate::payload::{PayloadIndex, parse_fields};
 use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -39,7 +41,23 @@ use xxhash_rust::xxh3::xxh3_64;
 /// **same** vindex still serialize, which is required for correctness:
 /// `VectorBackend::search` takes `&mut self` because the disk path
 /// mutates the working-set cache and the streaming-insert buffer.
-type VectorEntry = Arc<RwLock<VectorBackend>>;
+/// A vindex: the vector backend plus its payload index, behind one lock so a
+/// VSET updates both atomically and a filtered VSEARCH reads a consistent view.
+struct Vindex {
+    backend: VectorBackend,
+    payload: PayloadIndex,
+}
+
+impl Vindex {
+    fn new(backend: VectorBackend) -> Self {
+        Self {
+            backend,
+            payload: PayloadIndex::default(),
+        }
+    }
+}
+
+type VectorEntry = Arc<RwLock<Vindex>>;
 type VindexSet = HashMap<String, VectorEntry>;
 
 /// Query-time search list size for a disk Vamana index.
@@ -397,8 +415,8 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
     let entries: Vec<(String, usize)> = vs
         .iter()
         .filter_map(|(name, entry)| {
-            let backend = entry.read();
-            match &*backend {
+            let backend = &entry.read().backend;
+            match backend {
                 VectorBackend::Disk(i) => Some((name.clone(), i.dim())),
                 VectorBackend::Flat(_) => None,
             }
@@ -427,7 +445,10 @@ fn recover_vindexes(
         let vdir = dir.join(format!("vindex-{name}"));
         match DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph) {
             Ok(idx) => {
-                set.insert(name, Arc::new(RwLock::new(VectorBackend::Disk(idx))));
+                set.insert(
+                    name,
+                    Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(idx)))),
+                );
             }
             Err(e) => error!("shard {shard_id}: recovering vindex '{name}' failed: {e}"),
         }
@@ -648,14 +669,15 @@ async fn process(
                 return Err(format!("vindex '{walk_name}' not found"));
             };
             let mut idx = arc.write();
-            if idx.dim() != query.len() {
+            if idx.backend.dim() != query.len() {
                 return Err(format!(
                     "vindex '{walk_name}' dim {} but query has {}",
-                    idx.dim(),
+                    idx.backend.dim(),
                     query.len()
                 ));
             }
-            idx.search(&query, k, l_search)
+            idx.backend
+                .search(&query, k, l_search)
                 .map_err(|e| format!("vsearch failed: {e}"))
         });
         let hits = match join.await {
@@ -687,14 +709,16 @@ async fn process(
                         let vdir = dir.join(format!("vindex-{}", e.key()));
                         match DiskVamanaIndex::create_empty(&vdir, dim, VAMANA_L_SEARCH) {
                             Ok(idx) => {
-                                e.insert(Arc::new(RwLock::new(VectorBackend::Disk(idx))));
+                                e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(
+                                    idx,
+                                )))));
                                 Ok(true)
                             }
                             Err(err) => Err(format!("vindex disk create failed: {err}")),
                         }
                     } else {
-                        e.insert(Arc::new(RwLock::new(VectorBackend::Flat(FlatIndex::new(
-                            dim, kind,
+                        e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Flat(
+                            FlatIndex::new(dim, kind),
                         )))));
                         Ok(false)
                     }
@@ -715,7 +739,7 @@ async fn process(
             let mut rows: Vec<(String, u32, u8, u8, u64)> = vs
                 .iter()
                 .map(|(name, entry)| {
-                    let backend = entry.read();
+                    let backend = &entry.read().backend;
                     (
                         name.clone(),
                         backend.dim() as u32,
@@ -746,9 +770,9 @@ async fn process(
                     let (was_disk, fragment, payload_ids) = {
                         let guard = arc.read();
                         (
-                            matches!(*guard, VectorBackend::Disk(_)),
-                            guard.len() as u64,
-                            guard.live_ids(),
+                            matches!(guard.backend, VectorBackend::Disk(_)),
+                            guard.backend.len() as u64,
+                            guard.backend.live_ids(),
                         )
                     };
                     drop(arc);
@@ -791,10 +815,10 @@ async fn process(
                     // parking_lot guard must not be held across a suspension.
                     let insert_result = {
                         let mut idx = arc.write();
-                        if idx.dim() != vector.len() {
+                        if idx.backend.dim() != vector.len() {
                             Err(format!(
                                 "vindex '{name}' dim {} but vector has {}",
-                                idx.dim(),
+                                idx.backend.dim(),
                                 vector.len()
                             ))
                         } else {
@@ -802,15 +826,24 @@ async fn process(
                             // before the insert (race-free under this write
                             // lock) so an over-limit insert is rejected without
                             // storing; an overwrite never touches the quota.
-                            let was_new = !idx.contains(id);
+                            let was_new = !idx.backend.contains(id);
                             if was_new
                                 && let Some(max) = limit
                                 && quota.try_add(tenant, 1, max).is_err()
                             {
                                 return ShardResp::Err("tenant vector quota exceeded".to_owned());
                             }
-                            match idx.insert(id, &vector) {
-                                Ok(()) => Ok(()),
+                            match idx.backend.insert(id, &vector) {
+                                Ok(()) => {
+                                    // Index the payload's fields when one is
+                                    // supplied; an overwrite with a fresh payload
+                                    // replaces the id's old fields. A payload-less
+                                    // overwrite leaves the index (and blob) as is.
+                                    if let Some(blob) = &payload {
+                                        idx.payload.upsert(id, parse_fields(blob));
+                                    }
+                                    Ok(())
+                                }
                                 Err(e) => {
                                     if was_new && limit.is_some() {
                                         quota.sub(tenant, 1); // roll back reservation
@@ -847,7 +880,7 @@ async fn process(
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
                     let idx = arc.read();
-                    match idx.get(id) {
+                    match idx.backend.get(id) {
                         Ok(v) => ShardResp::Vector(v),
                         Err(e) => ShardResp::Err(format!("vget failed: {e}")),
                     }
@@ -859,7 +892,16 @@ async fn process(
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
-                    let result = { arc.write().delete(id) };
+                    // Delete the vector and drop its payload postings under one
+                    // lock; the blob in the vLog is reclaimed by the await below.
+                    let result = {
+                        let mut g = arc.write();
+                        let r = g.backend.delete(id);
+                        if matches!(r, Ok(true)) {
+                            g.payload.remove(id);
+                        }
+                        r
+                    };
                     match result {
                         Ok(existed) => {
                             if existed {
@@ -894,14 +936,15 @@ async fn process(
                     // any payload `await`.
                     let search_result = {
                         let mut idx = arc.write();
-                        if idx.dim() != query.len() {
+                        if idx.backend.dim() != query.len() {
                             Err(format!(
                                 "vindex '{name}' dim {} but query has {}",
-                                idx.dim(),
+                                idx.backend.dim(),
                                 query.len()
                             ))
                         } else {
-                            idx.search(&query, k, l_search)
+                            idx.backend
+                                .search(&query, k, l_search)
                                 .map_err(|e| format!("vsearch failed: {e}"))
                         }
                     };
@@ -966,7 +1009,7 @@ async fn process(
             let (n_vec, sz_bytes) = {
                 let v = vindexes.read();
                 v.values().fold((0u64, 0u64), |(acc_n, acc_b), entry| {
-                    let b = entry.read();
+                    let b = &entry.read().backend;
                     (acc_n + b.len() as u64, acc_b + b.approx_ram_bytes())
                 })
             };
