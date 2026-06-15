@@ -46,7 +46,7 @@ repository.
   these APIs must update its call sites, which is why `skeg-server` takes a minor
   version bump.
 
-### Versions to bump (at release)
+### Versions bumped
 
 - `skeg-vector` 0.1.5, `skeg-resp3` 0.2.1, `skeg-server` 0.5.0,
   `skeg-server-tenant` 0.2.1
