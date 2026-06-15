@@ -242,7 +242,7 @@ enum ShardReq {
         limit: Option<u64>,
         /// Optional opaque payload blob stored alongside the vector. `None`
         /// leaves the write path byte-identical to a payload-less VSET.
-        payload: Option<Vec<u8>>,
+        payload: Option<Bytes>,
     },
     Vget {
         name: String,
@@ -282,7 +282,7 @@ enum ShardResp {
     /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
     /// hits. `payload` is `Some` only when the request set `want_payload`;
     /// otherwise always `None`, so the non-payload path encodes identically.
-    Vsearch(Vec<(u64, f32, Option<Vec<u8>>)>),
+    Vsearch(Vec<(u64, f32, Option<Bytes>)>),
     Err(String),
 }
 
@@ -293,13 +293,11 @@ struct ShardMsg {
 
 // ── Vector payload sidecar ────────────────────────────────────────────────────
 //
-// An optional opaque payload blob per vector id is stored in the shard's own KV
-// vLog under a reserved key, not in the vector index, so the quantized walk stays
-// dense and the blob inherits the vLog's crash-safety, recovery, and compaction
-// for free. The key embeds the tenant (first 16 bytes, the vLog scoping
-// convention) so tenant A's blob is unreadable by tenant B, then a reserved
-// 3-byte marker that user KV keys never collide with, then the index name and
-// the fixed-width id. id last keeps the layout injective per (name, id).
+// An optional opaque payload blob per vector id, stored in the shard's KV vLog
+// (not the index, so the quantized walk stays dense) for free crash-safety and
+// recovery. The key is `tenant(16B LE) ++ marker(3B) ++ name ++ id(8B)`: the
+// tenant prefix scopes the blob (A's is unreadable by B), the marker keeps it
+// clear of user KV keys, and id-last makes the layout injective per (name, id).
 const PAYLOAD_MARKER: &[u8; 3] = b"\x00vp";
 /// Payload writes match the KV default durability so a blob is as crash-safe as
 /// the vector it annotates.
@@ -312,6 +310,32 @@ fn payload_key(tenant: u128, name: &str, id: u64) -> Vec<u8> {
     k.extend_from_slice(name.as_bytes());
     k.extend_from_slice(&id.to_le_bytes());
     k
+}
+
+/// Attach each hit's stored payload when `want_payload`, else leave it `None`.
+/// Shared by the inline and worker-pool VSEARCH paths. Payloads ride as `Bytes`
+/// (refcounted vLog reads) so no blob is copied on the way to the response.
+async fn attach_payloads(
+    vlog: &VLog,
+    tenant: u128,
+    name: &str,
+    hits: Vec<(u64, f32)>,
+    want_payload: bool,
+) -> Result<Vec<(u64, f32, Option<Bytes>)>, String> {
+    let mut out = Vec::with_capacity(hits.len());
+    for (id, score) in hits {
+        let blob = if want_payload {
+            let key = payload_key(tenant, name, id);
+            vlog.tenant(tenant)
+                .get(&key)
+                .await
+                .map_err(|e| format!("vsearch payload failed: {e}"))?
+        } else {
+            None
+        };
+        out.push((id, score, blob));
+    }
+    Ok(out)
 }
 
 // ── VINDEX registry (disk-backed indexes survive a restart) ───────────────────
@@ -640,21 +664,11 @@ async fn process(
             Err(_) => return ShardResp::Err("vsearch worker task failed".to_owned()),
         };
         // Payload fetch stays on the async shard thread (the vLog is not Send
-        // into the blocking task). No fetch when the flag is off.
-        let mut out = Vec::with_capacity(hits.len());
-        for (id, score) in hits {
-            let blob = if want_payload {
-                let key = payload_key(tenant, &name, id);
-                match vlog.tenant(tenant).get(&key).await {
-                    Ok(v) => v.map(|b| b.to_vec()),
-                    Err(e) => return ShardResp::Err(format!("vsearch payload failed: {e}")),
-                }
-            } else {
-                None
-            };
-            out.push((id, score, blob));
-        }
-        return ShardResp::Vsearch(out);
+        // into the blocking task).
+        return match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+            Ok(out) => ShardResp::Vsearch(out),
+            Err(e) => ShardResp::Err(e),
+        };
     }
     let vindexes: &RwLock<VindexSet> = vindexes;
     match req {
@@ -815,7 +829,7 @@ async fn process(
                                 let key = payload_key(tenant, &name, id);
                                 if let Err(e) = vlog
                                     .tenant(tenant)
-                                    .set(&key, &blob, PAYLOAD_DURABILITY)
+                                    .set(&key, &blob[..], PAYLOAD_DURABILITY)
                                     .await
                                 {
                                     return ShardResp::Err(format!("vset payload failed: {e}"));
@@ -894,27 +908,13 @@ async fn process(
                     match search_result {
                         Err(e) => ShardResp::Err(e),
                         Ok(hits) => {
-                            let mut out = Vec::with_capacity(hits.len());
-                            for (id, score) in hits {
-                                // ponytail: fetch a payload per local hit; some
-                                // get trimmed by the global top-k merge, but k is
-                                // small. Route the final-k by id if it ever bites.
-                                let blob = if want_payload {
-                                    let key = payload_key(tenant, &name, id);
-                                    match vlog.tenant(tenant).get(&key).await {
-                                        Ok(v) => v.map(|b| b.to_vec()),
-                                        Err(e) => {
-                                            return ShardResp::Err(format!(
-                                                "vsearch payload failed: {e}"
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-                                out.push((id, score, blob));
+                            // ponytail: fetch a payload per local hit; some get
+                            // trimmed by the global top-k merge, but k is small.
+                            // Route the final-k by id if it ever bites.
+                            match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+                                Ok(out) => ShardResp::Vsearch(out),
+                                Err(e) => ShardResp::Err(e),
                             }
-                            ShardResp::Vsearch(out)
                         }
                     }
                 }
@@ -1521,7 +1521,7 @@ impl ShardSet {
         vector: Vec<f32>,
         tenant: u128,
         limit: Option<u64>,
-        payload: Option<Vec<u8>>,
+        payload: Option<Bytes>,
     ) -> Result<(), ShardError> {
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
@@ -1611,7 +1611,7 @@ impl ShardSet {
         l_search: u32,
         tenant: u128,
         want_payload: bool,
-    ) -> Result<Vec<(u64, f32, Option<Vec<u8>>)>, ShardError> {
+    ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
         let mut pending = Vec::with_capacity(self.inner.n);
         for sender in &self.inner.senders {
             let (tx, rx) = oneshot::channel();
@@ -1629,7 +1629,7 @@ impl ShardSet {
                 .map_err(|_| ShardError::Unavailable)?;
             pending.push(rx);
         }
-        let mut merged: Vec<(u64, f32, Option<Vec<u8>>)> = Vec::new();
+        let mut merged: Vec<(u64, f32, Option<Bytes>)> = Vec::new();
         let mut first_err = None;
         for rx in pending {
             match rx.await.map_err(|_| ShardError::Unavailable)? {
@@ -2113,8 +2113,8 @@ mod tests {
     }
 
     // Find a hit's payload by id in a WITHPAYLOAD result.
-    fn payload_of(hits: &[(u64, f32, Option<Vec<u8>>)], id: u64) -> Option<&Vec<u8>> {
-        hits.iter().find(|h| h.0 == id).and_then(|h| h.2.as_ref())
+    fn payload_of(hits: &[(u64, f32, Option<Bytes>)], id: u64) -> Option<&[u8]> {
+        hits.iter().find(|h| h.0 == id).and_then(|h| h.2.as_deref())
     }
 
     // A payload stored with VSET comes back byte-identical with a WITHPAYLOAD
@@ -2131,7 +2131,7 @@ mod tests {
         let large: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         for (id, blob) in [(1u64, &empty), (2, &binary), (3, &large)] {
             shards
-                .vset("idx", id, tvec(id + 1), 0, None, Some(blob.clone()))
+                .vset("idx", id, tvec(id + 1), 0, None, Some(Bytes::from(blob.clone())))
                 .await
                 .unwrap();
         }
@@ -2141,9 +2141,9 @@ mod tests {
             .vsearch("idx", tvec(2), 10, 0, 0, true)
             .await
             .unwrap();
-        assert_eq!(payload_of(&hits, 1), Some(&empty));
-        assert_eq!(payload_of(&hits, 2), Some(&binary));
-        assert_eq!(payload_of(&hits, 3), Some(&large));
+        assert_eq!(payload_of(&hits, 1), Some(&empty[..]));
+        assert_eq!(payload_of(&hits, 2), Some(&binary[..]));
+        assert_eq!(payload_of(&hits, 3), Some(&large[..]));
 
         // Without the flag: no payload attached at all.
         let plain = shards
@@ -2163,11 +2163,11 @@ mod tests {
             let shards = ShardSet::open(&base, 2).unwrap();
             shards.vindex_create("persist", 64, 0, 1).await.unwrap(); // disk
             shards
-                .vset("persist", 10, tvec(11), 0, None, Some(b"keep".to_vec()))
+                .vset("persist", 10, tvec(11), 0, None, Some(Bytes::from_static(b"keep")))
                 .await
                 .unwrap();
             shards
-                .vset("persist", 20, tvec(21), 0, None, Some(b"gone".to_vec()))
+                .vset("persist", 20, tvec(21), 0, None, Some(Bytes::from_static(b"gone")))
                 .await
                 .unwrap();
             assert!(shards.vdel("persist", 20, 0).await.unwrap());
@@ -2177,7 +2177,7 @@ mod tests {
             .vsearch("persist", tvec(11), 10, 0, 0, true)
             .await
             .unwrap();
-        assert_eq!(payload_of(&hits, 10), Some(&b"keep".to_vec()));
+        assert_eq!(payload_of(&hits, 10), Some(&b"keep"[..]));
         // id 20 was deleted before restart: no hit, hence no payload.
         assert!(hits.iter().all(|h| h.0 != 20));
     }
@@ -2190,12 +2190,12 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 64, 0, 0).await.unwrap();
         shards
-            .vset("idx", 1, tvec(2), 7, None, Some(b"tenant-7-secret".to_vec()))
+            .vset("idx", 1, tvec(2), 7, None, Some(Bytes::from_static(b"tenant-7-secret")))
             .await
             .unwrap();
 
         let as7 = shards.vsearch("idx", tvec(2), 5, 0, 7, true).await.unwrap();
-        assert_eq!(payload_of(&as7, 1), Some(&b"tenant-7-secret".to_vec()));
+        assert_eq!(payload_of(&as7, 1), Some(&b"tenant-7-secret"[..]));
 
         let as9 = shards.vsearch("idx", tvec(2), 5, 0, 9, true).await.unwrap();
         assert!(as9.iter().any(|h| h.0 == 1), "vector is shared at this layer");
@@ -2210,7 +2210,7 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 64, 0, 0).await.unwrap();
         shards
-            .vset("idx", 1, tvec(2), 0, None, Some(b"stale".to_vec()))
+            .vset("idx", 1, tvec(2), 0, None, Some(Bytes::from_static(b"stale")))
             .await
             .unwrap();
         shards.vindex_drop("idx", 0).await.unwrap();

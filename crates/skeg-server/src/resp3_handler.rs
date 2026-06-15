@@ -452,7 +452,7 @@ async fn skeg_vset(
         if !args[3].eq_ignore_ascii_case(b"PAYLOAD") {
             return Frame::Error("ERR SKEG.VSET expected PAYLOAD before the blob".into());
         }
-        Some(args[4].to_vec())
+        Some(args[4].clone())
     } else {
         None
     };
@@ -636,7 +636,7 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
                 out.push(Frame::Bulk(Bytes::from(id.to_string())));
                 out.push(Frame::Double(f64::from(score)));
                 if want_payload {
-                    out.push(payload.map_or(Frame::Null, |b| Frame::Bulk(Bytes::from(b))));
+                    out.push(payload.map_or(Frame::Null, Frame::Bulk));
                 }
             }
             Frame::Array(out)
