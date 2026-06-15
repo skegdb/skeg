@@ -289,6 +289,9 @@ async fn dispatch_command(
         Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
+        Command::SkegVindexConsolidate { args } => {
+            skeg_vindex_consolidate(&args, shards, *tenant).await
+        }
         Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
@@ -416,6 +419,23 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
     };
     let scoped = scoped_vindex_name(tenant, raw_name);
     match shards.vindex_drop(&scoped, tenant_u128(tenant)).await {
+        Ok(()) => Frame::ok(),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.VINDEX.CONSOLIDATE name`. Fold the disk index's streaming delta into
+/// its graph (a no-op for flat indices). Useful after a bulk load.
+async fn skeg_vindex_consolidate(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    if args.len() != 1 {
+        return Frame::Error("ERR wrong number of arguments for 'SKEG.VINDEX.CONSOLIDATE'".into());
+    }
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let scoped = scoped_vindex_name(tenant, raw_name);
+    match shards.vindex_consolidate(&scoped).await {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }

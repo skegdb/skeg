@@ -106,6 +106,10 @@ pub enum Command {
     SkegVindexDrop {
         args: Vec<Bytes>,
     },
+    /// `SKEG.VINDEX.CONSOLIDATE name`. Arity 1; fold the disk delta into the graph.
+    SkegVindexConsolidate {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VSET name id vector [PAYLOAD blob]`. Arity 3 or 5.
     SkegVset {
         args: Vec<Bytes>,
@@ -290,6 +294,14 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVindexDrop { args })
+        }
+        "VINDEX.CONSOLIDATE" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.VINDEX.CONSOLIDATE",
+                });
+            }
+            Ok(Command::SkegVindexConsolidate { args })
         }
         "VSET" => {
             // `name id vector` or `name id vector PAYLOAD <blob>`.

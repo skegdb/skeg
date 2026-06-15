@@ -196,6 +196,15 @@ impl VectorBackend {
         }
     }
 
+    /// Fold a disk index's streaming delta into the graph (one full rebuild),
+    /// leaving it in its fast fully-indexed state. Flat has no delta: no-op.
+    fn consolidate(&mut self) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.consolidate(),
+        }
+    }
+
     /// Top-`k` for a payload filter whose matching id set is `s`. The planner's
     /// choice between exact scan and the filtered ANN walk:
     /// - flat is already brute-force, so an exact scan over `s` is always best;
@@ -308,6 +317,10 @@ enum ShardReq {
     /// Enumerate VINDEXes known to this shard. Replicated across all
     /// shards so callers can ask any one shard.
     VindexList,
+    /// Fold a disk vindex's streaming delta into its graph on this shard.
+    VindexConsolidate {
+        name: String,
+    },
     Vset {
         name: String,
         id: u64,
@@ -728,6 +741,7 @@ fn is_mutation(req: &ShardReq) -> bool {
             | ShardReq::Del(..)
             | ShardReq::VindexCreate { .. }
             | ShardReq::VindexDrop { .. }
+            | ShardReq::VindexConsolidate { .. }
             | ShardReq::Vset { .. }
             | ShardReq::Vdel { .. }
     )
@@ -752,6 +766,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
+        | ShardReq::VindexConsolidate { .. }
         | ShardReq::TenantCacheBytes(_)
         | ShardReq::Stats => None,
     }
@@ -876,6 +891,16 @@ async fn process(
             // Stable order so the TUI doesn't flicker between polls.
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             ShardResp::VindexList(rows)
+        }
+        ShardReq::VindexConsolidate { name } => {
+            let entry = vindexes.read().get(&name).cloned();
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => match arc.write().backend.consolidate() {
+                    Ok(()) => ShardResp::Done,
+                    Err(e) => ShardResp::Err(format!("consolidate failed: {e}")),
+                },
+            }
         }
         ShardReq::VindexDrop { name, tenant } => {
             // Pop the entry from the outer map first; this prevents new ops
@@ -1642,6 +1667,18 @@ impl ShardSet {
         .await
     }
 
+    /// Consolidate a disk vindex on every shard: fold each shard's streaming
+    /// delta into its graph. A no-op for flat indices. Useful after a bulk load.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is missing or a shard is unavailable.
+    pub async fn vindex_consolidate(&self, name: &str) -> Result<(), ShardError> {
+        let name = name.to_owned();
+        self.broadcast(|| ShardReq::VindexConsolidate { name: name.clone() })
+            .await
+    }
+
     /// List every VINDEX. `(name, dim, kind_byte, backend_byte, n_vectors)`
     /// per index, with `n_vectors` summed across shards (VINDEX is
     /// replicated per shard, but VSET routes by vec_id so each shard
@@ -2300,6 +2337,25 @@ mod tests {
         // A flat VINDEX, by contrast, is in-RAM and would not survive - so the
         // recovered set contains exactly the disk-backed index.
         assert!(shards.vget("persist", 42).await.unwrap().is_some());
+    }
+
+    // VINDEX.CONSOLIDATE folds a disk index's streaming delta into the graph;
+    // the same vectors are still searchable afterwards.
+    #[tokio::test]
+    async fn test_vindex_consolidate() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // disk
+        for id in 0u64..200 {
+            shards.vset("idx", id, tvec(id + 1), 0, None, None).await.unwrap();
+        }
+        shards.vindex_consolidate("idx").await.unwrap();
+        let hits = shards.vsearch("idx", tvec(90), 5, 0, 0, false, None).await.unwrap();
+        assert_eq!(hits[0].0, 89, "nearest still found after consolidate");
+        // Consolidate is idempotent and a no-op on flat indices.
+        shards.vindex_consolidate("idx").await.unwrap();
+        shards.vindex_create("flat", 64, 0, 0).await.unwrap();
+        shards.vindex_consolidate("flat").await.unwrap();
     }
 
     // Find a hit's payload by id in a WITHPAYLOAD result.
