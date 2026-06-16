@@ -99,32 +99,58 @@ impl PayloadIndex {
         self.by_field.get(field).and_then(|vs| vs.get(value))
     }
 
-    /// Every id that has any value for `field` (the `EXISTS` predicate).
-    fn field_ids(&self, field: &str) -> BTreeSet<u64> {
-        let mut out = BTreeSet::new();
+    /// Every id that has any value for `field` (the `EXISTS` predicate), sorted.
+    fn field_ids(&self, field: &str) -> Vec<u64> {
+        let mut out = Vec::new();
         if let Some(vs) = self.by_field.get(field) {
             for ids in vs.values() {
                 out.extend(ids.iter().copied());
             }
         }
-        out
+        sort_dedup(out)
     }
 
-    /// Union of ids whose `field` value lies in `[lo, hi]` (per the bounds).
-    fn range_ids(&self, field: &str, lo: &Bound<Value>, hi: &Bound<Value>) -> BTreeSet<u64> {
-        let mut out = BTreeSet::new();
+    /// Ids whose `field` value lies in `[lo, hi]` (per the bounds), sorted.
+    fn range_ids(&self, field: &str, lo: &Bound<Value>, hi: &Bound<Value>) -> Vec<u64> {
+        let mut out = Vec::new();
         if let Some(vs) = self.by_field.get(field) {
             for (_, ids) in vs.range((lo.as_ref(), hi.as_ref())) {
                 out.extend(ids.iter().copied());
             }
         }
-        out
+        sort_dedup(out)
     }
 
-    /// Every indexed id (the universe `NOT` complements against).
+    /// Every indexed id (the universe `NOT` complements against). Sorted, since
+    /// `by_id` is a `BTreeMap`.
     fn all_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.by_id.keys().copied()
     }
+}
+
+/// Sort + dedup an id list into the canonical sorted form the planner expects.
+fn sort_dedup(mut v: Vec<u64>) -> Vec<u64> {
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Intersection of two SORTED id lists (two-pointer, cache-friendly).
+fn intersect_sorted(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
 }
 
 /// A filter over payload fields. Built by [`parse_filter`], evaluated against a
@@ -152,17 +178,21 @@ impl Filter {
     /// field or value contributes the empty set; `NOT` complements against the
     /// indexed universe.
     #[must_use]
-    pub fn evaluate(&self, idx: &PayloadIndex) -> BTreeSet<u64> {
+    pub fn evaluate(&self, idx: &PayloadIndex) -> Vec<u64> {
         match self {
-            Filter::Eq(f, v) => idx.postings(f, v).cloned().unwrap_or_default(),
+            // A posting is already sorted (BTreeSet iteration order).
+            Filter::Eq(f, v) => idx
+                .postings(f, v)
+                .map(|b| b.iter().copied().collect())
+                .unwrap_or_default(),
             Filter::In(f, vs) => {
-                let mut out = BTreeSet::new();
+                let mut out = Vec::new();
                 for v in vs {
                     if let Some(p) = idx.postings(f, v) {
                         out.extend(p.iter().copied());
                     }
                 }
-                out
+                sort_dedup(out)
             }
             Filter::Range { field, lo, hi } => idx.range_ids(field, lo, hi),
             Filter::Exists(field) => idx.field_ids(field),
@@ -179,18 +209,18 @@ impl Filter {
                         other => positives.push(other),
                     }
                 }
-                let mut acc: BTreeSet<u64> = if positives.is_empty() {
+                let mut acc: Vec<u64> = if positives.is_empty() {
                     // Only negations: start from the universe, then subtract.
                     idx.all_ids().collect()
                 } else {
                     // Intersect smallest-first so the running set only shrinks.
-                    let mut sets: Vec<BTreeSet<u64>> =
+                    let mut sets: Vec<Vec<u64>> =
                         positives.iter().map(|p| p.evaluate(idx)).collect();
-                    sets.sort_by_key(BTreeSet::len);
+                    sets.sort_by_key(Vec::len);
                     let mut iter = sets.into_iter();
                     let mut a = iter.next().unwrap();
                     for s in iter {
-                        a = a.intersection(&s).copied().collect();
+                        a = intersect_sorted(&a, &s);
                         if a.is_empty() {
                             break;
                         }
@@ -201,18 +231,20 @@ impl Filter {
                     if acc.is_empty() {
                         break;
                     }
-                    let b = neg.evaluate(idx);
-                    acc.retain(|id| !b.contains(id));
+                    let b = neg.evaluate(idx); // sorted
+                    acc.retain(|id| b.binary_search(id).is_err());
                 }
                 acc
             }
-            Filter::Or(parts) => parts.iter().flat_map(|p| p.evaluate(idx)).collect(),
+            Filter::Or(parts) => sort_dedup(parts.iter().flat_map(|p| p.evaluate(idx)).collect()),
             Filter::Not(inner) => {
                 // A standalone `NOT` (top level, or inside `OR`) genuinely
                 // returns the universe minus the excluded set. `A AND NOT B`
                 // does NOT take this path: `And` subtracts instead (see above).
-                let excluded = inner.evaluate(idx);
-                idx.all_ids().filter(|id| !excluded.contains(id)).collect()
+                let excluded = inner.evaluate(idx); // sorted
+                idx.all_ids()
+                    .filter(|id| excluded.binary_search(id).is_err())
+                    .collect()
             }
         }
     }
@@ -525,7 +557,14 @@ mod tests {
         );
         idx.upsert(4, vec![("u".into(), kw("c"))]); // no `age` field
 
-        let eval = |s: &str| parse_filter(s).unwrap().evaluate(&idx);
+        // evaluate returns a sorted Vec; collect to a set for order-free asserts.
+        let eval = |s: &str| {
+            parse_filter(s)
+                .unwrap()
+                .evaluate(&idx)
+                .into_iter()
+                .collect::<BTreeSet<u64>>()
+        };
         assert_eq!(eval("u = a"), BTreeSet::from([1, 2]));
         assert_eq!(eval("age >= 40"), BTreeSet::from([2, 3]));
         assert_eq!(eval("age > 40"), BTreeSet::from([3]));

@@ -217,7 +217,7 @@ fn filter_grammar_stress_on_real_embeddings() {
 
     for expr in filters {
         let filter = parse_filter(expr).unwrap();
-        let s = filter.evaluate(&pidx);
+        let s: BTreeSet<u64> = filter.evaluate(&pidx).into_iter().collect();
         if s.is_empty() {
             println!("{expr:42} |S|=      0  (empty)");
             continue;

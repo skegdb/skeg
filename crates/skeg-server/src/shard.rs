@@ -10,7 +10,6 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -32,7 +31,6 @@ const IDLE_CONSOLIDATE_MIN: usize = 4096;
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
 
-use std::collections::BTreeSet;
 
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
@@ -246,43 +244,33 @@ impl VectorBackend {
         query: &[f32],
         k: usize,
         l_search: u32,
-        s: &BTreeSet<u64>,
+        s: &[u64],
     ) -> std::io::Result<Vec<(u64, f32)>> {
-        // Crossover between exact scan and the selectivity-adaptive walk. `s` is
-        // ALREADY per-shard (the vindex is sharded, so a 50k-match filter is ~6k
-        // per shard at 8 shards), and exact scan costs ~1 disk read per id (~3us).
-        // Above ~2k that beats the walk's flat ~5ms, so scan only the genuinely
-        // small filters and let everything else take the walk.
+        // `s` is the SORTED matching id list (from `Filter::evaluate`), already
+        // per-shard (the vindex is sharded, so a 50k-match filter is ~6k per shard
+        // at 8 shards). Exact scan costs ~1 disk read per id (~3us); above ~2k the
+        // selectivity-adaptive walk wins, so scan only the genuinely small filters.
         const FILTER_EXACT_MAX: usize = 2_048;
         match self {
-            VectorBackend::Flat(i) => {
-                let ids: Vec<u64> = s.iter().copied().collect();
-                Ok(i.score_ids(query, &ids, k))
-            }
-            VectorBackend::Disk(i) if s.len() <= FILTER_EXACT_MAX => {
-                let ids: Vec<u64> = s.iter().copied().collect();
-                i.score_ids(query, &ids, k)
-            }
+            VectorBackend::Flat(i) => Ok(i.score_ids(query, s, k)),
+            VectorBackend::Disk(i) if s.len() <= FILTER_EXACT_MAX => i.score_ids(query, s, k),
             VectorBackend::Disk(i) => {
                 // Seed the walk from a spread of matching ids so it can reach a
                 // cluster that sits away from the query (multi-seed).
                 const SEEDS: usize = 32;
                 let step = (s.len() / SEEDS).max(1);
                 let seeds: Vec<u64> = s.iter().copied().step_by(step).take(SEEDS).collect();
-                // The walk checks membership once per edge traversed (~1e5/query on
-                // a broad filter): a HashSet's O(1) cache-friendly lookup replaces
-                // the BTreeSet's O(log|S|) pointer-chase, the dominant broad-filter
-                // cost. Built once per query (O(|S|), negligible vs the walk).
-                let hs: HashSet<u64> = s.iter().copied().collect();
-                // Selectivity picks the walk plan: a dense filter (matches near
-                // the query) takes a cheap single walk, a sparse one the robust
-                // two-walk. `len()` is the live vector count.
+                // Membership is checked once per edge traversed (~1e5/query on a
+                // broad filter). `s` is sorted, so a binary search over the
+                // contiguous slice is the lookup - no per-query HashSet to build.
+                // Selectivity picks the walk plan: a dense filter (matches near the
+                // query) takes a cheap single walk, a sparse one the robust two-walk.
                 let selectivity = s.len() as f32 / (i.len().max(1)) as f32;
                 i.search_filtered(
                     query,
                     k,
                     l_search as usize,
-                    &|id| hs.contains(&id),
+                    &|id| s.binary_search(&id).is_ok(),
                     &seeds,
                     selectivity,
                 )
