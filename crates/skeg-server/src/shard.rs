@@ -31,7 +31,6 @@ const IDLE_CONSOLIDATE_MIN: usize = 4096;
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
 
-
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -929,7 +928,19 @@ async fn process(
                 Entry::Vacant(e) => {
                     if disk {
                         let vdir = dir.join(format!("vindex-{}", e.key()));
-                        match DiskVamanaIndex::create_empty(&vdir, dim, VAMANA_L_SEARCH) {
+                        // The disk tier is int8 by default; TurboQuant gives
+                        // sub-int8 RAM on the live write path (it needs no trained
+                        // codebook). f32/binary are flat-only -> fall back to int8.
+                        let tier = match kind {
+                            QuantKind::TurboQuant { .. } => kind,
+                            _ => QuantKind::Int8,
+                        };
+                        match DiskVamanaIndex::create_empty_with_tier(
+                            &vdir,
+                            dim,
+                            VAMANA_L_SEARCH,
+                            tier,
+                        ) {
                             Ok(idx) => {
                                 e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(
                                     idx,
@@ -1714,6 +1725,9 @@ impl ShardSet {
             0 => QuantKind::F32,
             1 => QuantKind::Int8,
             2 => QuantKind::Binary,
+            3 => QuantKind::TurboQuant { bits: 1 },
+            4 => QuantKind::TurboQuant { bits: 2 },
+            5 => QuantKind::TurboQuant { bits: 4 },
             other => return Err(ShardError::Storage(format!("unknown vindex kind {other}"))),
         };
         let disk = match backend {

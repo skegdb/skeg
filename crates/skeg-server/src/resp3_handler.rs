@@ -350,8 +350,12 @@ fn parse_kind_arg(b: &Bytes) -> Result<u8, Frame> {
         "f32" | "0" => Ok(0),
         "int8" | "1" => Ok(1),
         "binary" | "2" => Ok(2),
+        // Disk-tier TurboQuant (sub-int8 RAM on the live write path).
+        "tq1" | "3" => Ok(3),
+        "tq2" | "4" => Ok(4),
+        "tq4" | "5" => Ok(5),
         other => Err(Frame::Error(format!(
-            "ERR unknown kind '{other}'; expected f32 | int8 | binary"
+            "ERR unknown kind '{other}'; expected f32 | int8 | binary | tq1 | tq2 | tq4"
         ))),
     }
 }

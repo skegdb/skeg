@@ -914,6 +914,38 @@ const GRAPH_FILE: &str = "graph.vmn";
 const VECTORS_FILE: &str = "vectors.bin";
 /// Append-only WAL of delta inserts/deletes (replayed on open).
 const DELTA_LOG_FILE: &str = "delta.log";
+/// Persists which tier-1 quantiser a read-write disk index rebuilds at `open`
+/// and `consolidate`. Absent => `Int8` (the historical default). Only the KIND
+/// is stored, not codes: every tier here is deterministic from `vectors.bin`
+/// (int8 calibrates a scale; TurboQuant is data-oblivious, seed-derived).
+const TIER_FILE: &str = "tier.kind";
+
+/// Read the persisted RW tier kind (`Int8` if the sidecar is absent).
+fn read_tier(dir: &Path) -> QuantKind {
+    match std::fs::read_to_string(dir.join(TIER_FILE)) {
+        Ok(s) => match s.trim() {
+            "tq1" => QuantKind::TurboQuant { bits: 1 },
+            "tq2" => QuantKind::TurboQuant { bits: 2 },
+            "tq4" => QuantKind::TurboQuant { bits: 4 },
+            _ => QuantKind::Int8,
+        },
+        Err(_) => QuantKind::Int8,
+    }
+}
+
+/// Wire string for a RW tier kind. Non-RW tiers fall back to `int8`.
+fn tier_str(t: QuantKind) -> &'static str {
+    match t {
+        QuantKind::TurboQuant { bits: 1 } => "tq1",
+        QuantKind::TurboQuant { bits: 2 } => "tq2",
+        QuantKind::TurboQuant { bits: 4 } => "tq4",
+        _ => "int8",
+    }
+}
+
+fn write_tier(dir: &Path, t: QuantKind) -> io::Result<()> {
+    std::fs::write(dir.join(TIER_FILE), tier_str(t))
+}
 const GRAPH_MAGIC: u32 = 0x4E_4D_56_47; // "GVMN"
 const VEC_MAGIC: u32 = 0x4E_49_42_56; // "VBIN"
 const FORMAT_VERSION: u32 = 1;
@@ -1057,7 +1089,7 @@ impl DiskVamanaIndex {
     /// Panics if the two files disagree on `n` or `dim`.
     #[allow(clippy::cast_possible_truncation)] // row < n, and n was read as a u32
     pub fn open(dir: &Path) -> io::Result<DiskVamanaIndex> {
-        Self::open_with_tier(dir, QuantKind::Int8)
+        Self::open_with_tier(dir, read_tier(dir))
     }
 
     /// Like [`open`](Self::open) but with an explicit tier-1 quantisation:
@@ -1372,8 +1404,30 @@ impl DiskVamanaIndex {
     ///
     /// Panics if `dim == 0`.
     pub fn create_empty(dir: &Path, dim: usize, l_search: usize) -> io::Result<DiskVamanaIndex> {
+        Self::create_empty_with_tier(dir, dim, l_search, QuantKind::Int8)
+    }
+
+    /// Like [`create_empty`](Self::create_empty) but pins the RW tier-1 quantiser
+    /// (persisted in `tier.kind`, so every later `open`/`consolidate` rebuilds it).
+    /// `Int8` (default) or `TurboQuant { bits }` for sub-int8 RAM on live writes;
+    /// `Pq` is rejected here (it needs a trained codebook, so it stays serve-only).
+    ///
+    /// # Errors
+    ///
+    /// I/O errors writing the initial files.
+    pub fn create_empty_with_tier(
+        dir: &Path,
+        dim: usize,
+        l_search: usize,
+        tier: QuantKind,
+    ) -> io::Result<DiskVamanaIndex> {
         assert!(dim > 0, "dim must be positive");
+        assert!(
+            matches!(tier, QuantKind::Int8 | QuantKind::TurboQuant { .. }),
+            "RW disk tier must be int8 or turboquant; pq/f32/binary are not incrementally rebuildable here"
+        );
         std::fs::create_dir_all(dir)?;
+        write_tier(dir, tier)?;
         write_graph_vmn(&dir.join(GRAPH_FILE), 0, dim, 0, MAX_R, l_search, &[], &[])?;
         write_vectors_bin(
             &dir.join(VECTORS_FILE),
@@ -2147,6 +2201,70 @@ mod tests {
         assert!(
             recall >= 0.95,
             "on-disk Vamana recall@10 = {recall:.4} (target >= 0.95)"
+        );
+    }
+
+    // RW disk index with a TurboQuant tier: the live write path (create -> insert
+    // via delta -> consolidate) rebuilds a tq2 tier, the kind survives a reopen
+    // (persisted in tier.kind), search recall holds, and the tier is leaner in RAM
+    // than int8. This is "lean live writes": sub-int8 RAM WITHOUT a trained codebook.
+    #[test]
+    fn disk_rw_turboquant_tier() {
+        let dim = 64;
+        let n = 2000;
+        let vectors = random_vectors(n, dim, 42);
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mut tq = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            100,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        for id in 0..n {
+            tq.insert(id as u64, row(&vectors, id as u32, dim)).unwrap();
+        }
+        tq.consolidate().unwrap();
+        // tier.kind persisted: a fresh `open` (no explicit tier) rebuilds tq2.
+        drop(tq);
+        let tq = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(tq.len(), n, "all vectors live after RW tq build");
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut hits = 0;
+        let mut total = 0;
+        for _ in 0..50 {
+            let q: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+            let want = brute_force(&vectors, dim, &q, 10);
+            let got: Vec<u64> = tq
+                .search(&q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            hits += got.iter().filter(|id| want.contains(id)).count();
+            total += want.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.90,
+            "tq2 RW recall@10 = {recall:.4} (target >= 0.90)"
+        );
+
+        // The tq2 tier (dim/4 bytes/vec) is leaner in RAM than int8 (dim bytes/vec).
+        let i8dir = tmp.path().join("i8");
+        let mut i8 =
+            DiskVamanaIndex::create_empty_with_tier(&i8dir, dim, 100, QuantKind::Int8).unwrap();
+        for id in 0..n {
+            i8.insert(id as u64, row(&vectors, id as u32, dim)).unwrap();
+        }
+        i8.consolidate().unwrap();
+        assert!(
+            tq.resident_bytes() < i8.resident_bytes(),
+            "tq2 RAM {} should be < int8 RAM {}",
+            tq.resident_bytes(),
+            i8.resident_bytes()
         );
     }
 
