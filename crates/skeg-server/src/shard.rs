@@ -408,9 +408,14 @@ struct ShardMsg {
 // tenant prefix scopes the blob (A's is unreadable by B), the marker keeps it
 // clear of user KV keys, and id-last makes the layout injective per (name, id).
 const PAYLOAD_MARKER: &[u8; 3] = b"\x00vp";
-/// Payload writes match the KV default durability so a blob is as crash-safe as
-/// the vector it annotates.
-const PAYLOAD_DURABILITY: Durability = Durability::Kernel;
+/// Payload durability is matched to the VECTOR it annotates. The vector lands in
+/// the in-RAM delta + a raw (un-fsync'd) WAL append - i.e. `Relaxed` (survives a
+/// process crash via the OS buffer; the durable checkpoint is `consolidate`). So
+/// the payload uses `Relaxed` too: `Kernel` here would fsync per blob (a
+/// device-wide barrier on macOS, ~7 ms) making the payload STRONGER than its own
+/// vector and turning a 100k bulk load into ~13 min (31 s without it). Group
+/// commit can't amortise it because VSETs serialise on the per-vindex lock.
+const PAYLOAD_DURABILITY: Durability = Durability::Relaxed;
 
 fn payload_key(tenant: u128, name: &str, id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(16 + 3 + name.len() + 8);
@@ -2643,25 +2648,26 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 4).unwrap();
         shards.vindex_create("idx", dim as u32, 0, 1).await.unwrap(); // f32, disk
 
+        // SKEG_FIX_NOPAYLOAD isolates the durable payload-blob write (KV vLog)
+        // from the rest of the VSET path.
+        let no_payload = std::env::var("SKEG_FIX_NOPAYLOAD").is_ok();
         let t0 = Instant::now();
         for id in 0..n {
             let v = floats[id * dim..(id + 1) * dim].to_vec();
-            let pl = format!(
-                "cat=c{} user=u{} year={} type=t{} flag=1",
-                id % 10,
-                id % 1000,
-                2018 + (id % 8),
-                id % 4
-            );
+            let payload = if no_payload {
+                None
+            } else {
+                let pl = format!(
+                    "cat=c{} user=u{} year={} type=t{} flag=1",
+                    id % 10,
+                    id % 1000,
+                    2018 + (id % 8),
+                    id % 4
+                );
+                Some(Bytes::from(pl.into_bytes()))
+            };
             shards
-                .vset(
-                    "idx",
-                    id as u64,
-                    v,
-                    0,
-                    None,
-                    Some(Bytes::from(pl.into_bytes())),
-                )
+                .vset("idx", id as u64, v, 0, None, payload)
                 .await
                 .unwrap();
             let done = id + 1;

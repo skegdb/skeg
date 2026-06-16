@@ -2600,6 +2600,28 @@ mod tests {
         eprintln!("PLAIN recall after FINAL consolidate = {:.4}", h2 as f64 / t2 as f64);
     }
 
+    // Bulk-build floor: how long a single VamanaIndex::build of the real corpus
+    // takes (the irreducible graph-construction cost). Distinguishes "build is
+    // slow" from "per-insert overhead" in the server ingest. Run in --release.
+    #[test]
+    #[ignore = "build floor; needs fixture, run in --release"]
+    fn bulk_build_floor() {
+        use std::time::Instant;
+        let path =
+            std::env::var("SKEG_FIX_TIMING").unwrap_or_else(|_| "/tmp/skeg_fix_100k.f32".into());
+        let cap: usize = std::env::var("SKEG_FIX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000);
+        let (corpus, n_all, dim) = load_fixture(&path);
+        let n = n_all.min(cap);
+        let vecs = corpus[..n * dim].to_vec();
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let t = Instant::now();
+        let _idx = VamanaIndex::build(vecs, ids, dim, &VamanaConfig::default());
+        eprintln!("VamanaIndex::build({n}) = {:.1}s", t.elapsed().as_secs_f64());
+    }
+
     // Filtered walk recall: against the exact top-10 over the matching subset
     // (the ground truth), the oversampled filtered walk recovers >= 0.90 at a
     // low-selectivity (~50%) filter, and never returns a non-matching id.
