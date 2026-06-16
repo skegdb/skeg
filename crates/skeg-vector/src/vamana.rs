@@ -376,16 +376,18 @@ fn robust_prune(
 /// insertion: the int8 walk finds the candidate neighbourhood cheaply, but the
 /// edge selection runs on exact f32 (the int8 prune degraded recall). `vecs`
 /// must hold the f32 for every candidate id. Mirrors [`robust_prune`].
-/// Robust-prune over int8 codes (incremental insert). `candidates` carry a
-/// pseudo-distance `-dot(query_code, v_code)` (smaller = closer); distances to a
-/// chosen `p_star` are recomputed the same way via `quant.int8_dist`. All codes
-/// live in the RAM tier, so this never touches disk - unlike an f32 prune, which
-/// must read candidate vectors back from `vectors.bin` after a consolidate.
-fn robust_prune_int8(
+/// Robust-prune on exact f32 (incremental insert). `candidates` carry the f32
+/// distance to the query; distances to a chosen `p_star` come from `vecs`.
+/// f32 (not int8) is required for graph QUALITY: an int8-code prune tanks fresh
+/// recall on real clustered embeddings (~0.31 vs 1.0) because the build, unlike
+/// search, has no f32 rerank to recover the quantisation error. Candidate f32
+/// come from the in-RAM `fresh` cache while un-consolidated, from disk once a
+/// consolidate has folded them into `vectors.bin`.
+fn robust_prune_f32(
     candidates: &mut Vec<(f32, VecId)>,
     alpha: f32,
     r: usize,
-    quant: &QuantizedVectors,
+    vecs: &AHashMap<VecId, Vec<f32>>,
 ) -> SmallVec<[VecId; MAX_R]> {
     candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
@@ -396,13 +398,14 @@ fn robust_prune_int8(
         result.push(p_star);
         cursor += 1;
 
+        let p_star_vec = &vecs[&p_star];
         let mut write = cursor;
         for read in cursor..candidates.len() {
             let (d_pv, v) = candidates[read];
             if v == p_star {
                 continue;
             }
-            let d_star = -(quant.int8_dist(p_star as usize, v as usize) as f32);
+            let d_star = dist(p_star_vec, &vecs[&v]);
             if alpha * d_star > d_pv {
                 candidates[write] = (d_pv, v);
                 write += 1;
@@ -1668,22 +1671,19 @@ impl DiskVamanaIndex {
                 &mut seen,
                 None,
             );
-            // Edge selection on int8 codes (the RAM tier covers every row) - no
-            // disk reads, so insert cost stays in RAM whatever the consolidation
-            // state. Same recall as f32 prune (measured), at a fraction of the
-            // cost. ponytail: f32 prune read candidates from disk post-consolidate
-            // and bought no recall; int8 is the design.
-            let mut cands: Vec<(f32, VecId)> = visited
+            // Edge selection on exact f32 (graph quality - see robust_prune_f32).
+            // Candidate f32 come from the in-RAM `fresh` cache while un-
+            // consolidated; only consolidated rows hit disk.
+            let cand_ids: Vec<VecId> = visited.iter().filter(|&row| row != new_row).collect();
+            let mut vecs: AHashMap<VecId, Vec<f32>> = AHashMap::with_capacity(cand_ids.len());
+            for &c in &cand_ids {
+                vecs.insert(c, self.vector_at(c)?);
+            }
+            let mut cands: Vec<(f32, VecId)> = cand_ids
                 .iter()
-                .filter(|&row| row != new_row)
-                .map(|row| {
-                    (
-                        -(self.quant.int8_dist(new_row as usize, row as usize) as f32),
-                        row,
-                    )
-                })
+                .map(|&c| (dist(vector, &vecs[&c]), c))
                 .collect();
-            robust_prune_int8(&mut cands, ALPHA, MAX_R, &self.quant)
+            robust_prune_f32(&mut cands, ALPHA, MAX_R, &vecs)
         };
 
         let mut node = Node::new();
@@ -1701,13 +1701,19 @@ impl DiskVamanaIndex {
                 continue;
             }
             let neighbors: Vec<VecId> = self.nodes[j as usize].slice().to_vec();
+            let j_vec = self.vector_at(j)?;
+            let mut vecs: AHashMap<VecId, Vec<f32>> = AHashMap::with_capacity(neighbors.len() + 1);
+            for &nb in &neighbors {
+                vecs.insert(nb, self.vector_at(nb)?);
+            }
+            vecs.insert(new_row, vector.to_vec());
             let mut back: Vec<(f32, VecId)> = neighbors
                 .iter()
                 .copied()
                 .chain(std::iter::once(new_row))
-                .map(|v| (-(self.quant.int8_dist(j as usize, v as usize) as f32), v))
+                .map(|v| (dist(&j_vec, &vecs[&v]), v))
                 .collect();
-            let new_j = robust_prune_int8(&mut back, ALPHA, MAX_R, &self.quant);
+            let new_j = robust_prune_f32(&mut back, ALPHA, MAX_R, &vecs);
             self.nodes.as_mut_slice()[j as usize].set(&new_j);
         }
         Ok(())
@@ -2511,7 +2517,14 @@ mod tests {
         for id in base..n {
             disk.insert_incremental(id as u64, &corpus[id * dim..(id + 1) * dim])
                 .unwrap();
-            let threshold = (disk.main_len() / 2).max(4096);
+            // Geometric trigger; SKEG_FIX_CONS_FLOOR raises the floor so a run can
+            // keep f32 prune RAM-resident (no mid-load consolidate flushing `fresh`
+            // to disk) to characterise that policy.
+            let floor: usize = std::env::var("SKEG_FIX_CONS_FLOOR")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4096);
+            let threshold = (disk.main_len() / 2).max(floor);
             if disk.fresh_len() >= threshold {
                 disk.consolidate().unwrap();
                 consolidations += 1;
