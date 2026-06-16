@@ -829,46 +829,6 @@ impl QuantizedVectors {
         }
     }
 
-    /// Proxy distance between two STORED int8 rows (dot of their codes), the
-    /// symmetric counterpart of [`proxy`](Self::proxy) (stored-vs-query). Used
-    /// by incremental graph insertion, which compares two existing rows without
-    /// an f32 disk read. Greater = closer, matching `proxy`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the representation is not int8, or a row is out of range.
-    #[must_use]
-    pub fn int8_dist(&self, a: usize, b: usize) -> i32 {
-        assert!(a < self.n && b < self.n, "row out of range");
-        match &self.repr {
-            QuantRepr::Int8 { data, .. } => dot_int8(
-                &data[a * self.dim..(a + 1) * self.dim],
-                &data[b * self.dim..(b + 1) * self.dim],
-            ),
-            _ => panic!("int8_dist requires the int8 tier"),
-        }
-    }
-
-    /// Append one f32 vector as a new int8-quantised row, returning its row
-    /// index. Reuses the calibrated scale, so a streaming insert quantises the
-    /// same way the bulk build did.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the representation is not int8, or `vector.len() != dim`.
-    pub fn push_int8(&mut self, vector: &[f32]) -> usize {
-        assert_eq!(vector.len(), self.dim, "vector dim mismatch");
-        match &mut self.repr {
-            QuantRepr::Int8 { data, scale } => {
-                data.extend(vector.iter().map(|&x| quantize_i8(x, *scale)));
-            }
-            _ => panic!("push_int8 requires the int8 tier"),
-        }
-        let row = self.n;
-        self.n += 1;
-        row
-    }
-
     /// Persist the TurboQuant `codes` buffer to `path` and swap the in-RAM
     /// `Vec<u8>` for a memory-mapped view of the file. The OS page cache
     /// then decides which pages stay resident under memory pressure
@@ -1146,26 +1106,6 @@ mod tests {
         };
         let self_dot: i32 = qd.iter().map(|&x| i32::from(x) * i32::from(x)).sum();
         assert_eq!(q.proxy(0, &code), self_dot);
-    }
-
-    #[test]
-    fn int8_dist_and_push() {
-        // Two stored rows; int8_dist is the dot of their codes, symmetric and
-        // matching proxy(row, quantize_query(other)).
-        let data = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-        let mut q = QuantizedVectors::build(&data, 4, QuantKind::Int8);
-        assert_eq!(q.len(), 2);
-        // row0 . row1 (orthogonal-ish) vs row0 . row0 (self, larger).
-        assert!(q.int8_dist(0, 0) > q.int8_dist(0, 1));
-        // Symmetric, and consistent with the stored-vs-query proxy.
-        assert_eq!(q.int8_dist(0, 1), q.int8_dist(1, 0));
-        let qc = q.quantize_query(&data[4..8]); // row1 as a query
-        assert_eq!(q.int8_dist(0, 1), q.proxy(0, &qc));
-        // push_int8 appends a row at the next index, reusing the scale.
-        let r = q.push_int8(&[1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(r, 2);
-        assert_eq!(q.len(), 3);
-        assert_eq!(q.int8_dist(0, 2), q.int8_dist(0, 0)); // same vector as row0
     }
 
     #[test]

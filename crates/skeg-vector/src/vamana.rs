@@ -372,50 +372,6 @@ fn robust_prune(
     result
 }
 
-/// `robust_prune` over a precomputed map of f32 vectors, for incremental
-/// insertion: the int8 walk finds the candidate neighbourhood cheaply, but the
-/// edge selection runs on exact f32 (the int8 prune degraded recall). `vecs`
-/// must hold the f32 for every candidate id. Mirrors [`robust_prune`].
-/// Robust-prune on exact f32 (incremental insert). `candidates` carry the f32
-/// distance to the query; distances to a chosen `p_star` come from `vecs`.
-/// f32 (not int8) is required for graph QUALITY: an int8-code prune tanks fresh
-/// recall on real clustered embeddings (~0.31 vs 1.0) because the build, unlike
-/// search, has no f32 rerank to recover the quantisation error. Candidate f32
-/// come from the in-RAM `fresh` cache while un-consolidated, from disk once a
-/// consolidate has folded them into `vectors.bin`.
-fn robust_prune_f32(
-    candidates: &mut Vec<(f32, VecId)>,
-    alpha: f32,
-    r: usize,
-    vecs: &AHashMap<VecId, Vec<f32>>,
-) -> SmallVec<[VecId; MAX_R]> {
-    candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-    let mut result: SmallVec<[VecId; MAX_R]> = SmallVec::new();
-    let mut cursor = 0;
-    while cursor < candidates.len() && result.len() < r {
-        let (_, p_star) = candidates[cursor];
-        result.push(p_star);
-        cursor += 1;
-
-        let p_star_vec = &vecs[&p_star];
-        let mut write = cursor;
-        for read in cursor..candidates.len() {
-            let (d_pv, v) = candidates[read];
-            if v == p_star {
-                continue;
-            }
-            let d_star = dist(p_star_vec, &vecs[&v]);
-            if alpha * d_star > d_pv {
-                candidates[write] = (d_pv, v);
-                write += 1;
-            }
-        }
-        candidates.truncate(write);
-    }
-    result
-}
-
 // ── build ─────────────────────────────────────────────────────────────────────
 
 /// Tunables for [`VamanaIndex::build`].
@@ -1041,34 +997,6 @@ enum NodeBacking {
     },
 }
 
-impl NodeBacking {
-    /// Switch to an owned, growable backing (copying out of the mmap if needed).
-    /// Incremental insertion needs a mutable, appendable node array.
-    fn ensure_owned(&mut self) {
-        if let NodeBacking::Mapped { .. } = self {
-            let owned: Vec<Node> = self.to_vec();
-            *self = NodeBacking::Owned(owned);
-        }
-    }
-
-    /// Append a node, returning a mutable view (owned backing).
-    fn push_node(&mut self, node: Node) {
-        self.ensure_owned();
-        if let NodeBacking::Owned(v) = self {
-            v.push(node);
-        }
-    }
-
-    /// Mutable node slice (owned backing); used to update edges on insert.
-    fn as_mut_slice(&mut self) -> &mut [Node] {
-        self.ensure_owned();
-        match self {
-            NodeBacking::Owned(v) => v.as_mut_slice(),
-            NodeBacking::Mapped { .. } => unreachable!("ensure_owned just ran"),
-        }
-    }
-}
-
 impl std::ops::Deref for NodeBacking {
     type Target = [Node];
 
@@ -1112,11 +1040,6 @@ pub struct DiskVamanaIndex {
     /// Append-only log of delta mutations, replayed on `open` so streaming
     /// inserts/deletes survive a restart. `consolidate` truncates it.
     delta_log: File,
-    /// f32 vectors for nodes inserted incrementally into the graph but not yet
-    /// written to `vectors.bin` (keyed by graph row). The re-rank and
-    /// `consolidate` read these instead of the disk for those rows; a
-    /// `consolidate` flushes them to disk and clears the map.
-    fresh: AHashMap<VecId, Vec<f32>>,
 }
 
 impl DiskVamanaIndex {
@@ -1376,7 +1299,6 @@ impl DiskVamanaIndex {
             tombstones: AHashSet::new(),
             live_count: n as usize,
             delta_log,
-            fresh: AHashMap::new(),
         };
         index.replay_wal(&wal);
         Ok(index)
@@ -1485,19 +1407,10 @@ impl DiskVamanaIndex {
         self.delta.len()
     }
 
-    /// Number of vectors in the main graph (consolidated base + incremental
-    /// inserts not yet folded by a `consolidate`).
+    /// Number of vectors in the consolidated main graph.
     #[must_use]
     pub fn main_len(&self) -> usize {
         self.main_n as usize
-    }
-
-    /// Incremental inserts not yet consolidated: their f32 sits in the in-RAM
-    /// `fresh` cache. Used to trigger a geometric compaction so this stays
-    /// bounded (RAM) and recovery replay stays short.
-    #[must_use]
-    pub fn fresh_len(&self) -> usize {
-        self.fresh.len()
     }
 
     /// Graph entry point (the approximate medoid). Used by an external walk
@@ -1607,118 +1520,6 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
-    /// f32 for a graph row: from the in-RAM `fresh` map (incremental inserts not
-    /// yet flushed to disk) or from `vectors.bin`.
-    fn vector_at(&self, row: VecId) -> io::Result<Vec<f32>> {
-        match self.fresh.get(&row) {
-            Some(v) => Ok(v.clone()),
-            None => self.read_vector(row),
-        }
-    }
-
-    /// Insert `id` by linking it into the graph in place (FreshDiskANN-style),
-    /// instead of buffering it in the delta for a later full rebuild. New ids go
-    /// to the graph; an overwrite of a known id keeps the small delta path. The
-    /// walk and prune run on the int8 tier in RAM (no f32 disk read); the new
-    /// vector's f32 sits in `fresh` until a `consolidate` flushes it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the WAL append fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `vector.len()` does not equal the index dimension.
-    #[allow(clippy::cast_possible_truncation)] // row counts stay well under u32::MAX
-    pub fn insert_incremental(&mut self, id: u64, vector: &[f32]) -> io::Result<()> {
-        assert_eq!(vector.len(), self.dim, "vector dim mismatch");
-        // An overwrite of a known id stays on the delta path (it shadows main).
-        if self.id_to_main_row.contains_key(&id) || self.delta.contains_key(&id) {
-            return self.insert(id, vector);
-        }
-        // Durability: same WAL record as a delta insert, so a restart recovers
-        // it (replayed into the delta; persisting the grown graph is a later
-        // milestone).
-        let mut rec = Vec::with_capacity(1 + 8 + self.dim * 4);
-        rec.push(0u8);
-        rec.extend_from_slice(&id.to_le_bytes());
-        for &x in vector {
-            rec.extend_from_slice(&x.to_le_bytes());
-        }
-        self.delta_log.write_all(&rec)?;
-
-        self.tombstones.remove(&id);
-        let new_row = self.main_n;
-        let qrow = self.quant.push_int8(vector); // int8 code -> in-RAM distances
-        debug_assert_eq!(qrow as u32, new_row);
-
-        const ALPHA: f32 = 1.2;
-        const INSERT_L: usize = 200;
-        let edges: SmallVec<[VecId; MAX_R]> = if self.main_n == 0 {
-            self.medoid = new_row;
-            SmallVec::new()
-        } else {
-            let mut visited = VisitedBitset::new((self.main_n + 1) as usize);
-            let mut seen = VisitedBitset::new((self.main_n + 1) as usize);
-            greedy_search(
-                &[self.medoid],
-                INSERT_L,
-                None,
-                |id| -(self.quant.int8_dist(new_row as usize, id as usize) as f32),
-                |id| self.nodes[id as usize].slice().iter().copied().collect(),
-                None,
-                &mut visited,
-                &mut seen,
-                None,
-            );
-            // Edge selection on exact f32 (graph quality - see robust_prune_f32).
-            // Candidate f32 come from the in-RAM `fresh` cache while un-
-            // consolidated; only consolidated rows hit disk.
-            let cand_ids: Vec<VecId> = visited.iter().filter(|&row| row != new_row).collect();
-            let mut vecs: AHashMap<VecId, Vec<f32>> = AHashMap::with_capacity(cand_ids.len());
-            for &c in &cand_ids {
-                vecs.insert(c, self.vector_at(c)?);
-            }
-            let mut cands: Vec<(f32, VecId)> = cand_ids
-                .iter()
-                .map(|&c| (dist(vector, &vecs[&c]), c))
-                .collect();
-            robust_prune_f32(&mut cands, ALPHA, MAX_R, &vecs)
-        };
-
-        let mut node = Node::new();
-        node.set(&edges);
-        self.nodes.push_node(node);
-        self.ids.push(id);
-        self.id_to_main_row.insert(id, new_row);
-        self.fresh.insert(new_row, vector.to_vec());
-        self.main_n += 1;
-        self.live_count += 1;
-
-        // Back-edges: link new_row into each chosen neighbour, re-pruning if full.
-        for &j in &edges {
-            if self.nodes.as_mut_slice()[j as usize].try_push(new_row, MAX_R) {
-                continue;
-            }
-            let neighbors: Vec<VecId> = self.nodes[j as usize].slice().to_vec();
-            let j_vec = self.vector_at(j)?;
-            let mut vecs: AHashMap<VecId, Vec<f32>> = AHashMap::with_capacity(neighbors.len() + 1);
-            for &nb in &neighbors {
-                vecs.insert(nb, self.vector_at(nb)?);
-            }
-            vecs.insert(new_row, vector.to_vec());
-            let mut back: Vec<(f32, VecId)> = neighbors
-                .iter()
-                .copied()
-                .chain(std::iter::once(new_row))
-                .map(|v| (dist(&j_vec, &vecs[&v]), v))
-                .collect();
-            let new_j = robust_prune_f32(&mut back, ALPHA, MAX_R, &vecs);
-            self.nodes.as_mut_slice()[j as usize].set(&new_j);
-        }
-        Ok(())
-    }
-
     /// Tombstone `id`. Returns `true` if it was live.
     ///
     /// # Errors
@@ -1746,7 +1547,7 @@ impl DiskVamanaIndex {
             return Ok(Some(v.clone()));
         }
         match self.id_to_main_row.get(&id) {
-            Some(&row) => Ok(Some(self.vector_at(row)?)),
+            Some(&row) => Ok(Some(self.read_vector(row)?)),
             None => Ok(None),
         }
     }
@@ -1981,7 +1782,7 @@ impl DiskVamanaIndex {
                 if !reranked_ids.insert(id) {
                     continue;
                 }
-                let v = self.vector_at(vec_id)?;
+                let v = self.read_vector(vec_id)?;
                 disk_reads += 1;
                 scored.push((OrderedFloat(cosine_f32(query, &v)), id));
             }
@@ -2090,7 +1891,7 @@ impl DiskVamanaIndex {
             if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
                 continue;
             }
-            vectors.extend(self.vector_at(row)?);
+            vectors.extend(self.read_vector(row)?);
             ids.push(id);
         }
         // Delta vectors (always live).
@@ -2145,21 +1946,6 @@ mod tests {
             .collect();
         scored.sort_unstable();
         scored.into_iter().take(k).map(|(_, id)| id).collect()
-    }
-
-    /// Load a raw f32 fixture: little-endian `[u64 n][u64 dim][f32 n*dim]`.
-    /// Used by the `#[ignore]`d real-embedding recall test; the files live
-    /// outside the repo (export script in skeg-internal/bench-compare).
-    fn load_fixture(path: &str) -> (Vec<f32>, usize, usize) {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("fixture {path}: {e}"));
-        let n = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-        let dim = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        let floats: Vec<f32> = bytes[16..]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(floats.len(), n * dim, "fixture {path} size mismatch");
-        (floats, n, dim)
     }
 
     #[test]
@@ -2342,284 +2128,6 @@ mod tests {
             recall >= 0.95,
             "on-disk Vamana recall@10 = {recall:.4} (target >= 0.95)"
         );
-    }
-
-    // FreshDiskANN M1 mechanics (fast, always-run): incrementally inserted
-    // vectors are immediately searchable via the graph (no consolidate), and
-    // each finds ITSELF as top-1 - proving the linkage is sound. Recall QUALITY
-    // is gated on real embeddings in `disk_incremental_real_embeddings`, not on
-    // random data (random uniform is worst-case and unrepresentative).
-    #[test]
-    fn disk_incremental_insert_searchable() {
-        let dim = 64;
-        let n = 300;
-        let base = 2;
-        let vectors = random_vectors(n, dim, 42);
-        let base_idx = VamanaIndex::build(
-            vectors[..base * dim].to_vec(),
-            (0..base as u64).collect(),
-            dim,
-            &VamanaConfig::default(),
-        );
-        let tmp = tempfile::TempDir::new().unwrap();
-        base_idx.save(tmp.path()).unwrap();
-        let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
-        for id in base..n {
-            disk.insert_incremental(id as u64, row(&vectors, id as u32, dim))
-                .unwrap();
-        }
-        assert_eq!(disk.len(), n, "all inserted vectors live");
-
-        // Each inserted vector finds itself as top-1: it is in the graph and
-        // reachable from the medoid.
-        let probes: Vec<usize> = (base..n).step_by(20).collect();
-        let self_hits = probes
-            .iter()
-            .filter(|&&id| {
-                disk.search(row(&vectors, id as u32, dim), 1)
-                    .unwrap()
-                    .first()
-                    .map(|(i, _)| *i)
-                    == Some(id as u64)
-            })
-            .count();
-        assert!(
-            self_hits as f64 / probes.len() as f64 >= 0.95,
-            "incremental self-NN {self_hits}/{} - graph linkage broken",
-            probes.len()
-        );
-    }
-
-    // FreshDiskANN M1 recall on REAL embeddings (mxbai-1024): cheap incremental
-    // inserts degrade recall (fresh), then a SINGLE compaction restores it to the
-    // bulk SOL on the same vectors. This is the bargain - O(N log N) inserts +
-    // one O(N) merge, not O(N^2) rebuild-per-batch. Ignored by default (needs the
-    // fixture). Run:
-    //   SKEG_FIX_N=5000 cargo test -p skeg-vector --lib \
-    //     disk_incremental_real_embeddings -- --ignored --nocapture
-    #[test]
-    #[ignore = "needs real-embedding fixture (see skeg-internal/bench-compare export)"]
-    fn disk_incremental_real_embeddings() {
-        let corpus_path =
-            std::env::var("SKEG_FIX_CORPUS").unwrap_or_else(|_| "/tmp/skeg_fix_corpus.f32".into());
-        let queries_path = std::env::var("SKEG_FIX_QUERIES")
-            .unwrap_or_else(|_| "/tmp/skeg_fix_queries.f32".into());
-        let cap: usize = std::env::var("SKEG_FIX_N")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
-
-        let (corpus, n_all, dim) = load_fixture(&corpus_path);
-        let n = n_all.min(cap);
-        let vectors = corpus[..n * dim].to_vec();
-        let (qdata, nq, qdim) = load_fixture(&queries_path);
-        assert_eq!(qdim, dim, "query/corpus dim mismatch");
-
-        let queries: Vec<(Vec<f32>, Vec<u64>)> = (0..nq)
-            .map(|i| {
-                let q = qdata[i * dim..(i + 1) * dim].to_vec();
-                let want = brute_force(&vectors, dim, &q, 10);
-                (q, want)
-            })
-            .collect();
-        let recall_of = |idx: &DiskVamanaIndex| -> f64 {
-            let mut hits = 0;
-            let mut total = 0;
-            for (q, want) in &queries {
-                let got: Vec<u64> = idx
-                    .search(q, 10)
-                    .unwrap()
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-                hits += got.iter().filter(|id| want.contains(id)).count();
-                total += want.len();
-            }
-            hits as f64 / total as f64
-        };
-
-        // SOL: bulk-built over the same vectors (recall ceiling on this data).
-        let bulk = VamanaIndex::build(
-            vectors.clone(),
-            (0..n as u64).collect(),
-            dim,
-            &VamanaConfig::default(),
-        );
-        let tsol = tempfile::TempDir::new().unwrap();
-        bulk.save(tsol.path()).unwrap();
-        let sol = recall_of(&DiskVamanaIndex::open(tsol.path()).unwrap());
-
-        // Incremental from a 2-vector base, no consolidate.
-        let base = 2;
-        let base_idx = VamanaIndex::build(
-            vectors[..base * dim].to_vec(),
-            (0..base as u64).collect(),
-            dim,
-            &VamanaConfig::default(),
-        );
-        let tmp = tempfile::TempDir::new().unwrap();
-        base_idx.save(tmp.path()).unwrap();
-        let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
-        for id in base..n {
-            disk.insert_incremental(id as u64, &vectors[id * dim..(id + 1) * dim])
-                .unwrap();
-        }
-        assert_eq!(disk.len(), n);
-        let fresh = recall_of(&disk);
-
-        // Compaction restores graph quality to the bulk SOL.
-        disk.consolidate().unwrap();
-        let compacted = recall_of(&disk);
-
-        eprintln!(
-            "REAL mxbai n={n} dim={dim}: SOL(bulk)={sol:.4} fresh(incremental)={fresh:.4} compacted={compacted:.4}"
-        );
-        assert!(
-            compacted >= sol - 0.01,
-            "post-consolidate recall@10 = {compacted:.4} below SOL {sol:.4}"
-        );
-    }
-
-    // FreshDiskANN G-FD-1: ingest is O(N log N), not the old O(N^2). Loads real
-    // vectors and inserts them with the SAME geometric-consolidate policy as the
-    // shard (compact when un-consolidated >= consolidated). Prints per-vector rate
-    // at checkpoints - it must stay ~flat, not collapse. Ignored; run in release:
-    //   SKEG_FIX_N=100000 SKEG_FIX_TIMING=/tmp/skeg_fix_100k.f32 \
-    //     cargo test --release -p skeg-vector --lib freshdiskann_ingest_timing \
-    //     -- --ignored --nocapture
-    #[test]
-    #[ignore = "ingest timing; needs fixture, run in --release"]
-    fn freshdiskann_ingest_timing() {
-        use std::time::Instant;
-        let path =
-            std::env::var("SKEG_FIX_TIMING").unwrap_or_else(|_| "/tmp/skeg_fix_100k.f32".into());
-        let cap: usize = std::env::var("SKEG_FIX_N")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000);
-        let (corpus, n_all, dim) = load_fixture(&path);
-        let n = n_all.min(cap);
-
-        let base = 2;
-        let base_idx = VamanaIndex::build(
-            corpus[..base * dim].to_vec(),
-            (0..base as u64).collect(),
-            dim,
-            &VamanaConfig::default(),
-        );
-        let tmp = tempfile::TempDir::new().unwrap();
-        base_idx.save(tmp.path()).unwrap();
-        let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
-
-        let checkpoints = [10_000usize, 30_000, 50_000, 100_000];
-        let start = Instant::now();
-        let mut consolidations = 0;
-        for id in base..n {
-            disk.insert_incremental(id as u64, &corpus[id * dim..(id + 1) * dim])
-                .unwrap();
-            // Geometric trigger; SKEG_FIX_CONS_FLOOR raises the floor so a run can
-            // keep f32 prune RAM-resident (no mid-load consolidate flushing `fresh`
-            // to disk) to characterise that policy.
-            let floor: usize = std::env::var("SKEG_FIX_CONS_FLOOR")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4096);
-            let threshold = (disk.main_len() / 2).max(floor);
-            if disk.fresh_len() >= threshold {
-                disk.consolidate().unwrap();
-                consolidations += 1;
-            }
-            let done = id + 1;
-            if checkpoints.contains(&done) {
-                let secs = start.elapsed().as_secs_f64();
-                eprintln!(
-                    "ingest n={done}: {secs:.1}s  {:.0} vec/s  ({consolidations} consolidations)",
-                    done as f64 / secs
-                );
-            }
-        }
-        // No hard assert on wall-clock (machine-dependent); the printed vec/s rate
-        // across checkpoints is the O(N log N) evidence (flat, not collapsing).
-        assert_eq!(disk.len(), n);
-
-        // PLAIN search recall on the final graph (geometric-consolidate state, the
-        // server's exact shape). The bench showed this collapse to 0.228 at 100k
-        // while filtered held - so the plain walk from the medoid is the suspect.
-        let qpath = std::env::var("SKEG_FIX_QUERIES")
-            .unwrap_or_else(|_| "/tmp/skeg_fix_queries.f32".into());
-        let (qdata, nq, qdim) = load_fixture(&qpath);
-        assert_eq!(qdim, dim);
-        let mut hits = 0;
-        let mut total = 0;
-        for qi in 0..nq {
-            let q = &qdata[qi * dim..(qi + 1) * dim];
-            let want = brute_force(&corpus[..n * dim], dim, q, 10);
-            let got: Vec<u64> =
-                disk.search(q, 10).unwrap().into_iter().map(|(id, _)| id).collect();
-            hits += got.iter().filter(|id| want.contains(id)).count();
-            total += want.len();
-        }
-        eprintln!("PLAIN search recall@10 (geometric state) = {:.4}", hits as f64 / total as f64);
-
-        // (1) Reachability from the medoid: BFS over out-edges. If far below n,
-        // the plain walk (medoid-only entry) literally cannot reach most nodes -
-        // incremental insert is not maintaining global connectivity the way the
-        // bulk build's patch_connectivity does.
-        let mut seen_bfs = vec![false; disk.main_n as usize];
-        let mut stack = vec![disk.medoid];
-        seen_bfs[disk.medoid as usize] = true;
-        let mut reached = 1usize;
-        while let Some(r) = stack.pop() {
-            for &nb in disk.nodes[r as usize].slice() {
-                if !seen_bfs[nb as usize] {
-                    seen_bfs[nb as usize] = true;
-                    reached += 1;
-                    stack.push(nb);
-                }
-            }
-        }
-        eprintln!(
-            "reachable from medoid: {reached}/{} ({:.1}%)",
-            disk.main_n,
-            100.0 * reached as f64 / disk.main_n as f64
-        );
-
-        // (2) One final consolidate (folds the fresh tail, re-patches
-        // connectivity), then re-measure plain recall.
-        disk.consolidate().unwrap();
-        let mut h2 = 0;
-        let mut t2 = 0;
-        for qi in 0..nq {
-            let q = &qdata[qi * dim..(qi + 1) * dim];
-            let want = brute_force(&corpus[..n * dim], dim, q, 10);
-            let got: Vec<u64> =
-                disk.search(q, 10).unwrap().into_iter().map(|(id, _)| id).collect();
-            h2 += got.iter().filter(|id| want.contains(id)).count();
-            t2 += want.len();
-        }
-        eprintln!("PLAIN recall after FINAL consolidate = {:.4}", h2 as f64 / t2 as f64);
-    }
-
-    // Bulk-build floor: how long a single VamanaIndex::build of the real corpus
-    // takes (the irreducible graph-construction cost). Distinguishes "build is
-    // slow" from "per-insert overhead" in the server ingest. Run in --release.
-    #[test]
-    #[ignore = "build floor; needs fixture, run in --release"]
-    fn bulk_build_floor() {
-        use std::time::Instant;
-        let path =
-            std::env::var("SKEG_FIX_TIMING").unwrap_or_else(|_| "/tmp/skeg_fix_100k.f32".into());
-        let cap: usize = std::env::var("SKEG_FIX_N")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000);
-        let (corpus, n_all, dim) = load_fixture(&path);
-        let n = n_all.min(cap);
-        let vecs = corpus[..n * dim].to_vec();
-        let ids: Vec<u64> = (0..n as u64).collect();
-        let t = Instant::now();
-        let _idx = VamanaIndex::build(vecs, ids, dim, &VamanaConfig::default());
-        eprintln!("VamanaIndex::build({n}) = {:.1}s", t.elapsed().as_secs_f64());
     }
 
     // Filtered walk recall: against the exact top-10 over the matching subset
