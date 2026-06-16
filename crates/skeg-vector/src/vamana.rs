@@ -1596,7 +1596,7 @@ impl DiskVamanaIndex {
         k: usize,
         l_search: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, None, &[])
+        self.search_inner(query, k, l_search, None, &[], 1.0)
     }
 
     /// Filtered search: only ids for which `matches` returns true enter the
@@ -1620,12 +1620,16 @@ impl DiskVamanaIndex {
         l_search: usize,
         matches: &dyn Fn(u64) -> bool,
         seeds: &[u64],
+        selectivity: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, Some(matches), seeds)
+        self.search_inner(query, k, l_search, Some(matches), seeds, selectivity)
     }
 
     /// Shared search core. `matches == None` is the plain ANN search; `Some`
-    /// keeps only matching ids, walking an oversampled, fully-reranked frontier.
+    /// keeps only matching ids. `selectivity` = |matching| / live is the walk
+    /// planner's input: a DENSE filter (matches everywhere) needs only a single
+    /// navigate-all walk + filter-at-rerank (~plain-search cost), while a SPARSE
+    /// one needs the oversampled admit-gated + navigate-all two-walk.
     #[allow(clippy::cast_precision_loss)] // proxy is an ordering key, exact value irrelevant
     fn search_inner(
         &self,
@@ -1634,10 +1638,15 @@ impl DiskVamanaIndex {
         l_search: usize,
         matches: Option<&dyn Fn(u64) -> bool>,
         seeds: &[u64],
+        selectivity: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
-        /// Frontier blow-up for a filtered walk, so the post-filter still leaves
-        /// enough matching candidates. Capped at the main graph size.
+        /// Frontier blow-up for a SPARSE filtered walk, so the post-filter still
+        /// leaves enough matching candidates. Capped at the main graph size.
         const FILTER_OVERSAMPLE: usize = 4;
+        /// At or above this matching fraction, the filter is "dense": matches sit
+        /// near the query, so one navigate-all walk + filter-at-rerank suffices.
+        const DENSE_SELECTIVITY: f32 = 0.10;
+        let dense = matches.is_some() && selectivity >= DENSE_SELECTIVITY;
         assert_eq!(query.len(), self.dim, "query dim mismatch");
         let filtered = matches.is_some();
         if self.live_count == 0 || k == 0 {
@@ -1653,17 +1662,23 @@ impl DiskVamanaIndex {
             } else {
                 l_search
             };
-            // A filtered walk oversamples the frontier and reranks all of it so
-            // enough matching candidates survive the post-filter.
-            let list_size = if filtered {
+            // A SPARSE filtered walk oversamples the frontier so the post-filter
+            // still leaves enough matches; a dense one (or plain) does not.
+            let list_size = if filtered && !dense {
                 (base.max(k) * FILTER_OVERSAMPLE).min(self.main_n as usize)
             } else {
                 base.max(k)
             };
-            // Re-rank budget: how many candidates get an exact f32 disk read.
-            // Bounded for both modes so latency tracks `k`, not `|S|`.
+            // Re-rank budget (disk reads). Bounded so latency tracks `k`, not
+            // `|S|`. A dense filter reads ~k/selectivity of the proxy-ordered
+            // frontier to surface k matches (the rerank loop skips non-matches
+            // before any read).
             let rerank = if filtered {
-                (k * 8).max(64)
+                if dense {
+                    ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
+                } else {
+                    (k * 8).max(64)
+                }
             } else {
                 (k * 4).max(32).min(list_size)
             };
@@ -1731,10 +1746,11 @@ impl DiskVamanaIndex {
                         None,
                     )
                 };
-                if filtered {
-                    // Admit only live matching rows into the list, so the walk
-                    // explores the matching subgraph and a far cluster is not
-                    // evicted by near non-matching nodes.
+                if filtered && !dense {
+                    // Sparse filter: admit only live matching rows so the walk
+                    // explores the matching subgraph (a far cluster is not evicted
+                    // by near non-matching nodes), then a navigate-all walk to pick
+                    // up matches scattered near the query.
                     let admit = |row: VecId| -> bool {
                         let id = self.ids[row as usize];
                         !self.tombstones.contains(&id)
@@ -1744,7 +1760,11 @@ impl DiskVamanaIndex {
                     cand.extend(walk(&seed_rows, Some(&admit), None).iter());
                     cand.extend(walk(&[self.medoid], None, None).iter());
                 } else {
-                    cand.extend(walk(&seed_rows, None, early).iter());
+                    // Dense filter or plain: a single navigate-all walk; the
+                    // rerank drops non-matches. (Plain uses early-term; filtered
+                    // keeps it off so it does not stop before k matches surface.)
+                    let walk_early = if dense { None } else { early };
+                    cand.extend(walk(&seed_rows, None, walk_early).iter());
                 }
                 walk_span.record("visited", visited.iter().count());
                 walk_span.record("returned", cand.len());
@@ -2164,7 +2184,7 @@ mod tests {
             let want: Vec<u64> = scored.iter().take(10).map(|&(_, id)| id).collect();
 
             let got: Vec<u64> = disk
-                .search_filtered(&query, 10, 0, &matches, &seeds)
+                .search_filtered(&query, 10, 0, &matches, &seeds, 0.5)
                 .unwrap()
                 .into_iter()
                 .map(|(id, _)| id)

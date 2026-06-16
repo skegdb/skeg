@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use skeg_vector::{DiskVamanaIndex, VamanaConfig, VamanaIndex};
 
 /// Mirrors the server planner's crossover (`shard::VectorBackend::filtered_search`).
-const FILTER_EXACT_MAX: usize = 16_384;
+const FILTER_EXACT_MAX: usize = 2_048;
 const DIM: usize = 1024;
 const K: usize = 10;
 const MAX_QUERIES: usize = 50;
@@ -115,7 +115,8 @@ fn planner_search(
 ) -> (Vec<u64>, Duration) {
     let t = Instant::now();
     let got: Vec<u64> = if s.len() > FILTER_EXACT_MAX {
-        disk.search_filtered(q, K, 0, m, &seeds_of(s)).unwrap()
+        disk.search_filtered(q, K, 0, m, &seeds_of(s), s.len() as f32 / disk.len() as f32)
+            .unwrap()
     } else {
         disk.score_ids(q, s, K).unwrap()
     }
@@ -209,7 +210,14 @@ fn run_scheme(
         assert!(got.iter().all(|&id| pred(id)), "non-matching id returned");
         recall_p += overlap(&got, &want);
         let gw: Vec<u64> = disk
-            .search_filtered(q, K, 0, &pred, &seeds_of(&s))
+            .search_filtered(
+                q,
+                K,
+                0,
+                &pred,
+                &seeds_of(&s),
+                s.len() as f32 / disk.len() as f32,
+            )
             .unwrap()
             .into_iter()
             .map(|(id, _)| id)

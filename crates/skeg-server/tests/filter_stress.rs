@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use skeg_server::payload::{PayloadIndex, parse_fields, parse_filter};
 use skeg_vector::{DiskVamanaIndex, VamanaConfig, VamanaIndex};
 
-const FILTER_EXACT_MAX: usize = 16_384;
+const FILTER_EXACT_MAX: usize = 2_048;
 const DIM: usize = 1024;
 const K: usize = 10;
 
@@ -99,8 +99,15 @@ fn planner_search(disk: &DiskVamanaIndex, q: &[f32], s: &BTreeSet<u64>) -> (Vec<
     let ids: Vec<u64> = s.iter().copied().collect();
     let t = Instant::now();
     let hits = if s.len() > FILTER_EXACT_MAX {
-        disk.search_filtered(q, K, 0, &|id| s.contains(&id), &seeds_of(s))
-            .unwrap()
+        disk.search_filtered(
+            q,
+            K,
+            0,
+            &|id| s.contains(&id),
+            &seeds_of(s),
+            s.len() as f32 / disk.len() as f32,
+        )
+        .unwrap()
     } else {
         disk.score_ids(q, &ids, K).unwrap()
     };

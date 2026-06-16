@@ -232,12 +232,12 @@ impl VectorBackend {
         l_search: u32,
         s: &BTreeSet<u64>,
     ) -> std::io::Result<Vec<(u64, f32)>> {
-        // Crossover from the real-embedding selectivity bench (100k/500k mxbai):
-        // the two-walk is robust for broad filters (|S| above this), while a
-        // selective filter is cheaper and always exact via score_ids. Set so a
-        // sparse, selective filter (where the walk's recall dips) is scored
-        // exactly; the exact cost stays bounded (~1.5us/vector).
-        const FILTER_EXACT_MAX: usize = 16_384;
+        // Crossover between exact scan and the selectivity-adaptive walk. `s` is
+        // ALREADY per-shard (the vindex is sharded, so a 50k-match filter is ~6k
+        // per shard at 8 shards), and exact scan costs ~1 disk read per id (~3us).
+        // Above ~2k that beats the walk's flat ~5ms, so scan only the genuinely
+        // small filters and let everything else take the walk.
+        const FILTER_EXACT_MAX: usize = 2_048;
         match self {
             VectorBackend::Flat(i) => {
                 let ids: Vec<u64> = s.iter().copied().collect();
@@ -258,7 +258,18 @@ impl VectorBackend {
                 // the BTreeSet's O(log|S|) pointer-chase, the dominant broad-filter
                 // cost. Built once per query (O(|S|), negligible vs the walk).
                 let hs: HashSet<u64> = s.iter().copied().collect();
-                i.search_filtered(query, k, l_search as usize, &|id| hs.contains(&id), &seeds)
+                // Selectivity picks the walk plan: a dense filter (matches near
+                // the query) takes a cheap single walk, a sparse one the robust
+                // two-walk. `len()` is the live vector count.
+                let selectivity = s.len() as f32 / (i.len().max(1)) as f32;
+                i.search_filtered(
+                    query,
+                    k,
+                    l_search as usize,
+                    &|id| hs.contains(&id),
+                    &seeds,
+                    selectivity,
+                )
             }
         }
     }
@@ -2681,6 +2692,86 @@ mod tests {
             ids_of(&alice),
             BTreeSet::from([2]),
             "VMSET payload is filterable"
+        );
+    }
+
+    // Completeness: after a large concurrent VMSET, EVERY item's payload is
+    // indexed - each even id finds itself under the matching filter. Guards the
+    // ~10%-indexed bug seen when the bench queried mid-population.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vmset_indexes_all_payloads() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
+        let n: u64 = 4000;
+        let items: Vec<_> = (0..n)
+            .map(|id| {
+                let pl = if id % 2 == 0 {
+                    b"p=yes".as_slice()
+                } else {
+                    b"p=no".as_slice()
+                };
+                (id, tvec(id), Some(Bytes::copy_from_slice(pl)))
+            })
+            .collect();
+        let cnt = shards.vmset("idx", items, 0, None).await.unwrap();
+        assert_eq!(cnt, n as usize, "all items inserted");
+
+        // Every even id must find ITSELF (its exact vector) under `p = yes`.
+        let probes: Vec<u64> = (0..n).step_by(40).collect(); // all even
+        let mut found = 0;
+        for &id in &probes {
+            let got = shards
+                .vsearch("idx", tvec(id), 5, 0, 0, false, flt("p = yes"))
+                .await
+                .unwrap();
+            if ids_of(&got).contains(&id) {
+                found += 1;
+            }
+        }
+        assert_eq!(found, probes.len(), "every even id is indexed+self-matches");
+    }
+
+    // Same, but at a scale that triggers several geometric consolidates during
+    // the load (batched VMSET, like the bench), to catch a payload/consolidate
+    // or Relaxed-blob interaction that drops index entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vmset_indexes_all_payloads_at_scale() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
+        let n: u64 = 20_000;
+        let mut id = 0u64;
+        while id < n {
+            let end = (id + 256).min(n);
+            let items: Vec<_> = (id..end)
+                .map(|i| {
+                    let pl = if i % 2 == 0 {
+                        b"p=yes".as_slice()
+                    } else {
+                        b"p=no".as_slice()
+                    };
+                    (i, tvec(i), Some(Bytes::copy_from_slice(pl)))
+                })
+                .collect();
+            shards.vmset("idx", items, 0, None).await.unwrap();
+            id = end;
+        }
+        let probes: Vec<u64> = (0..n).step_by(400).collect(); // all even
+        let mut found = 0;
+        for &id in &probes {
+            let got = shards
+                .vsearch("idx", tvec(id), 5, 0, 0, false, flt("p = yes"))
+                .await
+                .unwrap();
+            if ids_of(&got).contains(&id) {
+                found += 1;
+            }
+        }
+        assert_eq!(
+            found,
+            probes.len(),
+            "every even id indexed after consolidates"
         );
     }
 
