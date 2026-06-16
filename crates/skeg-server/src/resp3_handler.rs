@@ -293,6 +293,7 @@ async fn dispatch_command(
             skeg_vindex_consolidate(&args, shards, *tenant).await
         }
         Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
+        Command::SkegVmset { args } => skeg_vmset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
         Command::SkegQuotaGet { args } => skeg_quota_get(&args, *tenant, tenant_backend),
@@ -486,6 +487,54 @@ async fn skeg_vset(
         .await
     {
         Ok(()) => Frame::ok(),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.VMSET name (id vector payload)+` - bulk insert. Items fan out
+/// concurrently so the durable payload-blob writes batch in the group committer.
+/// Returns the number of items inserted.
+async fn skeg_vmset(
+    args: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    if args.len() < 4 || (args.len() - 1) % 3 != 0 {
+        return Frame::Error(
+            "ERR wrong number of arguments for 'SKEG.VMSET'; want name (id vector payload)+".into(),
+        );
+    }
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let mut items: Vec<(u64, Vec<f32>, Option<Bytes>)> = Vec::with_capacity((args.len() - 1) / 3);
+    let mut i = 1;
+    while i < args.len() {
+        let id = match parse_u64_arg(&args[i], "id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let vector = match parse_vector(&args[i + 1]) {
+            Ok(v) => v,
+            Err(e) => return Frame::Error(format!("ERR {e}")),
+        };
+        let payload = if args[i + 2].is_empty() {
+            None
+        } else {
+            Some(args[i + 2].clone())
+        };
+        items.push((id, vector, payload));
+        i += 3;
+    }
+    let scoped = scoped_vindex_name(tenant, raw_name);
+    let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
+    match shards
+        .vmset(&scoped, items, tenant_u128(tenant), limit)
+        .await
+    {
+        Ok(n) => Frame::Integer(n as i64),
         Err(e) => shard_error(&e),
     }
 }

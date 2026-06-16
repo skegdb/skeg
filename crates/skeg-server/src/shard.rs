@@ -1761,6 +1761,37 @@ impl ShardSet {
         }
     }
 
+    /// Bulk insert: each item runs the normal [`vset`](Self::vset) path, but
+    /// CONCURRENTLY, so the per-vector durable payload-blob writes accumulate in
+    /// the group committer and flush in batches instead of one fsync-barrier per
+    /// vector. This is the whole bulk-ingest win (100k: ~770s serial -> ~34s).
+    /// Returns the count inserted; fails on the first item's error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any item fails (missing index, dim mismatch, quota, or
+    /// an unavailable shard).
+    pub async fn vmset(
+        &self,
+        name: &str,
+        items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
+        tenant: u128,
+        limit: Option<u64>,
+    ) -> Result<usize, ShardError> {
+        let mut set = tokio::task::JoinSet::new();
+        for (id, vector, payload) in items {
+            let this = self.clone();
+            let name = name.to_owned();
+            set.spawn(async move { this.vset(&name, id, vector, tenant, limit, payload).await });
+        }
+        let mut count = 0;
+        while let Some(joined) = set.join_next().await {
+            joined.map_err(|_| ShardError::Unavailable)??;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Vectors currently reserved by `tenant` against its quota (0 if
     /// untracked / unlimited). Read directly from the shared counter.
     #[must_use]
@@ -2680,6 +2711,111 @@ mod tests {
             }
         }
         eprintln!("TOTAL server-side {n}: {:.1}s", t0.elapsed().as_secs_f64());
+    }
+
+    // Lever A probe: does issuing VSETs CONCURRENTLY (so the group committer can
+    // batch the payload-blob writes) collapse ingest? Sequential awaits give the
+    // committer one entry at a time; concurrent waves of 256 let it batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "ingest profiling; needs /tmp/skeg_fix_100k.f32, run in --release"]
+    async fn ingest_timing_concurrent() {
+        use std::time::Instant;
+        let path =
+            std::env::var("SKEG_FIX_TIMING").unwrap_or_else(|_| "/tmp/skeg_fix_100k.f32".into());
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"));
+        let n_all = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        let dim = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let cap: usize = std::env::var("SKEG_FIX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000);
+        let n = n_all.min(cap);
+        let floats: std::sync::Arc<Vec<f32>> = std::sync::Arc::new(
+            bytes[16..16 + n_all * dim * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        );
+
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        shards.vindex_create("idx", dim as u32, 0, 1).await.unwrap();
+
+        let batch = 256;
+        let t0 = Instant::now();
+        let mut id = 0;
+        while id < n {
+            let end = (id + batch).min(n);
+            let mut set = tokio::task::JoinSet::new();
+            for i in id..end {
+                let s = shards.clone();
+                let f = floats.clone();
+                set.spawn(async move {
+                    let v = f[i * dim..(i + 1) * dim].to_vec();
+                    let pl = format!(
+                        "cat=c{} user=u{} year={} type=t{} flag=1",
+                        i % 10,
+                        i % 1000,
+                        2018 + (i % 8),
+                        i % 4
+                    );
+                    s.vset(
+                        "idx",
+                        i as u64,
+                        v,
+                        0,
+                        None,
+                        Some(Bytes::from(pl.into_bytes())),
+                    )
+                    .await
+                    .unwrap();
+                });
+            }
+            while set.join_next().await.is_some() {}
+            id = end;
+            if id % 10_000 == 0 {
+                let secs = t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "concurrent ingest n={id}: {secs:.1}s  {:.0} vec/s",
+                    id as f64 / secs
+                );
+            }
+        }
+        eprintln!("TOTAL concurrent {n}: {:.1}s", t0.elapsed().as_secs_f64());
+    }
+
+    // VMSET bulk-inserts every item (vectors searchable) and indexes each
+    // supplied payload (filtered search sees it), same as a sequence of VSETs.
+    #[tokio::test]
+    async fn vmset_bulk_inserts_and_indexes() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
+        let items = vec![
+            (1u64, tvec(1), Some(Bytes::from_static(b"user=bob"))),
+            (2u64, tvec(2), Some(Bytes::from_static(b"user=alice"))),
+            (3u64, tvec(3), None),
+        ];
+        let n = shards.vmset("idx", items, 0, None).await.unwrap();
+        assert_eq!(n, 3, "all three items inserted");
+
+        // Every vector is searchable.
+        let got = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(ids_of(&got).contains(&1), "id 1 searchable after VMSET");
+
+        // Supplied payloads are indexed: a filter selects exactly the match.
+        let alice = shards
+            .vsearch("idx", tvec(2), 10, 0, 0, false, flt("user = alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&alice),
+            BTreeSet::from([2]),
+            "VMSET payload is filterable"
+        );
     }
 
     // VDEL drops an id from the payload index, so a later filtered search no

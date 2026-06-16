@@ -114,6 +114,13 @@ pub enum Command {
     SkegVset {
         args: Vec<Bytes>,
     },
+    /// `SKEG.VMSET name (id vector payload)+`. Bulk insert: one `name` then
+    /// `(id, vector, payload)` triples (empty payload = none). The server fans
+    /// the items out concurrently so the durable blob writes batch in the group
+    /// committer - the bulk-ingest fast path. Arity 1 + 3k.
+    SkegVmset {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VDEL name id`. Arity 2.
     SkegVdel {
         args: Vec<Bytes>,
@@ -312,6 +319,16 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVset { args })
+        }
+        "VMSET" => {
+            // `name` then (id, vector, payload) triples: arity 1 + 3k, k >= 1.
+            if args.len() < 4 || (args.len() - 1) % 3 != 0 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VMSET",
+                    want: "name (id vector payload)+",
+                });
+            }
+            Ok(Command::SkegVmset { args })
         }
         "VDEL" => {
             if args.len() != 2 {
