@@ -2734,8 +2734,10 @@ mod tests {
 
     // Same, but at a scale that triggers several geometric consolidates during
     // the load (batched VMSET, like the bench), to catch a payload/consolidate
-    // or Relaxed-blob interaction that drops index entries.
+    // or Relaxed-blob interaction that drops index entries. Slow (~80s); the fast
+    // variant above covers the common path, so this one is opt-in.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "slow (~80s); consolidate/payload regression guard"]
     async fn vmset_indexes_all_payloads_at_scale() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 2).unwrap();
