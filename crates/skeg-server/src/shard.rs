@@ -146,7 +146,12 @@ impl VectorBackend {
         }
     }
 
-    /// Insert a vector; a disk backend consolidates once its delta is full.
+    /// Insert a vector. A disk backend inserts it straight into the graph
+    /// (FreshDiskANN-style, O(log N)), then compacts on a GEOMETRIC schedule -
+    /// once the un-consolidated inserts equal the consolidated size (a doubling).
+    /// That is O(log N) compactions over a bulk load = O(N log N) total, not the
+    /// O(N^2) of compacting every fixed batch, and it bounds the in-RAM `fresh`
+    /// cache + the recovery replay to <= half the index.
     fn insert(&mut self, id: u64, vector: &[f32]) -> std::io::Result<()> {
         match self {
             VectorBackend::Flat(i) => {
@@ -154,9 +159,9 @@ impl VectorBackend {
                 Ok(())
             }
             VectorBackend::Disk(i) => {
-                i.insert(id, vector)?;
-                let threshold = (i.main_len() / 20).max(DISK_CONSOLIDATE_MIN);
-                if i.delta_len() >= threshold {
+                i.insert_incremental(id, vector)?;
+                let threshold = (i.main_len() / 2).max(DISK_CONSOLIDATE_MIN);
+                if i.fresh_len() >= threshold {
                     i.consolidate()?;
                 }
                 Ok(())

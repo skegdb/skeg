@@ -376,11 +376,16 @@ fn robust_prune(
 /// insertion: the int8 walk finds the candidate neighbourhood cheaply, but the
 /// edge selection runs on exact f32 (the int8 prune degraded recall). `vecs`
 /// must hold the f32 for every candidate id. Mirrors [`robust_prune`].
-fn robust_prune_f32(
+/// Robust-prune over int8 codes (incremental insert). `candidates` carry a
+/// pseudo-distance `-dot(query_code, v_code)` (smaller = closer); distances to a
+/// chosen `p_star` are recomputed the same way via `quant.int8_dist`. All codes
+/// live in the RAM tier, so this never touches disk - unlike an f32 prune, which
+/// must read candidate vectors back from `vectors.bin` after a consolidate.
+fn robust_prune_int8(
     candidates: &mut Vec<(f32, VecId)>,
     alpha: f32,
     r: usize,
-    vecs: &AHashMap<VecId, Vec<f32>>,
+    quant: &QuantizedVectors,
 ) -> SmallVec<[VecId; MAX_R]> {
     candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
@@ -391,14 +396,13 @@ fn robust_prune_f32(
         result.push(p_star);
         cursor += 1;
 
-        let p_star_vec = &vecs[&p_star];
         let mut write = cursor;
         for read in cursor..candidates.len() {
             let (d_pv, v) = candidates[read];
             if v == p_star {
                 continue;
             }
-            let d_star = dist(p_star_vec, &vecs[&v]);
+            let d_star = -(quant.int8_dist(p_star as usize, v as usize) as f32);
             if alpha * d_star > d_pv {
                 candidates[write] = (d_pv, v);
                 write += 1;
@@ -1478,10 +1482,19 @@ impl DiskVamanaIndex {
         self.delta.len()
     }
 
-    /// Number of vectors in the consolidated main graph.
+    /// Number of vectors in the main graph (consolidated base + incremental
+    /// inserts not yet folded by a `consolidate`).
     #[must_use]
     pub fn main_len(&self) -> usize {
         self.main_n as usize
+    }
+
+    /// Incremental inserts not yet consolidated: their f32 sits in the in-RAM
+    /// `fresh` cache. Used to trigger a geometric compaction so this stays
+    /// bounded (RAM) and recovery replay stays short.
+    #[must_use]
+    pub fn fresh_len(&self) -> usize {
+        self.fresh.len()
     }
 
     /// Graph entry point (the approximate medoid). Used by an external walk
@@ -1655,18 +1668,22 @@ impl DiskVamanaIndex {
                 &mut seen,
                 None,
             );
-            // Edge selection on exact f32: read each candidate's vector (fresh
-            // map for recent inserts, disk for the rest) and prune in f32.
-            let cand_ids: Vec<VecId> = visited.iter().filter(|&row| row != new_row).collect();
-            let mut vecs: AHashMap<VecId, Vec<f32>> = AHashMap::with_capacity(cand_ids.len());
-            for &c in &cand_ids {
-                vecs.insert(c, self.vector_at(c)?);
-            }
-            let mut cands: Vec<(f32, VecId)> = cand_ids
+            // Edge selection on int8 codes (the RAM tier covers every row) - no
+            // disk reads, so insert cost stays in RAM whatever the consolidation
+            // state. Same recall as f32 prune (measured), at a fraction of the
+            // cost. ponytail: f32 prune read candidates from disk post-consolidate
+            // and bought no recall; int8 is the design.
+            let mut cands: Vec<(f32, VecId)> = visited
                 .iter()
-                .map(|&c| (dist(vector, &vecs[&c]), c))
+                .filter(|&row| row != new_row)
+                .map(|row| {
+                    (
+                        -(self.quant.int8_dist(new_row as usize, row as usize) as f32),
+                        row,
+                    )
+                })
                 .collect();
-            robust_prune_f32(&mut cands, ALPHA, MAX_R, &vecs)
+            robust_prune_int8(&mut cands, ALPHA, MAX_R, &self.quant)
         };
 
         let mut node = Node::new();
@@ -1684,19 +1701,13 @@ impl DiskVamanaIndex {
                 continue;
             }
             let neighbors: Vec<VecId> = self.nodes[j as usize].slice().to_vec();
-            let j_vec = self.vector_at(j)?;
-            let mut vecs: AHashMap<VecId, Vec<f32>> = AHashMap::with_capacity(neighbors.len() + 1);
-            for &nb in &neighbors {
-                vecs.insert(nb, self.vector_at(nb)?);
-            }
-            vecs.insert(new_row, vector.to_vec());
             let mut back: Vec<(f32, VecId)> = neighbors
                 .iter()
                 .copied()
                 .chain(std::iter::once(new_row))
-                .map(|v| (dist(&j_vec, &vecs[&v]), v))
+                .map(|v| (-(self.quant.int8_dist(j as usize, v as usize) as f32), v))
                 .collect();
-            let new_j = robust_prune_f32(&mut back, ALPHA, MAX_R, &vecs);
+            let new_j = robust_prune_int8(&mut back, ALPHA, MAX_R, &self.quant);
             self.nodes.as_mut_slice()[j as usize].set(&new_j);
         }
         Ok(())
@@ -2461,6 +2472,62 @@ mod tests {
             compacted >= sol - 0.01,
             "post-consolidate recall@10 = {compacted:.4} below SOL {sol:.4}"
         );
+    }
+
+    // FreshDiskANN G-FD-1: ingest is O(N log N), not the old O(N^2). Loads real
+    // vectors and inserts them with the SAME geometric-consolidate policy as the
+    // shard (compact when un-consolidated >= consolidated). Prints per-vector rate
+    // at checkpoints - it must stay ~flat, not collapse. Ignored; run in release:
+    //   SKEG_FIX_N=100000 SKEG_FIX_TIMING=/tmp/skeg_fix_100k.f32 \
+    //     cargo test --release -p skeg-vector --lib freshdiskann_ingest_timing \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore = "ingest timing; needs fixture, run in --release"]
+    fn freshdiskann_ingest_timing() {
+        use std::time::Instant;
+        let path =
+            std::env::var("SKEG_FIX_TIMING").unwrap_or_else(|_| "/tmp/skeg_fix_100k.f32".into());
+        let cap: usize = std::env::var("SKEG_FIX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000);
+        let (corpus, n_all, dim) = load_fixture(&path);
+        let n = n_all.min(cap);
+
+        let base = 2;
+        let base_idx = VamanaIndex::build(
+            corpus[..base * dim].to_vec(),
+            (0..base as u64).collect(),
+            dim,
+            &VamanaConfig::default(),
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        base_idx.save(tmp.path()).unwrap();
+        let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+
+        let checkpoints = [10_000usize, 30_000, 50_000, 100_000];
+        let start = Instant::now();
+        let mut consolidations = 0;
+        for id in base..n {
+            disk.insert_incremental(id as u64, &corpus[id * dim..(id + 1) * dim])
+                .unwrap();
+            let threshold = (disk.main_len() / 2).max(4096);
+            if disk.fresh_len() >= threshold {
+                disk.consolidate().unwrap();
+                consolidations += 1;
+            }
+            let done = id + 1;
+            if checkpoints.contains(&done) {
+                let secs = start.elapsed().as_secs_f64();
+                eprintln!(
+                    "ingest n={done}: {secs:.1}s  {:.0} vec/s  ({consolidations} consolidations)",
+                    done as f64 / secs
+                );
+            }
+        }
+        // No hard assert on wall-clock (machine-dependent); the printed vec/s rate
+        // across checkpoints is the O(N log N) evidence (flat, not collapsing).
+        assert_eq!(disk.len(), n);
     }
 
     // Filtered walk recall: against the exact top-10 over the matching subset
