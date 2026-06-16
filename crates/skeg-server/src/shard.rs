@@ -22,6 +22,13 @@ const COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 /// How often each shard writes an index snapshot for fast recovery.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often a shard checks its disk vindexes for an idle delta to fold.
+const IDLE_CONSOLIDATE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Only fold an idle delta once it is at least this large; below this the flat
+/// scan is cheap and a rebuild would churn the graph for little gain.
+const IDLE_CONSOLIDATE_MIN: usize = 4096;
+
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
 
@@ -214,6 +221,15 @@ impl VectorBackend {
         match self {
             VectorBackend::Flat(_) => Ok(()),
             VectorBackend::Disk(i) => i.consolidate(),
+        }
+    }
+
+    /// Un-consolidated streaming inserts (the in-RAM delta that a bulk load
+    /// leaves behind). 0 for flat. Drives the idle-consolidate trigger.
+    fn delta_len(&self) -> usize {
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.delta_len(),
         }
     }
 
@@ -724,6 +740,52 @@ fn run_shard(
                             tokio::time::sleep(SNAPSHOT_INTERVAL).await;
                             if let Err(e) = svlog.write_snapshot().await {
                                 error!("shard {shard_id}: snapshot failed: {e}");
+                            }
+                        }
+                    });
+
+                    // Idle consolidation: a bulk load leaves an un-consolidated
+                    // delta (RAM + a per-query flat scan). Once a vindex's writes
+                    // go quiet - its delta is unchanged across a tick - fold it,
+                    // so the served index is lean BY DEFAULT, not only after an
+                    // explicit VINDEX.CONSOLIDATE. The fold runs on a blocking
+                    // thread so the build does not stall the shard runtime.
+                    // ponytail: the swap still holds the per-vindex write lock for
+                    // the rebuild, so a query to THAT vindex mid-fold waits; it
+                    // fires only when idle, so collisions are rare. Upgrade path:
+                    // background build + atomic swap (no lock during the build).
+                    let kvindexes = vindexes.clone();
+                    tokio::task::spawn_local(async move {
+                        // Phase-shift shards so their idle folds (each a graph
+                        // rebuild) do not all run at once and stack their build
+                        // buffers into one RSS spike. ponytail: a process-wide
+                        // permit would serialise them exactly; the stagger is the
+                        // cheap version with no cross-shard plumbing.
+                        tokio::time::sleep(Duration::from_secs(shard_id as u64 * 2)).await;
+                        let mut prev: HashMap<String, usize> = HashMap::new();
+                        loop {
+                            tokio::time::sleep(IDLE_CONSOLIDATE_INTERVAL).await;
+                            let snap: Vec<(String, VectorEntry)> = {
+                                let g = kvindexes.read();
+                                g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
+                            };
+                            for (name, arc) in snap {
+                                let delta = arc.read().backend.delta_len();
+                                // Idle == unchanged since the previous tick.
+                                let idle = prev.insert(name.clone(), delta) == Some(delta);
+                                if idle && delta >= IDLE_CONSOLIDATE_MIN {
+                                    let a = arc.clone();
+                                    let nm = name.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if let Err(e) = a.write().backend.consolidate() {
+                                            error!(
+                                                "shard {shard_id}: idle consolidate '{nm}': {e}"
+                                            );
+                                        }
+                                    })
+                                    .await;
+                                    prev.insert(name, 0); // folded
+                                }
                             }
                         }
                     });
