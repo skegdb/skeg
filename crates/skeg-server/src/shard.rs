@@ -10,6 +10,7 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -146,12 +147,18 @@ impl VectorBackend {
         }
     }
 
-    /// Insert a vector. A disk backend inserts it straight into the graph
-    /// (FreshDiskANN-style, O(log N)), then compacts on a GEOMETRIC schedule -
-    /// once the un-consolidated inserts equal the consolidated size (a doubling).
-    /// That is O(log N) compactions over a bulk load = O(N log N) total, not the
-    /// O(N^2) of compacting every fixed batch, and it bounds the in-RAM `fresh`
-    /// cache + the recovery replay to <= half the index.
+    /// Insert a vector. A disk backend APPENDS it to the delta (cheap: buffer +
+    /// WAL, no graph work) and rebuilds the graph on a GEOMETRIC schedule - once
+    /// the un-built delta matches the built size (a doubling). That is O(log N)
+    /// bulk builds over a load = O(N) total build work, and every build is a
+    /// clean two-pass Vamana graph.
+    ///
+    /// We do NOT insert incrementally into the graph: that produced a graph that
+    /// stays connected but is poorly NAVIGABLE by the greedy walk (back-edge
+    /// re-pruning erodes the long-range edges), so plain recall@10 fell to ~0.31
+    /// vs 1.00 for a bulk build at 100k. Bulk-building beats incremental on both
+    /// recall and bulk-load speed; incremental insert is kept for an explicit
+    /// streaming path only.
     fn insert(&mut self, id: u64, vector: &[f32]) -> std::io::Result<()> {
         match self {
             VectorBackend::Flat(i) => {
@@ -159,9 +166,9 @@ impl VectorBackend {
                 Ok(())
             }
             VectorBackend::Disk(i) => {
-                i.insert_incremental(id, vector)?;
-                let threshold = (i.main_len() / 2).max(DISK_CONSOLIDATE_MIN);
-                if i.fresh_len() >= threshold {
+                i.insert(id, vector)?;
+                let threshold = i.main_len().max(DISK_CONSOLIDATE_MIN);
+                if i.delta_len() >= threshold {
                     i.consolidate()?;
                 }
                 Ok(())
@@ -246,7 +253,12 @@ impl VectorBackend {
                 const SEEDS: usize = 32;
                 let step = (s.len() / SEEDS).max(1);
                 let seeds: Vec<u64> = s.iter().copied().step_by(step).take(SEEDS).collect();
-                i.search_filtered(query, k, l_search as usize, &|id| s.contains(&id), &seeds)
+                // The walk checks membership once per edge traversed (~1e5/query on
+                // a broad filter): a HashSet's O(1) cache-friendly lookup replaces
+                // the BTreeSet's O(log|S|) pointer-chase, the dominant broad-filter
+                // cost. Built once per query (O(|S|), negligible vs the walk).
+                let hs: HashSet<u64> = s.iter().copied().collect();
+                i.search_filtered(query, k, l_search as usize, &|id| hs.contains(&id), &seeds)
             }
         }
     }
@@ -2352,10 +2364,16 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // disk
         for id in 0u64..200 {
-            shards.vset("idx", id, tvec(id + 1), 0, None, None).await.unwrap();
+            shards
+                .vset("idx", id, tvec(id + 1), 0, None, None)
+                .await
+                .unwrap();
         }
         shards.vindex_consolidate("idx").await.unwrap();
-        let hits = shards.vsearch("idx", tvec(90), 5, 0, 0, false, None).await.unwrap();
+        let hits = shards
+            .vsearch("idx", tvec(90), 5, 0, 0, false, None)
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, 89, "nearest still found after consolidate");
         // Consolidate is idempotent and a no-op on flat indices.
         shards.vindex_consolidate("idx").await.unwrap();
@@ -2594,6 +2612,68 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    // Ingest profiling: server-side cost of VSET (channel + payload index +
+    // incremental graph insert + geometric consolidate + WAL) with NO RESP3
+    // frame parse and NO Python client. Subtract from the harness's end-to-end
+    // build_s to isolate client/protocol overhead. Needs the real fixture; run:
+    //   SKEG_FIX_N=100000 cargo test -p skeg-server --release ingest_timing_server_side \
+    //     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "ingest profiling; needs /tmp/skeg_fix_100k.f32, run in --release"]
+    async fn ingest_timing_server_side() {
+        use std::time::Instant;
+        let path =
+            std::env::var("SKEG_FIX_TIMING").unwrap_or_else(|_| "/tmp/skeg_fix_100k.f32".into());
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"));
+        let n_all = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        let dim = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let cap: usize = std::env::var("SKEG_FIX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000);
+        let n = n_all.min(cap);
+        let floats: Vec<f32> = bytes[16..16 + n_all * dim * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        shards.vindex_create("idx", dim as u32, 0, 1).await.unwrap(); // f32, disk
+
+        let t0 = Instant::now();
+        for id in 0..n {
+            let v = floats[id * dim..(id + 1) * dim].to_vec();
+            let pl = format!(
+                "cat=c{} user=u{} year={} type=t{} flag=1",
+                id % 10,
+                id % 1000,
+                2018 + (id % 8),
+                id % 4
+            );
+            shards
+                .vset(
+                    "idx",
+                    id as u64,
+                    v,
+                    0,
+                    None,
+                    Some(Bytes::from(pl.into_bytes())),
+                )
+                .await
+                .unwrap();
+            let done = id + 1;
+            if done % 10_000 == 0 {
+                let s = t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "server-side ingest n={done}: {s:.1}s  {:.0} vec/s",
+                    done as f64 / s
+                );
+            }
+        }
+        eprintln!("TOTAL server-side {n}: {:.1}s", t0.elapsed().as_secs_f64());
     }
 
     // VDEL drops an id from the payload index, so a later filtered search no

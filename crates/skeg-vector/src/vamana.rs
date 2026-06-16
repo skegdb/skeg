@@ -2541,6 +2541,63 @@ mod tests {
         // No hard assert on wall-clock (machine-dependent); the printed vec/s rate
         // across checkpoints is the O(N log N) evidence (flat, not collapsing).
         assert_eq!(disk.len(), n);
+
+        // PLAIN search recall on the final graph (geometric-consolidate state, the
+        // server's exact shape). The bench showed this collapse to 0.228 at 100k
+        // while filtered held - so the plain walk from the medoid is the suspect.
+        let qpath = std::env::var("SKEG_FIX_QUERIES")
+            .unwrap_or_else(|_| "/tmp/skeg_fix_queries.f32".into());
+        let (qdata, nq, qdim) = load_fixture(&qpath);
+        assert_eq!(qdim, dim);
+        let mut hits = 0;
+        let mut total = 0;
+        for qi in 0..nq {
+            let q = &qdata[qi * dim..(qi + 1) * dim];
+            let want = brute_force(&corpus[..n * dim], dim, q, 10);
+            let got: Vec<u64> =
+                disk.search(q, 10).unwrap().into_iter().map(|(id, _)| id).collect();
+            hits += got.iter().filter(|id| want.contains(id)).count();
+            total += want.len();
+        }
+        eprintln!("PLAIN search recall@10 (geometric state) = {:.4}", hits as f64 / total as f64);
+
+        // (1) Reachability from the medoid: BFS over out-edges. If far below n,
+        // the plain walk (medoid-only entry) literally cannot reach most nodes -
+        // incremental insert is not maintaining global connectivity the way the
+        // bulk build's patch_connectivity does.
+        let mut seen_bfs = vec![false; disk.main_n as usize];
+        let mut stack = vec![disk.medoid];
+        seen_bfs[disk.medoid as usize] = true;
+        let mut reached = 1usize;
+        while let Some(r) = stack.pop() {
+            for &nb in disk.nodes[r as usize].slice() {
+                if !seen_bfs[nb as usize] {
+                    seen_bfs[nb as usize] = true;
+                    reached += 1;
+                    stack.push(nb);
+                }
+            }
+        }
+        eprintln!(
+            "reachable from medoid: {reached}/{} ({:.1}%)",
+            disk.main_n,
+            100.0 * reached as f64 / disk.main_n as f64
+        );
+
+        // (2) One final consolidate (folds the fresh tail, re-patches
+        // connectivity), then re-measure plain recall.
+        disk.consolidate().unwrap();
+        let mut h2 = 0;
+        let mut t2 = 0;
+        for qi in 0..nq {
+            let q = &qdata[qi * dim..(qi + 1) * dim];
+            let want = brute_force(&corpus[..n * dim], dim, q, 10);
+            let got: Vec<u64> =
+                disk.search(q, 10).unwrap().into_iter().map(|(id, _)| id).collect();
+            h2 += got.iter().filter(|id| want.contains(id)).count();
+            t2 += want.len();
+        }
+        eprintln!("PLAIN recall after FINAL consolidate = {:.4}", h2 as f64 / t2 as f64);
     }
 
     // Filtered walk recall: against the exact top-10 over the matching subset
