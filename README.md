@@ -263,11 +263,12 @@ metrics and OTLP tracing; a workspace test suite that's clean under
 `cargo clippy --workspace --all-targets`.
 
 **Honest about the edges.** skeg is not the lowest-latency *single-query* engine
-— Qdrant is comparable on p99 and raw hnswlib is faster still. Throughput per
-process scales with concurrency to a per-process ceiling, then you scale out with
-more processes; measure your own with `runner.py throughput` in
-[`skeg-bench`](https://github.com/skegdb/skeg-bench). Cold bulk-loading a fresh
-index is rebuild-based and trades build time for the lean serving footprint.
+— Qdrant is comparable on p99 and raw hnswlib is faster still. A single process
+saturates around 780 QPS at 1024-dim (more at lower dimensions); past that you
+scale out with processes, not cores — measure your own with `runner.py
+throughput` in [`skeg-bench`](https://github.com/skegdb/skeg-bench). Cold
+bulk-loading a fresh index is rebuild-based and trades build time for the lean
+serving footprint.
 Release binaries are aarch64 (Apple Silicon, Linux ARM); the source builds on
 x86_64 but AVX2/AVX-512 tuning and native Linux validation are on the roadmap,
 not done.
