@@ -90,3 +90,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "incremental_gate"
+harness = false
