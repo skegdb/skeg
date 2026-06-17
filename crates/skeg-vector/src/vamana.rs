@@ -1072,10 +1072,14 @@ pub struct DiskVamanaIndex {
     l_search: usize,
     /// The immutable base segment. Future LSM runs join it as more segments.
     base: Segment,
-    /// Additional immutable LSM runs, searched alongside `base`. Empty until
-    /// streaming writes flush into runs (Phase 2); the search path already
-    /// walks them.
+    /// Additional immutable LSM runs, searched alongside `base`. Streaming
+    /// writes flush from the delta into runs; `consolidate` folds them back.
     runs: Vec<Segment>,
+    /// Tier-1 quantiser, kept so a `flush` builds runs with the same tier as
+    /// the base (and so `consolidate` reopens with it).
+    tier: QuantKind,
+    /// Monotonic run-directory counter, so flushed run dirs never collide.
+    run_seq: u64,
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
@@ -1342,6 +1346,8 @@ impl DiskVamanaIndex {
                 vectors_file,
             },
             runs: Vec::new(),
+            tier,
+            run_seq: 0,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             tombstones: AHashSet::new(),
@@ -1349,7 +1355,25 @@ impl DiskVamanaIndex {
             delta_log,
         };
         index.replay_wal(&wal);
+        // Runs flushed before a restart are not reloaded; the WAL replay above
+        // already put their vectors back in L0, so the stale dirs are redundant
+        // (and would collide with `run-0` of this session). See the flush ADR.
+        index.clean_stale_runs();
         Ok(index)
+    }
+
+    /// Best-effort removal of leftover `run-*` directories from a prior session.
+    /// They are rebuildable from the WAL, so a failure to remove one is not
+    /// fatal to opening the index.
+    fn clean_stale_runs(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("run-") {
+                let _ = std::fs::remove_dir_all(entry.path()); // stale, rebuildable
+            }
+        }
     }
 
     /// Replay the delta WAL into the in-RAM delta. Tolerant of a truncated
@@ -1595,6 +1619,11 @@ impl DiskVamanaIndex {
         }
         self.delta_log.write_all(&rec)?;
         self.apply_insert(id, vector.to_vec());
+        // Keep the brute-forced L0 small: once it fills, fold it into a
+        // navigable run so search stays sub-linear between consolidations.
+        if self.delta.len() >= Self::FLUSH {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -1984,28 +2013,94 @@ impl DiskVamanaIndex {
         order
     }
 
-    /// Fold the delta and tombstones back into a fresh on-disk graph: rebuild
-    /// over the live set, re-save, and re-open. Heavy - meant for a background
-    /// task. A no-op if there is nothing live.
+    /// L0 (delta) size that triggers a flush into a navigable run. Small, so a
+    /// flush is a cheap few-thousand-vector bulk build and the brute-forced
+    /// delta search never grows large.
+    const FLUSH: usize = 4096;
+
+    /// Build the L0 delta into a fresh immutable run and clear L0. A pure
+    /// in-process optimisation: the WAL is left intact, so a crash mid-flush
+    /// loses nothing (the run is rebuildable from the WAL). See
+    /// `docs/adr-incremental-flush.md`. No-op when L0 is empty.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if rebuilding or re-saving fails.
+    /// Returns an I/O error if building, saving, or opening the run fails.
+    fn flush(&mut self) -> io::Result<()> {
+        if self.delta.is_empty() {
+            return Ok(());
+        }
+        let mut vectors: Vec<f32> = Vec::with_capacity(self.delta.len() * self.dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(self.delta.len());
+        for (&id, v) in &self.delta {
+            vectors.extend_from_slice(v);
+            ids.push(id);
+        }
+        let run_dir = self.dir.join(format!("run-{}", self.run_seq));
+        self.run_seq += 1;
+        let rebuilt = VamanaIndex::build(vectors, ids, self.dim, &VamanaConfig::default());
+        rebuilt.save(&run_dir)?;
+        // Open the run with this index's tier and keep only its base segment; the
+        // rest of the opened index (an empty delta/WAL over the run dir) is dropped.
+        let run = DiskVamanaIndex::open_with_tier(&run_dir, self.tier)?;
+        self.runs.push(run.base);
+        self.delta.clear();
+        Ok(())
+    }
+
+    /// Delete every flushed run directory and drop the in-RAM runs. Called once
+    /// `consolidate` has folded them into a fresh base.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a run directory cannot be removed.
+    fn discard_runs(&mut self) -> io::Result<()> {
+        for seq in 0..self.run_seq {
+            let d = self.dir.join(format!("run-{seq}"));
+            if d.exists() {
+                std::fs::remove_dir_all(&d)?;
+            }
+        }
+        self.runs.clear();
+        Ok(())
+    }
+
+    /// Fold the base, every run, the delta, and tombstones into one fresh
+    /// on-disk graph, then re-open. The newest version of each id wins (delta,
+    /// then runs newest-to-oldest, then base); tombstoned ids are dropped.
+    /// Heavy - meant for a background task. A no-op if nothing is live.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if rebuilding, re-saving, or re-opening fails.
     pub fn consolidate(&mut self) -> io::Result<()> {
         let mut vectors: Vec<f32> = Vec::new();
         let mut ids: Vec<u64> = Vec::new();
-        // Live main vectors not shadowed by the delta.
+        // Precedence (newest wins): delta > runs (newest first) > base. `seen`
+        // keeps each id once; tombstoned ids never enter the rebuild.
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        for (&id, v) in &self.delta {
+            if seen.insert(id) {
+                vectors.extend_from_slice(v);
+                ids.push(id);
+            }
+        }
+        for run in self.runs.iter().rev() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                vectors.extend(self.read_vector(run, row)?);
+                ids.push(id);
+            }
+        }
         for row in 0..self.base.main_n {
             let id = self.base.ids[row as usize];
-            if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
+            if self.tombstones.contains(&id) || !seen.insert(id) {
                 continue;
             }
             vectors.extend(self.read_vector(&self.base, row)?);
-            ids.push(id);
-        }
-        // Delta vectors (always live).
-        for (&id, v) in &self.delta {
-            vectors.extend_from_slice(v);
             ids.push(id);
         }
         if ids.is_empty() {
@@ -2013,12 +2108,14 @@ impl DiskVamanaIndex {
         }
         let dim = self.dim;
         let dir = self.dir.clone();
+        let tier = self.tier;
         let rebuilt = VamanaIndex::build(vectors, ids, dim, &VamanaConfig::default());
         rebuilt.save(&dir)?;
-        // The delta is now folded into the graph: the WAL must start empty so
-        // the reopen below does not replay stale records.
+        self.discard_runs()?;
+        // The delta + runs are now folded into the graph: the WAL must start
+        // empty so the reopen below does not replay stale records.
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
-        *self = DiskVamanaIndex::open(&dir)?;
+        *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         Ok(())
     }
 }
@@ -2581,6 +2678,74 @@ mod tests {
         );
         let hits = disk.search(&v_a, 1).unwrap();
         assert_eq!(hits[0].0, 5000, "the WAL-recovered vector is searchable");
+    }
+
+    // Insert past the L0 flush threshold so at least one run is built; returns
+    // the corpus so callers can probe specific vectors.
+    fn fill_past_flush(disk: &mut DiskVamanaIndex, n: usize, dim: usize) -> Vec<f32> {
+        let vectors = random_vectors(n, dim, 7);
+        for id in 0..n {
+            disk.insert(id as u64, &vectors[id * dim..(id + 1) * dim]).unwrap();
+        }
+        vectors
+    }
+
+    #[test]
+    fn disk_flush_builds_a_run_and_stays_searchable() {
+        let (dim, n) = (16, 5000); // > FLUSH (4096): one flush fires
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        let vectors = fill_past_flush(&mut disk, n, dim);
+
+        assert!(!disk.runs.is_empty(), "a flush must have built a run");
+        assert!(disk.delta.len() < 4096, "L0 stayed bounded after flushing");
+        assert_eq!(disk.len(), n, "every inserted vector is live");
+        let q = &vectors[100 * dim..101 * dim];
+        assert_eq!(disk.search(q, 1).unwrap()[0].0, 100, "a flushed vector is its own NN");
+    }
+
+    #[test]
+    fn disk_consolidate_folds_runs_into_base() {
+        let (dim, n) = (16, 5000);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        let vectors = fill_past_flush(&mut disk, n, dim);
+        disk.consolidate().unwrap();
+
+        assert!(disk.runs.is_empty(), "consolidate clears the runs");
+        assert_eq!(disk.base.main_n as usize, n, "all vectors folded into the base");
+        assert_eq!(disk.len(), n);
+        let run_dirs = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+            .count();
+        assert_eq!(run_dirs, 0, "run directories are removed once folded in");
+        let q = &vectors[4500 * dim..4501 * dim];
+        assert_eq!(disk.search(q, 1).unwrap()[0].0, 4500, "search exact after consolidate");
+    }
+
+    #[test]
+    fn disk_reopen_after_flush_recovers_via_wal() {
+        let (dim, n) = (16, 5000);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vectors = {
+            let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+            let v = fill_past_flush(&mut disk, n, dim);
+            assert!(!disk.runs.is_empty(), "flushed before drop");
+            v
+        }; // dropped: in-RAM runs gone, only the WAL + stale run dirs on disk
+
+        let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(disk.len(), n, "WAL replay restores every flushed vector");
+        let q = &vectors[100 * dim..101 * dim];
+        assert_eq!(disk.search(q, 1).unwrap()[0].0, 100, "recovered vector is searchable");
+        let stale = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+            .count();
+        assert_eq!(stale, 0, "stale run dirs are cleaned on open");
     }
 
     #[test]
