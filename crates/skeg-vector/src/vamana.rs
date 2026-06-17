@@ -2033,25 +2033,27 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if rebuilding, re-saving, or re-opening fails.
     pub fn consolidate(&mut self) -> io::Result<()> {
-        let mut vectors: Vec<f32> = Vec::new();
-        let mut ids: Vec<u64> = Vec::new();
-        // Precedence (newest wins): delta > runs (newest first) > base. `seen`
-        // keeps each id once; tombstoned ids never enter the rebuild.
+        let dim = self.dim;
+        // Collect the surviving (id, location) refs only - ~24 B each, not the
+        // full 2 GB of vectors. Precedence (newest wins): delta > runs (newest
+        // first) > base; `seen` keeps each id once, tombstoned ids never enter.
+        // `loc`: usize::MAX => delta, else index into `segs` (0 = base, 1.. = runs).
+        let segs: Vec<&Segment> =
+            std::iter::once(&self.base).chain(self.runs.iter()).collect();
         let mut seen: AHashSet<u64> = AHashSet::new();
-        for (&id, v) in &self.delta {
+        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        for &id in self.delta.keys() {
             if seen.insert(id) {
-                vectors.extend_from_slice(v);
-                ids.push(id);
+                survivors.push((id, usize::MAX, 0));
             }
         }
-        for run in self.runs.iter().rev() {
+        for (ri, run) in self.runs.iter().enumerate().rev() {
             for row in 0..run.main_n {
                 let id = run.ids[row as usize];
                 if self.tombstones.contains(&id) || !seen.insert(id) {
                     continue;
                 }
-                vectors.extend(self.read_vector(run, row)?);
-                ids.push(id);
+                survivors.push((id, ri + 1, row));
             }
         }
         for row in 0..self.base.main_n {
@@ -2059,13 +2061,26 @@ impl DiskVamanaIndex {
             if self.tombstones.contains(&id) || !seen.insert(id) {
                 continue;
             }
-            vectors.extend(self.read_vector(&self.base, row)?);
-            ids.push(id);
+            survivors.push((id, 0, row));
         }
-        if ids.is_empty() {
+        if survivors.is_empty() {
             return Ok(());
         }
-        let dim = self.dim;
+        // Rebuild in id order so a query's near-neighbours land at nearby
+        // vectors.bin rows and the re-rank's f32 reads stay cache-local. Without
+        // it the fold order scatters them and 500k+ search latency regresses ~1.5x
+        // (root-caused: the re-rank is disk-read bound at scale).
+        survivors.sort_unstable_by_key(|&(id, _, _)| id);
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
+        for (id, loc, row) in survivors {
+            if loc == usize::MAX {
+                vectors.extend_from_slice(&self.delta[&id]);
+            } else {
+                vectors.extend(self.read_vector(segs[loc], row)?);
+            }
+            ids.push(id);
+        }
         let dir = self.dir.clone();
         let tier = self.tier;
         let rebuilt = VamanaIndex::build(vectors, ids, dim, &VamanaConfig::default());
