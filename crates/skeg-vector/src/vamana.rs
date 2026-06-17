@@ -1770,57 +1770,50 @@ impl DiskVamanaIndex {
         // Graph walk over every segment (the base plus any LSM runs); each
         // contributes candidates that merge into `scored`. An empty segment is
         // skipped. The delta is brute-forced once below.
-        for seg in std::iter::once(&self.base).chain(self.runs.iter()) {
+        // Per-segment WALK (in-RAM, cheap) collects proxy-ranked candidate rows
+        // tagged with their segment; one GLOBAL re-rank below bounds the disk
+        // reads regardless of how many segments (base + runs) there are. This is
+        // what keeps query latency flat as the LSM accumulates runs.
+        let segs: Vec<&Segment> =
+            std::iter::once(&self.base).chain(self.runs.iter()).collect();
+        // Global re-rank budget (disk reads). Bounded so latency tracks `k`, not
+        // the corpus size or the segment count.
+        let rerank = if filtered {
+            if dense {
+                ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
+            } else {
+                (k * 8).max(64)
+            }
+        } else {
+            (k * 4).max(32)
+        };
+        let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
+        for (seg_idx, seg) in segs.iter().enumerate() {
             if seg.main_n == 0 {
                 continue;
             }
             let code = seg.quant.quantize_query(&normalized(query));
-            let base = if l_search == 0 {
-                self.l_search
+            // The base (segment 0) carries the deep beam. Runs are small and only
+            // feed the global re-rank, so they walk a shallow list - this keeps
+            // query latency flat as runs accumulate, instead of paying a full
+            // l_search beam per run.
+            let walk_base = if seg_idx == 0 {
+                if l_search == 0 { self.l_search } else { l_search }
             } else {
-                l_search
+                (k * 4).max(16)
             };
-            // A SPARSE filtered walk oversamples the frontier so the post-filter
-            // still leaves enough matches; a dense one (or plain) does not.
+            // A sparse filtered walk oversamples the frontier so the post-filter
+            // still leaves enough matches; a dense or plain walk does not.
             let list_size = if filtered && !dense {
-                (base.max(k) * FILTER_OVERSAMPLE).min(seg.main_n as usize)
+                (walk_base.max(k) * FILTER_OVERSAMPLE).min(seg.main_n as usize)
             } else {
-                base.max(k)
+                walk_base.max(k)
             };
-            // Re-rank budget (disk reads). Bounded so latency tracks `k`, not
-            // `|S|`. A dense filter reads ~k/selectivity of the proxy-ordered
-            // frontier to surface k matches (the rerank loop skips non-matches
-            // before any read).
-            let rerank = if filtered {
-                if dense {
-                    ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
-                } else {
-                    (k * 8).max(64)
-                }
-            } else {
-                (k * 4).max(32).min(list_size)
-            };
+            let early = (!filtered && speed_enabled()).then_some(EarlyTerm { k: rerank, window: 5 });
             let mut visited = VisitedBitset::new(seg.main_n as usize);
             let mut seen = VisitedBitset::new(seg.main_n as usize);
-            // Early-term signature tracks the re-rank candidate pool (top-rerank),
-            // not just top-k: the graph walk feeds the re-rank, and stability of
-            // the wider pool is what guarantees the final top-k is unchanged.
-            // Early-term could stop before enough matches are found; off when filtered.
-            let early = (!filtered && speed_enabled()).then_some(EarlyTerm {
-                k: rerank,
-                window: 5,
-            });
-            let walk_span = tracing::info_span!(
-                "vsearch.walk",
-                list_size,
-                rerank,
-                early = early.is_some(),
-                visited = tracing::field::Empty,
-                returned = tracing::field::Empty,
-            );
-            // Multi-seed: the medoid plus, for a filtered walk, the matching
-            // seed ids mapped to live graph rows. Starting inside the matching
-            // region lets the walk reach a cluster that sits away from the query.
+            // Medoid plus, for a filtered walk, matching seed rows so the walk can
+            // start inside a matching cluster that sits away from the query.
             let mut seed_rows: Vec<VecId> = vec![seg.medoid];
             for &id in seeds {
                 if let Some(&r) = seg.id_to_main_row.get(&id)
@@ -1833,100 +1826,66 @@ impl DiskVamanaIndex {
             let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
                 seg.nodes[id as usize].slice().iter().copied().collect()
             };
-            // Collect candidate rows. A plain search does one walk. A filtered
-            // search always does two and unions them, because the two cover
-            // opposite metadata shapes and neither alone is robust:
-            //   - admit-gated (only matching nodes admitted): recovers clustered
-            //     matches a query-ranked frontier would evict;
-            //   - navigate-all then filter at rerank: recovers scattered matches
-            //     near the query that the admit subgraph never reaches.
-            // An adaptive "skip the second walk when the first looks full" was
-            // tried and rejected: at ~5% scattered the admit walk fills the
-            // frontier yet misses the near-query matches, so recall collapsed
-            // (0.98 -> 0.65 on the 500k bench). Both walks are cheap; run both.
             let mut cand: Vec<(f32, VecId)> = Vec::new();
-            {
-                let _g = walk_span.enter();
-                // One walk over the shared scratch bitsets; `FnMut` so a filtered
-                // search can run it twice (admit-gated, then navigate-all).
-                let mut walk = |seeds: &[VecId],
-                                admit: Option<&dyn Fn(VecId) -> bool>,
-                                early: Option<EarlyTerm>| {
-                    greedy_search(
-                        seeds,
-                        list_size,
-                        early,
-                        dist,
-                        nbrs,
-                        admit,
-                        &mut visited,
-                        &mut seen,
-                        None,
-                    )
+            let mut walk = |seeds: &[VecId],
+                            admit: Option<&dyn Fn(VecId) -> bool>,
+                            early: Option<EarlyTerm>| {
+                greedy_search(
+                    seeds, list_size, early, dist, nbrs, admit, &mut visited, &mut seen, None,
+                )
+            };
+            if filtered && !dense {
+                // Two walks unioned (see history): an admit-gated walk recovers
+                // clustered matches, a navigate-all walk recovers scattered ones.
+                let admit = |row: VecId| -> bool {
+                    let id = seg.ids[row as usize];
+                    !self.tombstones.contains(&id)
+                        && !self.delta.contains_key(&id)
+                        && matches.is_none_or(|m| m(id))
                 };
-                if filtered && !dense {
-                    // Sparse filter: admit only live matching rows so the walk
-                    // explores the matching subgraph (a far cluster is not evicted
-                    // by near non-matching nodes), then a navigate-all walk to pick
-                    // up matches scattered near the query.
-                    let admit = |row: VecId| -> bool {
-                        let id = seg.ids[row as usize];
-                        !self.tombstones.contains(&id)
-                            && !self.delta.contains_key(&id)
-                            && matches.is_none_or(|m| m(id))
-                    };
-                    cand.extend(walk(&seed_rows, Some(&admit), None).iter());
-                    cand.extend(walk(&[seg.medoid], None, None).iter());
-                } else {
-                    // Dense filter or plain: a single navigate-all walk; the
-                    // rerank drops non-matches. (Plain uses early-term; filtered
-                    // keeps it off so it does not stop before k matches surface.)
-                    let walk_early = if dense { None } else { early };
-                    cand.extend(walk(&seed_rows, None, walk_early).iter());
-                }
-                walk_span.record("visited", visited.iter().count());
-                walk_span.record("returned", cand.len());
+                cand.extend(walk(&seed_rows, Some(&admit), None).iter());
+                cand.extend(walk(&[seg.medoid], None, None).iter());
+            } else {
+                let walk_early = if dense { None } else { early };
+                cand.extend(walk(&seed_rows, None, walk_early).iter());
             }
-            // Closest-by-proxy first, so the bounded re-rank reads the best
-            // matching candidates (and skips non-matching without a disk read).
-            cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            let rerank_span = tracing::info_span!(
-                "vsearch.rerank",
-                candidates = cand.len(),
-                disk_reads = tracing::field::Empty,
-                skipped = tracing::field::Empty,
-            );
-            let _rg = rerank_span.enter();
-            let mut disk_reads: usize = 0;
-            let mut skipped: usize = 0;
-            let mut reranked_ids: AHashSet<u64> = AHashSet::new();
-            for (_, vec_id) in cand {
-                if disk_reads >= rerank {
-                    break;
-                }
-                let id = seg.ids[vec_id as usize];
-                if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
-                    skipped += 1;
-                    continue;
-                }
-                // Drop non-matching ids (from the navigate-all walk) pre-read.
-                if let Some(m) = matches
-                    && !m(id)
-                {
-                    skipped += 1;
-                    continue;
-                }
-                // Dedup: both walks can surface the same row.
-                if !reranked_ids.insert(id) {
-                    continue;
-                }
-                let v = self.read_vector(seg, vec_id)?;
-                disk_reads += 1;
-                scored.push((OrderedFloat(cosine_f32(query, &v)), id));
+            for (proxy, row) in cand {
+                all_cand.push((proxy, seg_idx, row));
             }
-            rerank_span.record("disk_reads", disk_reads);
-            rerank_span.record("skipped", skipped);
         }
+        // Global re-rank: best-by-proxy first across every segment, bounded disk
+        // reads, dedup by id (a later segment can re-surface the same id).
+        all_cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let rerank_span = tracing::info_span!(
+            "vsearch.rerank",
+            candidates = all_cand.len(),
+            disk_reads = tracing::field::Empty,
+        );
+        let _rg = rerank_span.enter();
+        let mut disk_reads: usize = 0;
+        let mut reranked_ids: AHashSet<u64> = AHashSet::new();
+        for (_, seg_idx, row) in all_cand {
+            if disk_reads >= rerank {
+                break;
+            }
+            let seg = segs[seg_idx];
+            let id = seg.ids[row as usize];
+            if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
+                continue;
+            }
+            if let Some(m) = matches
+                && !m(id)
+            {
+                continue;
+            }
+            if !reranked_ids.insert(id) {
+                continue;
+            }
+            let v = self.read_vector(seg, row)?;
+            disk_reads += 1;
+            scored.push((OrderedFloat(cosine_f32(query, &v)), id));
+        }
+        rerank_span.record("disk_reads", disk_reads);
 
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
         for (&id, v) in &self.delta {
