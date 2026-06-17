@@ -376,12 +376,6 @@ impl FastRotation {
         }
     }
 
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
-
     /// Apply the transform to `x`, writing into `out`.
     ///
     /// # Panics

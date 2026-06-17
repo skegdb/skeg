@@ -364,16 +364,6 @@ fn turboquant_pack(code: &mut [u8], i: usize, bucket: usize, bits: u8) {
     code[byte] |= (bucket as u8) << shift;
 }
 
-/// Inverse of `turboquant_pack`: read the `bits`-wide bucket id at coord `i`.
-fn turboquant_unpack(code: &[u8], i: usize, bits: u8) -> usize {
-    let bits = bits as usize;
-    let codes_per_byte = 8 / bits;
-    let byte = i / codes_per_byte;
-    let shift = (i % codes_per_byte) * bits;
-    let mask = (1u8 << bits) - 1;
-    ((code[byte] >> shift) & mask) as usize
-}
-
 /// Encode one f32 vector into a TurboQuant `(code, scale)` pair.
 fn turboquant_encode_vec(
     v: &[f32],
@@ -1059,16 +1049,8 @@ impl QuantizedVectors {
                     // 1-bit: algebraic reduction `c * (2*masked - q_sum)`.
                     // q_sum precomputed at query time; SWAR scalar inner.
                     1 => tq1_adc_swar(code, centroids, q_rot, self.dim, *q_sum),
-                    _ => {
-                        // Fallback general scalar path. The supported set is
-                        // {1, 2, 4} - this arm is for future-proofing.
-                        let mut a = 0.0f32;
-                        for i in 0..self.dim {
-                            let bucket = turboquant_unpack(code, i, *bits);
-                            a += q_rot[i] * centroids[bucket];
-                        }
-                        a
-                    }
+                    // `build_turboquant` asserts bits in {1, 2, 4}.
+                    _ => unreachable!("TurboQuant bits must be in {{1, 2, 4}}"),
                 };
                 let ip = scales[row] * acc;
                 // Greater inner product = closer. Clamp into a safe range so

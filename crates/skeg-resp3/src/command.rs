@@ -430,50 +430,47 @@ fn parse_kv_mset(args: Vec<Bytes>) -> Result<Command, CommandError> {
     Ok(Command::Mset { pairs })
 }
 
-fn parse_kv_incr(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
-    if args.len() != 1 {
-        // The server formats arity errors for INCR and DECR with a
-        // shared label `INCR/DECR` for historical reasons; preserved
-        // byte-for-byte here.
-        return Err(CommandError::WrongArity {
-            command: "INCR/DECR",
-        });
-    }
-    Ok(Command::Incr {
-        key: args.swap_remove(0),
-    })
-}
-
-fn parse_kv_decr(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+// INCR and DECR share the same arity check and a single error label
+// (`INCR/DECR`, preserved byte-for-byte for existing clients); likewise
+// INCRBY/DECRBY. Each pair differs only in the Command variant built.
+fn incr_decr_key(mut args: Vec<Bytes>) -> Result<Bytes, CommandError> {
     if args.len() != 1 {
         return Err(CommandError::WrongArity {
             command: "INCR/DECR",
         });
     }
-    Ok(Command::Decr {
-        key: args.swap_remove(0),
-    })
+    Ok(args.swap_remove(0))
 }
 
-fn parse_kv_incrby(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+fn incr_decr_by_args(mut args: Vec<Bytes>) -> Result<(Bytes, i64), CommandError> {
     if args.len() != 2 {
         return Err(CommandError::WrongArity {
             command: "INCRBY/DECRBY",
         });
     }
     let delta = parse_i64(&args[1])?;
-    let key = args.swap_remove(0);
+    Ok((args.swap_remove(0), delta))
+}
+
+fn parse_kv_incr(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    Ok(Command::Incr {
+        key: incr_decr_key(args)?,
+    })
+}
+
+fn parse_kv_decr(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    Ok(Command::Decr {
+        key: incr_decr_key(args)?,
+    })
+}
+
+fn parse_kv_incrby(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    let (key, delta) = incr_decr_by_args(args)?;
     Ok(Command::IncrBy { key, delta })
 }
 
-fn parse_kv_decrby(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
-    if args.len() != 2 {
-        return Err(CommandError::WrongArity {
-            command: "INCRBY/DECRBY",
-        });
-    }
-    let delta = parse_i64(&args[1])?;
-    let key = args.swap_remove(0);
+fn parse_kv_decrby(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    let (key, delta) = incr_decr_by_args(args)?;
     Ok(Command::DecrBy { key, delta })
 }
 
