@@ -128,18 +128,27 @@ fn main() {
     println!("Pass: recall@10 >= 0.98 throughout AND p50(high-water) <= 2x p50(post-consolidate)");
     println!("=======================================================");
 
-    // Stream with the production geometric consolidation schedule.
+    // Stream and time it: total ingest, and the WORST single-insert pause (the
+    // flush cost). The build win of the LSM is that this max pause is a small
+    // bulk-build (a flush), not a full O(N log N) rebuild stall.
     let mut min_recall = 1.0f32;
+    let mut max_pause_ms = 0.0f64;
+    let ingest_t0 = Instant::now();
     for i in 0..n {
+        let t = Instant::now();
         idx.insert(i as u64, &corpus[i * dim..(i + 1) * dim]).unwrap();
+        max_pause_ms = max_pause_ms.max(t.elapsed().as_secs_f64() * 1000.0);
         if idx.delta_len() >= idx.main_len().max(DISK_CONSOLIDATE_MIN) {
             idx.consolidate().unwrap();
             let (r, _) = recall_p50(&idx, &corpus[..n * dim], i + 1, dim, &queries);
             min_recall = min_recall.min(r);
         }
     }
-    // Just after a consolidation: delta ~ 0.
+    let ingest_s = ingest_t0.elapsed().as_secs_f64();
+    // Just after a consolidation: delta ~ 0. Time the full rebuild for contrast.
+    let cons_t0 = Instant::now();
     idx.consolidate().unwrap();
+    let consolidate_s = cons_t0.elapsed().as_secs_f64();
     let (recall_lo, p50_lo) = recall_p50(&idx, &corpus[..n * dim], n, dim, &queries);
     min_recall = min_recall.min(recall_lo);
 
@@ -156,7 +165,11 @@ fn main() {
     let recall_pass = min_recall >= 0.98;
     let latency_pass = ratio <= 2.0;
 
+    let vec_per_s = n as f64 / ingest_s;
     println!("\n=== Incremental gate verdict ===");
+    println!("  ingest {n} vectors          {ingest_s:.2}s ({vec_per_s:.0} vec/s)");
+    println!("  max single-insert pause     {max_pause_ms:.1} ms  (a flush; the LSM build win)");
+    println!("  one full consolidate        {consolidate_s:.2}s  (the rebuild the LSM defers/amortises)");
     println!("  min recall@10 over stream  {min_recall:.4}   [{}]",
              if recall_pass { "PASS" } else { "FAIL" });
     println!("  p50 post-consolidate       {p50_lo:.2} ms");
