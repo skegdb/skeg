@@ -114,20 +114,20 @@ impl VectorBackend {
         }
     }
 
-    /// Approximate RAM footprint of this vindex in bytes. Used to
-    /// refresh the `VindexSizeBytes` gauge from STATS. Cheap enough
-    /// (no allocation, just arithmetic on len/dim) to be polled.
+    /// RAM footprint of this vindex in bytes. Used to refresh the
+    /// `VindexSizeBytes` gauge from STATS. Cheap (arithmetic / a sum
+    /// over resident structures), safe to poll.
     ///
     /// Flat indexes carry the full f32 row buffer in RAM. Disk indexes
-    /// only keep tier-1 codes resident (int8 today = 1 byte per
-    /// coordinate); the graph and full f32 vectors live on disk and
-    /// are paged in by the OS, so they are not counted here.
+    /// keep graph + quantized tier + delta resident; the full f32
+    /// vectors live on disk and are paged in by the OS, so they are not
+    /// counted here. The disk number is the index's own deterministic
+    /// `resident_bytes()` (tier-accurate: int8 vs tq1/tq2/tq4), not a
+    /// process RSS sample.
     fn approx_ram_bytes(&self) -> u64 {
-        let n = self.len() as u64;
-        let d = self.dim() as u64;
         match self {
-            VectorBackend::Flat(_) => n * d * 4,
-            VectorBackend::Disk(_) => n * d, // int8 tier
+            VectorBackend::Flat(_) => self.len() as u64 * self.dim() as u64 * 4,
+            VectorBackend::Disk(i) => i.resident_bytes() as u64,
         }
     }
 
