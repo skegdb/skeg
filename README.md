@@ -48,18 +48,22 @@ All numbers are reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-
 (public harness, real embeddings, brute-force ground truth). Measured single-machine
 on Apple Silicon; the RAM ratios are hardware-independent.
 
-**Lean *and* fast.** Single-tenant, 100K × 1024-dim, recall measured against
-exact brute force:
+**Lean *and* fast.** Single-tenant, 100K × 1024-dim, recall against exact brute
+force. Every engine at a reasonable default (LanceDB tuned to recall 1.0 for a
+fair fight):
 
-| engine | peak RAM | recall@10 | p50 latency |
+| engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
-| **skeg** (tq2) | **51 MB** | **1.000** | **2.4 ms** |
-| LanceDB (IVF-PQ, tuned) | 151 MB | 0.998 | 56 ms |
-| Qdrant (HNSW, f32) | 860 MB | 0.998 | 2.7 ms |
+| **skeg** (tq2) | **47 MB** | **1.000** | **2.5 ms** |
+| Milvus Lite | 108 MB | 0.934 | 2.7 ms |
+| LanceDB (IVF-PQ) | 198 MB | 0.998 | 59 ms |
+| hnswlib (raw HNSW) | 426 MB | 0.985 | 2.0 ms |
+| Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
+| Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-LanceDB matches skeg on disk-first frugality but pays 20× in latency to reach the
-same recall; Qdrant matches the latency but holds 17× the RAM. skeg is the only
-engine in the lean-*and*-fast corner.
+Every other engine gives up at least one axis — RAM, recall, or latency. skeg is
+the only one that is leanest, most accurate, *and* fast at once. The Pareto
+across all six is in [`skeg-bench`](https://github.com/skegdb/skeg-bench).
 
 **Multi-tenant density.** Pack tenants of 100K vectors on one box. skeg's RAM is
 bounded by the *largest tenant*, not the total — it stays flat as tenants grow:
