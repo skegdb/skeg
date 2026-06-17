@@ -4,56 +4,129 @@
 </p>
 
 <p align="center">
+  <strong>The vector database that fits.</strong><br>
+  Multi-tenant, disk-first, RAM-frugal &mdash; recall 1.0 at a fraction of the memory.
+</p>
+
+<p align="center">
   <a href="https://crates.io/crates/skeg-server"><img src="https://img.shields.io/crates/v/skeg-server.svg" alt="crates.io"></a>
   <a href="https://github.com/skegdb/skeg/releases"><img src="https://img.shields.io/github/v/release/skegdb/skeg.svg" alt="release"></a>
   <a href="https://github.com/skegdb/skeg/actions"><img src="https://img.shields.io/github/actions/workflow/status/skegdb/skeg/ci.yml?branch=main" alt="CI"></a>
   <img src="https://img.shields.io/badge/MSRV-1.88-orange.svg" alt="MSRV 1.88">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
+  <a href="https://github.com/skegdb/skeg-bench"><img src="https://img.shields.io/badge/benchmarks-reproducible-brightgreen.svg" alt="benchmarks"></a>
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
-# skeg
+---
 
-**A vector database that gets out of the model's way.** Multi-tenant, SSD-primary, RAM-frugal. Built for the machine where the LLM already owns most of the memory.
+Vector search where RAM is contested: a SaaS packing thousands of tenants on one
+box, a RAG service paying for memory by the gigabyte, an agent sharing a machine
+with the model it serves. skeg keeps the full vectors on SSD and only a small,
+quantized working set in RAM — so it serves at **recall 1.0** on a memory
+footprint the RAM-resident engines can't touch.
 
-> **Hardware target.** skeg was written and optimised for Apple Silicon (M-series). The numbers below are from an M1 Pro (16 GiB); the live dashboard is at [`skegdb.github.io/bench`](https://skegdb.github.io/bench/). x86_64 native tuning (AVX2/AVX-512) lands as soon as we have server hardware to benchmark on; release binaries are aarch64 only (Apple Silicon, Linux ARM), the source builds on x86_64 but is not yet tuned for it.
+Key-value and vectors in one engine. Redis-compatible wire protocol. First-class
+multi-tenancy with isolation that's leak-free by construction.
 
-## The point
+## Why it matters
 
-Most vector databases are designed to live alone on the machine. They expect every gigabyte of RAM the operating system can spare, and they take it.
+The same 50M-vector workload, RAM provisioned at $4/GB-month:
 
-skeg is built for the opposite case: a machine where the language model already owns most of the memory. The index sits on the SSD, a small bounded working set stays in RAM, and the rest of the system is left alone.
+| | resident RAM | cost / year |
+| --- | ---: | ---: |
+| **skeg** (tq2) | **19 GiB** | **$930** |
+| Qdrant (HNSW, f32) | 201 GiB | $9,647 |
 
-The number that matters is **co-residence**: a vector store serving retrievals **while a local LLM is answering**. A 3B model (Llama 3.2 Q4_K_M) running RAG over a corpus that sweeps from 10K to 1M vectors, both on the same M1 Pro.
+**90% less memory, same recall.** That gap is a larger model, a longer context,
+a second service — or a smaller bill. Run the numbers for your workload with
+[`skeg-bench`](https://github.com/skegdb/skeg-bench)'s cost calculator.
+
+## Benchmarks
+
+All numbers are reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench)
+(public harness, real embeddings, brute-force ground truth). Measured single-machine
+on Apple Silicon; the RAM ratios are hardware-independent.
+
+**Lean *and* fast.** Single-tenant, 100K × 1024-dim, recall measured against
+exact brute force:
+
+| engine | peak RAM | recall@10 | p50 latency |
+| --- | ---: | ---: | ---: |
+| **skeg** (tq2) | **51 MB** | **1.000** | **2.4 ms** |
+| LanceDB (IVF-PQ, tuned) | 151 MB | 0.998 | 56 ms |
+| Qdrant (HNSW, f32) | 860 MB | 0.998 | 2.7 ms |
+
+LanceDB matches skeg on disk-first frugality but pays 20× in latency to reach the
+same recall; Qdrant matches the latency but holds 17× the RAM. skeg is the only
+engine in the lean-*and*-fast corner.
+
+**Multi-tenant density.** Pack tenants of 100K vectors on one box. skeg's RAM is
+bounded by the *largest tenant*, not the total — it stays flat as tenants grow:
+
+| 5 tenants × 100K | peak RAM | recall | cross-tenant leaks |
+| --- | ---: | ---: | ---: |
+| **skeg** (per-tenant index) | **~200 MB** | **1.000** | **0** |
+| Qdrant (collection per tenant) | 1,818 MB | 0.996 | 0 |
+| Qdrant (shared + filter) | 3,494 MB | 0.957 | 0 |
+
+That's **9–17× less RAM at higher recall** — and isolation that holds under an
+adversarial leak-fuzz (query a tenant's index with another tenant's exact
+vector: zero rows cross the boundary, every time).
+
+**Fits where others fall over.** MNIST 60K in a hard 256 MB container:
+
+| | peak RAM | verdict @ 256 MB |
+| --- | ---: | :---: |
+| **skeg** (tq2) | **156 MB** | ✅ PASS |
+| Qdrant (f32) | 473 MB | ❌ OOM-killed |
+
+**Co-resident with a model.** A 3B LLM answering RAG over 1M vectors, both on one
+M1 Pro (16 GiB) — the index stays on SSD, the resident set stays flat:
+
+| Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
+| --- | ---: | ---: |
+| **skeg** (pq128) | **54 MiB** | **67 MiB** |
+| Qdrant (HNSW) | 254 MiB | 2,387 MiB |
 
 <!-- markdownlint-disable MD033 MD041 -->
 <p align="center">
-  <img src="assets/coresidence-rss.png" alt="Backend RSS while a 3B LLM serves RAG, swept from 10K to 1M vectors on an M1 Pro 16 GiB. skeg stays under 80 MiB; qdrant climbs into multi-GiB territory." width="780">
+  <img src="assets/coresidence-rss.png" alt="Backend RSS while a 3B LLM serves RAG, swept from 10K to 1M vectors on an M1 Pro 16 GiB. skeg stays under 80 MiB; Qdrant climbs into multi-GiB territory." width="760">
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
-| Co-resident with a 3B LLM, 1M vectors | backend RSS p50 | backend RSS max |
-| ------------------------------------- | --------------: | --------------: |
-| **skeg-pq128**                        |    **54 MiB**   |    **67 MiB**   |
-| qdrant (hnsw)                         |       254 MiB   |      2 387 MiB  |
+Full matrix (engine × scale × tier, p50/p99, recall, RSS) on the live dashboard:
+[`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
 
-(Steady state vs. query bursts. The HNSW peak is where the swap pressure shows up; skeg stays flat because the working set is on SSD.)
+## How it works
 
-The index lives on the SSD; when the query stream has gaps, the OS reclaims the cold pages and the resident set falls back toward nothing. The HNSW engines hold the graph and every vector in RAM the whole time. On a 16 GiB laptop where the model owns ~2.2 GiB and macOS takes several more, this is the difference between the machine breathing and the machine swapping.
+The index lives on the SSD. The Vamana graph is walked on disk with a small,
+byte-budgeted cache for the hot pages; the cache is S3-FIFO and returns evicted
+pages to the OS through jemalloc decay timers. A resident quantized tier drives
+the graph walk, and re-ranking against the full-precision vectors on disk
+recovers the accuracy quantization gives up.
 
-The gigabytes you get back are the memory you can give to a larger model, a longer context window, a second model, a vision encoder, the application doing the actual work.
+Five tiers trade memory for precision: `int8`, Product Quantization (128×256),
+and TurboQuant at 1/2/4 bits per coordinate. **tq2 is the sweet spot** — quarter
+the bytes of int8, recall ~1.0, latency on par. TurboQuant needs no trained
+codebook, so the lean tiers work under live writes, not just at serve time.
 
-## What it is
+The design and the eleven falsifications behind it are written up in
+[the series on the project blog](https://amanitaproject.com/).
 
-skeg is the storage layer for AI agents that run on the same hardware as the model. Vectors and key-value pairs in the same engine. **Multi-tenant**: prefix-routed namespaces with per-tenant isolation and a `HELLO 3 AUTH` authentication path (argon2id). Sized for machines that already have a language model resident in memory.
+## Multi-tenancy
 
-The server speaks two protocols. A native binary protocol on port 7379 for clients that want the lowest overhead. RESP3 on port 6379 for compatibility with existing Redis tooling. Both protocols expose the same operations.
+Multi-tenancy is first-class, not a filter convention:
 
-## What skeg is not
+- **Isolation by construction** — one index per tenant, so a query physically
+  cannot reach another tenant's vectors. No filter to misconfigure, no leak path.
+- **Hard quotas** — `max_vectors`, `max_disk_bytes`, set and read at runtime via
+  `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`.
+- **Fair eviction** — a noisy tenant can't starve a quiet one out of the cache.
+- **Authentication** — `HELLO 3 AUTH user pass` (argon2id), prefix-routed namespaces.
 
-skeg is not the lowest-latency single-query engine; Qdrant is comparable on p99. A single shard saturates around 640 QPS, and past that you need multiple processes, not more cores. It is younger in production than Qdrant or Chroma. Where it wins is the regime it was built for: laptops, DGX Spark, edge boxes, anywhere RAM is contested.
-
-For the full picture across engines, scales, and tiers, see the live dashboard: [`skegdb.github.io/bench`](https://skegdb.github.io/bench/). The isolated (non-co-resident) comparison at 500K is skeg-pq128 at ~228 MiB / recall@10 0.9994 against 2.3–3.0 GiB for the HNSW engines.
+Shipped in the `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant`
+crates. See [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
 
 ## Install
 
@@ -64,7 +137,7 @@ brew tap skegdb/tap
 brew install skeg
 ```
 
-The formula installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd service definition.
+Installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd service.
 
 ### From crates.io
 
@@ -72,11 +145,12 @@ The formula installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd 
 cargo install skeg-server
 ```
 
-This compiles from source on the host machine and installs `skeg` and `skeg-resp3` into `$CARGO_HOME/bin`. Requires a Rust toolchain (MSRV 1.88).
+Compiles from source and installs `skeg` and `skeg-resp3` into `$CARGO_HOME/bin`.
+Requires a Rust toolchain (MSRV 1.88).
 
 <!-- markdownlint-disable MD033 -->
 <details>
-<summary>Other install methods (tarball, source, Docker) and the published crate list</summary>
+<summary>Tarball, source, Docker, and the published crate list</summary>
 
 #### Pre-built tarball
 
@@ -88,7 +162,8 @@ tar -xzf skeg.tar.gz
 ./skeg --help
 ```
 
-SHA256 checksums are published alongside each tarball at the same URL with a `.sha256` suffix. Pin a specific version from the [releases page](https://github.com/skegdb/skeg/releases).
+SHA256 checksums are published alongside each tarball (`.sha256` suffix). Pin a
+version from the [releases page](https://github.com/skegdb/skeg/releases).
 
 #### From source
 
@@ -98,7 +173,7 @@ cd skeg
 cargo build --release --bin skeg --bin skeg-resp3
 ```
 
-Requirements: Rust 1.88 or newer. The binaries are at `target/release/skeg` and `target/release/skeg-resp3`.
+Requires Rust 1.88+. Binaries land at `target/release/skeg` and `target/release/skeg-resp3`.
 
 #### Docker
 
@@ -109,27 +184,27 @@ docker run -d --name skeg \
   ghcr.io/skegdb/skeg:latest
 ```
 
-The image bundles both `skeg` (native protocol, port 7379) and `skeg-resp3` (Redis-compat, port 6379). The default entrypoint is `skeg`; for the RESP3 surface override with `--entrypoint /usr/local/bin/skeg-resp3` and publish 6379 instead. Built for `linux/arm64`.
+Bundles both binaries (`skeg` native on 7379, `skeg-resp3` Redis-compat on 6379).
+Default entrypoint is `skeg`; for RESP3 override with `--entrypoint
+/usr/local/bin/skeg-resp3` and publish 6379. Built for `linux/arm64`. An Ollama
+companion setup lives in [`docker-compose.example.yml`](docker-compose.example.yml).
 
-For an Ollama companion setup with `docker compose`, see [`docker-compose.example.yml`](docker-compose.example.yml).
+#### Published crates
 
-#### Published library crates
-
-`skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`, `skeg-resp3`, `skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant`. Network adapters live in the [`skeg-rigging`](https://github.com/skegdb/skeg-rigging) and [`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net) repos.
+`skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`, `skeg-resp3`,
+`skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`, `skeg-server-tenant`,
+`skeg-multi-tenant`. Network adapters: [`skeg-rigging`](https://github.com/skegdb/skeg-rigging),
+[`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net).
 
 </details>
 <!-- markdownlint-enable MD033 -->
 
 ## Quickstart
 
-Start the server. The native binary protocol listens on 7379; RESP3 listens on 6379.
-
 ```sh
-skeg --data-dir ./data --addr 127.0.0.1:7379 &
-skeg-resp3 --data-dir ./data --addr 127.0.0.1:6379 &
+skeg --data-dir ./data --addr 127.0.0.1:7379 &       # native protocol
+skeg-resp3 --data-dir ./data --addr 127.0.0.1:6379 & # Redis-compatible
 ```
-
-If you built from source, the binaries are at `./target/release/skeg` and `./target/release/skeg-resp3`.
 
 Key-value through any Redis client:
 
@@ -137,114 +212,95 @@ Key-value through any Redis client:
 $ redis-cli -3 -p 6379
 > SET greeting "hello"
 OK
-> GET greeting
-"hello"
 > INCRBY counter 7
 (integer) 7
 ```
 
-Vector operations are namespaced under `SKEG.*` to stay out of the Redis command surface. Create an index, insert, search:
+Vectors are namespaced under `SKEG.*` to stay out of the Redis command surface:
 
 ```text
-> SKEG.VINDEX.CREATE docs 1024 int8 flat
+> SKEG.VINDEX.CREATE docs 1024 tq2 disk
 OK
-> SKEG.VINDEX.LIST
-name=docs dim=1024 kind=int8 backend=flat n_vectors=0
 > SKEG.VSET docs 1 <1024-float vector as bytes>
 OK
 > SKEG.VSEARCH docs 10 100 <query vector bytes>
 1) "1"
 2) (double) 0.987
-3) "7"
-4) (double) 0.954
 ...
 ```
+
+Runnable client examples (ingest, multi-tenant, filtered search) live in
+[`skeg-bench/examples`](https://github.com/skegdb/skeg-bench/tree/main/examples).
 
 <!-- markdownlint-disable MD033 -->
 <details>
 <summary>Command reference</summary>
 
-`SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` is the per-index storage precision: `f32 | int8 | binary`. `backend` chooses in-RAM flat scan or on-disk Vamana: `flat | disk`. The server-wide quantizer tier (`int8`, `pq[:M:K]`, `tq1`, `tq2`, `tq4`) is selected via the `--tier` CLI flag at server start, not per-index. The vector in `SKEG.VSET` and `SKEG.VSEARCH` is a raw byte buffer on the native protocol, or a bulk string on RESP3.
+`SKEG.VINDEX.CREATE <name> <dim> <kind> <backend>`. `kind` selects the index
+storage / tier: `f32 | int8 | tq1 | tq2 | tq4 | binary`. `backend` chooses
+in-RAM flat scan or on-disk Vamana: `flat | disk`. The vector in `SKEG.VSET` /
+`SKEG.VSEARCH` is a raw byte buffer on the native protocol, a bulk string on RESP3.
 
-Filtered search (RESP3): `SKEG.VSET <name> <id> <vector> [PAYLOAD <blob>]` attaches an optional payload of `key=value` fields; `SKEG.VSEARCH <name> <k> <l_search> <query> [WITHPAYLOAD] [FILTER <expr>]` returns the blob per hit (`WITHPAYLOAD`) and/or restricts results to payloads matching `<expr>`. The filter grammar covers `=`, `IN (...)`, the ranges `>= > <= < BETWEEN a AND b`, `EXISTS`, and `AND` / `OR` / `NOT` with parentheses. See [`docs/filtered-search.md`](docs/filtered-search.md).
+Filtered search (RESP3): `SKEG.VSET <name> <id> <vector> [PAYLOAD <blob>]`
+attaches `key=value` fields; `SKEG.VSEARCH <name> <k> <l_search> <query>
+[WITHPAYLOAD] [FILTER <expr>]` returns payloads and/or restricts to matches. The
+grammar covers `=`, `IN (...)`, ranges `>= > <= < BETWEEN a AND b`, `EXISTS`, and
+`AND` / `OR` / `NOT` with parentheses. See [`docs/filtered-search.md`](docs/filtered-search.md).
 
 </details>
 <!-- markdownlint-enable MD033 -->
 
-## Why it works
-
-The architecture is the answer to a single constraint: the resident set of the index must hold while the model owns the rest of the memory.
-
-The index lives on the SSD. The Vamana graph is walked on disk, with a small in-memory cache for the hot pages. Five tiers of vector quantization (`int8`, Product Quantization at 128×256, and TurboQuant at 1, 2, and 4 bits per coordinate) let you trade memory against precision. Re-ranking against full-precision vectors held on disk recovers the accuracy lost to quantization. The cache is S3-FIFO, bounded by a byte budget you configure, and gives evicted pages back to the operating system through jemalloc decay timers.
-
-The substrate, the design decisions, and the eleven falsifications that produced this architecture are documented in [the series on the project blog](https://amanitaproject.com/).
-
 ## Status
 
-**Working today.**
+**Shipping today.** KV and vector ops on both protocols; filtered vector search
+with the full filter grammar; first-class multi-tenancy with quotas and fair
+eviction; three durability tiers (relaxed / kernel / power-loss); Prometheus
+metrics and OTLP tracing; a workspace test suite that's clean under
+`cargo clippy --workspace --all-targets`.
 
-- KV operations on both protocols: `GET`, `SET`, `DEL`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXISTS`, `SELECT 0`.
-- Vector operations on both protocols: `SKEG.VINDEX.CREATE`, `SKEG.VINDEX.DROP`, `SKEG.VINDEX.LIST`, `SKEG.VSET`, `SKEG.VDEL`, `SKEG.VSEARCH`.
-- Filtered vector search (RESP3): per-vector payloads (`VSET ... PAYLOAD`) and metadata filters (`VSEARCH ... FILTER`) with equality, `IN`, ranges, `EXISTS`, and `AND`/`OR`/`NOT`. Selective filters score exactly; broad filters use a filtered graph walk, so recall holds for clustered or scattered metadata. See [`docs/filtered-search.md`](docs/filtered-search.md).
-- Admin / introspection: `SKEG.STATS`, `SKEG.SHARDS`, `SKEG.WHOAMI`, `HELLO 3 AUTH user pass` (argon2id).
-- Multi-tenant: per-tenant isolation with hard quotas (`max_vectors`, `max_disk_bytes`), runtime admin commands (`SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`), and fair cache eviction so a noisy tenant cannot starve a quiet one. Shipped in the `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant` crates (Apache-2.0, same as the engine). See [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
-- Three durability tiers: relaxed (`sync_data`), kernel (`fsync`), and power-loss (`F_FULLFSYNC` on macOS).
-- Observability: Prometheus exporter on `--metrics-port` (default-on) and OTLP/gRPC tracing via `SKEG_TRACE_OTLP_ENDPOINT` (see [`docs/observability.md`](docs/observability.md)).
-- Test suite covers the workspace with no clippy warnings under `cargo clippy --workspace --all-targets`.
-
-**Not yet.**
-
-- Native Linux validation. Linux is tested only through Docker.
-- The VSEARCH worker pool is opt-in via `--workers N`; the inline default is what produced the benchmark numbers.
-- No GPU acceleration, no horizontal scaling across nodes, no hosted service.
-- Native validation and architecture-specific tuning for x86_64 (Linux server hardware). Release binaries are aarch64 only; the SIMD path is NEON-only.
+**Honest about the edges.** skeg is not the lowest-latency *single-query* engine
+— Qdrant is comparable on p99, and a single shard saturates near 640 QPS (scale
+out with processes, not cores). Cold bulk-loading a fresh index is rebuild-based
+and trades build time for the lean serving footprint. Release binaries are
+aarch64 (Apple Silicon, Linux ARM); the source builds on x86_64 but AVX2/AVX-512
+tuning and native Linux validation are on the roadmap, not done.
 
 ## Documentation
 
-The project blog at [amanitaproject.com](https://amanitaproject.com/) carries the long-form design and benchmark documentation:
+Long-form design and benchmark write-ups on the [project blog](https://amanitaproject.com/):
+*Constraints as Method*, *Seven More Hypotheses*, *The Substrate*, *What Was Measured*.
 
-- *Constraints as Method.* The operating envelope and the first five falsifications.
-- *Seven More Hypotheses, One That Survived.* The path to TurboQuant.
-- *The Substrate.* The vLog, the group commit, the Vamana index, and the memory budget.
-- *What Was Measured: The Numbers.* The full benchmark record across engines, scales, and tiers.
+Operational guides in [`docs/`](docs/):
 
-Operational guides live in [`docs/`](docs/):
+- [`docs/multi-tenancy.md`](docs/multi-tenancy.md) — tenants, key scoping, quotas, fair eviction.
+- [`docs/filtered-search.md`](docs/filtered-search.md) — payloads, filter grammar, the planner.
+- [`docs/observability.md`](docs/observability.md) — Prometheus, OTel, tracing.
+- [`docs/ecosystem.md`](docs/ecosystem.md) — federation (hansa) and ingest pipelines.
 
-- [`docs/filtered-search.md`](docs/filtered-search.md). Payloads, the filter grammar, and how the planner serves selective vs broad filters.
-- [`docs/multi-tenancy.md`](docs/multi-tenancy.md). Tenant binary, key scoping, per-tenant quotas, the `SKEG.QUOTA` admin commands, and fair cache eviction.
-- [`docs/observability.md`](docs/observability.md). Prometheus exporter, scrape config, OTel collector integration, tracing roadmap.
-- [`docs/ecosystem.md`](docs/ecosystem.md). Federation (hansa) and ingest pipelines around the engine.
-
-Live benchmark dashboard with the latest measurements (engine × scale × tier matrix, p50/p99 latency, recall, RSS): [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
-
-## Ecosystem
-
-Federation (hansa) and ingest pipelines around the engine. See [`docs/ecosystem.md`](docs/ecosystem.md).
+Reproducible benchmark suite: [`skeg-bench`](https://github.com/skegdb/skeg-bench).
+Live dashboard: [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
 
 ## Roadmap
 
-Being explored, with no promised landing date. Direction depends on what shows up in real workloads and which constraint turns out to bite first.
+Driven by what real workloads ask for first:
 
-- x86_64 native tuning (AVX2 / AVX-512 SIMD paths) for Linux server hardware.
-- Child spans for the VSEARCH internals (walk, rerank) inside `skeg-vector`, exposed through the OTLP exporter.
-- Native OTel metrics export, in addition to the current Prometheus path.
+- x86_64 native tuning (AVX2 / AVX-512) and native Linux validation.
+- Incremental insert to close the cold-build gap.
+- Child spans for the VSEARCH internals through the OTLP exporter.
 - GPU acceleration for the kernels, once the host environment makes it sensible.
 
 ## Contributing
 
-Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before opening a pull request.
-
-A pre-push hook is shipped at `.githooks/pre-push` that runs the same three commands locally so `git push` blocks if any of them would fail. Enable it once per clone with:
-
-```sh
-git config core.hooksPath .githooks
-```
-
-Bypass (e.g. for a docs-only commit) with `SKIP_PREPUSH=1 git push`.
+Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
+--workspace` before opening a PR. A pre-push hook at `.githooks/pre-push` runs
+the same three locally — enable with `git config core.hooksPath .githooks`
+(bypass a docs-only push with `SKIP_PREPUSH=1`).
 
 ## Security
 
-Security issues should be reported by opening an issue with a brief description and a request to move the conversation private. A dedicated mailbox will be activated shortly. See [`SECURITY.md`](SECURITY.md).
+Report security issues by opening an issue with a brief description and a request
+to take the conversation private. See [`SECURITY.md`](SECURITY.md).
 
 ## License
 
