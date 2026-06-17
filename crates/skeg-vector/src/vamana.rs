@@ -1072,6 +1072,10 @@ pub struct DiskVamanaIndex {
     l_search: usize,
     /// The immutable base segment. Future LSM runs join it as more segments.
     base: Segment,
+    /// Additional immutable LSM runs, searched alongside `base`. Empty until
+    /// streaming writes flush into runs (Phase 2); the search path already
+    /// walks them.
+    runs: Vec<Segment>,
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
@@ -1337,6 +1341,7 @@ impl DiskVamanaIndex {
                 quant,
                 vectors_file,
             },
+            runs: Vec::new(),
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             tombstones: AHashSet::new(),
@@ -1613,16 +1618,16 @@ impl DiskVamanaIndex {
             return Ok(Some(v.clone()));
         }
         match self.base.id_to_main_row.get(&id) {
-            Some(&row) => Ok(Some(self.read_vector(row)?)),
+            Some(&row) => Ok(Some(self.read_vector(&self.base, row)?)),
             None => Ok(None),
         }
     }
 
     /// Read one f32 vector from `vectors.bin` by positioned read.
-    fn read_vector(&self, id: VecId) -> io::Result<Vec<f32>> {
+    fn read_vector(&self, seg: &Segment, id: VecId) -> io::Result<Vec<f32>> {
         let offset = HEADER_LEN as u64 + u64::from(id) * self.dim as u64 * 4;
         let mut buf = vec![0u8; self.dim * 4];
-        self.base.vectors_file.read_exact_at(&mut buf, offset)?;
+        seg.vectors_file.read_exact_at(&mut buf, offset)?;
         Ok(buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1720,9 +1725,14 @@ impl DiskVamanaIndex {
         }
         let mut scored: Vec<(OrderedFloat<f32>, u64)> = Vec::new();
 
-        // Main graph walk over the int8 tier (skipped entirely if main is empty).
-        if self.base.main_n > 0 {
-            let code = self.base.quant.quantize_query(&normalized(query));
+        // Graph walk over every segment (the base plus any LSM runs); each
+        // contributes candidates that merge into `scored`. An empty segment is
+        // skipped. The delta is brute-forced once below.
+        for seg in std::iter::once(&self.base).chain(self.runs.iter()) {
+            if seg.main_n == 0 {
+                continue;
+            }
+            let code = seg.quant.quantize_query(&normalized(query));
             let base = if l_search == 0 {
                 self.l_search
             } else {
@@ -1731,7 +1741,7 @@ impl DiskVamanaIndex {
             // A SPARSE filtered walk oversamples the frontier so the post-filter
             // still leaves enough matches; a dense one (or plain) does not.
             let list_size = if filtered && !dense {
-                (base.max(k) * FILTER_OVERSAMPLE).min(self.base.main_n as usize)
+                (base.max(k) * FILTER_OVERSAMPLE).min(seg.main_n as usize)
             } else {
                 base.max(k)
             };
@@ -1748,8 +1758,8 @@ impl DiskVamanaIndex {
             } else {
                 (k * 4).max(32).min(list_size)
             };
-            let mut visited = VisitedBitset::new(self.base.main_n as usize);
-            let mut seen = VisitedBitset::new(self.base.main_n as usize);
+            let mut visited = VisitedBitset::new(seg.main_n as usize);
+            let mut seen = VisitedBitset::new(seg.main_n as usize);
             // Early-term signature tracks the re-rank candidate pool (top-rerank),
             // not just top-k: the graph walk feeds the re-rank, and stability of
             // the wider pool is what guarantees the final top-k is unchanged.
@@ -1769,17 +1779,17 @@ impl DiskVamanaIndex {
             // Multi-seed: the medoid plus, for a filtered walk, the matching
             // seed ids mapped to live graph rows. Starting inside the matching
             // region lets the walk reach a cluster that sits away from the query.
-            let mut seed_rows: Vec<VecId> = vec![self.base.medoid];
+            let mut seed_rows: Vec<VecId> = vec![seg.medoid];
             for &id in seeds {
-                if let Some(&r) = self.base.id_to_main_row.get(&id)
+                if let Some(&r) = seg.id_to_main_row.get(&id)
                     && !self.tombstones.contains(&id)
                 {
                     seed_rows.push(r);
                 }
             }
-            let dist = |id: VecId| -(self.base.quant.proxy(id as usize, &code) as f32);
+            let dist = |id: VecId| -(seg.quant.proxy(id as usize, &code) as f32);
             let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
-                self.base.nodes[id as usize].slice().iter().copied().collect()
+                seg.nodes[id as usize].slice().iter().copied().collect()
             };
             // Collect candidate rows. A plain search does one walk. A filtered
             // search always does two and unions them, because the two cover
@@ -1818,13 +1828,13 @@ impl DiskVamanaIndex {
                     // by near non-matching nodes), then a navigate-all walk to pick
                     // up matches scattered near the query.
                     let admit = |row: VecId| -> bool {
-                        let id = self.base.ids[row as usize];
+                        let id = seg.ids[row as usize];
                         !self.tombstones.contains(&id)
                             && !self.delta.contains_key(&id)
                             && matches.is_none_or(|m| m(id))
                     };
                     cand.extend(walk(&seed_rows, Some(&admit), None).iter());
-                    cand.extend(walk(&[self.base.medoid], None, None).iter());
+                    cand.extend(walk(&[seg.medoid], None, None).iter());
                 } else {
                     // Dense filter or plain: a single navigate-all walk; the
                     // rerank drops non-matches. (Plain uses early-term; filtered
@@ -1852,7 +1862,7 @@ impl DiskVamanaIndex {
                 if disk_reads >= rerank {
                     break;
                 }
-                let id = self.base.ids[vec_id as usize];
+                let id = seg.ids[vec_id as usize];
                 if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
                     skipped += 1;
                     continue;
@@ -1868,7 +1878,7 @@ impl DiskVamanaIndex {
                 if !reranked_ids.insert(id) {
                     continue;
                 }
-                let v = self.read_vector(vec_id)?;
+                let v = self.read_vector(seg, vec_id)?;
                 disk_reads += 1;
                 scored.push((OrderedFloat(cosine_f32(query, &v)), id));
             }
@@ -1977,7 +1987,7 @@ impl DiskVamanaIndex {
             if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
                 continue;
             }
-            vectors.extend(self.read_vector(row)?);
+            vectors.extend(self.read_vector(&self.base, row)?);
             ids.push(id);
         }
         // Delta vectors (always live).
