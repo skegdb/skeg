@@ -1505,10 +1505,14 @@ impl DiskVamanaIndex {
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         let delta_bytes: usize = self.delta.values().map(|v| v.len() * 4 + 24).sum();
-        self.base.nodes.len() * std::mem::size_of::<Node>()
-            + self.base.ids.len() * std::mem::size_of::<u64>()
-            + self.base.id_to_main_row.len() * 16
-            + self.base.quant.memory_bytes()
+        let seg_bytes = |s: &Segment| {
+            s.nodes.len() * std::mem::size_of::<Node>()
+                + s.ids.len() * std::mem::size_of::<u64>()
+                + s.id_to_main_row.len() * 16
+                + s.quant.memory_bytes()
+        };
+        seg_bytes(&self.base)
+            + self.runs.iter().map(seg_bytes).sum::<usize>()
             + delta_bytes
             + self.tombstones.len() * 8
     }
@@ -1516,7 +1520,9 @@ impl DiskVamanaIndex {
     /// True if `id` currently resolves to a live vector.
     fn is_live(&self, id: u64) -> bool {
         !self.tombstones.contains(&id)
-            && (self.delta.contains_key(&id) || self.base.id_to_main_row.contains_key(&id))
+            && (self.delta.contains_key(&id)
+                || self.base.id_to_main_row.contains_key(&id)
+                || self.runs.iter().any(|r| r.id_to_main_row.contains_key(&id)))
     }
 
     /// True if `id` is a live (non-tombstoned) vector in this index. Cheap,
@@ -1537,6 +1543,7 @@ impl DiskVamanaIndex {
             .ids
             .iter()
             .copied()
+            .chain(self.runs.iter().flat_map(|r| r.ids.iter().copied()))
             .chain(self.delta.keys().copied())
             .filter(|id| !self.tombstones.contains(id))
             .collect();
@@ -1617,10 +1624,16 @@ impl DiskVamanaIndex {
         if let Some(v) = self.delta.get(&id) {
             return Ok(Some(v.clone()));
         }
-        match self.base.id_to_main_row.get(&id) {
-            Some(&row) => Ok(Some(self.read_vector(&self.base, row)?)),
-            None => Ok(None),
+        if let Some(&row) = self.base.id_to_main_row.get(&id) {
+            return Ok(Some(self.read_vector(&self.base, row)?));
         }
+        // Newest run wins on a shadowed id; runs are searched after the base.
+        for run in &self.runs {
+            if let Some(&row) = run.id_to_main_row.get(&id) {
+                return Ok(Some(self.read_vector(run, row)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Read one f32 vector from `vectors.bin` by positioned read.
