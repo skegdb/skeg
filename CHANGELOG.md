@@ -33,7 +33,29 @@ repository.
   with no extra build cost. The payload index is rebuilt from the stored blobs
   on the first filtered search after a restart.
 
+- **TurboQuant tiers on the read-write disk path.** `SKEG.VINDEX.CREATE name dim
+  tq1|tq2|tq4 disk` builds a live-writable disk index whose resident tier is
+  TurboQuant (`dim*bits/8` bytes/vector) instead of int8. No trained codebook
+  (unlike PQ, which stays serve-only), so it works under streaming writes. The
+  tier kind persists in a sidecar and is rebuilt on open and consolidate. tq2 is
+  the recommended sweet spot (recall ~1.0, sub-int8 RAM, latency ~int8); tq1 is
+  the leanest but best-effort below 512d.
+
+- **`SKEG.VMSET` bulk insert.** One `name` followed by `(id, vector, payload)`
+  triples; the server fans the items out concurrently so durable payload writes
+  batch in the group committer. Combined with relaxed payload durability and a
+  geometric delta rebuild, 100k ingest dropped from 1928s to 28s.
+
+- **`SKEG.VINDEX.CONSOLIDATE name`** force-folds a disk index's delta into the
+  graph after a bulk load. Idle indexes also self-consolidate: a per-shard
+  background task folds a delta that has been stable across ticks, so an index
+  is lean by default without an explicit call.
+
 ### Changed
+
+- **Vindex RAM accounting (`VindexSizeBytes` gauge) is now tier-accurate.** Disk
+  indexes report their own `resident_bytes()` (graph + quantized tier + delta)
+  instead of an `n*dim` int8 estimate, so the gauge tracks tq1/tq2/tq4 correctly.
 
 - **Plain (non-filtered) search and writes are unchanged.** A VSET without
   `PAYLOAD` does no extra work; a VSEARCH without `FILTER`/`WITHPAYLOAD` takes
