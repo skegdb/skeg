@@ -192,6 +192,45 @@ pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Dot product of two f32 slices. Scalar reference; `.sum()` does not
+/// auto-vectorize (f32 addition is non-associative).
+#[must_use]
+pub fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Dot product, NEON. 16 f32 per iteration over 4 independent accumulator groups
+/// to hide FMA latency - same shape as [`cosine_f32_neon`] without the two norm
+/// reductions, so ~3x fewer FMAs when the norms are already known.
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+    let n = a.len();
+    let block = n - (n % 16);
+    let mut i = 0;
+    // SAFETY: each `vld1q_f32` reads 4 f32 at offset `i + k*4 < block <= n`, in
+    // bounds for both slices (caller guarantees equal length). Reads only, no
+    // aliasing. NEON is baseline on aarch64.
+    let mut sdot = unsafe {
+        let mut dot = [vdupq_n_f32(0.0); 4];
+        while i < block {
+            for (k, d) in dot.iter_mut().enumerate() {
+                let va = vld1q_f32(a.as_ptr().add(i + k * 4));
+                let vb = vld1q_f32(b.as_ptr().add(i + k * 4));
+                *d = vfmaq_f32(*d, va, vb);
+            }
+            i += 16;
+        }
+        let dot = vaddq_f32(vaddq_f32(dot[0], dot[1]), vaddq_f32(dot[2], dot[3]));
+        vaddvq_f32(dot)
+    };
+    for i in i..n {
+        sdot += a[i] * b[i];
+    }
+    sdot
+}
+
 /// Dot product of two f32 slices.
 ///
 /// # Panics
@@ -200,7 +239,14 @@ pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
 #[must_use]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dimension mismatch");
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_f32_neon(a, b)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f32_scalar(a, b)
+    }
 }
 
 /// Hamming distance (number of differing bits) of two byte slices.
