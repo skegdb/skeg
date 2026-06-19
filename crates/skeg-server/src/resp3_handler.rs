@@ -1221,6 +1221,19 @@ mod tests {
         assert_eq!(command_cost(&cmd), 1);
     }
 
+    #[tokio::test]
+    async fn vindex_create_tq1_bad_dim_errors_not_panics() {
+        let (_dir, shards) = fresh_shards().await;
+        let t = TenantId::ZERO;
+        // 100 % 8 != 0: tq1 cannot pack it. Must be a clean error, and reaching
+        // the next line at all proves the server did not panic.
+        let bad = skeg_vindex_create(&args(&["bad", "100", "tq1", "disk"]), &shards, t).await;
+        assert!(matches!(bad, Frame::Error(_)));
+        // An 8-aligned dim is accepted.
+        let ok = skeg_vindex_create(&args(&["good", "128", "tq1", "disk"]), &shards, t).await;
+        assert!(matches!(ok, Frame::Simple(ref s) if s == "OK"));
+    }
+
     async fn fresh_shards() -> (TempDir, ShardSet) {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 1).unwrap();

@@ -1740,6 +1740,12 @@ impl ShardSet {
             }
         };
         let dim = dim as usize;
+        // Reject a dim the tier cannot pack here, before any shard touches the
+        // builder: a bad (kind, dim) must be a clean error, not a panic that
+        // kills the shard thread.
+        if let Err(reason) = kind.validate_dim(dim) {
+            return Err(ShardError::Storage(reason));
+        }
         let name = name.to_owned();
         self.broadcast(|| ShardReq::VindexCreate {
             name: name.clone(),
