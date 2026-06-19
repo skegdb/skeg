@@ -308,6 +308,8 @@ async fn dispatch_command(
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
         Command::SkegQuotaGet { args } => skeg_quota_get(&args, *tenant, tenant_backend),
+        Command::SkegQosSet { args } => skeg_qos_set(&args, *tenant, tenant_backend),
+        Command::SkegQosGet { args } => skeg_qos_get(&args, *tenant, tenant_backend),
         Command::SkegVsearch { args } => skeg_vsearch(&args, shards, *tenant).await,
         Command::Unknown { name, .. } => unknown_command(&name.to_ascii_uppercase()),
     }
@@ -651,6 +653,68 @@ fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
         Frame::Bulk(Bytes::from(fmt(limits.max_vectors))),
         Frame::Bulk(Bytes::from(fmt(limits.max_disk_bytes))),
     ])
+}
+
+/// `SKEG.QOS.SET tenant qps burst max_concurrent`. Admin only: sets a target
+/// tenant's QoS limits. Each field is a `u32` or `*` (unlimited).
+fn skeg_qos_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let qps = match parse_qos_limit(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let burst = match parse_qos_limit(&args[2]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let max_concurrent = match parse_qos_limit(&args[3]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let qos = crate::quota::TenantQos {
+        qps,
+        burst,
+        max_concurrent,
+    };
+    match backend.set_qos(target, qos) {
+        Ok(()) => Frame::ok(),
+        Err(crate::tenant::QuotaAdminError::Unsupported) => {
+            Frame::Error("ERR backend does not support setting qos".into())
+        }
+    }
+}
+
+/// `SKEG.QOS.GET tenant`. Admin only: returns `[qps, burst, max_concurrent]` as
+/// bulk strings, with `*` for an unlimited field.
+fn skeg_qos_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let qos = backend.qos(target);
+    let fmt = |o: Option<u32>| o.map_or_else(|| "*".to_string(), |v| v.to_string());
+    Frame::Array(vec![
+        Frame::Bulk(Bytes::from(fmt(qos.qps))),
+        Frame::Bulk(Bytes::from(fmt(qos.burst))),
+        Frame::Bulk(Bytes::from(fmt(qos.max_concurrent))),
+    ])
+}
+
+/// Parse a QoS limit field: `*` = unlimited (`None`), else a `u32`.
+fn parse_qos_limit(b: &Bytes) -> Result<Option<u32>, Frame> {
+    if b.as_ref() == b"*" {
+        return Ok(None);
+    }
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Frame::Error("ERR qos limit must be a non-negative integer or '*' for unlimited".into())
+        })
 }
 
 /// `SKEG.VSEARCH name k l_search vector_bytes`. Returns an array of

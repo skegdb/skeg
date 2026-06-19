@@ -27,7 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use handler::handle_connection;
-pub use quota::{TenantLimits, TenantVectorQuota};
+pub use quota::{TenantLimits, TenantQos, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
 use skeg_vector::QuantKind;

@@ -121,6 +121,23 @@ pub trait TenantBackend: Send + Sync {
         Err(QuotaAdminError::Unsupported)
     }
 
+    /// Read a tenant's QoS limits. Default: all-unlimited, so existing backends
+    /// and single-tenant deployments are unaffected.
+    fn qos(&self, id: TenantId) -> crate::quota::TenantQos {
+        let _ = id;
+        crate::quota::TenantQos::default()
+    }
+
+    /// Set a tenant's QoS limits. Default: unsupported (no writable store).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuotaAdminError`] if the backend cannot store QoS limits.
+    fn set_qos(&self, id: TenantId, qos: crate::quota::TenantQos) -> Result<(), QuotaAdminError> {
+        let _ = (id, qos);
+        Err(QuotaAdminError::Unsupported)
+    }
+
     /// Per-command admission gate (rate limit / concurrency cap). Called once
     /// per command after the tenant is resolved and before execution. The
     /// returned [`AdmitGuard`] is held by the engine for the command's whole

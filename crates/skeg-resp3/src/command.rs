@@ -142,6 +142,16 @@ pub enum Command {
         args: Vec<Bytes>,
     },
 
+    /// `SKEG.QOS.SET tenant qps burst max_concurrent`. Arity 4. Admin only;
+    /// each is a u32, or `*` for unlimited. Inner parsing in the dispatcher.
+    SkegQosSet {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.QOS.GET tenant`. Arity 1. Admin only; reads a tenant's QoS limits.
+    SkegQosGet {
+        args: Vec<Bytes>,
+    },
+
     /// Any command that was syntactically a valid array of bulks but whose
     /// name we have not wired into a typed variant yet. The dispatch layer
     /// gets the original name and args verbatim.
@@ -368,6 +378,24 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegQuotaGet { args })
+        }
+        "QOS.SET" => {
+            if args.len() != 4 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.QOS.SET",
+                    want: "tenant qps burst max_concurrent",
+                });
+            }
+            Ok(Command::SkegQosSet { args })
+        }
+        "QOS.GET" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.QOS.GET",
+                    want: "tenant",
+                });
+            }
+            Ok(Command::SkegQosGet { args })
         }
         // Unknown SKEG.* verb: pass through so the dispatcher emits
         // `ERR unknown command 'SKEG.<verb>'`.
@@ -1228,6 +1256,34 @@ mod tests {
             err.to_string(),
             "wrong number of arguments for 'SKEG.QUOTA.SET'; \
              want tenant max_vectors max_disk_bytes"
+        );
+    }
+
+    #[test]
+    fn skeg_qos_set_four_args() {
+        let cmd = parse_command(arr(&[b"SKEG.QOS.SET", b"acme", b"100", b"200", b"*"])).unwrap();
+        let Command::SkegQosSet { args } = cmd else {
+            panic!("expected SkegQosSet");
+        };
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn skeg_qos_get_one_arg() {
+        let cmd = parse_command(arr(&[b"SKEG.QOS.GET", b"acme"])).unwrap();
+        let Command::SkegQosGet { args } = cmd else {
+            panic!("expected SkegQosGet");
+        };
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn skeg_qos_set_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.QOS.SET", b"acme"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.QOS.SET'; \
+             want tenant qps burst max_concurrent"
         );
     }
 

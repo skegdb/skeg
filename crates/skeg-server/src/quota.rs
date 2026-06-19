@@ -20,6 +20,19 @@ pub struct TenantLimits {
     pub max_disk_bytes: Option<u64>,
 }
 
+/// A tenant's QoS limits as plain numbers. `None` on a field means unlimited.
+/// The engine only carries these between the admin command and the backend; the
+/// meaning (token-bucket rate / concurrency cap) lives in the backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantQos {
+    /// Sustained requests per second. `None` = unlimited.
+    pub qps: Option<u32>,
+    /// Token-bucket burst allowance. `None` = unlimited.
+    pub burst: Option<u32>,
+    /// Maximum concurrent in-flight commands. `None` = unlimited.
+    pub max_concurrent: Option<u32>,
+}
+
 /// Admission rejected because it would exceed a tenant's quota.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotaExceeded;
