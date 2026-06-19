@@ -25,9 +25,10 @@ pub struct TenantLimits {
 /// meaning (token-bucket rate / concurrency cap) lives in the backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TenantQos {
-    /// Sustained requests per second. `None` = unlimited.
-    pub qps: Option<u32>,
-    /// Token-bucket burst allowance. `None` = unlimited.
+    /// Sustained compute credits per second (token-bucket refill). A flat
+    /// command costs 1 credit; a vector search costs more. `None` = unlimited.
+    pub rate: Option<u32>,
+    /// Token-bucket burst allowance, in credits. `None` = unlimited.
     pub burst: Option<u32>,
     /// Maximum concurrent in-flight commands. `None` = unlimited.
     pub max_concurrent: Option<u32>,

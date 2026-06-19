@@ -142,7 +142,7 @@ pub enum Command {
         args: Vec<Bytes>,
     },
 
-    /// `SKEG.QOS.SET tenant qps burst max_concurrent`. Arity 4. Admin only;
+    /// `SKEG.QOS.SET tenant rate burst max_concurrent`. Arity 4. Admin only;
     /// each is a u32, or `*` for unlimited. Inner parsing in the dispatcher.
     SkegQosSet {
         args: Vec<Bytes>,
@@ -383,7 +383,7 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             if args.len() != 4 {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.QOS.SET",
-                    want: "tenant qps burst max_concurrent",
+                    want: "tenant rate burst max_concurrent",
                 });
             }
             Ok(Command::SkegQosSet { args })
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "wrong number of arguments for 'SKEG.QOS.SET'; \
-             want tenant qps burst max_concurrent"
+             want tenant rate burst max_concurrent"
         );
     }
 

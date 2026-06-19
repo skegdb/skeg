@@ -143,10 +143,12 @@ pub trait TenantBackend: Send + Sync {
     /// returned [`AdmitGuard`] is held by the engine for the command's whole
     /// lifetime and dropped after the response, so a backend can reserve a
     /// concurrency slot in `admit` and release it via the guard's `Drop`.
-    /// `Err` refuses the command. The default admits everything, so existing
-    /// backends and single-tenant deployments are unaffected.
-    fn admit(&self, id: TenantId) -> Result<AdmitGuard, AdmitRejected> {
-        let _ = id;
+    /// `Err` refuses the command. `cost` is the command's coarse compute weight
+    /// (QoS credits; see the engine cost model) — a backend charges it against
+    /// the tenant's budget. The default admits everything and ignores `cost`, so
+    /// existing backends and single-tenant deployments are unaffected.
+    fn admit(&self, id: TenantId, cost: u32) -> Result<AdmitGuard, AdmitRejected> {
+        let _ = (id, cost);
         Ok(AdmitGuard::allow())
     }
 }

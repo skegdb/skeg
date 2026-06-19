@@ -205,6 +205,28 @@ pub async fn handle_connection_resp3(
     debug!(?peer, "RESP3 connection closed");
 }
 
+/// Coarse compute cost of a command, in QoS credits. A vector search's work is
+/// dominated by `l_search` (the graph walk) plus `k` (the rerank), both read
+/// straight from the command args with no index lookup; every other command is
+/// a flat 1. Deliberately coarse: vector dimension and tenant data size are
+/// roughly constant per index and can be folded in later if a measurement shows
+/// the weighting is off.
+fn command_cost(cmd: &Command) -> u32 {
+    match cmd {
+        // args: name k l_search vector [WITHPAYLOAD] [FILTER expr]
+        Command::SkegVsearch { args } => {
+            let num = |i: usize| {
+                args.get(i)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0)
+            };
+            num(1).saturating_add(num(2)).max(1)
+        }
+        _ => 1,
+    }
+}
+
 async fn dispatch_command(
     cmd: Command,
     state: &mut ConnectionState,
@@ -218,7 +240,7 @@ async fn dispatch_command(
     // cap reserved in `admit` actually bounds the command's in-flight lifetime.
     let _admit = match (&cmd, tenant_backend) {
         (Command::Hello(_) | Command::SkegAuth { .. }, _) | (_, None) => None,
-        (_, Some(ctx)) => match ctx.admit(*tenant) {
+        (_, Some(ctx)) => match ctx.admit(*tenant, command_cost(&cmd)) {
             Ok(guard) => Some(guard),
             Err(rejected) => return Frame::Error(rejected.message),
         },
@@ -662,7 +684,7 @@ fn skeg_qos_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBac
         Ok(t) => t,
         Err(e) => return e,
     };
-    let qps = match parse_qos_limit(&args[1]) {
+    let rate = match parse_qos_limit(&args[1]) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -675,7 +697,7 @@ fn skeg_qos_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBac
         Err(e) => return e,
     };
     let qos = crate::quota::TenantQos {
-        qps,
+        rate,
         burst,
         max_concurrent,
     };
@@ -697,7 +719,7 @@ fn skeg_qos_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBac
     let qos = backend.qos(target);
     let fmt = |o: Option<u32>| o.map_or_else(|| "*".to_string(), |v| v.to_string());
     Frame::Array(vec![
-        Frame::Bulk(Bytes::from(fmt(qos.qps))),
+        Frame::Bulk(Bytes::from(fmt(qos.rate))),
         Frame::Bulk(Bytes::from(fmt(qos.burst))),
         Frame::Bulk(Bytes::from(fmt(qos.max_concurrent))),
     ])
@@ -1180,6 +1202,23 @@ mod tests {
             .iter()
             .map(|s| Bytes::copy_from_slice(s.as_bytes()))
             .collect()
+    }
+
+    #[test]
+    fn command_cost_vsearch_sums_k_and_l_search() {
+        // SKEG.VSEARCH idx k=10 l_search=128 vec -> 138 credits.
+        let cmd = Command::SkegVsearch {
+            args: args(&["idx", "10", "128", "vec"]),
+        };
+        assert_eq!(command_cost(&cmd), 138);
+    }
+
+    #[test]
+    fn command_cost_kv_is_one() {
+        let cmd = Command::Get {
+            key: Bytes::from_static(b"k"),
+        };
+        assert_eq!(command_cost(&cmd), 1);
     }
 
     async fn fresh_shards() -> (TempDir, ShardSet) {
