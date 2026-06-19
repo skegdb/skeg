@@ -212,6 +212,17 @@ async fn dispatch_command(
     shards: &ShardSet,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
+    // Per-command admission (multi-tenant QoS). Hello/SkegAuth establish or
+    // change the tenant and are never gated. Single-tenant (no backend) skips
+    // entirely. `_admit` is held until this function returns, so a concurrency
+    // cap reserved in `admit` actually bounds the command's in-flight lifetime.
+    let _admit = match (&cmd, tenant_backend) {
+        (Command::Hello(_) | Command::SkegAuth { .. }, _) | (_, None) => None,
+        (_, Some(ctx)) => match ctx.admit(*tenant) {
+            Ok(guard) => Some(guard),
+            Err(rejected) => return Frame::Error(rejected.message),
+        },
+    };
     match cmd {
         Command::Hello(args) => {
             // Verify credentials when AUTH is supplied. When AUTH is
