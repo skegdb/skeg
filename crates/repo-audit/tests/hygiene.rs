@@ -29,6 +29,26 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Recursively collect `*.md` files under `dir`, skipping `target/` and dot
+/// directories (`.git`, `.github`, ...). Used for the docs em-dash check.
+fn md_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if p.is_dir() {
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            md_files(&p, out);
+        } else if p.extension().is_some_and(|x| x == "md") {
+            out.push(p);
+        }
+    }
+}
+
 #[test]
 fn no_internal_codes_or_non_english() {
     // CARGO_MANIFEST_DIR is `crates/repo-audit`; its parent is `crates/`.
@@ -83,6 +103,31 @@ fn no_internal_codes_or_non_english() {
                         line.trim()
                     ));
                 }
+            }
+        }
+    }
+
+    // Em-dash is banned in docs too. Scan `*.md` from the workspace root (README,
+    // docs/, per-crate READMEs, CHANGELOG). Only the em-dash rule applies here -
+    // prose legitimately uses words the source-code rules (slice/tier/Q-codes)
+    // would flag, so those stay `.rs`-only.
+    let workspace_root = crates_dir.parent().expect("workspace root");
+    let em_dash = Regex::new("\u{2014}").unwrap();
+    let mut md = Vec::new();
+    md_files(workspace_root, &mut md);
+    for f in &md {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for (lineno, line) in content.lines().enumerate() {
+            if em_dash.is_match(line) {
+                let rel = f.strip_prefix(workspace_root).unwrap_or(f);
+                violations.push(format!(
+                    "{}:{}: [em-dash] {}",
+                    rel.display(),
+                    lineno + 1,
+                    line.trim()
+                ));
             }
         }
     }
