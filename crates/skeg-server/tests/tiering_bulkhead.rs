@@ -62,7 +62,12 @@ async fn load(shards: &ShardSet, name: &str, n: u64) {
         let end = (id + 4096).min(n);
         // `None` infers to `Option<Bytes>` from vmset's signature.
         shards
-            .vmset(name, (id..end).map(|i| (i, vec_for(i), None)).collect(), 0, None)
+            .vmset(
+                name,
+                (id..end).map(|i| (i, vec_for(i), None)).collect(),
+                0,
+                None,
+            )
             .await
             .unwrap();
         id = end;
@@ -89,8 +94,14 @@ async fn reopen_does_not_stall_other_indexes() {
     let qb = vec_for(11);
 
     // Warm both, then evict only A.
-    shards.vsearch("A", qa.clone(), 10, 0, 0, false, None).await.unwrap();
-    shards.vsearch("B", qb.clone(), 10, 0, 0, false, None).await.unwrap();
+    shards
+        .vsearch("A", qa.clone(), 10, 0, 0, false, None)
+        .await
+        .unwrap();
+    shards
+        .vsearch("B", qb.clone(), 10, 0, 0, false, None)
+        .await
+        .unwrap();
     let evicted = shards.control_handle().evict(0, "A").await.unwrap();
     assert!(evicted, "A must have been resident before eviction");
 
@@ -98,7 +109,10 @@ async fn reopen_does_not_stall_other_indexes() {
     let a_shards = shards.clone();
     let a_task = tokio::spawn(async move {
         let s = Instant::now();
-        a_shards.vsearch("A", qa, 10, 0, 0, false, None).await.unwrap();
+        a_shards
+            .vsearch("A", qa, 10, 0, 0, false, None)
+            .await
+            .unwrap();
         s.elapsed()
     });
 
@@ -106,7 +120,10 @@ async fn reopen_does_not_stall_other_indexes() {
     let mut b_lat = Vec::new();
     loop {
         let s = Instant::now();
-        shards.vsearch("B", qb.clone(), 10, 0, 0, false, None).await.unwrap();
+        shards
+            .vsearch("B", qb.clone(), 10, 0, 0, false, None)
+            .await
+            .unwrap();
         b_lat.push(s.elapsed());
         if a_task.is_finished() {
             break;

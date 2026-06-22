@@ -414,7 +414,10 @@ impl Default for VamanaConfig {
 /// the validated default (64) is used.
 fn disk_build_config() -> VamanaConfig {
     let mut cfg = VamanaConfig::default();
-    if let Some(l) = std::env::var("SKEG_L_BUILD").ok().and_then(|s| s.parse().ok()) {
+    if let Some(l) = std::env::var("SKEG_L_BUILD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         cfg.l_build = l;
     }
     cfg
@@ -1787,8 +1790,9 @@ impl DiskVamanaIndex {
         // tagged with their segment; one GLOBAL re-rank below bounds the disk
         // reads regardless of how many segments (base + runs) there are. This is
         // what keeps query latency flat as the LSM accumulates runs.
-        let segs: Vec<&Segment> =
-            std::iter::once(&self.base).chain(self.runs.iter()).collect();
+        let segs: Vec<&Segment> = std::iter::once(&self.base)
+            .chain(self.runs.iter())
+            .collect();
         // Global re-rank budget (disk reads). Bounded so latency tracks `k`, not
         // the corpus size or the segment count.
         let rerank = if filtered {
@@ -1811,7 +1815,11 @@ impl DiskVamanaIndex {
             // query latency flat as runs accumulate, instead of paying a full
             // l_search beam per run.
             let walk_base = if seg_idx == 0 {
-                if l_search == 0 { self.l_search } else { l_search }
+                if l_search == 0 {
+                    self.l_search
+                } else {
+                    l_search
+                }
             } else {
                 (k * 4).max(16)
             };
@@ -1822,7 +1830,10 @@ impl DiskVamanaIndex {
             } else {
                 walk_base.max(k)
             };
-            let early = (!filtered && speed_enabled()).then_some(EarlyTerm { k: rerank, window: 5 });
+            let early = (!filtered && speed_enabled()).then_some(EarlyTerm {
+                k: rerank,
+                window: 5,
+            });
             let mut visited = VisitedBitset::new(seg.main_n as usize);
             let mut seen = VisitedBitset::new(seg.main_n as usize);
             // Medoid plus, for a filtered walk, matching seed rows so the walk can
@@ -1844,7 +1855,15 @@ impl DiskVamanaIndex {
                             admit: Option<&dyn Fn(VecId) -> bool>,
                             early: Option<EarlyTerm>| {
                 greedy_search(
-                    seeds, list_size, early, dist, nbrs, admit, &mut visited, &mut seen, None,
+                    seeds,
+                    list_size,
+                    early,
+                    dist,
+                    nbrs,
+                    admit,
+                    &mut visited,
+                    &mut seen,
+                    None,
                 )
             };
             if filtered && !dense {
@@ -1941,7 +1960,13 @@ impl DiskVamanaIndex {
                 self.l_search,
                 None, // trace: want the full walk, no early termination
                 |id| -(self.base.quant.proxy(id as usize, &code) as f32),
-                |id| self.base.nodes[id as usize].slice().iter().copied().collect(),
+                |id| {
+                    self.base.nodes[id as usize]
+                        .slice()
+                        .iter()
+                        .copied()
+                        .collect()
+                },
                 None, // trace: no filter admission
                 &mut visited,
                 &mut seen,
@@ -2051,8 +2076,9 @@ impl DiskVamanaIndex {
         // full 2 GB of vectors. Precedence (newest wins): delta > runs (newest
         // first) > base; `seen` keeps each id once, tombstoned ids never enter.
         // `loc`: usize::MAX => delta, else index into `segs` (0 = base, 1.. = runs).
-        let segs: Vec<&Segment> =
-            std::iter::once(&self.base).chain(self.runs.iter()).collect();
+        let segs: Vec<&Segment> = std::iter::once(&self.base)
+            .chain(self.runs.iter())
+            .collect();
         let mut seen: AHashSet<u64> = AHashSet::new();
         let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
         for &id in self.delta.keys() {
@@ -2672,7 +2698,8 @@ mod tests {
     fn fill_past_flush(disk: &mut DiskVamanaIndex, n: usize, dim: usize) -> Vec<f32> {
         let vectors = random_vectors(n, dim, 7);
         for id in 0..n {
-            disk.insert(id as u64, &vectors[id * dim..(id + 1) * dim]).unwrap();
+            disk.insert(id as u64, &vectors[id * dim..(id + 1) * dim])
+                .unwrap();
         }
         vectors
     }
@@ -2688,7 +2715,11 @@ mod tests {
         assert!(disk.delta.len() < 4096, "L0 stayed bounded after flushing");
         assert_eq!(disk.len(), n, "every inserted vector is live");
         let q = &vectors[100 * dim..101 * dim];
-        assert_eq!(disk.search(q, 1).unwrap()[0].0, 100, "a flushed vector is its own NN");
+        assert_eq!(
+            disk.search(q, 1).unwrap()[0].0,
+            100,
+            "a flushed vector is its own NN"
+        );
     }
 
     #[test]
@@ -2700,7 +2731,10 @@ mod tests {
         disk.consolidate().unwrap();
 
         assert!(disk.runs.is_empty(), "consolidate clears the runs");
-        assert_eq!(disk.base.main_n as usize, n, "all vectors folded into the base");
+        assert_eq!(
+            disk.base.main_n as usize, n,
+            "all vectors folded into the base"
+        );
         assert_eq!(disk.len(), n);
         let run_dirs = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -2709,7 +2743,11 @@ mod tests {
             .count();
         assert_eq!(run_dirs, 0, "run directories are removed once folded in");
         let q = &vectors[4500 * dim..4501 * dim];
-        assert_eq!(disk.search(q, 1).unwrap()[0].0, 4500, "search exact after consolidate");
+        assert_eq!(
+            disk.search(q, 1).unwrap()[0].0,
+            4500,
+            "search exact after consolidate"
+        );
     }
 
     #[test]
@@ -2726,7 +2764,11 @@ mod tests {
         let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
         assert_eq!(disk.len(), n, "WAL replay restores every flushed vector");
         let q = &vectors[100 * dim..101 * dim];
-        assert_eq!(disk.search(q, 1).unwrap()[0].0, 100, "recovered vector is searchable");
+        assert_eq!(
+            disk.search(q, 1).unwrap()[0].0,
+            100,
+            "recovered vector is searchable"
+        );
         let stale = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(Result::ok)

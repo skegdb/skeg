@@ -57,7 +57,10 @@ fn fill(buf: &mut [f32], state: &mut u64) {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn parse_tier(s: &str) -> QuantKind {

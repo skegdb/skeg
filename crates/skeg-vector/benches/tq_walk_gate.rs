@@ -337,40 +337,44 @@ fn main() {
     // aggressive tier: it clears 0.95 at >=512d but dips just under on
     // low-dim distributions (~0.94-0.95 at 384d), so it gates best-effort
     // there (0.94 floor, `PASS*`). tq2 is the recommended sweet spot.
-    let summarize = |label: &str, dim: usize, res: Option<((f32, f32), (f32, f32), (f32, f32))>| match res {
-        Some(((r4, _), (r2, _), (r1, ref1))) => {
-            let thr1 = if dim >= 512 { 0.95 } else { 0.94 };
-            let p4 = r4 >= 0.95;
-            let p2 = r2 >= 0.95;
-            let p1 = r1 >= thr1;
-            let l1 = if !p1 {
-                "FAIL"
-            } else if dim >= 512 {
-                "PASS"
-            } else {
-                "PASS*"
-            };
-            println!(
-                "  {label:<14}  4b walk {r4:.4} {l4}   2b walk {r2:.4} {l2}   1b walk {r1:.4} {l1}   (f32 ref {ref1:.4})",
-                label = label,
-                r4 = r4,
-                l4 = if p4 { "PASS" } else { "FAIL" },
-                r2 = r2,
-                l2 = if p2 { "PASS" } else { "FAIL" },
-                r1 = r1,
-                l1 = l1,
-                ref1 = ref1,
-            );
-            (p4, p2, p1)
-        }
-        None => {
-            println!("  {label:<14}  dataset missing");
-            (false, false, false)
+    let summarize = |label: &str, dim: usize, res: Option<((f32, f32), (f32, f32), (f32, f32))>| {
+        match res {
+            Some(((r4, _), (r2, _), (r1, ref1))) => {
+                let thr1 = if dim >= 512 { 0.95 } else { 0.94 };
+                let p4 = r4 >= 0.95;
+                let p2 = r2 >= 0.95;
+                let p1 = r1 >= thr1;
+                let l1 = if !p1 {
+                    "FAIL"
+                } else if dim >= 512 {
+                    "PASS"
+                } else {
+                    "PASS*"
+                };
+                println!(
+                    "  {label:<14}  4b walk {r4:.4} {l4}   2b walk {r2:.4} {l2}   1b walk {r1:.4} {l1}   (f32 ref {ref1:.4})",
+                    label = label,
+                    r4 = r4,
+                    l4 = if p4 { "PASS" } else { "FAIL" },
+                    r2 = r2,
+                    l2 = if p2 { "PASS" } else { "FAIL" },
+                    r1 = r1,
+                    l1 = l1,
+                    ref1 = ref1,
+                );
+                (p4, p2, p1)
+            }
+            None => {
+                println!("  {label:<14}  dataset missing");
+                (false, false, false)
+            }
         }
     };
     let (mx4, mx2, mx1) = summarize("mxbai 1024d", 1024, mxbai);
     let (mn4, mn2, mn1) = summarize("MiniLM 384d", 384, minilm);
-    println!("  (* 1-bit gates best-effort below 512d: 0.94 floor; tq2 is the recommended sweet spot)");
+    println!(
+        "  (* 1-bit gates best-effort below 512d: 0.94 floor; tq2 is the recommended sweet spot)"
+    );
 
     let verdict = |p_mx: bool, p_mn: bool| match (p_mx, p_mn) {
         (true, true) => "PASS dual-distribution",

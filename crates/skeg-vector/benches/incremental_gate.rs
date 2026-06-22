@@ -99,7 +99,11 @@ fn recall_p50(
         let t0 = Instant::now();
         let got = idx.search_with_l(query, K, L_SEARCH).expect("search");
         lats.push(t0.elapsed().as_secs_f64() * 1000.0);
-        let hit = got.iter().take(K).filter(|(id, _)| truth.contains(id)).count();
+        let hit = got
+            .iter()
+            .take(K)
+            .filter(|(id, _)| truth.contains(id))
+            .count();
         recalls.push(hit as f32 / K as f32);
     }
     lats.sort_unstable_by(|a, b| a.total_cmp(b));
@@ -119,9 +123,13 @@ fn main() {
     let tmp = std::env::temp_dir().join(format!("inc-gate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let mut idx =
-        DiskVamanaIndex::create_empty_with_tier(&tmp, dim, L_SEARCH, QuantKind::TurboQuant { bits: 2 })
-            .expect("create");
+    let mut idx = DiskVamanaIndex::create_empty_with_tier(
+        &tmp,
+        dim,
+        L_SEARCH,
+        QuantKind::TurboQuant { bits: 2 },
+    )
+    .expect("create");
 
     println!("=======================================================");
     println!("Incremental-insert gate - stream {n} vectors (mxbai {dim}d)");
@@ -136,7 +144,8 @@ fn main() {
     let ingest_t0 = Instant::now();
     for i in 0..n {
         let t = Instant::now();
-        idx.insert(i as u64, &corpus[i * dim..(i + 1) * dim]).unwrap();
+        idx.insert(i as u64, &corpus[i * dim..(i + 1) * dim])
+            .unwrap();
         max_pause_ms = max_pause_ms.max(t.elapsed().as_secs_f64() * 1000.0);
         if idx.delta_len() >= idx.main_len().max(DISK_CONSOLIDATE_MIN) {
             idx.consolidate().unwrap();
@@ -156,7 +165,8 @@ fn main() {
     // by re-inserting the most recent main_len vectors (overwrite = delta entry).
     let hw = idx.main_len().min(n);
     for i in (n - hw)..n {
-        idx.insert(i as u64, &corpus[i * dim..(i + 1) * dim]).unwrap();
+        idx.insert(i as u64, &corpus[i * dim..(i + 1) * dim])
+            .unwrap();
     }
     let (recall_hi, p50_hi) = recall_p50(&idx, &corpus[..n * dim], n, dim, &queries);
     min_recall = min_recall.min(recall_hi);
@@ -169,15 +179,35 @@ fn main() {
     println!("\n=== Incremental gate verdict ===");
     println!("  ingest {n} vectors          {ingest_s:.2}s ({vec_per_s:.0} vec/s)");
     println!("  max single-insert pause     {max_pause_ms:.1} ms  (a flush; the LSM build win)");
-    println!("  one full consolidate        {consolidate_s:.2}s  (the rebuild the LSM defers/amortises)");
-    println!("  min recall@10 over stream  {min_recall:.4}   [{}]",
-             if recall_pass { "PASS" } else { "FAIL" });
+    println!(
+        "  one full consolidate        {consolidate_s:.2}s  (the rebuild the LSM defers/amortises)"
+    );
+    println!(
+        "  min recall@10 over stream  {min_recall:.4}   [{}]",
+        if recall_pass { "PASS" } else { "FAIL" }
+    );
     println!("  p50 post-consolidate       {p50_lo:.2} ms");
     println!("  p50 at high-water (delta~main_len)  {p50_hi:.2} ms");
-    println!("  latency ratio              {ratio:.1}x        [{}]",
-             if latency_pass { "PASS" } else { "FAIL (delta is brute-forced today; LSM runs fix this)" });
-    println!("\n  recall -> {}", if recall_pass { "PASS" } else { "FAIL" });
-    println!("  bounded latency -> {}", if latency_pass { "PASS" } else { "FAIL (expected red on this branch until the LSM lands)" });
+    println!(
+        "  latency ratio              {ratio:.1}x        [{}]",
+        if latency_pass {
+            "PASS"
+        } else {
+            "FAIL (delta is brute-forced today; LSM runs fix this)"
+        }
+    );
+    println!(
+        "\n  recall -> {}",
+        if recall_pass { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  bounded latency -> {}",
+        if latency_pass {
+            "PASS"
+        } else {
+            "FAIL (expected red on this branch until the LSM lands)"
+        }
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

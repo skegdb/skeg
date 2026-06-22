@@ -1315,15 +1315,11 @@ mod tests {
                 CommandKind::VindexCreate,
             ),
             (
-                Command::SkegVindexDrop {
-                    args: args(&["i"]),
-                },
+                Command::SkegVindexDrop { args: args(&["i"]) },
                 CommandKind::VindexDrop,
             ),
             (
-                Command::SkegQosSet {
-                    args: args(&["t"]),
-                },
+                Command::SkegQosSet { args: args(&["t"]) },
                 CommandKind::Admin,
             ),
             (Command::Ping(None), CommandKind::Meta),
@@ -1420,7 +1416,7 @@ mod tests {
         let n = 2000u64;
 
         for (name, create_args) in [
-            ("def", args(&["def", "64", "disk"])),      // 3 args -> kind defaults to tq2
+            ("def", args(&["def", "64", "disk"])), // 3 args -> kind defaults to tq2
             ("i8", args(&["i8", "64", "int8", "disk"])), // 4 args -> explicit int8
         ] {
             let f = dispatch_command(

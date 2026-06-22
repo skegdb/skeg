@@ -2236,7 +2236,15 @@ impl IndexStat {
         vectors: usize,
         evictable: bool,
     ) -> Self {
-        Self { tenant, index, shard, resident_bytes, last_access_ms, vectors, evictable }
+        Self {
+            tenant,
+            index,
+            shard,
+            resident_bytes,
+            last_access_ms,
+            vectors,
+            evictable,
+        }
     }
 }
 
@@ -2607,12 +2615,18 @@ mod tests {
 
         let q = vec![20.0f32, 0.0, 0.0, 0.0];
         let ids = |r: &[(u64, f32, Option<Bytes>)]| r.iter().map(|h| h.0).collect::<Vec<_>>();
-        let before = ids(&shards.vsearch("ev", q.clone(), 5, 0, 0, false, None).await.unwrap());
+        let before = ids(&shards
+            .vsearch("ev", q.clone(), 5, 0, 0, false, None)
+            .await
+            .unwrap());
         assert!(!before.is_empty());
 
         let ctl = shards.control_handle();
         assert!(
-            ctl.open_indices().await.iter().any(|s| s.index == "ev" && s.evictable),
+            ctl.open_indices()
+                .await
+                .iter()
+                .any(|s| s.index == "ev" && s.evictable),
             "index is resident and evictable before eviction"
         );
 
@@ -2656,14 +2670,21 @@ mod tests {
             // backend 1 = disk Vamana (evictable + lazily reopenable).
             shards.vindex_create(&name, dim as u32, 1, 1).await.unwrap();
             for id in 1..=m {
-                shards.vset(&name, id, vec_for(t, id), 0, None, None).await.unwrap();
+                shards
+                    .vset(&name, id, vec_for(t, id), 0, None, None)
+                    .await
+                    .unwrap();
             }
             shards.vindex_consolidate(&name).await.unwrap();
         }
 
         let ctl = shards.control_handle();
         let resident = |ctl: ControlHandle| async move {
-            ctl.open_indices().await.iter().map(|s| s.resident_bytes).sum::<usize>()
+            ctl.open_indices()
+                .await
+                .iter()
+                .map(|s| s.resident_bytes)
+                .sum::<usize>()
         };
 
         let r_all = resident(ctl.clone()).await;
@@ -2677,12 +2698,18 @@ mod tests {
             "scale-to-zero: {k} tenants resident {r_all} B -> 3 hot {r_hot} B = {reclaimed:.0}% reclaimed"
         );
         assert!(r_hot < r_all, "eviction must reclaim resident RAM");
-        assert!(reclaimed > 50.0, "evicting 7/10 idle tenants reclaims the majority");
+        assert!(
+            reclaimed > 50.0,
+            "evicting 7/10 idle tenants reclaims the majority"
+        );
 
         // A cold (evicted) tenant reloads lazily on access, data intact.
         let q = vec_for(9, m); // closest to t9's id=m vector
         let hits = shards.vsearch("t9", q, 5, 0, 0, false, None).await.unwrap();
-        assert!(!hits.is_empty(), "evicted tenant reopens and serves on next query");
+        assert!(
+            !hits.is_empty(),
+            "evicted tenant reopens and serves on next query"
+        );
         assert!(
             ctl.open_indices().await.iter().any(|s| s.index == "t9"),
             "reopened tenant is resident again"
