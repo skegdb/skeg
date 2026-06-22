@@ -214,7 +214,7 @@ repository.
   handler creates. Traces shipped through the OTLP exporter carry the
   full hierarchy without extra configuration.
 
-- **`compat-tests/redis_py_compat.py`** — end-to-end smoke against a
+- **`compat-tests/redis_py_compat.py`** - end-to-end smoke against a
   live `skeg-resp3` driven through `redis-py` 5+. Exercises every
   typed command from v0.3.5, asserts byte-exact error strings, and
   validates RESP2/RESP3 negotiation. Manual gate (not part of `cargo
@@ -486,7 +486,7 @@ repository.
 - `skeg-platform` 0.1.2 -> 0.1.3 (additive: `DurabilityModel`)
 - `skeg-server` 0.2.2 -> 0.3.0
 
-## [0.2.2] — 2026-05-29
+## [0.2.2] - 2026-05-29
 
 ### Changed
 
@@ -520,7 +520,7 @@ repository.
   finish their inner lock window before dropping it; on POSIX the
   directory deletion is decoupled from the file-handle lifetime.
 
-## [0.2.1] — 2026-05-29
+## [0.2.1] - 2026-05-29
 
 ### Added
 
@@ -538,7 +538,7 @@ repository.
   - `skeg_vindex_vectors` and `skeg_vindex_size_bytes` are aggregated
     on `STATS` from the shard's vindex set; the size approximation is
     `n * dim * 4` for flat indexes and `n * dim` for disk (tier-1
-    int8 codes only — the graph and full f32 vectors live on disk and
+    int8 codes only - the graph and full f32 vectors live on disk and
     are not counted as RAM).
 - `skeg_telemetry::incr_gauge` / `decr_gauge` / `add_gauge` for
   delta-style updates on gauges (used by the compaction RAII guard).
@@ -552,7 +552,7 @@ repository.
   start displaying real values on the previously-empty gauges with
   no rewrite.
 
-## [0.2.0] — 2026-05-28
+## [0.2.0] - 2026-05-28
 
 ### Added
 
@@ -609,7 +609,7 @@ repository.
   `VindexSizeBytes`, `VindexVectors`) are still TODO. The schema is
   stable; dashboards written against v0.1.2 keep working.
 
-## [0.1.2] — 2026-05-28
+## [0.1.2] - 2026-05-28
 
 ### Added
 
@@ -651,7 +651,7 @@ repository.
   will land in a follow-up; the schema is stable and dashboards
   written today will not need to change.
 
-## [0.1.1] — 2026-05-26
+## [0.1.1] - 2026-05-26
 
 ### Added
 
@@ -668,7 +668,7 @@ repository.
   `VINDEX.CREATE docs DIM 1024 METRIC cosine` form that the previous
   README implied.
 
-## [Unreleased] — pre-release v0.1.0
+## [Unreleased] - pre-release v0.1.0
 
 ### Added
 

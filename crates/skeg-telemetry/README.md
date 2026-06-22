@@ -11,7 +11,7 @@ Zero-overhead atomic counters and histograms for skeg.
   on M-series P-cores.
 - Histograms are fixed exponential buckets (1 µs → 1 s, plus `+Inf`).
 - When the crate is compiled with no features, every public function is an
-  empty body and the caller's arguments are sunk into `let _ = …` — verified
+  empty body and the caller's arguments are sunk into `let _ = …` - verified
   with `cargo asm` to compile to a tail call elimination.
 
 ## Features

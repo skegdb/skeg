@@ -12,7 +12,7 @@ what is the source of truth, and what survives a crash at the worst moment?
 
 Quality attributes in tension: **durability** (no acknowledged write is ever
 lost), **crash-safety** (a crash mid-flush leaves a consistent index),
-**simplicity** (this is the one data-critical path — minimise the surface that
+**simplicity** (this is the one data-critical path - minimise the surface that
 can corrupt data), and **restart cost** (defer-able).
 
 ## Decision
@@ -34,9 +34,9 @@ truncate the WAL.**
   dir is ignored; the WAL still holds every vector. No loss, no corruption.
 - **Crash after a flush, before consolidate**: the run dirs exist but are not yet
   discovered on open (see "deferred" below); the WAL replays all of them back
-  into L0. The data is intact — it is just served from L0 again until the next
+  into L0. The data is intact - it is just served from L0 again until the next
   flush. No loss.
-- **Crash during consolidate**: unchanged from today — the rebuild writes to the
+- **Crash during consolidate**: unchanged from today - the rebuild writes to the
   graph files and only truncates the WAL after a successful reopen; a crash
   before that leaves the old graph + full WAL, which replays cleanly.
 
@@ -53,7 +53,7 @@ truncate the WAL.**
 ## Consequences
 
 - **Positive:** the durability guarantee is unchanged from the proven
-  delta-WAL + consolidate model — the data-critical path gains no new way to lose
+  delta-WAL + consolidate model - the data-critical path gains no new way to lose
   data. Runs are a throwaway, rebuildable cache.
 - **Negative:** the WAL grows with all un-consolidated writes (as the delta did
   before), and restart re-absorbs them into L0 (a known, bounded cost). Run dirs

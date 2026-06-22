@@ -1,4 +1,4 @@
-# Incremental insert — design
+# Incremental insert - design
 
 Status: **design** (branch `feat/incremental-insert`). Nothing here is built yet.
 
@@ -13,19 +13,19 @@ folds the delta back by **rebuilding the whole graph from scratch**
 
 Consequences:
 
-- **Recall is already perfect** — the delta is an exact f32 scan, so streaming
+- **Recall is already perfect** - the delta is an exact f32 scan, so streaming
   writes never lose recall. (This is *not* the thing to fix. The old
   FreshDiskANN in-place insert that collapsed to recall 0.31 was removed; we are
   not bringing it back.)
-- **Delta search is O(delta)** — latency grows linearly with un-consolidated
+- **Delta search is O(delta)** - latency grows linearly with un-consolidated
   writes until the next consolidation.
-- **Consolidation is a full O(N log N) rebuild** — one big stall. At 500K this
+- **Consolidation is a full O(N log N) rebuild** - one big stall. At 500K this
   is the ~2× cold-build cost that Qdrant (incremental HNSW) and brinicle
   (streaming HNSW) beat us on. It is the *only* axis where skeg loses, and it is
   exactly where the competition aims.
 
-**Goal:** make ingest smooth — bounded, sub-linear delta search and *no single
-big rebuild stall* — without giving up the perfect recall or the lean footprint,
+**Goal:** make ingest smooth - bounded, sub-linear delta search and *no single
+big rebuild stall* - without giving up the perfect recall or the lean footprint,
 and **without ever mutating a mature graph in place** (the source of the 0.31
 collapse).
 
@@ -38,7 +38,7 @@ The removed FreshDiskANN path inserted into the *mature* `main` graph: greedy
 search for neighbours, add bidirectional edges, robust-prune the new node **and
 its neighbours**. Pruning existing nodes eroded the back-edges that make the
 medoid-rooted greedy walk reach the whole graph. The graph stayed 100%
-*reachable* but became greedy-*unnavigable* — plain recall 0.31. Any design that
+*reachable* but became greedy-*unnavigable* - plain recall 0.31. Any design that
 mutates edges of an existing large graph risks the same. So: **segments are
 immutable. We never prune an edge that exists.** Erosion cannot happen if we
 never erode.
@@ -58,12 +58,12 @@ Lk  the big base segment (today's `main`)
 - **Insert** → append to L0 (RAM + WAL), O(1). No graph touched.
 - **Flush** → when L0 reaches `FLUSH` (e.g. 4096), bulk-build a small immutable
   L1 segment from it (`VamanaIndex::build` over a few thousand vectors = a few
-  ms) and clear L0. Cheap because it is small and fresh — no erosion, it is a
+  ms) and clear L0. Cheap because it is small and fresh - no erosion, it is a
   brand-new graph.
 - **Compaction** → when a level holds too many runs (or too many bytes), merge
   its runs (+ optionally the next level) into one fresh immutable segment in the
   next level. Leveled like RocksDB: small merges are frequent and cheap, big
-  merges are rare. Total write amplification is **O(log N), spread out** —
+  merges are rare. Total write amplification is **O(log N), spread out** -
   there is no longer a single O(N log N) stall.
 - **Search** → greedy-walk *every* segment's graph (they are independent, walk
   them with the existing rayon pool), brute-force the tiny L0, merge the
@@ -85,7 +85,7 @@ navigable graph.
 | erosion risk | none | **none** (immutable runs) |
 
 The win is *smoothness*: we trade one big periodic rebuild for many small merges,
-which is precisely how Qdrant/brinicle avoid the stall — but our runs stay
+which is precisely how Qdrant/brinicle avoid the stall - but our runs stay
 immutable and bulk-built, so recall never drifts.
 
 ### Costs and the knobs that bound them
@@ -106,7 +106,7 @@ Reuse the bench discipline. New gate `incremental_gate`:
 
 - **Recall through a cycle.** Stream N real embeddings (mxbai-1024 and
   MiniLM-384) in batches; after every batch, recall@10 vs brute-force GT must
-  stay **≥ 0.98** (it should stay ~1.0 — f32 rerank — this gate catches a merge
+  stay **≥ 0.98** (it should stay ~1.0 - f32 rerank - this gate catches a merge
   bug, not quantization).
 - **Latency stays bounded.** p50 must not grow unbounded with un-merged writes:
   measure p50 at delta=0 and at the pre-compaction high-water mark; the ratio
@@ -120,7 +120,7 @@ Reuse the bench discipline. New gate `incremental_gate`:
 
 1. Unit: L0 flush builds a correct small segment; search merges runs correctly;
    newest-run-wins on id shadowing; tombstones honoured across runs.
-2. Property: insert M random vectors in random batches, query each — every result
+2. Property: insert M random vectors in random batches, query each - every result
    id is live and the top-1 is the true nearest (small N, exact check).
 3. Recall gate on real embeddings, streamed (above).
 4. Latency gate (above).
@@ -132,7 +132,7 @@ Write the gate first (red), implement to green, then the property tests.
 ## Phased implementation
 
 1. **Multi-run search.** Generalise `search_inner` to walk a `Vec<Segment>` +
-   L0, merge, rerank. No write path yet — seed with the existing `main` as the
+   L0, merge, rerank. No write path yet - seed with the existing `main` as the
    sole run to prove no regression (gate: Slice A unchanged).
 2. **L0 + flush.** Promote the delta to L0 with a `FLUSH` threshold that
    bulk-builds an immutable run. Geometric, small.
@@ -145,7 +145,7 @@ Write the gate first (red), implement to green, then the property tests.
 
 ## Open questions
 
-- Size ratio / fan-out sweet spot — measure, do not guess (Slice-A + a streaming
+- Size ratio / fan-out sweet spot - measure, do not guess (Slice-A + a streaming
   workload).
 - Do we keep a single big base segment (today's `main`) special-cased, or treat
   it as just the top level? Start special-cased (less churn), revisit.
@@ -156,5 +156,5 @@ Write the gate first (red), implement to green, then the property tests.
 
 Stream 500K vectors and serve them at recall@10 ≥ 0.98 and bounded p50, with
 **no merge pause longer than building one level**, and steady-state numbers no
-worse than the current single-graph index. That closes the cold-build gap — the
+worse than the current single-graph index. That closes the cold-build gap - the
 last axis where the competition leads.
