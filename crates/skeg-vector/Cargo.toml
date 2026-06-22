@@ -1,6 +1,6 @@
 [package]
 name = "skeg-vector"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -90,3 +90,11 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "incremental_gate"
+harness = false
+
+[[bench]]
+name = "tiering_gate"
+harness = false

@@ -1,6 +1,6 @@
 [package]
 name = "skeg-server-tenant"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -24,9 +24,9 @@ name = "skeg-server"
 path = "src/main.rs"
 
 [dependencies]
-skeg-server = { path = "../skeg-server", version = "0.4" }
+skeg-server = { path = "../skeg-server", version = "0.5" }
 skeg-tenant = { path = "../skeg-tenant", version = "0.1" }
-skeg-vector = { path = "../skeg-vector", version = "0.1.4" }
+skeg-vector = { path = "../skeg-vector", version = "0.1.5" }
 skeg-platform = { path = "../skeg-platform", version = "0.1" }
 
 tokio = { workspace = true }

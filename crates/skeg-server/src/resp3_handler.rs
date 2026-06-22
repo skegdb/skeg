@@ -30,8 +30,9 @@ use skeg_resp3::{
     parse_command,
 };
 
+use crate::payload::parse_filter;
 use crate::shard::ShardSet;
-use crate::tenant::{AnonymousPolicy, TenantBackend, TenantId};
+use crate::tenant::{Admission, AnonymousPolicy, CommandKind, TenantBackend, TenantId};
 
 /// Format a VINDEX name with the tenant scope. `TenantId::ZERO` returns the
 /// raw name (single-tenant deployments stay byte-identical to pre-tenancy).
@@ -63,7 +64,7 @@ impl ScopedKey {
     /// The owning tenant id as a `u128`, for per-tenant cache accounting. `0`
     /// for the unscoped (anonymous) default, matching `VLog`'s tenant 0 path.
     fn accounting_tenant(&self) -> u128 {
-        u128::from_le_bytes(*self.tenant.as_bytes())
+        tenant_u128(self.tenant)
     }
 
     /// Cheap runtime check the prefix invariant still holds. Called at
@@ -204,6 +205,65 @@ pub async fn handle_connection_resp3(
     debug!(?peer, "RESP3 connection closed");
 }
 
+/// Coarse compute cost of a command, in QoS credits. A vector search's work is
+/// dominated by `l_search` (the graph walk) plus `k` (the rerank), both read
+/// straight from the command args with no index lookup; every other command is
+/// a flat 1. Deliberately coarse: vector dimension and tenant data size are
+/// roughly constant per index and can be folded in later if a measurement shows
+/// the weighting is off.
+fn command_cost(cmd: &Command) -> u32 {
+    match cmd {
+        // args: name k l_search vector [WITHPAYLOAD] [FILTER expr]
+        Command::SkegVsearch { args } => {
+            let num = |i: usize| {
+                args.get(i)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0)
+            };
+            num(1).saturating_add(num(2)).max(1)
+        }
+        _ => 1,
+    }
+}
+
+/// Classify a command for the admission gate ([`CommandKind`]). Grouped by
+/// (resource, action); index-lifecycle ops stay individual (the RBAC target).
+/// Exhaustive over `Command` so a new command must be classified here.
+fn command_kind(cmd: &Command) -> CommandKind {
+    match cmd {
+        Command::Get { .. } | Command::Mget { .. } | Command::Exists { .. } => CommandKind::KvRead,
+        Command::Set { .. }
+        | Command::Mset { .. }
+        | Command::Del { .. }
+        | Command::Incr { .. }
+        | Command::Decr { .. }
+        | Command::IncrBy { .. }
+        | Command::DecrBy { .. } => CommandKind::KvWrite,
+        Command::SkegVsearch { .. } => CommandKind::VectorRead,
+        Command::SkegVset { .. } | Command::SkegVmset { .. } | Command::SkegVdel { .. } => {
+            CommandKind::VectorWrite
+        }
+        Command::SkegVindexCreate { .. } => CommandKind::VindexCreate,
+        Command::SkegVindexDrop { .. } => CommandKind::VindexDrop,
+        Command::SkegVindexConsolidate { .. } => CommandKind::VindexConsolidate,
+        Command::SkegVindexList => CommandKind::VindexList,
+        Command::SkegQuotaSet { .. }
+        | Command::SkegQuotaGet { .. }
+        | Command::SkegQosSet { .. }
+        | Command::SkegQosGet { .. } => CommandKind::Admin,
+        Command::Hello(_)
+        | Command::Ping(_)
+        | Command::Echo(_)
+        | Command::Select { .. }
+        | Command::SkegStats
+        | Command::SkegShards
+        | Command::SkegWhoami
+        | Command::SkegAuth { .. }
+        | Command::Unknown { .. } => CommandKind::Meta,
+    }
+}
+
 async fn dispatch_command(
     cmd: Command,
     state: &mut ConnectionState,
@@ -211,6 +271,24 @@ async fn dispatch_command(
     shards: &ShardSet,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
+    // Per-command admission (multi-tenant QoS). Hello/SkegAuth establish or
+    // change the tenant and are never gated. Single-tenant (no backend) skips
+    // entirely. `_admit` is held until this function returns, so a concurrency
+    // cap reserved in `admit` actually bounds the command's in-flight lifetime.
+    let _admit = match (&cmd, tenant_backend) {
+        (Command::Hello(_) | Command::SkegAuth { .. }, _) | (_, None) => None,
+        (_, Some(ctx)) => {
+            let admission = Admission {
+                tenant: *tenant,
+                op: command_kind(&cmd),
+                cost: command_cost(&cmd),
+            };
+            match ctx.admit(admission) {
+                Ok(guard) => Some(guard),
+                Err(rejected) => return Frame::Error(rejected.message),
+            }
+        }
+    };
     match cmd {
         Command::Hello(args) => {
             // Verify credentials when AUTH is supplied. When AUTH is
@@ -288,21 +366,18 @@ async fn dispatch_command(
         Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
+        Command::SkegVindexConsolidate { args } => {
+            skeg_vindex_consolidate(&args, shards, *tenant).await
+        }
         Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
+        Command::SkegVmset { args } => skeg_vmset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
         Command::SkegQuotaGet { args } => skeg_quota_get(&args, *tenant, tenant_backend),
+        Command::SkegQosSet { args } => skeg_qos_set(&args, *tenant, tenant_backend),
+        Command::SkegQosGet { args } => skeg_qos_get(&args, *tenant, tenant_backend),
         Command::SkegVsearch { args } => skeg_vsearch(&args, shards, *tenant).await,
-        Command::Unknown { name, args } => {
-            dispatch_unknown(
-                &name.to_ascii_uppercase(),
-                args,
-                shards,
-                *tenant,
-                tenant_backend,
-            )
-            .await
-        }
+        Command::Unknown { name, .. } => unknown_command(&name.to_ascii_uppercase()),
     }
 }
 
@@ -310,13 +385,7 @@ async fn dispatch_command(
 /// `Command` variant. After phase 4 every KV / `SKEG.*` verb skeg
 /// supports flows through the typed path; this fallback only handles
 /// genuinely unknown command names and unknown `SKEG.*` verbs.
-async fn dispatch_unknown(
-    name: &str,
-    _args: Vec<Bytes>,
-    _shards: &ShardSet,
-    _tenant: TenantId,
-    _tenant_backend: Option<&Arc<dyn TenantBackend>>,
-) -> Frame {
+fn unknown_command(name: &str) -> Frame {
     Frame::Error(format!("ERR unknown command '{name}'"))
 }
 
@@ -360,8 +429,12 @@ fn parse_kind_arg(b: &Bytes) -> Result<u8, Frame> {
         "f32" | "0" => Ok(0),
         "int8" | "1" => Ok(1),
         "binary" | "2" => Ok(2),
+        // Disk-tier TurboQuant (sub-int8 RAM on the live write path).
+        "tq1" | "3" => Ok(3),
+        "tq2" | "4" => Ok(4),
+        "tq4" | "5" => Ok(5),
         other => Err(Frame::Error(format!(
-            "ERR unknown kind '{other}'; expected f32 | int8 | binary"
+            "ERR unknown kind '{other}'; expected f32 | int8 | binary | tq1 | tq2 | tq4"
         ))),
     }
 }
@@ -378,13 +451,25 @@ fn parse_backend_arg(b: &Bytes) -> Result<u8, Frame> {
 }
 
 /// `SKEG.VINDEX.CREATE name dim kind backend`. Name is scoped per tenant.
+/// Wire byte for tq2, the default tier (recall ~1.0, sub-int8 RAM). Used when
+/// `SKEG.VINDEX.CREATE` is called without an explicit kind. Mirrors
+/// `parse_kind_arg`'s `"tq2" => 4`.
+const DEFAULT_KIND_TQ2: u8 = 4;
+
 async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
-    if args.len() != 4 {
-        return Frame::Error(
-            "ERR wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim kind backend"
-                .into(),
-        );
-    }
+    // `name dim [kind] backend`: kind is optional and defaults to tq2. Arity (not
+    // token shape) disambiguates - kind and backend share numeric aliases (0/1),
+    // so a 3-arg call is always [name, dim, backend].
+    let (kind_arg, backend_arg) = match args.len() {
+        4 => (Some(&args[2]), &args[3]),
+        3 => (None, &args[2]),
+        _ => {
+            return Frame::Error(
+                "ERR wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim [kind] backend"
+                    .into(),
+            );
+        }
+    };
     let raw_name = match parse_utf8_arg(&args[0], "name") {
         Ok(s) => s,
         Err(e) => return e,
@@ -398,11 +483,14 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
         Ok(v) => v,
         Err(e) => return e,
     };
-    let kind = match parse_kind_arg(&args[2]) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let kind = match kind_arg {
+        Some(b) => match parse_kind_arg(b) {
+            Ok(v) => v,
+            Err(e) => return e,
+        },
+        None => DEFAULT_KIND_TQ2,
     };
-    let backend = match parse_backend_arg(&args[3]) {
+    let backend = match parse_backend_arg(backend_arg) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -435,6 +523,23 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
     }
 }
 
+/// `SKEG.VINDEX.CONSOLIDATE name`. Fold the disk index's streaming delta into
+/// its graph (a no-op for flat indices). Useful after a bulk load.
+async fn skeg_vindex_consolidate(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    if args.len() != 1 {
+        return Frame::Error("ERR wrong number of arguments for 'SKEG.VINDEX.CONSOLIDATE'".into());
+    }
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let scoped = scoped_vindex_name(tenant, raw_name);
+    match shards.vindex_consolidate(&scoped).await {
+        Ok(()) => Frame::ok(),
+        Err(e) => shard_error(&e),
+    }
+}
+
 /// `SKEG.VSET name id vector_bytes`. `vector_bytes` is a bulk string
 /// carrying raw little-endian `f32` values; its length must be `dim * 4`.
 async fn skeg_vset(
@@ -443,9 +548,10 @@ async fn skeg_vset(
     tenant: TenantId,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
 ) -> Frame {
-    if args.len() != 3 {
+    if args.len() != 3 && args.len() != 5 {
         return Frame::Error(
-            "ERR wrong number of arguments for 'SKEG.VSET'; want name id vector".into(),
+            "ERR wrong number of arguments for 'SKEG.VSET'; want name id vector [PAYLOAD blob]"
+                .into(),
         );
     }
     let raw_name = match parse_utf8_arg(&args[0], "name") {
@@ -460,15 +566,73 @@ async fn skeg_vset(
         Ok(v) => v,
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
+    // Optional `PAYLOAD <blob>`: an opaque byte buffer stored alongside the
+    // vector and returned by a WITHPAYLOAD search.
+    let payload = if args.len() == 5 {
+        if !args[3].eq_ignore_ascii_case(b"PAYLOAD") {
+            return Frame::Error("ERR SKEG.VSET expected PAYLOAD before the blob".into());
+        }
+        Some(args[4].clone())
+    } else {
+        None
+    };
     let scoped = scoped_vindex_name(tenant, raw_name);
     // Limit comes from the pluggable backend; `None` (no backend / unlimited)
     // skips quota enforcement entirely.
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
     match shards
-        .vset(&scoped, id, vector, tenant_u128(tenant), limit)
+        .vset(&scoped, id, vector, tenant_u128(tenant), limit, payload)
         .await
     {
         Ok(()) => Frame::ok(),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.VMSET name (id vector payload)+` - bulk insert. Items fan out
+/// concurrently so the durable payload-blob writes batch in the group committer.
+/// Returns the number of items inserted.
+async fn skeg_vmset(
+    args: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    if args.len() < 4 || (args.len() - 1) % 3 != 0 {
+        return Frame::Error(
+            "ERR wrong number of arguments for 'SKEG.VMSET'; want name (id vector payload)+".into(),
+        );
+    }
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let mut items: Vec<(u64, Vec<f32>, Option<Bytes>)> = Vec::with_capacity((args.len() - 1) / 3);
+    let mut i = 1;
+    while i < args.len() {
+        let id = match parse_u64_arg(&args[i], "id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let vector = match parse_vector(&args[i + 1]) {
+            Ok(v) => v,
+            Err(e) => return Frame::Error(format!("ERR {e}")),
+        };
+        let payload = if args[i + 2].is_empty() {
+            None
+        } else {
+            Some(args[i + 2].clone())
+        };
+        items.push((id, vector, payload));
+        i += 3;
+    }
+    let scoped = scoped_vindex_name(tenant, raw_name);
+    let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
+    match shards
+        .vmset(&scoped, items, tenant_u128(tenant), limit)
+        .await
+    {
+        Ok(n) => Frame::Integer(n as i64),
         Err(e) => shard_error(&e),
     }
 }
@@ -572,6 +736,68 @@ fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
     ])
 }
 
+/// `SKEG.QOS.SET tenant qps burst max_concurrent`. Admin only: sets a target
+/// tenant's QoS limits. Each field is a `u32` or `*` (unlimited).
+fn skeg_qos_set(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let rate = match parse_qos_limit(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let burst = match parse_qos_limit(&args[2]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let max_concurrent = match parse_qos_limit(&args[3]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let qos = crate::quota::TenantQos {
+        rate,
+        burst,
+        max_concurrent,
+    };
+    match backend.set_qos(target, qos) {
+        Ok(()) => Frame::ok(),
+        Err(crate::tenant::QuotaAdminError::Unsupported) => {
+            Frame::Error("ERR backend does not support setting qos".into())
+        }
+    }
+}
+
+/// `SKEG.QOS.GET tenant`. Admin only: returns `[qps, burst, max_concurrent]` as
+/// bulk strings, with `*` for an unlimited field.
+fn skeg_qos_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantBackend>>) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let qos = backend.qos(target);
+    let fmt = |o: Option<u32>| o.map_or_else(|| "*".to_string(), |v| v.to_string());
+    Frame::Array(vec![
+        Frame::Bulk(Bytes::from(fmt(qos.rate))),
+        Frame::Bulk(Bytes::from(fmt(qos.burst))),
+        Frame::Bulk(Bytes::from(fmt(qos.max_concurrent))),
+    ])
+}
+
+/// Parse a QoS limit field: `*` = unlimited (`None`), else a `u32`.
+fn parse_qos_limit(b: &Bytes) -> Result<Option<u32>, Frame> {
+    if b.as_ref() == b"*" {
+        return Ok(None);
+    }
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Frame::Error("ERR qos limit must be a non-negative integer or '*' for unlimited".into())
+        })
+}
+
 /// `SKEG.VSEARCH name k l_search vector_bytes`. Returns an array of
 /// `k` pairs `[id (bulk u64-string), score (Double in RESP3 / Bulk in RESP2)]`.
 #[tracing::instrument(
@@ -587,9 +813,11 @@ fn skeg_quota_get(args: &[Bytes], caller: TenantId, ctx: Option<&Arc<dyn TenantB
     ),
 )]
 async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
-    if args.len() != 4 {
+    if !(4..=7).contains(&args.len()) {
         return Frame::Error(
-            "ERR wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector".into(),
+            "ERR wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector \
+             [WITHPAYLOAD] [FILTER expr]"
+                .into(),
         );
     }
     let raw_name = match parse_utf8_arg(&args[0], "name") {
@@ -608,19 +836,65 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
         Ok(v) => v,
         Err(e) => return Frame::Error(format!("ERR {e}")),
     };
+    // Optional tail: `WITHPAYLOAD` and/or `FILTER <expr>`, in either order.
+    let mut want_payload = false;
+    let mut filter = None;
+    let mut i = 4;
+    while i < args.len() {
+        if args[i].eq_ignore_ascii_case(b"WITHPAYLOAD") {
+            want_payload = true;
+            i += 1;
+        } else if args[i].eq_ignore_ascii_case(b"FILTER") {
+            let Some(expr) = args.get(i + 1) else {
+                return Frame::Error("ERR SKEG.VSEARCH FILTER needs an expression".into());
+            };
+            let expr = match parse_utf8_arg(expr, "filter") {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            match parse_filter(expr) {
+                Ok(f) => filter = Some(f),
+                Err(e) => return Frame::Error(format!("ERR bad FILTER: {e}")),
+            }
+            i += 2;
+        } else {
+            return Frame::Error(format!(
+                "ERR unexpected SKEG.VSEARCH argument; want WITHPAYLOAD or FILTER, got '{}'",
+                String::from_utf8_lossy(&args[i])
+            ));
+        }
+    }
     let span = tracing::Span::current();
     span.record("vindex", raw_name);
     span.record("k", k);
     span.record("l_search", l_search);
     span.record("vector_dim", query.len());
     let scoped = scoped_vindex_name(tenant, raw_name);
-    match shards.vsearch(&scoped, query, k, l_search).await {
+    match shards
+        .vsearch(
+            &scoped,
+            query,
+            k,
+            l_search,
+            tenant_u128(tenant),
+            want_payload,
+            filter,
+        )
+        .await
+    {
         Ok(hits) => {
             span.record("hits", hits.len());
-            let mut out = Vec::with_capacity(hits.len() * 2);
-            for (id, score) in hits {
+            // Default: flat [id, score, ...] pairs (unchanged). WITHPAYLOAD:
+            // [id, score, payload, ...] triples, where payload is a bulk string
+            // (empty blobs included) or Null when the id has no stored payload.
+            let stride = if want_payload { 3 } else { 2 };
+            let mut out = Vec::with_capacity(hits.len() * stride);
+            for (id, score, payload) in hits {
                 out.push(Frame::Bulk(Bytes::from(id.to_string())));
                 out.push(Frame::Double(f64::from(score)));
+                if want_payload {
+                    out.push(payload.map_or(Frame::Null, Frame::Bulk));
+                }
             }
             Frame::Array(out)
         }
@@ -989,6 +1263,209 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn command_cost_vsearch_sums_k_and_l_search() {
+        // SKEG.VSEARCH idx k=10 l_search=128 vec -> 138 credits.
+        let cmd = Command::SkegVsearch {
+            args: args(&["idx", "10", "128", "vec"]),
+        };
+        assert_eq!(command_cost(&cmd), 138);
+    }
+
+    #[test]
+    fn command_cost_kv_is_one() {
+        let cmd = Command::Get {
+            key: Bytes::from_static(b"k"),
+        };
+        assert_eq!(command_cost(&cmd), 1);
+    }
+
+    #[test]
+    fn command_kind_classifies_for_rbac() {
+        let cases = [
+            (
+                Command::Get {
+                    key: Bytes::from_static(b"k"),
+                },
+                CommandKind::KvRead,
+            ),
+            (
+                Command::Set {
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"v"),
+                },
+                CommandKind::KvWrite,
+            ),
+            (
+                Command::SkegVsearch {
+                    args: args(&["i", "1", "1", "v"]),
+                },
+                CommandKind::VectorRead,
+            ),
+            (
+                Command::SkegVset {
+                    args: args(&["i", "1", "v"]),
+                },
+                CommandKind::VectorWrite,
+            ),
+            (
+                Command::SkegVindexCreate {
+                    args: args(&["i", "4", "1", "1"]),
+                },
+                CommandKind::VindexCreate,
+            ),
+            (
+                Command::SkegVindexDrop { args: args(&["i"]) },
+                CommandKind::VindexDrop,
+            ),
+            (
+                Command::SkegQosSet { args: args(&["t"]) },
+                CommandKind::Admin,
+            ),
+            (Command::Ping(None), CommandKind::Meta),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(command_kind(&cmd), want, "misclassified {cmd:?}");
+        }
+    }
+
+    /// A backend that records every `Admission.op` it sees and refuses
+    /// `VindexDrop` - the minimal per-command RBAC the new seam enables.
+    struct RbacBackend {
+        seen: std::sync::Mutex<Vec<CommandKind>>,
+    }
+
+    impl TenantBackend for RbacBackend {
+        fn verify_login(&self, _user: &str, _password: &[u8]) -> Option<TenantId> {
+            None
+        }
+        fn has_tenant(&self, _id: TenantId) -> bool {
+            false
+        }
+        fn admit(&self, a: Admission) -> Result<crate::AdmitGuard, crate::AdmitRejected> {
+            self.seen.lock().unwrap().push(a.op);
+            if a.op == CommandKind::VindexDrop {
+                return Err(crate::AdmitRejected {
+                    message: "FORBIDDEN drop denied".into(),
+                });
+            }
+            Ok(crate::AdmitGuard::allow())
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_refuses_command_by_kind() {
+        let (_dir, shards) = fresh_shards().await;
+        let concrete = std::sync::Arc::new(RbacBackend {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let backend: std::sync::Arc<dyn TenantBackend> = concrete.clone();
+        let mut state = ConnectionState::new(0);
+        let mut tenant = tid_from_name("t");
+
+        // VINDEX.DROP is refused at the gate, by op, before touching the shard.
+        let f = dispatch_command(
+            Command::SkegVindexDrop {
+                args: args(&["idx"]),
+            },
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("FORBIDDEN")),
+            "VINDEX.DROP must be refused by the gate, got {f:?}"
+        );
+
+        // GET passes the gate (it may then fail on a missing key, but never with
+        // the admit rejection).
+        let f = dispatch_command(
+            Command::Get {
+                key: Bytes::from_static(b"k"),
+            },
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            !matches!(&f, Frame::Error(e) if e.contains("FORBIDDEN")),
+            "GET must pass the gate, got {f:?}"
+        );
+
+        let seen = concrete.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![CommandKind::VindexDrop, CommandKind::KvRead],
+            "admit must see each command's classified op"
+        );
+    }
+
+    #[tokio::test]
+    async fn vindex_create_defaults_to_tq2_tier() {
+        // A disk VINDEX.CREATE with the kind omitted (3 args) must default to a
+        // sub-int8 tier (tq2). Verified behaviorally: same data, the default
+        // index is leaner in RAM than an explicit int8 one.
+        let (_dir, shards) = fresh_shards().await;
+        let mut state = ConnectionState::new(0);
+        let mut tenant = TenantId::ZERO;
+        let dim = 64usize;
+        let n = 2000u64;
+
+        for (name, create_args) in [
+            ("def", args(&["def", "64", "disk"])), // 3 args -> kind defaults to tq2
+            ("i8", args(&["i8", "64", "int8", "disk"])), // 4 args -> explicit int8
+        ] {
+            let f = dispatch_command(
+                Command::SkegVindexCreate { args: create_args },
+                &mut state,
+                &mut tenant,
+                &shards,
+                None,
+            )
+            .await;
+            assert!(!matches!(f, Frame::Error(_)), "create {name} failed: {f:?}");
+            for id in 1..=n {
+                let mut v = vec![0f32; dim];
+                v[0] = id as f32;
+                v[1 + (id as usize % (dim - 1))] = 1.0;
+                shards.vset(name, id, v, 0, None, None).await.unwrap();
+            }
+            shards.vindex_consolidate(name).await.unwrap();
+        }
+
+        let stats = shards.control_handle().open_indices().await;
+        let rb = |idx: &str| {
+            stats
+                .iter()
+                .filter(|s| s.index == idx)
+                .map(|s| s.resident_bytes)
+                .sum::<usize>()
+        };
+        assert!(
+            rb("def") < rb("i8"),
+            "default tier must be leaner than int8: def={} i8={}",
+            rb("def"),
+            rb("i8")
+        );
+    }
+
+    #[tokio::test]
+    async fn vindex_create_tq1_bad_dim_errors_not_panics() {
+        let (_dir, shards) = fresh_shards().await;
+        let t = TenantId::ZERO;
+        // 100 % 8 != 0: tq1 cannot pack it. Must be a clean error, and reaching
+        // the next line at all proves the server did not panic.
+        let bad = skeg_vindex_create(&args(&["bad", "100", "tq1", "disk"]), &shards, t).await;
+        assert!(matches!(bad, Frame::Error(_)));
+        // An 8-aligned dim is accepted.
+        let ok = skeg_vindex_create(&args(&["good", "128", "tq1", "disk"]), &shards, t).await;
+        assert!(matches!(ok, Frame::Simple(ref s) if s == "OK"));
+    }
+
     async fn fresh_shards() -> (TempDir, ShardSet) {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 1).unwrap();
@@ -1037,6 +1514,165 @@ mod tests {
         let (_dir, shards) = fresh_shards().await;
         let resp = kv_mset(&args(&["k1", "v1", "k2"]), &shards, TenantId::ZERO, None).await;
         assert!(matches!(resp, Frame::Error(ref e) if e.contains("wrong number")));
+    }
+
+    // Raw f32-LE bytes, the on-wire vector encoding parse_vector expects.
+    fn vec_arg(v: &[f32]) -> Bytes {
+        Bytes::from(v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())
+    }
+
+    // End-to-end through the RESP3 handlers: VSET ... PAYLOAD then
+    // VSEARCH ... WITHPAYLOAD returns the blob (the surface is callable, not
+    // just documented). Also covers the keyword-typo rejection.
+    #[tokio::test]
+    async fn vset_payload_then_vsearch_withpayload() {
+        let (_dir, shards) = fresh_shards().await;
+        let t = TenantId::ZERO;
+        let q = vec_arg(&[1.0, 0.0]);
+
+        let created = skeg_vindex_create(&args(&["idx", "2", "f32", "flat"]), &shards, t).await;
+        assert!(matches!(created, Frame::Simple(ref s) if s == "OK"));
+
+        let set = skeg_vset(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"1"),
+                q.clone(),
+                Bytes::from_static(b"PAYLOAD"),
+                Bytes::from_static(b"hello"),
+            ],
+            &shards,
+            t,
+            None,
+        )
+        .await;
+        assert!(matches!(set, Frame::Simple(ref s) if s == "OK"));
+
+        let resp = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"5"),
+                Bytes::from_static(b"0"),
+                q.clone(),
+                Bytes::from_static(b"WITHPAYLOAD"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        match resp {
+            // One hit, encoded as an [id, score, payload] triple.
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], Frame::Bulk(ref b) if &b[..] == b"1"));
+                assert!(matches!(items[1], Frame::Double(_)));
+                assert!(matches!(items[2], Frame::Bulk(ref b) if &b[..] == b"hello"));
+            }
+            other => panic!("expected Array triple, got {other:?}"),
+        }
+
+        // Without WITHPAYLOAD: flat [id, score] pair, no payload slot.
+        let plain = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"5"),
+                Bytes::from_static(b"0"),
+                q.clone(),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        assert!(matches!(plain, Frame::Array(ref items) if items.len() == 2));
+
+        // A mistyped trailing keyword is rejected, not silently ignored.
+        let bad = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"5"),
+                Bytes::from_static(b"0"),
+                q,
+                Bytes::from_static(b"NOPE"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        assert!(matches!(bad, Frame::Error(_)));
+    }
+
+    // End-to-end through the RESP3 handler: VSET ... PAYLOAD then
+    // VSEARCH ... FILTER returns only the matching ids (surface is callable).
+    #[tokio::test]
+    async fn vsearch_filter_selects_matching_ids() {
+        let (_dir, shards) = fresh_shards().await;
+        let t = TenantId::ZERO;
+        let created = skeg_vindex_create(&args(&["idx", "2", "f32", "flat"]), &shards, t).await;
+        assert!(matches!(created, Frame::Simple(ref s) if s == "OK"));
+
+        for (id, who) in [("1", "user=bob"), ("2", "user=alice"), ("3", "user=alice")] {
+            let set = skeg_vset(
+                &[
+                    Bytes::from_static(b"idx"),
+                    Bytes::copy_from_slice(id.as_bytes()),
+                    vec_arg(&[1.0, 0.0]),
+                    Bytes::from_static(b"PAYLOAD"),
+                    Bytes::copy_from_slice(who.as_bytes()),
+                ],
+                &shards,
+                t,
+                None,
+            )
+            .await;
+            assert!(matches!(set, Frame::Simple(ref s) if s == "OK"));
+        }
+
+        let resp = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"10"),
+                Bytes::from_static(b"0"),
+                vec_arg(&[1.0, 0.0]),
+                Bytes::from_static(b"FILTER"),
+                Bytes::from_static(b"user = alice"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        match resp {
+            // Two alice hits as [id, score] pairs; bob's id 1 excluded.
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 4);
+                let ids: Vec<&[u8]> = items
+                    .iter()
+                    .step_by(2)
+                    .map(|f| match f {
+                        Frame::Bulk(b) => &b[..],
+                        other => panic!("expected id bulk, got {other:?}"),
+                    })
+                    .collect();
+                assert!(ids.contains(&&b"2"[..]) && ids.contains(&&b"3"[..]));
+                assert!(!ids.contains(&&b"1"[..]), "bob's id 1 must be filtered out");
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+
+        // A malformed filter is a clean error, not a panic.
+        let bad = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"10"),
+                Bytes::from_static(b"0"),
+                vec_arg(&[1.0, 0.0]),
+                Bytes::from_static(b"FILTER"),
+                Bytes::from_static(b"user =="),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        assert!(matches!(bad, Frame::Error(ref e) if e.contains("bad FILTER")));
     }
 
     #[tokio::test]
@@ -1108,13 +1744,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn skeg_namespace_rejects_unknown_verb() {
-        // Unknown `SKEG.*` verbs come through the parser as `Unknown`
-        // and the dispatcher emits the legacy `ERR unknown command
-        // 'SKEG.<verb>'` byte-for-byte.
-        let (_dir, shards) = fresh_shards().await;
-        let resp = dispatch_unknown("SKEG.WHATEVER", vec![], &shards, TenantId::ZERO, None).await;
+    #[test]
+    fn skeg_namespace_rejects_unknown_verb() {
+        // Unknown `SKEG.*` verbs come through the parser as `Unknown` and the
+        // dispatcher emits the legacy `ERR unknown command 'SKEG.<verb>'`.
+        let resp = unknown_command("SKEG.WHATEVER");
         assert!(matches!(resp, Frame::Error(ref e) if e.contains("'SKEG.WHATEVER'")));
     }
 

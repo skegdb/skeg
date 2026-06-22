@@ -106,15 +106,27 @@ pub enum Command {
     SkegVindexDrop {
         args: Vec<Bytes>,
     },
-    /// `SKEG.VSET name id vector`. Arity 3.
+    /// `SKEG.VINDEX.CONSOLIDATE name`. Arity 1; fold the disk delta into the graph.
+    SkegVindexConsolidate {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.VSET name id vector [PAYLOAD blob]`. Arity 3 or 5.
     SkegVset {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.VMSET name (id vector payload)+`. Bulk insert: one `name` then
+    /// `(id, vector, payload)` triples (empty payload = none). The server fans
+    /// the items out concurrently so the durable blob writes batch in the group
+    /// committer - the bulk-ingest fast path. Arity 1 + 3k.
+    SkegVmset {
         args: Vec<Bytes>,
     },
     /// `SKEG.VDEL name id`. Arity 2.
     SkegVdel {
         args: Vec<Bytes>,
     },
-    /// `SKEG.VSEARCH name k l_search vector`. Arity 4.
+    /// `SKEG.VSEARCH name k l_search vector [WITHPAYLOAD] [FILTER expr]`.
+    /// Arity 4 to 7; the handler validates the optional tail tokens.
     SkegVsearch {
         args: Vec<Bytes>,
     },
@@ -127,6 +139,16 @@ pub enum Command {
     },
     /// `SKEG.QUOTA.GET tenant`. Arity 1. Admin only; reads a tenant's quotas.
     SkegQuotaGet {
+        args: Vec<Bytes>,
+    },
+
+    /// `SKEG.QOS.SET tenant rate burst max_concurrent`. Arity 4. Admin only;
+    /// each is a u32, or `*` for unlimited. Inner parsing in the dispatcher.
+    SkegQosSet {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.QOS.GET tenant`. Arity 1. Admin only; reads a tenant's QoS limits.
+    SkegQosGet {
         args: Vec<Bytes>,
     },
 
@@ -290,14 +312,33 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             }
             Ok(Command::SkegVindexDrop { args })
         }
+        "VINDEX.CONSOLIDATE" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.VINDEX.CONSOLIDATE",
+                });
+            }
+            Ok(Command::SkegVindexConsolidate { args })
+        }
         "VSET" => {
-            if args.len() != 3 {
+            // `name id vector` or `name id vector PAYLOAD <blob>`.
+            if args.len() != 3 && args.len() != 5 {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.VSET",
-                    want: "name id vector",
+                    want: "name id vector [PAYLOAD blob]",
                 });
             }
             Ok(Command::SkegVset { args })
+        }
+        "VMSET" => {
+            // `name` then (id, vector, payload) triples: arity 1 + 3k, k >= 1.
+            if args.len() < 4 || (args.len() - 1) % 3 != 0 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VMSET",
+                    want: "name (id vector payload)+",
+                });
+            }
+            Ok(Command::SkegVmset { args })
         }
         "VDEL" => {
             if args.len() != 2 {
@@ -309,10 +350,13 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             Ok(Command::SkegVdel { args })
         }
         "VSEARCH" => {
-            if args.len() != 4 {
+            // `name k l_search vector` plus optional trailing `WITHPAYLOAD`
+            // and/or `FILTER <expr>` (in either order); the handler validates
+            // the tail tokens.
+            if !(4..=7).contains(&args.len()) {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.VSEARCH",
-                    want: "name k l_search vector",
+                    want: "name k l_search vector [WITHPAYLOAD] [FILTER expr]",
                 });
             }
             Ok(Command::SkegVsearch { args })
@@ -334,6 +378,24 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegQuotaGet { args })
+        }
+        "QOS.SET" => {
+            if args.len() != 4 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.QOS.SET",
+                    want: "tenant rate burst max_concurrent",
+                });
+            }
+            Ok(Command::SkegQosSet { args })
+        }
+        "QOS.GET" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.QOS.GET",
+                    want: "tenant",
+                });
+            }
+            Ok(Command::SkegQosGet { args })
         }
         // Unknown SKEG.* verb: pass through so the dispatcher emits
         // `ERR unknown command 'SKEG.<verb>'`.
@@ -396,50 +458,47 @@ fn parse_kv_mset(args: Vec<Bytes>) -> Result<Command, CommandError> {
     Ok(Command::Mset { pairs })
 }
 
-fn parse_kv_incr(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
-    if args.len() != 1 {
-        // The server formats arity errors for INCR and DECR with a
-        // shared label `INCR/DECR` for historical reasons; preserved
-        // byte-for-byte here.
-        return Err(CommandError::WrongArity {
-            command: "INCR/DECR",
-        });
-    }
-    Ok(Command::Incr {
-        key: args.swap_remove(0),
-    })
-}
-
-fn parse_kv_decr(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+// INCR and DECR share the same arity check and a single error label
+// (`INCR/DECR`, preserved byte-for-byte for existing clients); likewise
+// INCRBY/DECRBY. Each pair differs only in the Command variant built.
+fn incr_decr_key(mut args: Vec<Bytes>) -> Result<Bytes, CommandError> {
     if args.len() != 1 {
         return Err(CommandError::WrongArity {
             command: "INCR/DECR",
         });
     }
-    Ok(Command::Decr {
-        key: args.swap_remove(0),
-    })
+    Ok(args.swap_remove(0))
 }
 
-fn parse_kv_incrby(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+fn incr_decr_by_args(mut args: Vec<Bytes>) -> Result<(Bytes, i64), CommandError> {
     if args.len() != 2 {
         return Err(CommandError::WrongArity {
             command: "INCRBY/DECRBY",
         });
     }
     let delta = parse_i64(&args[1])?;
-    let key = args.swap_remove(0);
+    Ok((args.swap_remove(0), delta))
+}
+
+fn parse_kv_incr(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    Ok(Command::Incr {
+        key: incr_decr_key(args)?,
+    })
+}
+
+fn parse_kv_decr(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    Ok(Command::Decr {
+        key: incr_decr_key(args)?,
+    })
+}
+
+fn parse_kv_incrby(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    let (key, delta) = incr_decr_by_args(args)?;
     Ok(Command::IncrBy { key, delta })
 }
 
-fn parse_kv_decrby(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
-    if args.len() != 2 {
-        return Err(CommandError::WrongArity {
-            command: "INCRBY/DECRBY",
-        });
-    }
-    let delta = parse_i64(&args[1])?;
-    let key = args.swap_remove(0);
+fn parse_kv_decrby(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    let (key, delta) = incr_decr_by_args(args)?;
     Ok(Command::DecrBy { key, delta })
 }
 
@@ -1168,7 +1227,7 @@ mod tests {
         let err = parse_command(arr(&[b"SKEG.VSET", b"x"])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "wrong number of arguments for 'SKEG.VSET'; want name id vector"
+            "wrong number of arguments for 'SKEG.VSET'; want name id vector [PAYLOAD blob]"
         );
     }
 
@@ -1197,6 +1256,34 @@ mod tests {
             err.to_string(),
             "wrong number of arguments for 'SKEG.QUOTA.SET'; \
              want tenant max_vectors max_disk_bytes"
+        );
+    }
+
+    #[test]
+    fn skeg_qos_set_four_args() {
+        let cmd = parse_command(arr(&[b"SKEG.QOS.SET", b"acme", b"100", b"200", b"*"])).unwrap();
+        let Command::SkegQosSet { args } = cmd else {
+            panic!("expected SkegQosSet");
+        };
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn skeg_qos_get_one_arg() {
+        let cmd = parse_command(arr(&[b"SKEG.QOS.GET", b"acme"])).unwrap();
+        let Command::SkegQosGet { args } = cmd else {
+            panic!("expected SkegQosGet");
+        };
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn skeg_qos_set_wrong_arity_error_string() {
+        let err = parse_command(arr(&[b"SKEG.QOS.SET", b"acme"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wrong number of arguments for 'SKEG.QOS.SET'; \
+             want tenant rate burst max_concurrent"
         );
     }
 
@@ -1232,7 +1319,7 @@ mod tests {
         let err = parse_command(arr(&[b"SKEG.VSEARCH", b"x"])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector"
+            "wrong number of arguments for 'SKEG.VSEARCH'; want name k l_search vector [WITHPAYLOAD] [FILTER expr]"
         );
     }
 

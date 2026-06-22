@@ -11,6 +11,7 @@
 //! via [`Server::with_tenant_backend`].
 
 pub mod handler;
+pub mod payload;
 pub mod quota;
 pub mod resp3_handler;
 pub mod shard;
@@ -26,11 +27,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use handler::handle_connection;
-pub use quota::{TenantLimits, TenantVectorQuota};
+pub use quota::{TenantLimits, TenantQos, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
+pub use shard::{ControlHandle, IndexStat};
 use skeg_vector::QuantKind;
-pub use tenant::{AnonymousPolicy, QuotaAdminError, TenantBackend, TenantId};
+pub use tenant::{
+    Admission, AdmitGuard, AdmitRejected, AnonymousPolicy, CommandKind, QuotaAdminError,
+    TenantBackend, TenantId,
+};
 
 pub struct Server {
     listener: TcpListener,
@@ -210,6 +215,14 @@ impl Server {
     #[must_use]
     pub fn n_shards(&self) -> usize {
         self.shards.n_shards()
+    }
+
+    /// Control-plane handle for vindex tiering (enumerate / report RAM /
+    /// evict). An external policy crate attaches a background task to it; the
+    /// engine provides only the mechanism.
+    #[must_use]
+    pub fn control_handle(&self) -> ControlHandle {
+        self.shards.control_handle()
     }
 
     /// Accept connections and handle them until an I/O error on `accept`.

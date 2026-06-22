@@ -185,7 +185,7 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                     "index name not utf-8",
                 ));
             };
-            match shards.vset(name, id, vector, 0, None).await {
+            match shards.vset(name, id, vector, 0, None, None).await {
                 Ok(()) => {
                     if frame.header.flags.contains(Flags::NO_REPLY) {
                         None
@@ -256,10 +256,17 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 hits = tracing::field::Empty,
             );
             let _guard = span.enter();
-            match shards.vsearch(name, query, k as usize, l_search).await {
+            // Native wire stays payload-less in P1a; drop the (always-None)
+            // blob and encode (id, score) pairs as before.
+            match shards
+                .vsearch(name, query, k as usize, l_search, 0, false, None)
+                .await
+            {
                 Ok(hits) => {
                     span.record("hits", hits.len());
-                    Some(encode_ok_vsearch(req_id, &hits))
+                    let pairs: Vec<(u64, f32)> =
+                        hits.into_iter().map(|(id, score, _)| (id, score)).collect();
+                    Some(encode_ok_vsearch(req_id, &pairs))
                 }
                 Err(e) => Some(shard_err_to_response(req_id, &e)),
             }

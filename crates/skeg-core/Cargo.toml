@@ -1,6 +1,6 @@
 [package]
 name = "skeg-core"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -46,6 +46,11 @@ harness = false
 # Custom main, wall-clock medians.
 [[bench]]
 name = "cache_tenant_accounting"
+harness = false
+
+# Does fair eviction's over-share scan bottleneck as resident tenants grow?
+[[bench]]
+name = "cache_eviction_scaling"
 harness = false
 
 [lints]

@@ -78,6 +78,41 @@ pub enum QuantKind {
     TurboQuant { bits: u8 },
 }
 
+impl QuantKind {
+    /// Check that this kind can quantize vectors of `dim`, so the create path
+    /// can reject a bad combination cleanly instead of panicking deep in the
+    /// builder. TurboQuant bit-packs `8 / bits` codes per byte (and its block
+    /// rotation needs an even `dim`, which divisibility by `8 / bits` already
+    /// guarantees); PQ splits `dim` into `m` subvectors. Other kinds take any
+    /// positive `dim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason if `dim` is incompatible with this kind.
+    pub fn validate_dim(self, dim: usize) -> Result<(), String> {
+        match self {
+            QuantKind::TurboQuant { bits } => {
+                let codes_per_byte = 8 / usize::from(bits);
+                if dim % codes_per_byte != 0 {
+                    return Err(format!(
+                        "tq{bits} requires a dimension divisible by {codes_per_byte} (got {dim})"
+                    ));
+                }
+                Ok(())
+            }
+            QuantKind::Pq { m, .. } => {
+                if m == 0 || dim % m != 0 {
+                    return Err(format!(
+                        "PQ requires the dimension ({dim}) to be divisible by m ({m})"
+                    ));
+                }
+                Ok(())
+            }
+            QuantKind::F32 | QuantKind::Int8 | QuantKind::Binary => Ok(()),
+        }
+    }
+}
+
 /// A query vector quantized to match a [`QuantizedVectors`] set.
 #[derive(Debug, Clone)]
 pub enum QueryCode {
@@ -362,16 +397,6 @@ fn turboquant_pack(code: &mut [u8], i: usize, bucket: usize, bits: u8) {
     let byte = i / codes_per_byte;
     let shift = (i % codes_per_byte) * bits;
     code[byte] |= (bucket as u8) << shift;
-}
-
-/// Inverse of `turboquant_pack`: read the `bits`-wide bucket id at coord `i`.
-fn turboquant_unpack(code: &[u8], i: usize, bits: u8) -> usize {
-    let bits = bits as usize;
-    let codes_per_byte = 8 / bits;
-    let byte = i / codes_per_byte;
-    let shift = (i % codes_per_byte) * bits;
-    let mask = (1u8 << bits) - 1;
-    ((code[byte] >> shift) & mask) as usize
 }
 
 /// Encode one f32 vector into a TurboQuant `(code, scale)` pair.
@@ -1059,16 +1084,8 @@ impl QuantizedVectors {
                     // 1-bit: algebraic reduction `c * (2*masked - q_sum)`.
                     // q_sum precomputed at query time; SWAR scalar inner.
                     1 => tq1_adc_swar(code, centroids, q_rot, self.dim, *q_sum),
-                    _ => {
-                        // Fallback general scalar path. The supported set is
-                        // {1, 2, 4} - this arm is for future-proofing.
-                        let mut a = 0.0f32;
-                        for i in 0..self.dim {
-                            let bucket = turboquant_unpack(code, i, *bits);
-                            a += q_rot[i] * centroids[bucket];
-                        }
-                        a
-                    }
+                    // `build_turboquant` asserts bits in {1, 2, 4}.
+                    _ => unreachable!("TurboQuant bits must be in {{1, 2, 4}}"),
                 };
                 let ip = scales[row] * acc;
                 // Greater inner product = closer. Clamp into a safe range so
@@ -1084,6 +1101,19 @@ impl QuantizedVectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_dim_turboquant_packing() {
+        // tq1 packs 8 codes/byte -> dim must be % 8; 100 % 8 == 4 -> reject.
+        assert!(QuantKind::TurboQuant { bits: 1 }.validate_dim(128).is_ok());
+        assert!(QuantKind::TurboQuant { bits: 1 }.validate_dim(100).is_err());
+        // tq2 needs % 4, tq4 needs % 2 -> both fine at 100.
+        assert!(QuantKind::TurboQuant { bits: 2 }.validate_dim(100).is_ok());
+        assert!(QuantKind::TurboQuant { bits: 4 }.validate_dim(100).is_ok());
+        // Non-packed kinds accept any positive dim.
+        assert!(QuantKind::Int8.validate_dim(100).is_ok());
+        assert!(QuantKind::F32.validate_dim(100).is_ok());
+    }
 
     #[test]
     fn int8_calibration_maps_max_to_127() {

@@ -263,11 +263,12 @@ fn top_k_signature(list: &SearchList, k: usize) -> u64 {
 /// semantics (insert -> test_and_set; `true` means "already present").
 #[allow(clippy::too_many_arguments)] // 8 args is the price of generic closures + scratch buffers
 fn greedy_search<D, N>(
-    entry: VecId,
+    seeds: &[VecId],
     list_size: usize,
     early_term: Option<EarlyTerm>,
     dist_to_query: D,
     neighbors: N,
+    admit: Option<&dyn Fn(VecId) -> bool>,
     visited: &mut VisitedBitset,
     seen: &mut VisitedBitset,
     mut trace: Option<&mut Vec<VecId>>,
@@ -280,8 +281,20 @@ where
     visited.clear();
     seen.clear();
 
-    list.insert(dist_to_query(entry), entry);
-    seen.test_and_set(entry);
+    // Seed the frontier from every entry point. A plain search passes one
+    // (the medoid); a filtered search passes points drawn from the matching set
+    // so the walk starts inside the matching region, not only at the centre.
+    //
+    // `admit` (filtered search only) gates which nodes may enter the list: only
+    // matching nodes are kept and expanded, so the walk explores the matching
+    // subgraph and a far matching cluster is not evicted by near non-matching
+    // nodes. Edges are still followed through `neighbors`; non-matching nodes
+    // are simply never admitted as candidates.
+    for &s in seeds {
+        if !seen.test_and_set(s) && admit.is_none_or(|a| a(s)) {
+            list.insert(dist_to_query(s), s);
+        }
+    }
 
     // Early-termination: track top-k signature stability across expansions.
     let mut last_sig: u64 = 0;
@@ -298,7 +311,9 @@ where
             if seen.test_and_set(nbr) {
                 continue;
             }
-            list.insert(dist_to_query(nbr), nbr);
+            if admit.is_none_or(|a| a(nbr)) {
+                list.insert(dist_to_query(nbr), nbr);
+            }
         }
         if let Some(et) = early_term {
             let sig = top_k_signature(&list, et.k);
@@ -364,7 +379,9 @@ fn robust_prune(
 pub struct VamanaConfig {
     /// Max out-degree `R`.
     pub r: usize,
-    /// Search-list size during the build.
+    /// Search-list size during the build. 64 is validated recall- and
+    /// latency-neutral vs the old 125 across 100d-3072d and 60k-1.18M (8
+    /// datasets), at ~2.5x faster builds: 125 was over-provisioned.
     pub l_build: usize,
     /// Search-list size at query time.
     pub l_search: usize,
@@ -382,7 +399,7 @@ impl Default for VamanaConfig {
     fn default() -> VamanaConfig {
         VamanaConfig {
             r: 64,
-            l_build: 125,
+            l_build: 64,
             l_search: 100,
             alpha1: 1.0,
             alpha2: 1.2,
@@ -390,6 +407,20 @@ impl Default for VamanaConfig {
             seed: 0x42,
         }
     }
+}
+
+/// Build config for DiskVamana's internal rebuilds (flush, consolidate). The
+/// `SKEG_L_BUILD` env var overrides `l_build` for benchmarking/tuning; otherwise
+/// the validated default (64) is used.
+fn disk_build_config() -> VamanaConfig {
+    let mut cfg = VamanaConfig::default();
+    if let Some(l) = std::env::var("SKEG_L_BUILD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        cfg.l_build = l;
+    }
+    cfg
 }
 
 /// Random `R`-regular directed graph - the build's starting point.
@@ -535,11 +566,12 @@ fn insert_point_concurrent(
     let p_vec = source.row(p);
     let t_walk = Instant::now();
     greedy_search(
-        medoid,
+        &[medoid],
         l_build,
         None, // build: never early-terminate (full candidate pool for prune)
         |id| dist(p_vec, source.row(id)),
         |id| locked_neighbors(graph, id),
+        None, // build: no filter admission
         &mut scratch.visited,
         &mut scratch.seen,
         None,
@@ -845,11 +877,12 @@ impl VamanaIndex {
             window: 5,
         });
         let list = greedy_search(
-            self.medoid,
+            &[self.medoid],
             list_size,
             early,
             |id| dist(query, self.vectors.row(id)),
             |id| self.nodes[id as usize].slice().iter().copied().collect(),
+            None, // in-RAM search: no filter admission
             &mut visited,
             &mut seen,
             None,
@@ -897,6 +930,38 @@ const GRAPH_FILE: &str = "graph.vmn";
 const VECTORS_FILE: &str = "vectors.bin";
 /// Append-only WAL of delta inserts/deletes (replayed on open).
 const DELTA_LOG_FILE: &str = "delta.log";
+/// Persists which tier-1 quantiser a read-write disk index rebuilds at `open`
+/// and `consolidate`. Absent => `Int8` (the historical default). Only the KIND
+/// is stored, not codes: every tier here is deterministic from `vectors.bin`
+/// (int8 calibrates a scale; TurboQuant is data-oblivious, seed-derived).
+const TIER_FILE: &str = "tier.kind";
+
+/// Read the persisted RW tier kind (`Int8` if the sidecar is absent).
+fn read_tier(dir: &Path) -> QuantKind {
+    match std::fs::read_to_string(dir.join(TIER_FILE)) {
+        Ok(s) => match s.trim() {
+            "tq1" => QuantKind::TurboQuant { bits: 1 },
+            "tq2" => QuantKind::TurboQuant { bits: 2 },
+            "tq4" => QuantKind::TurboQuant { bits: 4 },
+            _ => QuantKind::Int8,
+        },
+        Err(_) => QuantKind::Int8,
+    }
+}
+
+/// Wire string for a RW tier kind. Non-RW tiers fall back to `int8`.
+fn tier_str(t: QuantKind) -> &'static str {
+    match t {
+        QuantKind::TurboQuant { bits: 1 } => "tq1",
+        QuantKind::TurboQuant { bits: 2 } => "tq2",
+        QuantKind::TurboQuant { bits: 4 } => "tq4",
+        _ => "int8",
+    }
+}
+
+fn write_tier(dir: &Path, t: QuantKind) -> io::Result<()> {
+    std::fs::write(dir.join(TIER_FILE), tier_str(t))
+}
 const GRAPH_MAGIC: u32 = 0x4E_4D_56_47; // "GVMN"
 const VEC_MAGIC: u32 = 0x4E_49_42_56; // "VBIN"
 const FORMAT_VERSION: u32 = 1;
@@ -1004,16 +1069,33 @@ impl std::ops::Deref for NodeBacking {
 /// in `vectors.bin`. Live inserts land in an in-RAM `delta` (a small flat
 /// buffer); a search merges a graph walk over the main with a flat scan of
 /// the delta. `consolidate` folds the delta back into a fresh on-disk graph.
-pub struct DiskVamanaIndex {
-    dim: usize,
+/// An immutable on-disk Vamana segment: the graph, its in-RAM quantized tier,
+/// the external-id mapping, and the f32 `vectors.bin` it re-ranks against. The
+/// index holds one base segment today; the LSM design folds streaming writes
+/// into additional segments (runs) without ever mutating an existing one.
+struct Segment {
     main_n: u32,
     nodes: NodeBacking,
     ids: Vec<u64>,
     id_to_main_row: AHashMap<u64, VecId>,
     medoid: VecId,
-    l_search: usize,
     quant: QuantizedVectors,
     vectors_file: File,
+}
+
+pub struct DiskVamanaIndex {
+    dim: usize,
+    l_search: usize,
+    /// The immutable base segment. Future LSM runs join it as more segments.
+    base: Segment,
+    /// Additional immutable LSM runs, searched alongside `base`. Streaming
+    /// writes flush from the delta into runs; `consolidate` folds them back.
+    runs: Vec<Segment>,
+    /// Tier-1 quantiser, kept so a `flush` builds runs with the same tier as
+    /// the base (and so `consolidate` reopens with it).
+    tier: QuantKind,
+    /// Monotonic run-directory counter, so flushed run dirs never collide.
+    run_seq: u64,
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
@@ -1040,7 +1122,7 @@ impl DiskVamanaIndex {
     /// Panics if the two files disagree on `n` or `dim`.
     #[allow(clippy::cast_possible_truncation)] // row < n, and n was read as a u32
     pub fn open(dir: &Path) -> io::Result<DiskVamanaIndex> {
-        Self::open_with_tier(dir, QuantKind::Int8)
+        Self::open_with_tier(dir, read_tier(dir))
     }
 
     /// Like [`open`](Self::open) but with an explicit tier-1 quantisation:
@@ -1269,14 +1351,19 @@ impl DiskVamanaIndex {
 
         let mut index = DiskVamanaIndex {
             dim,
-            main_n: n,
-            nodes,
-            ids,
-            id_to_main_row,
-            medoid,
             l_search,
-            quant,
-            vectors_file,
+            base: Segment {
+                main_n: n,
+                nodes,
+                ids,
+                id_to_main_row,
+                medoid,
+                quant,
+                vectors_file,
+            },
+            runs: Vec::new(),
+            tier,
+            run_seq: 0,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             tombstones: AHashSet::new(),
@@ -1284,7 +1371,25 @@ impl DiskVamanaIndex {
             delta_log,
         };
         index.replay_wal(&wal);
+        // Runs flushed before a restart are not reloaded; the WAL replay above
+        // already put their vectors back in L0, so the stale dirs are redundant
+        // (and would collide with `run-0` of this session). See the flush ADR.
+        index.clean_stale_runs();
         Ok(index)
+    }
+
+    /// Best-effort removal of leftover `run-*` directories from a prior session.
+    /// They are rebuildable from the WAL, so a failure to remove one is not
+    /// fatal to opening the index.
+    fn clean_stale_runs(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("run-") {
+                let _ = std::fs::remove_dir_all(entry.path()); // stale, rebuildable
+            }
+        }
     }
 
     /// Replay the delta WAL into the in-RAM delta. Tolerant of a truncated
@@ -1355,8 +1460,30 @@ impl DiskVamanaIndex {
     ///
     /// Panics if `dim == 0`.
     pub fn create_empty(dir: &Path, dim: usize, l_search: usize) -> io::Result<DiskVamanaIndex> {
+        Self::create_empty_with_tier(dir, dim, l_search, QuantKind::Int8)
+    }
+
+    /// Like [`create_empty`](Self::create_empty) but pins the RW tier-1 quantiser
+    /// (persisted in `tier.kind`, so every later `open`/`consolidate` rebuilds it).
+    /// `Int8` (default) or `TurboQuant { bits }` for sub-int8 RAM on live writes;
+    /// `Pq` is rejected here (it needs a trained codebook, so it stays serve-only).
+    ///
+    /// # Errors
+    ///
+    /// I/O errors writing the initial files.
+    pub fn create_empty_with_tier(
+        dir: &Path,
+        dim: usize,
+        l_search: usize,
+        tier: QuantKind,
+    ) -> io::Result<DiskVamanaIndex> {
         assert!(dim > 0, "dim must be positive");
+        assert!(
+            matches!(tier, QuantKind::Int8 | QuantKind::TurboQuant { .. }),
+            "RW disk tier must be int8 or turboquant; pq/f32/binary are not incrementally rebuildable here"
+        );
         std::fs::create_dir_all(dir)?;
+        write_tier(dir, tier)?;
         write_graph_vmn(&dir.join(GRAPH_FILE), 0, dim, 0, MAX_R, l_search, &[], &[])?;
         write_vectors_bin(
             &dir.join(VECTORS_FILE),
@@ -1393,14 +1520,14 @@ impl DiskVamanaIndex {
     /// Number of vectors in the consolidated main graph.
     #[must_use]
     pub fn main_len(&self) -> usize {
-        self.main_n as usize
+        self.base.main_n as usize
     }
 
     /// Graph entry point (the approximate medoid). Used by an external walk
     /// that drives the graph with its own proxy distance (the PQ-tier gate).
     #[must_use]
     pub fn medoid(&self) -> VecId {
-        self.medoid
+        self.base.medoid
     }
 
     /// Out-edges of node `id`. Used by an external walk that drives the graph
@@ -1411,17 +1538,21 @@ impl DiskVamanaIndex {
     /// Panics if `id` is out of range.
     #[must_use]
     pub fn neighbors(&self, id: VecId) -> &[VecId] {
-        self.nodes[id as usize].slice()
+        self.base.nodes[id as usize].slice()
     }
 
     /// Bytes held in RAM: graph + ids + int8 tier + the (small) f32 delta.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         let delta_bytes: usize = self.delta.values().map(|v| v.len() * 4 + 24).sum();
-        self.nodes.len() * std::mem::size_of::<Node>()
-            + self.ids.len() * std::mem::size_of::<u64>()
-            + self.id_to_main_row.len() * 16
-            + self.quant.memory_bytes()
+        let seg_bytes = |s: &Segment| {
+            s.nodes.len() * std::mem::size_of::<Node>()
+                + s.ids.len() * std::mem::size_of::<u64>()
+                + s.id_to_main_row.len() * 16
+                + s.quant.memory_bytes()
+        };
+        seg_bytes(&self.base)
+            + self.runs.iter().map(seg_bytes).sum::<usize>()
             + delta_bytes
             + self.tombstones.len() * 8
     }
@@ -1429,7 +1560,9 @@ impl DiskVamanaIndex {
     /// True if `id` currently resolves to a live vector.
     fn is_live(&self, id: u64) -> bool {
         !self.tombstones.contains(&id)
-            && (self.delta.contains_key(&id) || self.id_to_main_row.contains_key(&id))
+            && (self.delta.contains_key(&id)
+                || self.base.id_to_main_row.contains_key(&id)
+                || self.runs.iter().any(|r| r.id_to_main_row.contains_key(&id)))
     }
 
     /// True if `id` is a live (non-tombstoned) vector in this index. Cheap,
@@ -1438,6 +1571,46 @@ impl DiskVamanaIndex {
     #[must_use]
     pub fn contains(&self, id: u64) -> bool {
         self.is_live(id)
+    }
+
+    /// Every live (non-tombstoned) vector id: main ids plus streaming-delta
+    /// ids, minus tombstones. Used to reclaim per-id sidecar state (e.g.
+    /// payload blobs) when the whole index is dropped. In-memory, no disk read.
+    #[must_use]
+    pub fn live_ids(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .base
+            .ids
+            .iter()
+            .copied()
+            .chain(self.runs.iter().flat_map(|r| r.ids.iter().copied()))
+            .chain(self.delta.keys().copied())
+            .filter(|id| !self.tombstones.contains(id))
+            .collect();
+        // A delta overwrite of a main id appears in both sources; dedup.
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Exact top-`k` `(id, cosine)` over just the candidate `ids`, the
+    /// brute-force path a filtered search takes once a predicate has narrowed
+    /// the corpus. Full-precision f32 cosine (one disk read per main-resident
+    /// id), so the result is exact. Non-live or unknown ids are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading a stored vector fails.
+    pub fn score_ids(&self, query: &[f32], ids: &[u64], k: usize) -> io::Result<Vec<(u64, f32)>> {
+        let mut scored: Vec<(u64, f32)> = Vec::new();
+        for &id in ids {
+            if let Some(v) = self.get(id)? {
+                scored.push((id, cosine_f32(query, &v)));
+            }
+        }
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(k);
+        Ok(scored)
     }
 
     /// Insert or overwrite the vector for `id`. The vector lands in the in-RAM
@@ -1462,6 +1635,11 @@ impl DiskVamanaIndex {
         }
         self.delta_log.write_all(&rec)?;
         self.apply_insert(id, vector.to_vec());
+        // Keep the brute-forced L0 small: once it fills, fold it into a
+        // navigable run so search stays sub-linear between consolidations.
+        if self.delta.len() >= Self::FLUSH {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -1491,17 +1669,23 @@ impl DiskVamanaIndex {
         if let Some(v) = self.delta.get(&id) {
             return Ok(Some(v.clone()));
         }
-        match self.id_to_main_row.get(&id) {
-            Some(&row) => Ok(Some(self.read_vector(row)?)),
-            None => Ok(None),
+        if let Some(&row) = self.base.id_to_main_row.get(&id) {
+            return Ok(Some(self.read_vector(&self.base, row)?));
         }
+        // Newest run wins on a shadowed id; runs are searched after the base.
+        for run in &self.runs {
+            if let Some(&row) = run.id_to_main_row.get(&id) {
+                return Ok(Some(self.read_vector(run, row)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Read one f32 vector from `vectors.bin` by positioned read.
-    fn read_vector(&self, id: VecId) -> io::Result<Vec<f32>> {
+    fn read_vector(&self, seg: &Segment, id: VecId) -> io::Result<Vec<f32>> {
         let offset = HEADER_LEN as u64 + u64::from(id) * self.dim as u64 * 4;
         let mut buf = vec![0u8; self.dim * 4];
-        self.vectors_file.read_exact_at(&mut buf, offset)?;
+        seg.vectors_file.read_exact_at(&mut buf, offset)?;
         Ok(buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1535,92 +1719,211 @@ impl DiskVamanaIndex {
     /// # Panics
     ///
     /// Panics if `query.len()` does not equal the index dimension.
-    #[allow(clippy::cast_precision_loss)] // proxy is an ordering key, exact value irrelevant
     pub fn search_with_l(
         &self,
         query: &[f32],
         k: usize,
         l_search: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
+        self.search_inner(query, k, l_search, None, &[], 1.0)
+    }
+
+    /// Filtered search: only ids for which `matches` returns true enter the
+    /// result. Oversamples the frontier and reranks all of it so enough matching
+    /// candidates survive the post-filter. `seeds` are external ids drawn from
+    /// the matching set; the walk also starts from them (mapped to graph rows)
+    /// so it begins inside the matching region rather than only at the medoid -
+    /// the fix for filters whose matches cluster away from the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a re-rank read from `vectors.bin` fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not equal the index dimension.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: usize,
+        matches: &dyn Fn(u64) -> bool,
+        seeds: &[u64],
+        selectivity: f32,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        self.search_inner(query, k, l_search, Some(matches), seeds, selectivity)
+    }
+
+    /// Shared search core. `matches == None` is the plain ANN search; `Some`
+    /// keeps only matching ids. `selectivity` = |matching| / live is the walk
+    /// planner's input: a DENSE filter (matches everywhere) needs only a single
+    /// navigate-all walk + filter-at-rerank (~plain-search cost), while a SPARSE
+    /// one needs the oversampled admit-gated + navigate-all two-walk.
+    #[allow(clippy::cast_precision_loss)] // proxy is an ordering key, exact value irrelevant
+    fn search_inner(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: usize,
+        matches: Option<&dyn Fn(u64) -> bool>,
+        seeds: &[u64],
+        selectivity: f32,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        /// Frontier blow-up for a SPARSE filtered walk, so the post-filter still
+        /// leaves enough matching candidates. Capped at the main graph size.
+        const FILTER_OVERSAMPLE: usize = 4;
+        /// At or above this matching fraction, the filter is "dense": matches sit
+        /// near the query, so one navigate-all walk + filter-at-rerank suffices.
+        const DENSE_SELECTIVITY: f32 = 0.10;
+        let dense = matches.is_some() && selectivity >= DENSE_SELECTIVITY;
         assert_eq!(query.len(), self.dim, "query dim mismatch");
+        let filtered = matches.is_some();
         if self.live_count == 0 || k == 0 {
             return Ok(Vec::new());
         }
         let mut scored: Vec<(OrderedFloat<f32>, u64)> = Vec::new();
 
-        // Main graph walk over the int8 tier (skipped entirely if main is empty).
-        if self.main_n > 0 {
-            let code = self.quant.quantize_query(&normalized(query));
-            let base = if l_search == 0 {
-                self.l_search
+        // Graph walk over every segment (the base plus any LSM runs); each
+        // contributes candidates that merge into `scored`. An empty segment is
+        // skipped. The delta is brute-forced once below.
+        // Per-segment WALK (in-RAM, cheap) collects proxy-ranked candidate rows
+        // tagged with their segment; one GLOBAL re-rank below bounds the disk
+        // reads regardless of how many segments (base + runs) there are. This is
+        // what keeps query latency flat as the LSM accumulates runs.
+        let segs: Vec<&Segment> = std::iter::once(&self.base)
+            .chain(self.runs.iter())
+            .collect();
+        // Global re-rank budget (disk reads). Bounded so latency tracks `k`, not
+        // the corpus size or the segment count.
+        let rerank = if filtered {
+            if dense {
+                ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
             } else {
-                l_search
+                (k * 8).max(64)
+            }
+        } else {
+            (k * 4).max(32)
+        };
+        let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
+        for (seg_idx, seg) in segs.iter().enumerate() {
+            if seg.main_n == 0 {
+                continue;
+            }
+            let code = seg.quant.quantize_query(&normalized(query));
+            // The base (segment 0) carries the deep beam. Runs are small and only
+            // feed the global re-rank, so they walk a shallow list - this keeps
+            // query latency flat as runs accumulate, instead of paying a full
+            // l_search beam per run.
+            let walk_base = if seg_idx == 0 {
+                if l_search == 0 {
+                    self.l_search
+                } else {
+                    l_search
+                }
+            } else {
+                (k * 4).max(16)
             };
-            let list_size = base.max(k);
-            let rerank = (k * 4).max(32).min(list_size);
-            let mut visited = VisitedBitset::new(self.main_n as usize);
-            let mut seen = VisitedBitset::new(self.main_n as usize);
-            // Early-term signature tracks the re-rank candidate pool (top-rerank),
-            // not just top-k: the graph walk feeds the re-rank, and stability of
-            // the wider pool is what guarantees the final top-k is unchanged.
-            let early = speed_enabled().then_some(EarlyTerm {
+            // A sparse filtered walk oversamples the frontier so the post-filter
+            // still leaves enough matches; a dense or plain walk does not.
+            let list_size = if filtered && !dense {
+                (walk_base.max(k) * FILTER_OVERSAMPLE).min(seg.main_n as usize)
+            } else {
+                walk_base.max(k)
+            };
+            let early = (!filtered && speed_enabled()).then_some(EarlyTerm {
                 k: rerank,
                 window: 5,
             });
-            let walk_span = tracing::info_span!(
-                "vsearch.walk",
-                list_size,
-                rerank,
-                early = early.is_some(),
-                visited = tracing::field::Empty,
-                returned = tracing::field::Empty,
-            );
-            let list = {
-                let _g = walk_span.enter();
-                let list = greedy_search(
-                    self.medoid,
+            let mut visited = VisitedBitset::new(seg.main_n as usize);
+            let mut seen = VisitedBitset::new(seg.main_n as usize);
+            // Medoid plus, for a filtered walk, matching seed rows so the walk can
+            // start inside a matching cluster that sits away from the query.
+            let mut seed_rows: Vec<VecId> = vec![seg.medoid];
+            for &id in seeds {
+                if let Some(&r) = seg.id_to_main_row.get(&id)
+                    && !self.tombstones.contains(&id)
+                {
+                    seed_rows.push(r);
+                }
+            }
+            let dist = |id: VecId| -(seg.quant.proxy(id as usize, &code) as f32);
+            let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
+                seg.nodes[id as usize].slice().iter().copied().collect()
+            };
+            let mut cand: Vec<(f32, VecId)> = Vec::new();
+            let mut walk = |seeds: &[VecId],
+                            admit: Option<&dyn Fn(VecId) -> bool>,
+                            early: Option<EarlyTerm>| {
+                greedy_search(
+                    seeds,
                     list_size,
                     early,
-                    |id| -(self.quant.proxy(id as usize, &code) as f32),
-                    |id| self.nodes[id as usize].slice().iter().copied().collect(),
+                    dist,
+                    nbrs,
+                    admit,
                     &mut visited,
                     &mut seen,
                     None,
-                );
-                walk_span.record("visited", visited.iter().count());
-                walk_span.record("returned", list.iter().count());
-                list
+                )
             };
-            let rerank_span = tracing::info_span!(
-                "vsearch.rerank",
-                candidates = tracing::field::Empty,
-                disk_reads = tracing::field::Empty,
-                skipped = tracing::field::Empty,
-            );
-            let _rg = rerank_span.enter();
-            let mut disk_reads: usize = 0;
-            let mut skipped: usize = 0;
-            let mut candidates: usize = 0;
-            for (_, vec_id) in list.iter().take(rerank) {
-                candidates += 1;
-                let id = self.ids[vec_id as usize];
-                // Skip if tombstoned or superseded by a delta entry.
-                if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
-                    skipped += 1;
-                    continue;
-                }
-                let v = self.read_vector(vec_id)?;
-                disk_reads += 1;
-                scored.push((OrderedFloat(cosine_f32(query, &v)), id));
+            if filtered && !dense {
+                // Two walks unioned (see history): an admit-gated walk recovers
+                // clustered matches, a navigate-all walk recovers scattered ones.
+                let admit = |row: VecId| -> bool {
+                    let id = seg.ids[row as usize];
+                    !self.tombstones.contains(&id)
+                        && !self.delta.contains_key(&id)
+                        && matches.is_none_or(|m| m(id))
+                };
+                cand.extend(walk(&seed_rows, Some(&admit), None).iter());
+                cand.extend(walk(&[seg.medoid], None, None).iter());
+            } else {
+                let walk_early = if dense { None } else { early };
+                cand.extend(walk(&seed_rows, None, walk_early).iter());
             }
-            rerank_span.record("candidates", candidates);
-            rerank_span.record("disk_reads", disk_reads);
-            rerank_span.record("skipped", skipped);
+            for (proxy, row) in cand {
+                all_cand.push((proxy, seg_idx, row));
+            }
         }
+        // Global re-rank: best-by-proxy first across every segment, bounded disk
+        // reads, dedup by id (a later segment can re-surface the same id).
+        all_cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let rerank_span = tracing::info_span!(
+            "vsearch.rerank",
+            candidates = all_cand.len(),
+            disk_reads = tracing::field::Empty,
+        );
+        let _rg = rerank_span.enter();
+        let mut disk_reads: usize = 0;
+        let mut reranked_ids: AHashSet<u64> = AHashSet::new();
+        for (_, seg_idx, row) in all_cand {
+            if disk_reads >= rerank {
+                break;
+            }
+            let seg = segs[seg_idx];
+            let id = seg.ids[row as usize];
+            if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
+                continue;
+            }
+            if let Some(m) = matches
+                && !m(id)
+            {
+                continue;
+            }
+            if !reranked_ids.insert(id) {
+                continue;
+            }
+            let v = self.read_vector(seg, row)?;
+            disk_reads += 1;
+            scored.push((OrderedFloat(cosine_f32(query, &v)), id));
+        }
+        rerank_span.record("disk_reads", disk_reads);
 
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
         for (&id, v) in &self.delta {
-            scored.push((OrderedFloat(cosine_f32(query, v)), id));
+            if matches.is_none_or(|m| m(id)) {
+                scored.push((OrderedFloat(cosine_f32(query, v)), id));
+            }
         }
 
         scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
@@ -1648,16 +1951,23 @@ impl DiskVamanaIndex {
     pub fn search_node_trace(&self, query: &[f32]) -> io::Result<Vec<VecId>> {
         assert_eq!(query.len(), self.dim, "query dim mismatch");
         let mut trace = Vec::new();
-        if self.main_n > 0 {
-            let code = self.quant.quantize_query(&normalized(query));
-            let mut visited = VisitedBitset::new(self.main_n as usize);
-            let mut seen = VisitedBitset::new(self.main_n as usize);
+        if self.base.main_n > 0 {
+            let code = self.base.quant.quantize_query(&normalized(query));
+            let mut visited = VisitedBitset::new(self.base.main_n as usize);
+            let mut seen = VisitedBitset::new(self.base.main_n as usize);
             greedy_search(
-                self.medoid,
+                &[self.base.medoid],
                 self.l_search,
                 None, // trace: want the full walk, no early termination
-                |id| -(self.quant.proxy(id as usize, &code) as f32),
-                |id| self.nodes[id as usize].slice().iter().copied().collect(),
+                |id| -(self.base.quant.proxy(id as usize, &code) as f32),
+                |id| {
+                    self.base.nodes[id as usize]
+                        .slice()
+                        .iter()
+                        .copied()
+                        .collect()
+                },
+                None, // trace: no filter admission
                 &mut visited,
                 &mut seen,
                 Some(&mut trace),
@@ -1673,17 +1983,17 @@ impl DiskVamanaIndex {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // node count is a u32
     pub fn bfs_order(&self) -> Vec<VecId> {
-        let n = self.main_n as usize;
+        let n = self.base.main_n as usize;
         let mut order = Vec::with_capacity(n);
         let mut seen = vec![false; n];
         let mut queue = std::collections::VecDeque::new();
         if n > 0 {
-            seen[self.medoid as usize] = true;
-            queue.push_back(self.medoid);
+            seen[self.base.medoid as usize] = true;
+            queue.push_back(self.base.medoid);
         }
         while let Some(cur) = queue.pop_front() {
             order.push(cur);
-            for &nbr in self.nodes[cur as usize].slice() {
+            for &nbr in self.base.nodes[cur as usize].slice() {
                 if !seen[nbr as usize] {
                     seen[nbr as usize] = true;
                     queue.push_back(nbr);
@@ -1700,41 +2010,125 @@ impl DiskVamanaIndex {
         order
     }
 
-    /// Fold the delta and tombstones back into a fresh on-disk graph: rebuild
-    /// over the live set, re-save, and re-open. Heavy - meant for a background
-    /// task. A no-op if there is nothing live.
+    /// L0 (delta) size that triggers a flush into a navigable run. Small, so a
+    /// flush is a cheap few-thousand-vector bulk build and the brute-forced
+    /// delta search never grows large.
+    const FLUSH: usize = 4096;
+
+    /// Build the L0 delta into a fresh immutable run and clear L0. A pure
+    /// in-process optimisation: the WAL is left intact, so a crash mid-flush
+    /// loses nothing (the run is rebuildable from the WAL). See
+    /// `docs/adr-incremental-flush.md`. No-op when L0 is empty.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if rebuilding or re-saving fails.
-    pub fn consolidate(&mut self) -> io::Result<()> {
-        let mut vectors: Vec<f32> = Vec::new();
-        let mut ids: Vec<u64> = Vec::new();
-        // Live main vectors not shadowed by the delta.
-        for row in 0..self.main_n {
-            let id = self.ids[row as usize];
-            if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
-                continue;
-            }
-            vectors.extend(self.read_vector(row)?);
-            ids.push(id);
+    /// Returns an I/O error if building, saving, or opening the run fails.
+    fn flush(&mut self) -> io::Result<()> {
+        if self.delta.is_empty() {
+            return Ok(());
         }
-        // Delta vectors (always live).
+        let mut vectors: Vec<f32> = Vec::with_capacity(self.delta.len() * self.dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(self.delta.len());
         for (&id, v) in &self.delta {
             vectors.extend_from_slice(v);
             ids.push(id);
         }
-        if ids.is_empty() {
+        let run_dir = self.dir.join(format!("run-{}", self.run_seq));
+        self.run_seq += 1;
+        let rebuilt = VamanaIndex::build(vectors, ids, self.dim, &disk_build_config());
+        rebuilt.save(&run_dir)?;
+        // Open the run with this index's tier and keep only its base segment; the
+        // rest of the opened index (an empty delta/WAL over the run dir) is dropped.
+        let run = DiskVamanaIndex::open_with_tier(&run_dir, self.tier)?;
+        self.runs.push(run.base);
+        self.delta.clear();
+        Ok(())
+    }
+
+    /// Delete every flushed run directory and drop the in-RAM runs. Called once
+    /// `consolidate` has folded them into a fresh base.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a run directory cannot be removed.
+    fn discard_runs(&mut self) -> io::Result<()> {
+        for seq in 0..self.run_seq {
+            let d = self.dir.join(format!("run-{seq}"));
+            if d.exists() {
+                std::fs::remove_dir_all(&d)?;
+            }
+        }
+        self.runs.clear();
+        Ok(())
+    }
+
+    /// Fold the base, every run, the delta, and tombstones into one fresh
+    /// on-disk graph, then re-open. The newest version of each id wins (delta,
+    /// then runs newest-to-oldest, then base); tombstoned ids are dropped.
+    /// Heavy - meant for a background task. A no-op if nothing is live.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if rebuilding, re-saving, or re-opening fails.
+    pub fn consolidate(&mut self) -> io::Result<()> {
+        let dim = self.dim;
+        // Collect the surviving (id, location) refs only - ~24 B each, not the
+        // full 2 GB of vectors. Precedence (newest wins): delta > runs (newest
+        // first) > base; `seen` keeps each id once, tombstoned ids never enter.
+        // `loc`: usize::MAX => delta, else index into `segs` (0 = base, 1.. = runs).
+        let segs: Vec<&Segment> = std::iter::once(&self.base)
+            .chain(self.runs.iter())
+            .collect();
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        for &id in self.delta.keys() {
+            if seen.insert(id) {
+                survivors.push((id, usize::MAX, 0));
+            }
+        }
+        for (ri, run) in self.runs.iter().enumerate().rev() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                survivors.push((id, ri + 1, row));
+            }
+        }
+        for row in 0..self.base.main_n {
+            let id = self.base.ids[row as usize];
+            if self.tombstones.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            survivors.push((id, 0, row));
+        }
+        if survivors.is_empty() {
             return Ok(());
         }
-        let dim = self.dim;
+        // Rebuild in id order so a query's near-neighbours land at nearby
+        // vectors.bin rows and the re-rank's f32 reads stay cache-local. Without
+        // it the fold order scatters them and 500k+ search latency regresses ~1.5x
+        // (root-caused: the re-rank is disk-read bound at scale).
+        survivors.sort_unstable_by_key(|&(id, _, _)| id);
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
+        for (id, loc, row) in survivors {
+            if loc == usize::MAX {
+                vectors.extend_from_slice(&self.delta[&id]);
+            } else {
+                vectors.extend(self.read_vector(segs[loc], row)?);
+            }
+            ids.push(id);
+        }
         let dir = self.dir.clone();
-        let rebuilt = VamanaIndex::build(vectors, ids, dim, &VamanaConfig::default());
+        let tier = self.tier;
+        let rebuilt = VamanaIndex::build(vectors, ids, dim, &disk_build_config());
         rebuilt.save(&dir)?;
-        // The delta is now folded into the graph: the WAL must start empty so
-        // the reopen below does not replay stale records.
+        self.discard_runs()?;
+        // The delta + runs are now folded into the graph: the WAL must start
+        // empty so the reopen below does not replay stale records.
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
-        *self = DiskVamanaIndex::open(&dir)?;
+        *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         Ok(())
     }
 }
@@ -1878,11 +2272,12 @@ mod tests {
         let mut visited = VisitedBitset::new(n);
         let mut seen = VisitedBitset::new(n);
         let list = greedy_search(
-            0,
+            &[0],
             50,
             None,
             |id| dist(&query, row(&vectors, id, dim)),
             |id| nodes[id as usize].slice().iter().copied().collect(),
+            None,
             &mut visited,
             &mut seen,
             None,
@@ -1908,9 +2303,9 @@ mod tests {
 
         assert_eq!(disk.len(), index.len());
         assert_eq!(disk.dim(), dim);
-        assert_eq!(disk.medoid, index.medoid);
-        assert_eq!(disk.ids, ids);
-        for (a, b) in disk.nodes.iter().zip(index.nodes.iter()) {
+        assert_eq!(disk.base.medoid, index.medoid);
+        assert_eq!(disk.base.ids, ids);
+        for (a, b) in disk.base.nodes.iter().zip(index.nodes.iter()) {
             assert_eq!(a.degree, b.degree, "node degree must survive the roundtrip");
             assert_eq!(
                 a.slice(),
@@ -1951,6 +2346,123 @@ mod tests {
         assert!(
             recall >= 0.95,
             "on-disk Vamana recall@10 = {recall:.4} (target >= 0.95)"
+        );
+    }
+
+    // RW disk index with a TurboQuant tier: the live write path (create -> insert
+    // via delta -> consolidate) rebuilds a tq2 tier, the kind survives a reopen
+    // (persisted in tier.kind), search recall holds, and the tier is leaner in RAM
+    // than int8. This is "lean live writes": sub-int8 RAM WITHOUT a trained codebook.
+    #[test]
+    fn disk_rw_turboquant_tier() {
+        let dim = 64;
+        let n = 2000;
+        let vectors = random_vectors(n, dim, 42);
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mut tq = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            100,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        for id in 0..n {
+            tq.insert(id as u64, row(&vectors, id as u32, dim)).unwrap();
+        }
+        tq.consolidate().unwrap();
+        // tier.kind persisted: a fresh `open` (no explicit tier) rebuilds tq2.
+        drop(tq);
+        let tq = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(tq.len(), n, "all vectors live after RW tq build");
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut hits = 0;
+        let mut total = 0;
+        for _ in 0..50 {
+            let q: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+            let want = brute_force(&vectors, dim, &q, 10);
+            let got: Vec<u64> = tq
+                .search(&q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            hits += got.iter().filter(|id| want.contains(id)).count();
+            total += want.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.90,
+            "tq2 RW recall@10 = {recall:.4} (target >= 0.90)"
+        );
+
+        // The tq2 tier (dim/4 bytes/vec) is leaner in RAM than int8 (dim bytes/vec).
+        let i8dir = tmp.path().join("i8");
+        let mut i8 =
+            DiskVamanaIndex::create_empty_with_tier(&i8dir, dim, 100, QuantKind::Int8).unwrap();
+        for id in 0..n {
+            i8.insert(id as u64, row(&vectors, id as u32, dim)).unwrap();
+        }
+        i8.consolidate().unwrap();
+        assert!(
+            tq.resident_bytes() < i8.resident_bytes(),
+            "tq2 RAM {} should be < int8 RAM {}",
+            tq.resident_bytes(),
+            i8.resident_bytes()
+        );
+    }
+
+    // Filtered walk recall: against the exact top-10 over the matching subset
+    // (the ground truth), the oversampled filtered walk recovers >= 0.90 at a
+    // low-selectivity (~50%) filter, and never returns a non-matching id.
+    #[test]
+    fn disk_filtered_search_recall() {
+        let dim = 64;
+        let n = 1000;
+        let vectors = random_vectors(n, dim, 42);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let index = VamanaIndex::build(vectors.clone(), ids, dim, &VamanaConfig::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        index.save(tmp.path()).unwrap();
+        let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+
+        let matches = |id: u64| id % 2 == 0; // even ids, ~50% selectivity
+        // A handful of matching ids spread across the set, used as walk seeds.
+        let seeds: Vec<u64> = (0..n as u64)
+            .filter(|&id| matches(id))
+            .step_by(64)
+            .collect();
+        let mut rng = StdRng::seed_from_u64(777);
+        let mut hits = 0;
+        let mut total = 0;
+        for _ in 0..50 {
+            let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+            // Ground truth: exact top-10 cosine over just the matching ids.
+            let mut scored: Vec<(f32, u64)> = (0..n as u64)
+                .filter(|&id| matches(id))
+                .map(|id| (cosine_f32(&query, row(&vectors, id as u32, dim)), id))
+                .collect();
+            scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            let want: Vec<u64> = scored.iter().take(10).map(|&(_, id)| id).collect();
+
+            let got: Vec<u64> = disk
+                .search_filtered(&query, 10, 0, &matches, &seeds, 0.5)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                got.iter().all(|&id| matches(id)),
+                "filtered walk returned a non-matching id"
+            );
+            hits += got.iter().filter(|id| want.contains(id)).count();
+            total += want.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.90,
+            "filtered walk recall@10 = {recall:.4} (target >= 0.90)"
         );
     }
 
@@ -2179,6 +2691,90 @@ mod tests {
         );
         let hits = disk.search(&v_a, 1).unwrap();
         assert_eq!(hits[0].0, 5000, "the WAL-recovered vector is searchable");
+    }
+
+    // Insert past the L0 flush threshold so at least one run is built; returns
+    // the corpus so callers can probe specific vectors.
+    fn fill_past_flush(disk: &mut DiskVamanaIndex, n: usize, dim: usize) -> Vec<f32> {
+        let vectors = random_vectors(n, dim, 7);
+        for id in 0..n {
+            disk.insert(id as u64, &vectors[id * dim..(id + 1) * dim])
+                .unwrap();
+        }
+        vectors
+    }
+
+    #[test]
+    fn disk_flush_builds_a_run_and_stays_searchable() {
+        let (dim, n) = (16, 5000); // > FLUSH (4096): one flush fires
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        let vectors = fill_past_flush(&mut disk, n, dim);
+
+        assert!(!disk.runs.is_empty(), "a flush must have built a run");
+        assert!(disk.delta.len() < 4096, "L0 stayed bounded after flushing");
+        assert_eq!(disk.len(), n, "every inserted vector is live");
+        let q = &vectors[100 * dim..101 * dim];
+        assert_eq!(
+            disk.search(q, 1).unwrap()[0].0,
+            100,
+            "a flushed vector is its own NN"
+        );
+    }
+
+    #[test]
+    fn disk_consolidate_folds_runs_into_base() {
+        let (dim, n) = (16, 5000);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        let vectors = fill_past_flush(&mut disk, n, dim);
+        disk.consolidate().unwrap();
+
+        assert!(disk.runs.is_empty(), "consolidate clears the runs");
+        assert_eq!(
+            disk.base.main_n as usize, n,
+            "all vectors folded into the base"
+        );
+        assert_eq!(disk.len(), n);
+        let run_dirs = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+            .count();
+        assert_eq!(run_dirs, 0, "run directories are removed once folded in");
+        let q = &vectors[4500 * dim..4501 * dim];
+        assert_eq!(
+            disk.search(q, 1).unwrap()[0].0,
+            4500,
+            "search exact after consolidate"
+        );
+    }
+
+    #[test]
+    fn disk_reopen_after_flush_recovers_via_wal() {
+        let (dim, n) = (16, 5000);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vectors = {
+            let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+            let v = fill_past_flush(&mut disk, n, dim);
+            assert!(!disk.runs.is_empty(), "flushed before drop");
+            v
+        }; // dropped: in-RAM runs gone, only the WAL + stale run dirs on disk
+
+        let disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(disk.len(), n, "WAL replay restores every flushed vector");
+        let q = &vectors[100 * dim..101 * dim];
+        assert_eq!(
+            disk.search(q, 1).unwrap()[0].0,
+            100,
+            "recovered vector is searchable"
+        );
+        let stale = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+            .count();
+        assert_eq!(stale, 0, "stale run dirs are cleaned on open");
     }
 
     #[test]

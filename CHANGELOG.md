@@ -7,6 +7,131 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.5.0] - unreleased
+
+### Added
+
+- **Filtered vector search.** A vector can carry an optional payload, and a
+  search can restrict its results to vectors whose payload matches a filter.
+  `SKEG.VSET <name> <id> <vector> [PAYLOAD <blob>]` stores an opaque blob beside
+  the vector (in the KV vLog under a reserved, tenant-scoped key, so the
+  quantized graph stays dense). `SKEG.VSEARCH <name> <k> <l_search> <query>
+  [WITHPAYLOAD] [FILTER <expr>]` returns the blob with each hit (`WITHPAYLOAD`)
+  and/or applies a payload filter (`FILTER`). The blob's `key=value` fields are
+  parsed into a per-index payload index; the filter grammar supports `field =
+  value`, `field IN (...)`, the ranges `>= > <= < BETWEEN a AND b`, `field
+  EXISTS`, and `AND` / `OR` / `NOT` with parentheses. A field repeated in a
+  payload is multi-valued (matches any of its values).
+
+- **Adaptive filtered-search planner.** A selective filter (small matching set)
+  is scored exactly over just the matching vectors. A broad filter runs a
+  filtered graph search: two complementary walks merged (one that explores only
+  the matching subgraph, one that navigates the whole graph and filters at
+  re-rank), so recall holds whether the matching vectors cluster together (real
+  metadata) or scatter. Validated on real 1024-dim embeddings at 100k and 500k:
+  recall@10 0.98 to 1.00 across selectivities and metadata shapes, at query time
+  with no extra build cost. The payload index is rebuilt from the stored blobs
+  on the first filtered search after a restart.
+
+- **TurboQuant tiers on the read-write disk path.** `SKEG.VINDEX.CREATE name dim
+  tq1|tq2|tq4 disk` builds a live-writable disk index whose resident tier is
+  TurboQuant (`dim*bits/8` bytes/vector) instead of int8. No trained codebook
+  (unlike PQ, which stays serve-only), so it works under streaming writes. The
+  tier kind persists in a sidecar and is rebuilt on open and consolidate. tq2 is
+  the recommended sweet spot (recall ~1.0, sub-int8 RAM, latency ~int8); tq1 is
+  the leanest but best-effort below 512d.
+
+- **`SKEG.VMSET` bulk insert.** One `name` followed by `(id, vector, payload)`
+  triples; the server fans the items out concurrently so durable payload writes
+  batch in the group committer. Combined with relaxed payload durability and a
+  geometric delta rebuild, 100k ingest dropped from 1928s to 28s.
+
+- **`SKEG.VINDEX.CONSOLIDATE name`** force-folds a disk index's delta into the
+  graph after a bulk load. Idle indexes also self-consolidate: a per-shard
+  background task folds a delta that has been stable across ticks, so an index
+  is lean by default without an explicit call.
+
+- **Vindex tiering control plane (mechanism, not policy).** A new
+  `Server::control_handle()` returns a `ControlHandle` for managing resident
+  vindexes out of band: `open_indices()` enumerates every open index per shard
+  with its `IndexStat` (resident bytes, last-access, vector count, whether it is
+  evictable), `total_resident_bytes()` sums the fleet, and `evict(tenant, index)`
+  drops an index from RAM **non-destructively** - the `vindex-<name>/` files stay
+  and the next access reopens it lazily. A disk-backed index reopens off the
+  shard thread (`spawn_blocking`), so a cold-start reopen does not stall other
+  indexes on the same shard. The eviction *policy* (RAM budget, LRU, hysteresis)
+  is left to an external controller; the engine ships only the knobs.
+
+- **tq2 is now the default tier.** `SKEG.VINDEX.CREATE name dim backend` (kind
+  omitted, 3 args) builds a tq2 disk index, and `--mode serve` without `--tier`
+  serves tq2. Validated recall-neutral vs int8 across 100-784d real embeddings
+  (r@10 >= 0.999, r@100 within 0.004) at lower RAM. Pass an explicit kind / `--tier
+  int8` for the prior full-fidelity tier. Behavior change on upgrade: an existing
+  serve deployment that relied on the implicit int8 default now serves tq2
+  (recall-neutral, leaner) unless it passes `--tier int8`.
+
+- **Per-command admission carries the command kind.** `TenantBackend::admit` now
+  takes an `Admission { tenant, op, cost }` (was `(tenant, cost)`), where `op` is
+  a coarse `CommandKind`. A backend can apply command-level RBAC (e.g. refuse
+  `VINDEX.DROP` for some tenants) and per-operation metering from one gate. Both
+  types are `#[non_exhaustive]`. Single-tenant deployments and the default
+  (admit-everything) backend are unaffected.
+
+### Changed
+
+- **Vindex RAM accounting (`VindexSizeBytes` gauge) is now tier-accurate.** Disk
+  indexes report their own `resident_bytes()` (graph + quantized tier + delta)
+  instead of an `n*dim` int8 estimate, so the gauge tracks tq1/tq2/tq4 correctly.
+
+- **Plain (non-filtered) search and writes are unchanged.** A VSET without
+  `PAYLOAD` does no extra work; a VSEARCH without `FILTER`/`WITHPAYLOAD` takes
+  the existing path byte-for-byte. The native binary protocol stays
+  payload/filter-free; RESP3 is the surface for the new feature.
+
+- **`ShardSet::vset` / `ShardSet::vsearch` gained parameters** (payload, the
+  tenant, `want_payload`, and an optional filter), and `skeg-vector` gained
+  `DiskVamanaIndex::search_filtered` / `score_ids` / `live_ids`. Library code on
+  these APIs must update its call sites, which is why `skeg-server` takes a minor
+  version bump.
+
+- **`TenantBackend::admit` signature changed** from `admit(tenant, cost)` to
+  `admit(Admission)`. Backends that override it must update; the default
+  (admit-everything) is unchanged, so single-tenant and non-overriding backends
+  need no change.
+
+### Versions bumped
+
+- `skeg-vector` 0.1.5, `skeg-resp3` 0.2.1, `skeg-server` 0.5.0,
+  `skeg-server-tenant` 0.2.1
+
+## [0.4.1] - 2026-06-15
+
+### Added
+
+- **Fair per-tenant cache eviction.** Per-tenant cache accounting already
+  shipped; eviction itself was tenant-blind, so under a noisy neighbour a
+  tenant with a large hot set could evict another tenant's small hot set in
+  FIFO order. The Main queue's victim selection is now share-aware: it
+  computes an equal share (`cache budget / active tenants`) once per
+  eviction and, when some tenant is over its share, briefly skips
+  under-share victims (bounded to 16 re-queues) to evict an over-share
+  tenant instead. The Small queue stays tenant-blind on purpose: it already
+  absorbs scan floods, so no fairness is needed there. A flooding tenant can
+  no longer starve a quiet tenant's working set out of the cache.
+
+### Changed
+
+- **Single-tenant and anonymous traffic is unchanged.** Fairness activates
+  only when more than one tenant is resident in a cache shard; with a single
+  tenant the eviction path is byte-identical to before and adds no
+  measurable overhead. The over-share scan is `O(active tenants)` once per
+  eviction but short-circuits on the first over-share tenant; a scaling
+  bench (1 to 10000 resident tenants) shows eviction cost stays flat.
+
+### Versions bumped
+
+- `skeg-core` 0.3.1, `skeg-server` 0.4.1
+
 ## [0.4.0] - 2026-06-14
 
 ### Added

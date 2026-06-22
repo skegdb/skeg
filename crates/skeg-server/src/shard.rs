@@ -12,8 +12,17 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Monotonic milliseconds since process start. Cheap; used to stamp a vindex's
+/// `last_access` for the tiering controller's LRU ordering.
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 /// How often each shard checks whether a segment needs compacting.
 const COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
@@ -21,8 +30,17 @@ const COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 /// How often each shard writes an index snapshot for fast recovery.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often a shard checks its disk vindexes for an idle delta to fold.
+const IDLE_CONSOLIDATE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Only fold an idle delta once it is at least this large; below this the flat
+/// scan is cheap and a rebuild would churn the graph for little gain.
+const IDLE_CONSOLIDATE_MIN: usize = 4096;
+
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
+
+use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -39,7 +57,53 @@ use xxhash_rust::xxh3::xxh3_64;
 /// **same** vindex still serialize, which is required for correctness:
 /// `VectorBackend::search` takes `&mut self` because the disk path
 /// mutates the working-set cache and the streaming-insert buffer.
-type VectorEntry = Arc<RwLock<VectorBackend>>;
+/// A vindex: the vector backend plus its payload index, behind one lock so a
+/// VSET updates both atomically and a filtered VSEARCH reads a consistent view.
+struct Vindex {
+    backend: VectorBackend,
+    payload: PayloadIndex,
+    /// True once the payload index reflects all stored blobs. A freshly created
+    /// vindex starts loaded (VSETs fill the index directly); a recovered one
+    /// starts unloaded and is rebuilt from the blobs on the first filtered
+    /// search (see `ensure_payload_loaded`).
+    payload_loaded: bool,
+    /// `now_ms()` of the last access (lookup via `get_or_reopen`). Drives the
+    /// tiering controller's LRU eviction ordering. Atomic so a stamp needs only
+    /// a shared borrow (no write lock on the read path).
+    last_access: AtomicU64,
+}
+
+impl Vindex {
+    fn new(backend: VectorBackend) -> Self {
+        Self {
+            backend,
+            payload: PayloadIndex::default(),
+            payload_loaded: true,
+            last_access: AtomicU64::new(now_ms()),
+        }
+    }
+
+    /// A vindex reopened from disk: its payload index is empty and must be
+    /// rebuilt from the stored blobs before a filtered search can use it.
+    fn recovered(backend: VectorBackend) -> Self {
+        Self {
+            payload_loaded: false,
+            ..Self::new(backend)
+        }
+    }
+
+    /// Stamp this vindex as accessed now.
+    fn touch(&self) {
+        self.last_access.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Milliseconds (process clock) of the last recorded access.
+    fn last_access_ms(&self) -> u64 {
+        self.last_access.load(Ordering::Relaxed)
+    }
+}
+
+type VectorEntry = Arc<RwLock<Vindex>>;
 type VindexSet = HashMap<String, VectorEntry>;
 
 /// Query-time search list size for a disk Vamana index.
@@ -74,20 +138,20 @@ impl VectorBackend {
         }
     }
 
-    /// Approximate RAM footprint of this vindex in bytes. Used to
-    /// refresh the `VindexSizeBytes` gauge from STATS. Cheap enough
-    /// (no allocation, just arithmetic on len/dim) to be polled.
+    /// RAM footprint of this vindex in bytes. Used to refresh the
+    /// `VindexSizeBytes` gauge from STATS. Cheap (arithmetic / a sum
+    /// over resident structures), safe to poll.
     ///
     /// Flat indexes carry the full f32 row buffer in RAM. Disk indexes
-    /// only keep tier-1 codes resident (int8 today = 1 byte per
-    /// coordinate); the graph and full f32 vectors live on disk and
-    /// are paged in by the OS, so they are not counted here.
+    /// keep graph + quantized tier + delta resident; the full f32
+    /// vectors live on disk and are paged in by the OS, so they are not
+    /// counted here. The disk number is the index's own deterministic
+    /// `resident_bytes()` (tier-accurate: int8 vs tq1/tq2/tq4), not a
+    /// process RSS sample.
     fn approx_ram_bytes(&self) -> u64 {
-        let n = self.len() as u64;
-        let d = self.dim() as u64;
         match self {
-            VectorBackend::Flat(_) => n * d * 4,
-            VectorBackend::Disk(_) => n * d, // int8 tier
+            VectorBackend::Flat(_) => self.len() as u64 * self.dim() as u64 * 4,
+            VectorBackend::Disk(i) => i.resident_bytes() as u64,
         }
     }
 
@@ -111,7 +175,18 @@ impl VectorBackend {
         }
     }
 
-    /// Insert a vector; a disk backend consolidates once its delta is full.
+    /// Insert a vector. A disk backend APPENDS it to the delta (cheap: buffer +
+    /// WAL, no graph work) and rebuilds the graph on a GEOMETRIC schedule - once
+    /// the un-built delta matches the built size (a doubling). That is O(log N)
+    /// bulk builds over a load = O(N) total build work, and every build is a
+    /// clean two-pass Vamana graph.
+    ///
+    /// We do NOT insert incrementally into the graph: that produced a graph that
+    /// stays connected but is poorly NAVIGABLE by the greedy walk (back-edge
+    /// re-pruning erodes the long-range edges), so plain recall@10 fell to ~0.31
+    /// vs 1.00 for a bulk build at 100k. Bulk-building beats incremental on both
+    /// recall and bulk-load speed; incremental insert is kept for an explicit
+    /// streaming path only.
     fn insert(&mut self, id: u64, vector: &[f32]) -> std::io::Result<()> {
         match self {
             VectorBackend::Flat(i) => {
@@ -120,7 +195,7 @@ impl VectorBackend {
             }
             VectorBackend::Disk(i) => {
                 i.insert(id, vector)?;
-                let threshold = (i.main_len() / 20).max(DISK_CONSOLIDATE_MIN);
+                let threshold = i.main_len().max(DISK_CONSOLIDATE_MIN);
                 if i.delta_len() >= threshold {
                     i.consolidate()?;
                 }
@@ -149,6 +224,80 @@ impl VectorBackend {
         match self {
             VectorBackend::Flat(i) => Ok(i.get(id)),
             VectorBackend::Disk(i) => i.get(id),
+        }
+    }
+
+    /// Every live vector id. Used to reclaim per-id payload blobs on
+    /// `VINDEX.DROP`, where the blobs live in the KV vLog under a reserved key.
+    fn live_ids(&self) -> Vec<u64> {
+        match self {
+            VectorBackend::Flat(i) => i.live_ids(),
+            VectorBackend::Disk(i) => i.live_ids(),
+        }
+    }
+
+    /// Fold a disk index's streaming delta into the graph (one full rebuild),
+    /// leaving it in its fast fully-indexed state. Flat has no delta: no-op.
+    fn consolidate(&mut self) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.consolidate(),
+        }
+    }
+
+    /// Un-consolidated streaming inserts (the in-RAM delta that a bulk load
+    /// leaves behind). 0 for flat. Drives the idle-consolidate trigger.
+    fn delta_len(&self) -> usize {
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.delta_len(),
+        }
+    }
+
+    /// Top-`k` for a payload filter whose matching id set is `s`. The planner's
+    /// choice between exact scan and the filtered ANN walk:
+    /// - flat is already brute-force, so an exact scan over `s` is always best;
+    /// - on disk, a selective filter (small `s`) scans `s` exactly, while a
+    ///   low-selectivity filter (large `s`) takes the filtered walk, which visits
+    ///   far fewer nodes than `|s|` disk reads.
+    ///
+    /// `FILTER_EXACT_MAX` is a heuristic crossover, to be tuned by a bench.
+    fn filtered_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: u32,
+        s: &[u64],
+    ) -> std::io::Result<Vec<(u64, f32)>> {
+        // `s` is the SORTED matching id list (from `Filter::evaluate`), already
+        // per-shard (the vindex is sharded, so a 50k-match filter is ~6k per shard
+        // at 8 shards). Exact scan costs ~1 disk read per id (~3us); above ~2k the
+        // selectivity-adaptive walk wins, so scan only the genuinely small filters.
+        const FILTER_EXACT_MAX: usize = 2_048;
+        match self {
+            VectorBackend::Flat(i) => Ok(i.score_ids(query, s, k)),
+            VectorBackend::Disk(i) if s.len() <= FILTER_EXACT_MAX => i.score_ids(query, s, k),
+            VectorBackend::Disk(i) => {
+                // Seed the walk from a spread of matching ids so it can reach a
+                // cluster that sits away from the query (multi-seed).
+                const SEEDS: usize = 32;
+                let step = (s.len() / SEEDS).max(1);
+                let seeds: Vec<u64> = s.iter().copied().step_by(step).take(SEEDS).collect();
+                // Membership is checked once per edge traversed (~1e5/query on a
+                // broad filter). `s` is sorted, so a binary search over the
+                // contiguous slice is the lookup - no per-query HashSet to build.
+                // Selectivity picks the walk plan: a dense filter (matches near the
+                // query) takes a cheap single walk, a sparse one the robust two-walk.
+                let selectivity = s.len() as f32 / (i.len().max(1)) as f32;
+                i.search_filtered(
+                    query,
+                    k,
+                    l_search as usize,
+                    &|id| s.binary_search(&id).is_ok(),
+                    &seeds,
+                    selectivity,
+                )
+            }
         }
     }
 
@@ -223,6 +372,19 @@ enum ShardReq {
     /// Enumerate VINDEXes known to this shard. Replicated across all
     /// shards so callers can ask any one shard.
     VindexList,
+    /// Fold a disk vindex's streaming delta into its graph on this shard.
+    VindexConsolidate {
+        name: String,
+    },
+    /// Non-destructive evict: drop the in-RAM entry for `name` without touching
+    /// its files, so the next access reopens it lazily. `name` is the scoped
+    /// map key. Allowed in read-only (serve) mode: it frees RAM, not data.
+    Evict {
+        name: String,
+    },
+    /// Per-index RAM / access stats for this shard's open vindexes. Used by the
+    /// tiering controller to decide what to evict.
+    IndexStats,
     Vset {
         name: String,
         id: u64,
@@ -231,6 +393,9 @@ enum ShardReq {
         tenant: u128,
         /// Tenant's max vectors, if any. `None` skips quota enforcement.
         limit: Option<u64>,
+        /// Optional opaque payload blob stored alongside the vector. `None`
+        /// leaves the write path byte-identical to a payload-less VSET.
+        payload: Option<Bytes>,
     },
     Vget {
         name: String,
@@ -247,6 +412,13 @@ enum ShardReq {
         query: Vec<f32>,
         k: usize,
         l_search: u32,
+        /// Owning tenant, needed to locate each hit's payload blob.
+        tenant: u128,
+        /// When true, attach each hit's stored payload to the response.
+        want_payload: bool,
+        /// Optional payload filter. When set, the search is the exact
+        /// brute-force over the matching id set instead of the ANN walk.
+        filter: Option<Filter>,
     },
 }
 
@@ -263,14 +435,138 @@ enum ShardResp {
     VindexList(Vec<(String, u32, u8, u8, u64)>),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
-    /// VSEARCH result for this shard's fragment: `(vec_id, cosine)` hits.
-    Vsearch(Vec<(u64, f32)>),
+    /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
+    /// hits. `payload` is `Some` only when the request set `want_payload`;
+    /// otherwise always `None`, so the non-payload path encodes identically.
+    Vsearch(Vec<(u64, f32, Option<Bytes>)>),
+    /// Evict result: `true` if an entry was present and removed, `false` if it
+    /// was already absent (evicted or never open) on this shard.
+    Evicted(bool),
+    /// Per-index stats for this shard: `(scoped_name, resident_bytes,
+    /// last_access_ms, n_vectors, evictable)`.
+    IndexStats(Vec<(String, usize, u64, usize, bool)>),
     Err(String),
 }
 
 struct ShardMsg {
     req: ShardReq,
     reply: oneshot::Sender<ShardResp>,
+}
+
+// ── Vector payload sidecar ────────────────────────────────────────────────────
+//
+// An optional opaque payload blob per vector id, stored in the shard's KV vLog
+// (not the index, so the quantized walk stays dense) for free crash-safety and
+// recovery. The key is `tenant(16B LE) ++ marker(3B) ++ name ++ id(8B)`: the
+// tenant prefix scopes the blob (A's is unreadable by B), the marker keeps it
+// clear of user KV keys, and id-last makes the layout injective per (name, id).
+const PAYLOAD_MARKER: &[u8; 3] = b"\x00vp";
+/// Payload durability is matched to the VECTOR it annotates. The vector lands in
+/// the in-RAM delta + a raw (un-fsync'd) WAL append - i.e. `Relaxed` (survives a
+/// process crash via the OS buffer; the durable checkpoint is `consolidate`). So
+/// the payload uses `Relaxed` too: `Kernel` here would fsync per blob (a
+/// device-wide barrier on macOS, ~7 ms) making the payload STRONGER than its own
+/// vector and turning a 100k bulk load into ~13 min (31 s without it). Group
+/// commit can't amortise it because VSETs serialise on the per-vindex lock.
+const PAYLOAD_DURABILITY: Durability = Durability::Relaxed;
+
+fn payload_key(tenant: u128, name: &str, id: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(16 + 3 + name.len() + 8);
+    k.extend_from_slice(&tenant.to_le_bytes());
+    k.extend_from_slice(PAYLOAD_MARKER);
+    k.extend_from_slice(name.as_bytes());
+    k.extend_from_slice(&id.to_le_bytes());
+    k
+}
+
+/// Rebuild a recovered vindex's payload index from its stored blobs, once, the
+/// first time a filtered search needs it. Idempotent and tenant-scoped: the
+/// query's tenant locates the blobs (a real vindex is single-tenant). Runs the
+/// blob reads outside the lock, then populates under it.
+async fn ensure_payload_loaded(
+    vlog: &VLog,
+    arc: &VectorEntry,
+    tenant: u128,
+    name: &str,
+) -> Result<(), String> {
+    if arc.read().payload_loaded {
+        return Ok(());
+    }
+    let ids = arc.read().backend.live_ids();
+    let mut parsed = Vec::with_capacity(ids.len());
+    for id in ids {
+        let key = payload_key(tenant, name, id);
+        match vlog.tenant(tenant).get(&key).await {
+            Ok(Some(blob)) => parsed.push((id, parse_fields(&blob))),
+            Ok(None) => {}
+            Err(e) => return Err(format!("payload index rebuild failed: {e}")),
+        }
+    }
+    let mut g = arc.write();
+    // Re-check under the write lock: another task may have loaded it meanwhile.
+    if !g.payload_loaded {
+        for (id, fields) in parsed {
+            g.payload.upsert(id, fields);
+        }
+        g.payload_loaded = true;
+    }
+    Ok(())
+}
+
+/// Run a VSEARCH against one vindex: exact brute-force over a filter's matching
+/// ids, or the ANN walk when there is no filter. Shared by the inline and
+/// worker-pool paths; the caller holds the vindex write lock.
+fn search_vindex(
+    idx: &mut Vindex,
+    name: &str,
+    query: &[f32],
+    k: usize,
+    l_search: u32,
+    filter: &Option<Filter>,
+) -> Result<Vec<(u64, f32)>, String> {
+    if idx.backend.dim() != query.len() {
+        return Err(format!(
+            "vindex '{name}' dim {} but query has {}",
+            idx.backend.dim(),
+            query.len()
+        ));
+    }
+    if let Some(f) = filter {
+        let s = f.evaluate(&idx.payload);
+        idx.backend
+            .filtered_search(query, k, l_search, &s)
+            .map_err(|e| format!("vsearch failed: {e}"))
+    } else {
+        idx.backend
+            .search(query, k, l_search)
+            .map_err(|e| format!("vsearch failed: {e}"))
+    }
+}
+
+/// Attach each hit's stored payload when `want_payload`, else leave it `None`.
+/// Shared by the inline and worker-pool VSEARCH paths. Payloads ride as `Bytes`
+/// (refcounted vLog reads) so no blob is copied on the way to the response.
+async fn attach_payloads(
+    vlog: &VLog,
+    tenant: u128,
+    name: &str,
+    hits: Vec<(u64, f32)>,
+    want_payload: bool,
+) -> Result<Vec<(u64, f32, Option<Bytes>)>, String> {
+    let mut out = Vec::with_capacity(hits.len());
+    for (id, score) in hits {
+        let blob = if want_payload {
+            let key = payload_key(tenant, name, id);
+            vlog.tenant(tenant)
+                .get(&key)
+                .await
+                .map_err(|e| format!("vsearch payload failed: {e}"))?
+        } else {
+            None
+        };
+        out.push((id, score, blob));
+    }
+    Ok(out)
 }
 
 // ── VINDEX registry (disk-backed indexes survive a restart) ───────────────────
@@ -326,21 +622,30 @@ fn read_registry(dir: &Path) -> Vec<(String, usize)> {
     out
 }
 
-/// Rewrite the registry from the current disk-backed VINDEXes (best-effort).
+/// Rewrite the registry (best-effort).
+///
+/// The registry tracks every on-disk vindex (the `vindex-<name>/` dirs), NOT
+/// only the resident ones. An evicted vindex is gone from the map but its dir
+/// stays; rebuilding the registry purely from the map would drop it and break
+/// lazy reopen + restart recovery. So: start from the existing registry, fold in
+/// the resident disk vindexes, then keep only entries whose dir still exists
+/// (VINDEX.DROP removes the dir). This covers all three writers without touching
+/// their call sites: create adds (dir + map), evict keeps (dir, not in map),
+/// drop prunes (no dir).
 fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
-    let vs = vindexes.read();
-    let entries: Vec<(String, usize)> = vs
-        .iter()
-        .filter_map(|(name, entry)| {
-            let backend = entry.read();
-            match &*backend {
-                VectorBackend::Disk(i) => Some((name.clone(), i.dim())),
-                VectorBackend::Flat(_) => None,
+    use std::collections::BTreeMap;
+    let mut by_name: BTreeMap<String, usize> = read_registry(dir).into_iter().collect();
+    {
+        let vs = vindexes.read();
+        for (name, entry) in vs.iter() {
+            if let VectorBackend::Disk(i) = &entry.read().backend {
+                by_name.insert(name.clone(), i.dim());
             }
-        })
-        .collect();
-    let entries_ref: Vec<(&str, usize)> = entries.iter().map(|(n, d)| (n.as_str(), *d)).collect();
-    if let Err(e) = write_registry(dir, &entries_ref) {
+        }
+    }
+    by_name.retain(|name, _| dir.join(format!("vindex-{name}")).exists());
+    let entries: Vec<(&str, usize)> = by_name.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+    if let Err(e) = write_registry(dir, &entries) {
         error!("vindex registry write failed: {e}");
     }
 }
@@ -362,12 +667,128 @@ fn recover_vindexes(
         let vdir = dir.join(format!("vindex-{name}"));
         match DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph) {
             Ok(idx) => {
-                set.insert(name, Arc::new(RwLock::new(VectorBackend::Disk(idx))));
+                set.insert(
+                    name,
+                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx)))),
+                );
             }
             Err(e) => error!("shard {shard_id}: recovering vindex '{name}' failed: {e}"),
         }
     }
     set
+}
+
+/// Look up a vindex by its (already tenant-scoped) name, reopening it lazily if
+/// it was evicted. Stamps `last_access` on every hit.
+///
+/// - Hit: clone the `Arc`. No await, no blocking - the hot path.
+/// - Miss but the name is in the on-disk registry (a disk index that was
+///   evicted, not dropped): reopen it. Reopened via `Vindex::recovered`, so its
+///   payload index rebuilds on the first filtered search, exactly like a
+///   restart.
+/// - Miss and not in the registry: `None` (a genuine "not found").
+///
+/// The shard runs on a single-threaded (`current_thread`) runtime, so a
+/// synchronous `open_with_tier_full` here would block the executor for the whole
+/// reopen - starving every other request queued on this shard, other tenants
+/// included. So the open runs on the blocking pool via `spawn_blocking`;
+/// awaiting the join yields the shard thread back to other tasks. That is the
+/// bulkhead around the cold-start cost: only the triggering request pays the
+/// reopen latency (~the index's resident size in reads), not the whole shard.
+///
+/// No lock is held across the `.await` (a parking_lot guard is `!Send` and must
+/// not anyway). The triggering request still waits for the reopen - unavoidable,
+/// it needs the data. The tiering policy is responsible for not thrashing
+/// (hysteresis); this is just the mechanism.
+///
+/// ponytail: no in-flight dedup. Two requests racing on the same just-evicted
+/// index both open it; the write-lock double-check below keeps the first
+/// published and drops the loser. Wasteful (a second open) but correct. Upgrade
+/// path if a reopen storm spikes RAM: an in-flight set + `Notify`.
+async fn get_or_reopen(
+    vindexes: &RwLock<VindexSet>,
+    dir: &Path,
+    tier: QuantKind,
+    mmap_tier: bool,
+    mmap_graph: bool,
+    name: &str,
+) -> Option<VectorEntry> {
+    // Fast path: resident. Clone + stamp under a short read lock, no await.
+    if let Some(entry) = vindexes.read().get(name).cloned() {
+        entry.read().touch();
+        return Some(entry);
+    }
+    // Miss. Only disk-backed indexes survive in the registry and can be
+    // reopened; a flat (in-RAM) index that is gone is gone.
+    if !read_registry(dir).iter().any(|(n, _)| n == name) {
+        return None;
+    }
+    // Reopen OFF the shard thread (see the doc comment). No guard is held here.
+    let vdir = dir.join(format!("vindex-{name}"));
+    let opened = tokio::task::spawn_blocking(move || {
+        DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph)
+    })
+    .await;
+    let idx = match opened {
+        Ok(Ok(idx)) => idx,
+        Ok(Err(e)) => {
+            error!("reopening evicted vindex '{name}' failed: {e}");
+            return None;
+        }
+        Err(e) => {
+            error!("reopen task for vindex '{name}' panicked: {e}");
+            return None;
+        }
+    };
+    // Publish under a brief write lock. A racing request may have reopened the
+    // same index while we awaited; if so, drop the one we just opened (loser of
+    // the race) and return the resident one.
+    let mut w = vindexes.write();
+    if let Some(entry) = w.get(name).cloned() {
+        drop(idx);
+        entry.read().touch();
+        return Some(entry);
+    }
+    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx))));
+    entry.read().touch();
+    w.insert(name.to_owned(), entry.clone());
+    Some(entry)
+}
+
+/// Build the scoped map key for `index` under `tenant`, mirroring the RESP3
+/// handler's `scoped_vindex_name`: tenant `0` (single-tenant / anonymous) uses
+/// the raw name; otherwise the key is `<32 hex>::<index>`, the hex being the
+/// tenant id's bytes in `to_le_bytes` order (matching `tenant_u128`).
+fn scope_key(tenant: u128, index: &str) -> String {
+    if tenant == 0 {
+        return index.to_owned();
+    }
+    use std::fmt::Write;
+    let mut s = String::with_capacity(32 + 2 + index.len());
+    for b in tenant.to_le_bytes() {
+        let _ = write!(s, "{b:02x}");
+    }
+    s.push_str("::");
+    s.push_str(index);
+    s
+}
+
+/// Inverse of [`scope_key`]: split a scoped map key into `(tenant, index)`. A
+/// key with no `::` prefix (or a malformed one) is the tenant-`0` namespace.
+fn unscope_key(key: &str) -> (u128, String) {
+    if let Some((hex, index)) = key.split_once("::")
+        && hex.len() == 32
+    {
+        let mut bytes = [0u8; 16];
+        if (0..16).all(|i| {
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                .map(|b| bytes[i] = b)
+                .is_ok()
+        }) {
+            return (u128::from_le_bytes(bytes), index.to_owned());
+        }
+    }
+    (0, key.to_owned())
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
@@ -470,6 +891,52 @@ fn run_shard(
                             }
                         }
                     });
+
+                    // Idle consolidation: a bulk load leaves an un-consolidated
+                    // delta (RAM + a per-query flat scan). Once a vindex's writes
+                    // go quiet - its delta is unchanged across a tick - fold it,
+                    // so the served index is lean BY DEFAULT, not only after an
+                    // explicit VINDEX.CONSOLIDATE. The fold runs on a blocking
+                    // thread so the build does not stall the shard runtime.
+                    // ponytail: the swap still holds the per-vindex write lock for
+                    // the rebuild, so a query to THAT vindex mid-fold waits; it
+                    // fires only when idle, so collisions are rare. Upgrade path:
+                    // background build + atomic swap (no lock during the build).
+                    let kvindexes = vindexes.clone();
+                    tokio::task::spawn_local(async move {
+                        // Phase-shift shards so their idle folds (each a graph
+                        // rebuild) do not all run at once and stack their build
+                        // buffers into one RSS spike. ponytail: a process-wide
+                        // permit would serialise them exactly; the stagger is the
+                        // cheap version with no cross-shard plumbing.
+                        tokio::time::sleep(Duration::from_secs(shard_id as u64 * 2)).await;
+                        let mut prev: HashMap<String, usize> = HashMap::new();
+                        loop {
+                            tokio::time::sleep(IDLE_CONSOLIDATE_INTERVAL).await;
+                            let snap: Vec<(String, VectorEntry)> = {
+                                let g = kvindexes.read();
+                                g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
+                            };
+                            for (name, arc) in snap {
+                                let delta = arc.read().backend.delta_len();
+                                // Idle == unchanged since the previous tick.
+                                let idle = prev.insert(name.clone(), delta) == Some(delta);
+                                if idle && delta >= IDLE_CONSOLIDATE_MIN {
+                                    let a = arc.clone();
+                                    let nm = name.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if let Err(e) = a.write().backend.consolidate() {
+                                            error!(
+                                                "shard {shard_id}: idle consolidate '{nm}': {e}"
+                                            );
+                                        }
+                                    })
+                                    .await;
+                                    prev.insert(name, 0); // folded
+                                }
+                            }
+                        }
+                    });
                 }
 
                 while let Some(msg) = rx.recv().await {
@@ -491,9 +958,11 @@ fn run_shard(
                         // hot path (the enum is `Copy`).
                         let op_kind = telemetry_op(&msg.req);
                         let t0 = std::time::Instant::now();
-                        let resp =
-                            process(&vlog, &vindexes, &dir, msg.req, read_only, workers, &quota)
-                                .await;
+                        let resp = process(
+                            &vlog, &vindexes, &dir, msg.req, read_only, workers, &quota, tier,
+                            mmap_tier, mmap_graph,
+                        )
+                        .await;
                         if let Some(op) = op_kind {
                             skeg_telemetry::record_op(op, shard_id_u16, t0.elapsed());
                         }
@@ -517,6 +986,7 @@ fn is_mutation(req: &ShardReq) -> bool {
             | ShardReq::Del(..)
             | ShardReq::VindexCreate { .. }
             | ShardReq::VindexDrop { .. }
+            | ShardReq::VindexConsolidate { .. }
             | ShardReq::Vset { .. }
             | ShardReq::Vdel { .. }
     )
@@ -541,11 +1011,15 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
+        | ShardReq::VindexConsolidate { .. }
+        | ShardReq::Evict { .. }
+        | ShardReq::IndexStats
         | ShardReq::TenantCacheBytes(_)
         | ShardReq::Stats => None,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process(
     vlog: &VLog,
     vindexes: &Arc<RwLock<VindexSet>>,
@@ -554,6 +1028,9 @@ async fn process(
     read_only: bool,
     workers: usize,
     quota: &Arc<crate::quota::TenantVectorQuota>,
+    tier: QuantKind,
+    mmap_tier: bool,
+    mmap_graph: bool,
 ) -> ShardResp {
     if read_only && is_mutation(&req) {
         return ShardResp::Err("server is in serve mode (read-only)".to_owned());
@@ -567,6 +1044,9 @@ async fn process(
             query,
             k,
             l_search,
+            tenant,
+            want_payload,
+            filter,
         } = req
     {
         // Look up + clone the per-vindex Arc on the shard thread; the
@@ -574,27 +1054,32 @@ async fn process(
         // concurrent VSEARCH calls on different vindexes run in
         // parallel on the blocking pool (the previous design serialised
         // them on the outer RwLock).
-        let entry = vindexes.read().get(&name).cloned();
-        let join = tokio::task::spawn_blocking(move || -> ShardResp {
+        let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+        // A filter reads the payload index; rebuild it from blobs first (async,
+        // before the blocking walk) if this vindex was just recovered from disk.
+        if filter.is_some()
+            && let Some(arc) = &entry
+            && let Err(e) = ensure_payload_loaded(vlog, arc, tenant, &name).await
+        {
+            return ShardResp::Err(e);
+        }
+        let walk_name = name.clone();
+        let join = tokio::task::spawn_blocking(move || -> Result<Vec<(u64, f32)>, String> {
             let Some(arc) = entry else {
-                return ShardResp::Err(format!("vindex '{name}' not found"));
+                return Err(format!("vindex '{walk_name}' not found"));
             };
-            let mut idx = arc.write();
-            if idx.dim() != query.len() {
-                return ShardResp::Err(format!(
-                    "vindex '{name}' dim {} but query has {}",
-                    idx.dim(),
-                    query.len()
-                ));
-            }
-            match idx.search(&query, k, l_search) {
-                Ok(hits) => ShardResp::Vsearch(hits),
-                Err(e) => ShardResp::Err(format!("vsearch failed: {e}")),
-            }
+            search_vindex(&mut arc.write(), &walk_name, &query, k, l_search, &filter)
         });
-        return match join.await {
-            Ok(resp) => resp,
-            Err(_) => ShardResp::Err("vsearch worker task failed".to_owned()),
+        let hits = match join.await {
+            Ok(Ok(hits)) => hits,
+            Ok(Err(e)) => return ShardResp::Err(e),
+            Err(_) => return ShardResp::Err("vsearch worker task failed".to_owned()),
+        };
+        // Payload fetch stays on the async shard thread (the vLog is not Send
+        // into the blocking task).
+        return match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+            Ok(out) => ShardResp::Vsearch(out),
+            Err(e) => ShardResp::Err(e),
         };
     }
     let vindexes: &RwLock<VindexSet> = vindexes;
@@ -612,16 +1097,30 @@ async fn process(
                 Entry::Vacant(e) => {
                     if disk {
                         let vdir = dir.join(format!("vindex-{}", e.key()));
-                        match DiskVamanaIndex::create_empty(&vdir, dim, VAMANA_L_SEARCH) {
+                        // The disk tier is int8 by default; TurboQuant gives
+                        // sub-int8 RAM on the live write path (it needs no trained
+                        // codebook). f32/binary are flat-only -> fall back to int8.
+                        let tier = match kind {
+                            QuantKind::TurboQuant { .. } => kind,
+                            _ => QuantKind::Int8,
+                        };
+                        match DiskVamanaIndex::create_empty_with_tier(
+                            &vdir,
+                            dim,
+                            VAMANA_L_SEARCH,
+                            tier,
+                        ) {
                             Ok(idx) => {
-                                e.insert(Arc::new(RwLock::new(VectorBackend::Disk(idx))));
+                                e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(
+                                    idx,
+                                )))));
                                 Ok(true)
                             }
                             Err(err) => Err(format!("vindex disk create failed: {err}")),
                         }
                     } else {
-                        e.insert(Arc::new(RwLock::new(VectorBackend::Flat(FlatIndex::new(
-                            dim, kind,
+                        e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Flat(
+                            FlatIndex::new(dim, kind),
                         )))));
                         Ok(false)
                     }
@@ -642,7 +1141,7 @@ async fn process(
             let mut rows: Vec<(String, u32, u8, u8, u64)> = vs
                 .iter()
                 .map(|(name, entry)| {
-                    let backend = entry.read();
+                    let backend = &entry.read().backend;
                     (
                         name.clone(),
                         backend.dim() as u32,
@@ -656,6 +1155,44 @@ async fn process(
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             ShardResp::VindexList(rows)
         }
+        ShardReq::VindexConsolidate { name } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => match arc.write().backend.consolidate() {
+                    Ok(()) => ShardResp::Done,
+                    Err(e) => ShardResp::Err(format!("consolidate failed: {e}")),
+                },
+            }
+        }
+        ShardReq::Evict { name } => {
+            // Pop the entry without touching its files. In-flight ops keep their
+            // cloned `Arc` alive and finish; the graph + tier + delta free when
+            // the last clone drops. A later access reopens it via
+            // `get_or_reopen`. Files stay, so this is allowed in serve mode.
+            let removed = vindexes.write().remove(&name).is_some();
+            ShardResp::Evicted(removed)
+        }
+        ShardReq::IndexStats => {
+            let vs = vindexes.read();
+            let rows: Vec<(String, usize, u64, usize, bool)> = vs
+                .iter()
+                .map(|(name, entry)| {
+                    let g = entry.read();
+                    // Only disk-backed indexes can be reopened after an evict;
+                    // a flat index lives only in RAM.
+                    let evictable = matches!(g.backend, VectorBackend::Disk(_));
+                    (
+                        name.clone(),
+                        g.backend.approx_ram_bytes() as usize,
+                        g.last_access_ms(),
+                        g.backend.len(),
+                        evictable,
+                    )
+                })
+                .collect();
+            ShardResp::IndexStats(rows)
+        }
         ShardReq::VindexDrop { name, tenant } => {
             // Pop the entry from the outer map first; this prevents new ops
             // from observing it. In-flight ops on this vindex keep their
@@ -666,16 +1203,32 @@ async fn process(
             let removed = vindexes.write().remove(&name);
             match removed {
                 Some(arc) => {
-                    let guard = arc.read();
-                    let was_disk = matches!(*guard, VectorBackend::Disk(_));
-                    // Credit this fragment's vectors back to the tenant quota.
-                    let fragment = guard.len() as u64;
-                    drop(guard);
+                    // Read everything off the index in a tight block so the
+                    // guard is gone before the payload-del `await` below.
+                    // `live_ids` is enumerated now, while the index still
+                    // exists, so we can reclaim its payload blobs.
+                    let (was_disk, fragment, payload_ids) = {
+                        let guard = arc.read();
+                        (
+                            matches!(guard.backend, VectorBackend::Disk(_)),
+                            guard.backend.len() as u64,
+                            guard.backend.live_ids(),
+                        )
+                    };
                     drop(arc);
                     quota.sub(tenant, fragment);
                     if was_disk {
                         let _ = std::fs::remove_dir_all(dir.join(format!("vindex-{name}")));
                         persist_registry(dir, vindexes);
+                    }
+                    // Drop the index's payload blobs. Without this a recreated
+                    // index reusing the same name and id would resurface a stale
+                    // blob under the same reserved key.
+                    for id in payload_ids {
+                        let key = payload_key(tenant, &name, id);
+                        if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
+                            return ShardResp::Err(format!("vindex drop payload failed: {e}"));
+                        }
                     }
                     ShardResp::Done
                 }
@@ -688,53 +1241,86 @@ async fn process(
             vector,
             tenant,
             limit,
+            payload,
         } => {
             // Outer read to look up the entry; clone the Arc and drop the
             // outer lock before taking the per-vindex write. This lets
             // another vindex's ops run in parallel with this one.
-            let entry = vindexes.read().get(&name).cloned();
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
-                    let mut idx = arc.write();
-                    if idx.dim() != vector.len() {
-                        ShardResp::Err(format!(
-                            "vindex '{name}' dim {} but vector has {}",
-                            idx.dim(),
-                            vector.len()
-                        ))
-                    } else {
-                        // Quota: only a NEW id consumes a slot. Reserve before
-                        // the insert (race-free under this write lock) so an
-                        // over-limit insert is rejected without storing; an
-                        // overwrite (was_new == false) never touches the quota.
-                        let was_new = !idx.contains(id);
-                        if was_new
-                            && let Some(max) = limit
-                            && quota.try_add(tenant, 1, max).is_err()
-                        {
-                            return ShardResp::Err("tenant vector quota exceeded".to_owned());
-                        }
-                        match idx.insert(id, &vector) {
-                            Ok(()) => ShardResp::Done,
-                            Err(e) => {
-                                if was_new && limit.is_some() {
-                                    quota.sub(tenant, 1); // roll back reservation
-                                }
-                                ShardResp::Err(format!("vset failed: {e}"))
+                    // Insert under the per-vindex write lock, then drop the
+                    // guard before any `await` (the payload write below): a
+                    // parking_lot guard must not be held across a suspension.
+                    let insert_result = {
+                        let mut idx = arc.write();
+                        if idx.backend.dim() != vector.len() {
+                            Err(format!(
+                                "vindex '{name}' dim {} but vector has {}",
+                                idx.backend.dim(),
+                                vector.len()
+                            ))
+                        } else {
+                            // Quota: only a NEW id consumes a slot. Reserve
+                            // before the insert (race-free under this write
+                            // lock) so an over-limit insert is rejected without
+                            // storing; an overwrite never touches the quota.
+                            let was_new = !idx.backend.contains(id);
+                            if was_new
+                                && let Some(max) = limit
+                                && quota.try_add(tenant, 1, max).is_err()
+                            {
+                                return ShardResp::Err("tenant vector quota exceeded".to_owned());
                             }
+                            match idx.backend.insert(id, &vector) {
+                                Ok(()) => {
+                                    // Index the payload's fields when one is
+                                    // supplied; an overwrite with a fresh payload
+                                    // replaces the id's old fields. A payload-less
+                                    // overwrite leaves the index (and blob) as is.
+                                    if let Some(blob) = &payload {
+                                        idx.payload.upsert(id, parse_fields(blob));
+                                    }
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    if was_new && limit.is_some() {
+                                        quota.sub(tenant, 1); // roll back reservation
+                                    }
+                                    Err(format!("vset failed: {e}"))
+                                }
+                            }
+                        }
+                    };
+                    match insert_result {
+                        Err(e) => ShardResp::Err(e),
+                        Ok(()) => {
+                            // Store the payload blob only when one was supplied;
+                            // a payload-less VSET issues no KV write at all.
+                            if let Some(blob) = payload {
+                                let key = payload_key(tenant, &name, id);
+                                if let Err(e) = vlog
+                                    .tenant(tenant)
+                                    .set(&key, &blob[..], PAYLOAD_DURABILITY)
+                                    .await
+                                {
+                                    return ShardResp::Err(format!("vset payload failed: {e}"));
+                                }
+                            }
+                            ShardResp::Done
                         }
                     }
                 }
             }
         }
         ShardReq::Vget { name, id } => {
-            let entry = vindexes.read().get(&name).cloned();
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
                     let idx = arc.read();
-                    match idx.get(id) {
+                    match idx.backend.get(id) {
                         Ok(v) => ShardResp::Vector(v),
                         Err(e) => ShardResp::Err(format!("vget failed: {e}")),
                     }
@@ -742,15 +1328,30 @@ async fn process(
             }
         }
         ShardReq::Vdel { name, id, tenant } => {
-            let entry = vindexes.read().get(&name).cloned();
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
-                    let mut idx = arc.write();
-                    match idx.delete(id) {
+                    // Delete the vector and drop its payload postings under one
+                    // lock; the blob in the vLog is reclaimed by the await below.
+                    let result = {
+                        let mut g = arc.write();
+                        let r = g.backend.delete(id);
+                        if matches!(r, Ok(true)) {
+                            g.payload.remove(id);
+                        }
+                        r
+                    };
+                    match result {
                         Ok(existed) => {
                             if existed {
                                 quota.sub(tenant, 1);
+                                // Reclaim the payload blob, if any. Harmless when
+                                // the id never had one (del returns false).
+                                let key = payload_key(tenant, &name, id);
+                                if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
+                                    return ShardResp::Err(format!("vdel payload failed: {e}"));
+                                }
                             }
                             ShardResp::Existed(existed)
                         }
@@ -764,22 +1365,35 @@ async fn process(
             query,
             k,
             l_search,
+            tenant,
+            want_payload,
+            filter,
         } => {
-            let entry = vindexes.read().get(&name).cloned();
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
-                    let mut idx = arc.write();
-                    if idx.dim() != query.len() {
-                        ShardResp::Err(format!(
-                            "vindex '{name}' dim {} but query has {}",
-                            idx.dim(),
-                            query.len()
-                        ))
-                    } else {
-                        match idx.search(&query, k, l_search) {
-                            Ok(hits) => ShardResp::Vsearch(hits),
-                            Err(e) => ShardResp::Err(format!("vsearch failed: {e}")),
+                    // A filter reads the payload index; rebuild it from blobs
+                    // first if this vindex was just recovered from disk.
+                    if filter.is_some()
+                        && let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &name).await
+                    {
+                        return ShardResp::Err(e);
+                    }
+                    // Run the walk (or filtered brute-force) under the lock,
+                    // then drop the guard before any payload `await`.
+                    let search_result =
+                        search_vindex(&mut arc.write(), &name, &query, k, l_search, &filter);
+                    match search_result {
+                        Err(e) => ShardResp::Err(e),
+                        Ok(hits) => {
+                            // ponytail: fetch a payload per local hit; some get
+                            // trimmed by the global top-k merge, but k is small.
+                            // Route the final-k by id if it ever bites.
+                            match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+                                Ok(out) => ShardResp::Vsearch(out),
+                                Err(e) => ShardResp::Err(e),
+                            }
                         }
                     }
                 }
@@ -831,7 +1445,7 @@ async fn process(
             let (n_vec, sz_bytes) = {
                 let v = vindexes.read();
                 v.values().fold((0u64, 0u64), |(acc_n, acc_b), entry| {
-                    let b = entry.read();
+                    let b = &entry.read().backend;
                     (acc_n + b.len() as u64, acc_b + b.approx_ram_bytes())
                 })
             };
@@ -1308,6 +1922,9 @@ impl ShardSet {
             0 => QuantKind::F32,
             1 => QuantKind::Int8,
             2 => QuantKind::Binary,
+            3 => QuantKind::TurboQuant { bits: 1 },
+            4 => QuantKind::TurboQuant { bits: 2 },
+            5 => QuantKind::TurboQuant { bits: 4 },
             other => return Err(ShardError::Storage(format!("unknown vindex kind {other}"))),
         };
         let disk = match backend {
@@ -1320,6 +1937,12 @@ impl ShardSet {
             }
         };
         let dim = dim as usize;
+        // Reject a dim the tier cannot pack here, before any shard touches the
+        // builder: a bad (kind, dim) must be a clean error, not a panic that
+        // kills the shard thread.
+        if let Err(reason) = kind.validate_dim(dim) {
+            return Err(ShardError::Storage(reason));
+        }
         let name = name.to_owned();
         self.broadcast(|| ShardReq::VindexCreate {
             name: name.clone(),
@@ -1342,6 +1965,18 @@ impl ShardSet {
             tenant,
         })
         .await
+    }
+
+    /// Consolidate a disk vindex on every shard: fold each shard's streaming
+    /// delta into its graph. A no-op for flat indices. Useful after a bulk load.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is missing or a shard is unavailable.
+    pub async fn vindex_consolidate(&self, name: &str) -> Result<(), ShardError> {
+        let name = name.to_owned();
+        self.broadcast(|| ShardReq::VindexConsolidate { name: name.clone() })
+            .await
     }
 
     /// List every VINDEX. `(name, dim, kind_byte, backend_byte, n_vectors)`
@@ -1386,6 +2021,7 @@ impl ShardSet {
         vector: Vec<f32>,
         tenant: u128,
         limit: Option<u64>,
+        payload: Option<Bytes>,
     ) -> Result<(), ShardError> {
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
@@ -1394,12 +2030,44 @@ impl ShardSet {
             vector,
             tenant,
             limit,
+            payload,
         };
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
+    }
+
+    /// Bulk insert: each item runs the normal [`vset`](Self::vset) path, but
+    /// CONCURRENTLY, so the per-vector durable payload-blob writes accumulate in
+    /// the group committer and flush in batches instead of one fsync-barrier per
+    /// vector. This is the whole bulk-ingest win (100k: ~770s serial -> ~34s).
+    /// Returns the count inserted; fails on the first item's error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any item fails (missing index, dim mismatch, quota, or
+    /// an unavailable shard).
+    pub async fn vmset(
+        &self,
+        name: &str,
+        items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
+        tenant: u128,
+        limit: Option<u64>,
+    ) -> Result<usize, ShardError> {
+        let mut set = tokio::task::JoinSet::new();
+        for (id, vector, payload) in items {
+            let this = self.clone();
+            let name = name.to_owned();
+            set.spawn(async move { this.vset(&name, id, vector, tenant, limit, payload).await });
+        }
+        let mut count = 0;
+        while let Some(joined) = set.join_next().await {
+            joined.map_err(|_| ShardError::Unavailable)??;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Vectors currently reserved by `tenant` against its quota (0 if
@@ -1472,7 +2140,10 @@ impl ShardSet {
         query: Vec<f32>,
         k: usize,
         l_search: u32,
-    ) -> Result<Vec<(u64, f32)>, ShardError> {
+        tenant: u128,
+        want_payload: bool,
+        filter: Option<Filter>,
+    ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
         let mut pending = Vec::with_capacity(self.inner.n);
         for sender in &self.inner.senders {
             let (tx, rx) = oneshot::channel();
@@ -1481,6 +2152,9 @@ impl ShardSet {
                 query: query.clone(),
                 k,
                 l_search,
+                tenant,
+                want_payload,
+                filter: filter.clone(),
             };
             sender
                 .send(ShardMsg { req, reply: tx })
@@ -1488,7 +2162,7 @@ impl ShardSet {
                 .map_err(|_| ShardError::Unavailable)?;
             pending.push(rx);
         }
-        let mut merged: Vec<(u64, f32)> = Vec::new();
+        let mut merged: Vec<(u64, f32, Option<Bytes>)> = Vec::new();
         let mut first_err = None;
         for rx in pending {
             match rx.await.map_err(|_| ShardError::Unavailable)? {
@@ -1509,6 +2183,143 @@ impl ShardSet {
         merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
         Ok(merged)
+    }
+
+    /// A control-plane handle over these shards (enumerate / report RAM /
+    /// evict vindexes). The eviction policy lives outside the engine.
+    #[must_use]
+    pub fn control_handle(&self) -> ControlHandle {
+        ControlHandle {
+            shards: self.clone(),
+        }
+    }
+}
+
+/// One open vindex on one shard, as seen by the tiering controller. A vindex is
+/// sharded, so a logical index produces up to `n_shards` of these.
+///
+/// `#[non_exhaustive]`: this will grow (resident tier, pinned flag, ...); a new
+/// field must not be a breaking change for the policy crate that reads it.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct IndexStat {
+    /// Owning tenant id (`0` = single-tenant / anonymous namespace).
+    pub tenant: u128,
+    /// Index name without the tenant scope prefix.
+    pub index: String,
+    /// Shard this fragment lives on.
+    pub shard: usize,
+    /// RAM held by this fragment (graph + tier + delta for disk; f32 rows for
+    /// flat).
+    pub resident_bytes: usize,
+    /// `now_ms()` of the last access on this shard.
+    pub last_access_ms: u64,
+    /// Live vectors in this fragment.
+    pub vectors: usize,
+    /// True if the fragment can be evicted and lazily reopened (disk-backed).
+    pub evictable: bool,
+}
+
+impl IndexStat {
+    /// Construct one stat row. Needed because the struct is `#[non_exhaustive]`,
+    /// so downstream crates (the policy crate's tests, an alternative backend)
+    /// cannot use a struct literal. Takes today's fields; any field added later
+    /// defaults here and gets a `with_*` setter, so this signature stays stable
+    /// as the struct grows - the whole point of `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(
+        tenant: u128,
+        index: String,
+        shard: usize,
+        resident_bytes: usize,
+        last_access_ms: u64,
+        vectors: usize,
+        evictable: bool,
+    ) -> Self {
+        Self {
+            tenant,
+            index,
+            shard,
+            resident_bytes,
+            last_access_ms,
+            vectors,
+            evictable,
+        }
+    }
+}
+
+/// Control-plane handle for vindex lifecycle: enumerate open indexes, report
+/// their RAM, and evict (non-destructive, lazy-reopen) ones the policy chooses.
+///
+/// This is the *mechanism* half of the tiering seam. The *policy* - global RAM
+/// budget, LRU vs working-set, anti-thrash hysteresis, hot-tenant pinning -
+/// lives in a separate crate that drives this handle from a background task.
+///
+/// Cheap to clone; clones share the same shard worker threads.
+#[derive(Clone)]
+pub struct ControlHandle {
+    shards: ShardSet,
+}
+
+impl ControlHandle {
+    /// Snapshot of every open vindex across all shards, one row per
+    /// (shard, index). The caller aggregates per logical index as it needs.
+    pub async fn open_indices(&self) -> Vec<IndexStat> {
+        let mut out = Vec::new();
+        for shard in 0..self.shards.inner.n {
+            if let Ok(ShardResp::IndexStats(rows)) =
+                self.shards.call(shard, ShardReq::IndexStats).await
+            {
+                for (key, resident_bytes, last_access_ms, vectors, evictable) in rows {
+                    let (tenant, index) = unscope_key(&key);
+                    out.push(IndexStat::new(
+                        tenant,
+                        index,
+                        shard,
+                        resident_bytes,
+                        last_access_ms,
+                        vectors,
+                        evictable,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Evict `index` for `tenant` from RAM on every shard. Non-destructive: the
+    /// files stay and the index reopens lazily on its next access. `Ok(true)`
+    /// if any shard had it resident, `Ok(false)` if it was already absent
+    /// everywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable or reports a storage error.
+    pub async fn evict(&self, tenant: u128, index: &str) -> Result<bool, ShardError> {
+        let name = scope_key(tenant, index);
+        let mut any = false;
+        for shard in 0..self.shards.inner.n {
+            match self
+                .shards
+                .call(shard, ShardReq::Evict { name: name.clone() })
+                .await?
+            {
+                ShardResp::Evicted(b) => any |= b,
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(any)
+    }
+
+    /// Total resident bytes of all open vindexes across all shards. Convenience
+    /// for a global RAM budget check.
+    pub async fn total_resident_bytes(&self) -> usize {
+        self.open_indices()
+            .await
+            .iter()
+            .map(|s| s.resident_bytes)
+            .sum()
     }
 }
 
@@ -1573,6 +2384,8 @@ impl ShardTenantView<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -1723,12 +2536,23 @@ mod tests {
         let v = vec![1.0f32, 0.0, 0.0, 0.0];
         let lim = Some(2u64);
 
-        shards.vset("idx7", 1, v.clone(), 7, lim).await.unwrap();
-        shards.vset("idx7", 2, v.clone(), 7, lim).await.unwrap();
+        shards
+            .vset("idx7", 1, v.clone(), 7, lim, None)
+            .await
+            .unwrap();
+        shards
+            .vset("idx7", 2, v.clone(), 7, lim, None)
+            .await
+            .unwrap();
         assert_eq!(shards.tenant_vector_count(7), 2);
 
         // A third new id exceeds the limit -> rejected, count unchanged.
-        assert!(shards.vset("idx7", 3, v.clone(), 7, lim).await.is_err());
+        assert!(
+            shards
+                .vset("idx7", 3, v.clone(), 7, lim, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             shards.tenant_vector_count(7),
             2,
@@ -1737,21 +2561,224 @@ mod tests {
 
         // Overwriting an existing id is always allowed and free, even at the cap.
         shards
-            .vset("idx7", 1, vec![0.0, 1.0, 0.0, 0.0], 7, lim)
+            .vset("idx7", 1, vec![0.0, 1.0, 0.0, 0.0], 7, lim, None)
             .await
             .unwrap();
         assert_eq!(shards.tenant_vector_count(7), 2, "overwrite is free");
 
         // A different tenant has its own independent budget.
-        shards.vset("idx9", 1, v.clone(), 9, Some(1)).await.unwrap();
+        shards
+            .vset("idx9", 1, v.clone(), 9, Some(1), None)
+            .await
+            .unwrap();
         assert_eq!(shards.tenant_vector_count(9), 1);
         assert_eq!(shards.tenant_vector_count(7), 2, "tenant 9 did not touch 7");
 
         // VDEL frees a slot for tenant 7, letting a new id back in.
         assert!(shards.vdel("idx7", 2, 7).await.unwrap());
         assert_eq!(shards.tenant_vector_count(7), 1);
-        shards.vset("idx7", 3, v.clone(), 7, lim).await.unwrap();
+        shards
+            .vset("idx7", 3, v.clone(), 7, lim, None)
+            .await
+            .unwrap();
         assert_eq!(shards.tenant_vector_count(7), 2);
+    }
+
+    #[test]
+    fn test_scope_key_roundtrip() {
+        // Tenant 0 is the unscoped namespace (byte-identical to pre-tenancy).
+        assert_eq!(scope_key(0, "idx"), "idx");
+        assert_eq!(unscope_key("idx"), (0, "idx".to_owned()));
+        // A non-zero tenant round-trips through the `<32 hex>::<index>` form.
+        for t in [1u128, 42, 0x0123_4567_89ab_cdef, u128::MAX] {
+            let key = scope_key(t, "myindex");
+            assert!(key.contains("::"));
+            assert_eq!(unscope_key(&key), (t, "myindex".to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evict_then_lazy_reopen() {
+        // Evict is non-destructive: it frees RAM but leaves the files, so the
+        // next access lazily reopens the index with its data intact.
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        // Disk-backed (backend byte 1) so it can be evicted and reopened.
+        shards.vindex_create("ev", 4, 1, 1).await.unwrap();
+        for id in 1u64..=20 {
+            let v = vec![id as f32, 0.0, 0.0, 0.0];
+            shards.vset("ev", id, v, 0, None, None).await.unwrap();
+        }
+        // Fold the delta into the on-disk graph so the data is durable across
+        // the evict (not just in the streaming WAL).
+        shards.vindex_consolidate("ev").await.unwrap();
+
+        let q = vec![20.0f32, 0.0, 0.0, 0.0];
+        let ids = |r: &[(u64, f32, Option<Bytes>)]| r.iter().map(|h| h.0).collect::<Vec<_>>();
+        let before = ids(&shards
+            .vsearch("ev", q.clone(), 5, 0, 0, false, None)
+            .await
+            .unwrap());
+        assert!(!before.is_empty());
+
+        let ctl = shards.control_handle();
+        assert!(
+            ctl.open_indices()
+                .await
+                .iter()
+                .any(|s| s.index == "ev" && s.evictable),
+            "index is resident and evictable before eviction"
+        );
+
+        // Evict frees it on every shard that held it.
+        assert!(ctl.evict(0, "ev").await.unwrap());
+        assert!(
+            ctl.open_indices().await.iter().all(|s| s.index != "ev"),
+            "evicted index must not be resident"
+        );
+        // Evicting again is a no-op (already gone everywhere).
+        assert!(!ctl.evict(0, "ev").await.unwrap());
+
+        // Next search lazily reopens it; results match the pre-evict ones.
+        let after = ids(&shards.vsearch("ev", q, 5, 0, 0, false, None).await.unwrap());
+        assert_eq!(before, after, "lazy reopen returns the same results");
+        assert!(
+            ctl.open_indices().await.iter().any(|s| s.index == "ev"),
+            "reopened index is resident again"
+        );
+    }
+
+    /// Scale-to-zero: a fleet of K disk-backed tenant indices, all resident,
+    /// then evict the cold majority. Measures the RAM the eviction reclaims
+    /// (`resident_bytes`, allocator-independent) and proves a cold tenant reloads
+    /// with its data intact. This is the engine half of the BUSL overcommit story.
+    #[tokio::test]
+    async fn scale_to_zero_reclaims_fleet_ram() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        let k = 10usize; // tenants
+        let m = 1000u64; // vectors each
+        let dim = 128usize;
+        let vec_for = |t: usize, id: u64| {
+            let mut v = vec![0f32; dim];
+            v[0] = id as f32;
+            v[1 + (t % (dim - 1))] = 1.0; // a per-tenant component
+            v
+        };
+        for t in 0..k {
+            let name = format!("t{t}");
+            // backend 1 = disk Vamana (evictable + lazily reopenable).
+            shards.vindex_create(&name, dim as u32, 1, 1).await.unwrap();
+            for id in 1..=m {
+                shards
+                    .vset(&name, id, vec_for(t, id), 0, None, None)
+                    .await
+                    .unwrap();
+            }
+            shards.vindex_consolidate(&name).await.unwrap();
+        }
+
+        let ctl = shards.control_handle();
+        let resident = |ctl: ControlHandle| async move {
+            ctl.open_indices()
+                .await
+                .iter()
+                .map(|s| s.resident_bytes)
+                .sum::<usize>()
+        };
+
+        let r_all = resident(ctl.clone()).await;
+        // Scale-to-zero: keep 3 hot, evict the 7 cold tenants.
+        for t in 3..k {
+            assert!(ctl.evict(0, &format!("t{t}")).await.unwrap());
+        }
+        let r_hot = resident(ctl.clone()).await;
+        let reclaimed = 100.0 * (r_all - r_hot) as f64 / r_all as f64;
+        println!(
+            "scale-to-zero: {k} tenants resident {r_all} B -> 3 hot {r_hot} B = {reclaimed:.0}% reclaimed"
+        );
+        assert!(r_hot < r_all, "eviction must reclaim resident RAM");
+        assert!(
+            reclaimed > 50.0,
+            "evicting 7/10 idle tenants reclaims the majority"
+        );
+
+        // A cold (evicted) tenant reloads lazily on access, data intact.
+        let q = vec_for(9, m); // closest to t9's id=m vector
+        let hits = shards.vsearch("t9", q, 5, 0, 0, false, None).await.unwrap();
+        assert!(
+            !hits.is_empty(),
+            "evicted tenant reopens and serves on next query"
+        );
+        assert!(
+            ctl.open_indices().await.iter().any(|s| s.index == "t9"),
+            "reopened tenant is resident again"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_after_evict_keeps_evicted_reopenable() {
+        // Regression: persist_registry used to rebuild from the resident map, so a
+        // create/drop after an evict rewrote the registry WITHOUT the evicted
+        // vindex -> its dir stayed but it was no longer reopenable ("not found").
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        for n in ["a", "b"] {
+            shards.vindex_create(n, 4, 1, 1).await.unwrap(); // disk-backed
+            for id in 1u64..=20 {
+                shards
+                    .vset(n, id, vec![id as f32, 0., 0., 0.], 0, None, None)
+                    .await
+                    .unwrap();
+            }
+            shards.vindex_consolidate(n).await.unwrap();
+        }
+        shards.control_handle().evict(0, "a").await.unwrap(); // a: out of map, dir stays
+        shards.vindex_create("c", 4, 1, 1).await.unwrap(); // triggers persist_registry (the bug trigger)
+
+        // Without the fix, "a" was dropped from the registry here -> not found.
+        let q = vec![20.0f32, 0., 0., 0.];
+        let hits = shards.vsearch("a", q, 5, 0, 0, false, None).await.unwrap();
+        assert!(
+            !hits.is_empty(),
+            "evicted 'a' must reopen after an intervening create"
+        );
+    }
+
+    #[tokio::test]
+    async fn evicted_vindex_survives_restart() {
+        // The registry (not the resident map) is the source of truth for restart
+        // recovery. An evicted vindex - out of the map, files + registry entry
+        // still on disk - whose registry entry survived an intervening create
+        // must come back on a full restart. Guards the registry-as-truth fix
+        // across process boundaries, not just in-process lazy reopen.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_owned();
+        {
+            let shards = ShardSet::open(&base, 2).unwrap();
+            for n in ["a", "b"] {
+                shards.vindex_create(n, 4, 1, 1).await.unwrap(); // disk-backed
+                for id in 1u64..=20 {
+                    shards
+                        .vset(n, id, vec![id as f32, 0., 0., 0.], 0, None, None)
+                        .await
+                        .unwrap();
+                }
+                shards.vindex_consolidate(n).await.unwrap();
+            }
+            shards.control_handle().evict(0, "a").await.unwrap(); // a: out of map, files + registry stay
+            shards.vindex_create("c", 4, 1, 1).await.unwrap(); // rewrites the registry (must keep "a")
+            // shards dropped here: worker threads flush and exit.
+        }
+
+        // Restart: recover_vindexes must reopen "a" from the registry.
+        let shards = ShardSet::open(&base, 2).unwrap();
+        let q = vec![20.0f32, 0., 0., 0.];
+        let hits = shards.vsearch("a", q, 5, 0, 0, false, None).await.unwrap();
+        assert!(
+            !hits.is_empty(),
+            "evicted-then-restarted 'a' must recover from the registry"
+        );
     }
 
     /// A scoped key: 16-byte tenant prefix (LE) + raw, as the RESP3 handler
@@ -1812,7 +2839,10 @@ mod tests {
         shards.vindex_create("idx", 4, 0, 0).await.unwrap();
         let v = vec![1.0f32, 0.0, 0.0, 0.0];
         for id in 0..50u64 {
-            shards.vset("idx", id, v.clone(), 0, None).await.unwrap();
+            shards
+                .vset("idx", id, v.clone(), 0, None, None)
+                .await
+                .unwrap();
         }
         assert_eq!(
             shards.tenant_vector_count(0),
@@ -1954,7 +2984,7 @@ mod tests {
             shards.vindex_create("persist", 64, 0, 1).await.unwrap();
             for id in 0u64..150 {
                 shards
-                    .vset("persist", id, tvec(id + 1), 0, None)
+                    .vset("persist", id, tvec(id + 1), 0, None, None)
                     .await
                     .unwrap();
             }
@@ -1964,11 +2994,461 @@ mod tests {
         // Restart: a fresh ShardSet on the same dir recovers the disk VINDEX
         // from the registry + WAL.
         let shards = ShardSet::open(&base, 4).unwrap();
-        let hits = shards.vsearch("persist", tvec(89), 5, 0).await.unwrap();
+        let hits = shards
+            .vsearch("persist", tvec(89), 5, 0, 0, false, None)
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, 88, "disk VINDEX must be recovered after restart");
         // A flat VINDEX, by contrast, is in-RAM and would not survive - so the
         // recovered set contains exactly the disk-backed index.
         assert!(shards.vget("persist", 42).await.unwrap().is_some());
+    }
+
+    // VINDEX.CONSOLIDATE folds a disk index's streaming delta into the graph;
+    // the same vectors are still searchable afterwards.
+    #[tokio::test]
+    async fn test_vindex_consolidate() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // disk
+        for id in 0u64..200 {
+            shards
+                .vset("idx", id, tvec(id + 1), 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("idx").await.unwrap();
+        let hits = shards
+            .vsearch("idx", tvec(90), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].0, 89, "nearest still found after consolidate");
+        // Consolidate is idempotent and a no-op on flat indices.
+        shards.vindex_consolidate("idx").await.unwrap();
+        shards.vindex_create("flat", 64, 0, 0).await.unwrap();
+        shards.vindex_consolidate("flat").await.unwrap();
+    }
+
+    // Find a hit's payload by id in a WITHPAYLOAD result.
+    fn payload_of(hits: &[(u64, f32, Option<Bytes>)], id: u64) -> Option<&[u8]> {
+        hits.iter().find(|h| h.0 == id).and_then(|h| h.2.as_deref())
+    }
+
+    // A payload stored with VSET comes back byte-identical with a WITHPAYLOAD
+    // search, for empty, binary-with-NUL, and large (>4KB) blobs. Without
+    // WITHPAYLOAD no payload is attached.
+    #[tokio::test]
+    async fn test_payload_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap(); // flat
+
+        let empty: Vec<u8> = Vec::new();
+        let binary: Vec<u8> = vec![0u8, 1, 2, 0, 255, 0, 7];
+        let large: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        for (id, blob) in [(1u64, &empty), (2, &binary), (3, &large)] {
+            shards
+                .vset(
+                    "idx",
+                    id,
+                    tvec(id + 1),
+                    0,
+                    None,
+                    Some(Bytes::from(blob.clone())),
+                )
+                .await
+                .unwrap();
+        }
+
+        // WITHPAYLOAD: each id carries its exact blob.
+        let hits = shards
+            .vsearch("idx", tvec(2), 10, 0, 0, true, None)
+            .await
+            .unwrap();
+        assert_eq!(payload_of(&hits, 1), Some(&empty[..]));
+        assert_eq!(payload_of(&hits, 2), Some(&binary[..]));
+        assert_eq!(payload_of(&hits, 3), Some(&large[..]));
+
+        // Without the flag: no payload attached at all.
+        let plain = shards
+            .vsearch("idx", tvec(2), 10, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(plain.iter().all(|h| h.2.is_none()));
+    }
+
+    // Payloads survive a restart (disk index + vLog replay), and a VDEL before
+    // the restart removes the blob for good.
+    #[tokio::test]
+    async fn test_payload_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_owned();
+        {
+            let shards = ShardSet::open(&base, 2).unwrap();
+            shards.vindex_create("persist", 64, 0, 1).await.unwrap(); // disk
+            shards
+                .vset(
+                    "persist",
+                    10,
+                    tvec(11),
+                    0,
+                    None,
+                    Some(Bytes::from_static(b"keep")),
+                )
+                .await
+                .unwrap();
+            shards
+                .vset(
+                    "persist",
+                    20,
+                    tvec(21),
+                    0,
+                    None,
+                    Some(Bytes::from_static(b"gone")),
+                )
+                .await
+                .unwrap();
+            assert!(shards.vdel("persist", 20, 0).await.unwrap());
+        }
+        let shards = ShardSet::open(&base, 2).unwrap();
+        let hits = shards
+            .vsearch("persist", tvec(11), 10, 0, 0, true, None)
+            .await
+            .unwrap();
+        assert_eq!(payload_of(&hits, 10), Some(&b"keep"[..]));
+        // id 20 was deleted before restart: no hit, hence no payload.
+        assert!(hits.iter().all(|h| h.0 != 20));
+    }
+
+    // A payload is scoped to its tenant. The vector index is shared at this
+    // layer, so tenant 9 still sees id 1, but reads no payload for it.
+    #[tokio::test]
+    async fn test_payload_tenant_isolation() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        shards
+            .vset(
+                "idx",
+                1,
+                tvec(2),
+                7,
+                None,
+                Some(Bytes::from_static(b"tenant-7-secret")),
+            )
+            .await
+            .unwrap();
+
+        let as7 = shards
+            .vsearch("idx", tvec(2), 5, 0, 7, true, None)
+            .await
+            .unwrap();
+        assert_eq!(payload_of(&as7, 1), Some(&b"tenant-7-secret"[..]));
+
+        let as9 = shards
+            .vsearch("idx", tvec(2), 5, 0, 9, true, None)
+            .await
+            .unwrap();
+        assert!(
+            as9.iter().any(|h| h.0 == 1),
+            "vector is shared at this layer"
+        );
+        assert_eq!(
+            payload_of(&as9, 1),
+            None,
+            "tenant 9 must not read tenant 7's payload"
+        );
+    }
+
+    // Dropping an index reclaims its payload blobs, so a recreated index
+    // reusing the same name and id does not resurface a stale payload.
+    #[tokio::test]
+    async fn test_payload_dropped_with_index() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        shards
+            .vset(
+                "idx",
+                1,
+                tvec(2),
+                0,
+                None,
+                Some(Bytes::from_static(b"stale")),
+            )
+            .await
+            .unwrap();
+        shards.vindex_drop("idx", 0).await.unwrap();
+
+        // Recreate and re-insert the same id with NO payload.
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        shards.vset("idx", 1, tvec(2), 0, None, None).await.unwrap();
+        let hits = shards
+            .vsearch("idx", tvec(2), 5, 0, 0, true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            payload_of(&hits, 1),
+            None,
+            "dropped payload must not resurface"
+        );
+    }
+
+    fn flt(s: &str) -> Option<crate::payload::Filter> {
+        Some(crate::payload::parse_filter(s).unwrap())
+    }
+
+    fn ids_of(hits: &[(u64, f32, Option<Bytes>)]) -> BTreeSet<u64> {
+        hits.iter().map(|h| h.0).collect()
+    }
+
+    // A FILTER returns the exact nearest among only the matching ids, not the
+    // global nearest minus non-matches. id 1 is the global nearest (the query is
+    // its own vector) but belongs to `bob`; a `user = alice` filter must return
+    // alice's vectors and exclude id 1 entirely.
+    #[tokio::test]
+    async fn test_filter_exact_over_subset() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        let set = |id: u64, who: &'static [u8]| {
+            let s = &shards;
+            async move {
+                s.vset("idx", id, tvec(id), 0, None, Some(Bytes::from_static(who)))
+                    .await
+                    .unwrap();
+            }
+        };
+        set(1, b"user=bob").await;
+        set(2, b"user=alice type=doc").await;
+        set(3, b"user=alice type=img").await;
+
+        // Query == id 1's vector, so id 1 is the global nearest.
+        let global = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&global).iter().next(),
+            Some(&1),
+            "id 1 is global nearest"
+        );
+
+        // user = alice excludes id 1 (bob) and returns alice's two, exactly.
+        let alice = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("user = alice"))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&alice), BTreeSet::from([2, 3]));
+
+        // AND narrows further; an empty match yields zero hits.
+        let one = shards
+            .vsearch(
+                "idx",
+                tvec(1),
+                10,
+                0,
+                0,
+                false,
+                flt("user = alice AND type = doc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&one), BTreeSet::from([2]));
+        let none = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("user = nobody"))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    // VMSET bulk-inserts every item (vectors searchable) and indexes each
+    // supplied payload (filtered search sees it), same as a sequence of VSETs.
+    #[tokio::test]
+    async fn vmset_bulk_inserts_and_indexes() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
+        let items = vec![
+            (1u64, tvec(1), Some(Bytes::from_static(b"user=bob"))),
+            (2u64, tvec(2), Some(Bytes::from_static(b"user=alice"))),
+            (3u64, tvec(3), None),
+        ];
+        let n = shards.vmset("idx", items, 0, None).await.unwrap();
+        assert_eq!(n, 3, "all three items inserted");
+
+        // Every vector is searchable.
+        let got = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(ids_of(&got).contains(&1), "id 1 searchable after VMSET");
+
+        // Supplied payloads are indexed: a filter selects exactly the match.
+        let alice = shards
+            .vsearch("idx", tvec(2), 10, 0, 0, false, flt("user = alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&alice),
+            BTreeSet::from([2]),
+            "VMSET payload is filterable"
+        );
+    }
+
+    // Completeness: after a large concurrent VMSET, EVERY item's payload is
+    // indexed - each even id finds itself under the matching filter. Guards the
+    // ~10%-indexed bug seen when the bench queried mid-population.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vmset_indexes_all_payloads() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
+        let n: u64 = 4000;
+        let items: Vec<_> = (0..n)
+            .map(|id| {
+                let pl = if id % 2 == 0 {
+                    b"p=yes".as_slice()
+                } else {
+                    b"p=no".as_slice()
+                };
+                (id, tvec(id), Some(Bytes::copy_from_slice(pl)))
+            })
+            .collect();
+        let cnt = shards.vmset("idx", items, 0, None).await.unwrap();
+        assert_eq!(cnt, n as usize, "all items inserted");
+
+        // Every even id must find ITSELF (its exact vector) under `p = yes`.
+        let probes: Vec<u64> = (0..n).step_by(40).collect(); // all even
+        let mut found = 0;
+        for &id in &probes {
+            let got = shards
+                .vsearch("idx", tvec(id), 5, 0, 0, false, flt("p = yes"))
+                .await
+                .unwrap();
+            if ids_of(&got).contains(&id) {
+                found += 1;
+            }
+        }
+        assert_eq!(found, probes.len(), "every even id is indexed+self-matches");
+    }
+
+    // Same, but at a scale that triggers several geometric consolidates during
+    // the load (batched VMSET, like the bench), to catch a payload/consolidate
+    // or Relaxed-blob interaction that drops index entries. Slow (~80s); the fast
+    // variant above covers the common path, so this one is opt-in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "slow (~80s); consolidate/payload regression guard"]
+    async fn vmset_indexes_all_payloads_at_scale() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
+        let n: u64 = 20_000;
+        let mut id = 0u64;
+        while id < n {
+            let end = (id + 256).min(n);
+            let items: Vec<_> = (id..end)
+                .map(|i| {
+                    let pl = if i % 2 == 0 {
+                        b"p=yes".as_slice()
+                    } else {
+                        b"p=no".as_slice()
+                    };
+                    (i, tvec(i), Some(Bytes::copy_from_slice(pl)))
+                })
+                .collect();
+            shards.vmset("idx", items, 0, None).await.unwrap();
+            id = end;
+        }
+        let probes: Vec<u64> = (0..n).step_by(400).collect(); // all even
+        let mut found = 0;
+        for &id in &probes {
+            let got = shards
+                .vsearch("idx", tvec(id), 5, 0, 0, false, flt("p = yes"))
+                .await
+                .unwrap();
+            if ids_of(&got).contains(&id) {
+                found += 1;
+            }
+        }
+        assert_eq!(
+            found,
+            probes.len(),
+            "every even id indexed after consolidates"
+        );
+    }
+
+    // VDEL drops an id from the payload index, so a later filtered search no
+    // longer returns it; an overwrite VSET replaces the id's fields.
+    #[tokio::test]
+    async fn test_filter_index_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("idx", 64, 0, 0).await.unwrap();
+        shards
+            .vset("idx", 1, tvec(1), 0, None, Some(Bytes::from_static(b"k=a")))
+            .await
+            .unwrap();
+        shards
+            .vset("idx", 2, tvec(2), 0, None, Some(Bytes::from_static(b"k=a")))
+            .await
+            .unwrap();
+
+        // Overwrite id 2 to k=b: it leaves the k=a set.
+        shards
+            .vset("idx", 2, tvec(2), 0, None, Some(Bytes::from_static(b"k=b")))
+            .await
+            .unwrap();
+        let a = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a"))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&a), BTreeSet::from([1]));
+
+        // VDEL id 1: the k=a set is now empty.
+        assert!(shards.vdel("idx", 1, 0).await.unwrap());
+        let a2 = shards
+            .vsearch("idx", tvec(1), 10, 0, 0, false, flt("k = a"))
+            .await
+            .unwrap();
+        assert!(a2.is_empty());
+    }
+
+    // After a restart the payload index is rebuilt from the stored blobs on the
+    // first filtered search, so a FILTER returns the same ids as before.
+    #[tokio::test]
+    async fn test_filter_index_rebuilt_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_owned();
+        {
+            let shards = ShardSet::open(&base, 2).unwrap();
+            shards.vindex_create("persist", 64, 0, 1).await.unwrap(); // disk
+            for id in 1u64..=4 {
+                let who: &[u8] = if id % 2 == 0 {
+                    b"user=alice"
+                } else {
+                    b"user=bob"
+                };
+                shards
+                    .vset(
+                        "persist",
+                        id,
+                        tvec(id),
+                        0,
+                        None,
+                        Some(Bytes::from(who.to_vec())),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        // Restart: the payload index starts empty and is rebuilt on first use.
+        let shards = ShardSet::open(&base, 2).unwrap();
+        let alice = shards
+            .vsearch("persist", tvec(2), 10, 0, 0, false, flt("user = alice"))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&alice), BTreeSet::from([2, 4]));
     }
 
     /// Two VSEARCH callers hitting **different** vindexes on the same
@@ -1994,7 +3474,12 @@ mod tests {
     ///
     /// Measured locally on M1: 1.5×–2.0× depending on warm-up and
     /// concurrent system load; never below 1.4×.
+    // Wall-clock ratio gate: inherently flaky on shared / low-core CI runners
+    // (a contended ubuntu runner can't deliver the 1.2x parallel speedup even
+    // though the locks parallelise correctly). Ignored by default like the other
+    // perf gates; run locally with `--ignored`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "wall-clock perf gate, flaky on shared CI; run locally with --ignored"]
     async fn test_per_vindex_locks_concurrency_gate() {
         let dir = TempDir::new().unwrap();
         let shards =
@@ -2017,8 +3502,11 @@ mod tests {
         };
         for id in 0..n {
             let v = make_vec(id);
-            shards.vset("a", id, v.clone(), 0, None).await.unwrap();
-            shards.vset("b", id, v, 0, None).await.unwrap();
+            shards
+                .vset("a", id, v.clone(), 0, None, None)
+                .await
+                .unwrap();
+            shards.vset("b", id, v, 0, None, None).await.unwrap();
         }
 
         let query = make_vec(99_999);
@@ -2032,12 +3520,18 @@ mod tests {
         let t = std::time::Instant::now();
         let h1 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s1.vsearch("a", q1.clone(), 10, 0).await.unwrap();
+                let _ = s1
+                    .vsearch("a", q1.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s2.vsearch("a", q2.clone(), 10, 0).await.unwrap();
+                let _ = s2
+                    .vsearch("a", q2.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         h1.await.unwrap();
@@ -2052,12 +3546,18 @@ mod tests {
         let t = std::time::Instant::now();
         let h1 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s1.vsearch("a", q1.clone(), 10, 0).await.unwrap();
+                let _ = s1
+                    .vsearch("a", q1.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..iters {
-                let _ = s2.vsearch("b", q2.clone(), 10, 0).await.unwrap();
+                let _ = s2
+                    .vsearch("b", q2.clone(), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
             }
         });
         h1.await.unwrap();

@@ -32,7 +32,7 @@ Total number of operations served, broken down by op. Stable labels:
 
 Per-op latency, in seconds. Reported as Prometheus cumulative buckets
 plus `_count` and `_sum`. The bucket bounds are fixed at compile time
-and documented in [`skeg-telemetry/src/histograms.rs`](crates/skeg-telemetry/src/histograms.rs).
+and documented in [`skeg-telemetry/src/histograms.rs`](../crates/skeg-telemetry/src/histograms.rs).
 Useful queries:
 
 ```promql
@@ -67,14 +67,14 @@ scrape_configs:
 ```
 
 That is enough to populate the dashboard JSON shipped under
-[`assets/grafana/`](assets/grafana/).
+[`assets/grafana/`](../assets/grafana/).
 
 ## OpenTelemetry: use the collector's Prometheus receiver
 
 skeg does not link the OpenTelemetry SDK directly on the hot path. Atomic
 counters keep the per-op overhead near zero; an OpenTelemetry receiver in
 your collector picks up the same `/metrics` endpoint and forwards it as
-OTLP. Sample [otel-collector-config.yaml](assets/grafana/otel-collector-config.yaml):
+OTLP. Sample [otel-collector-config.yaml](../assets/grafana/otel-collector-config.yaml):
 
 ```yaml
 receivers:
