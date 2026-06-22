@@ -32,7 +32,7 @@ use skeg_resp3::{
 
 use crate::payload::parse_filter;
 use crate::shard::ShardSet;
-use crate::tenant::{AnonymousPolicy, TenantBackend, TenantId};
+use crate::tenant::{Admission, AnonymousPolicy, CommandKind, TenantBackend, TenantId};
 
 /// Format a VINDEX name with the tenant scope. `TenantId::ZERO` returns the
 /// raw name (single-tenant deployments stay byte-identical to pre-tenancy).
@@ -227,6 +227,43 @@ fn command_cost(cmd: &Command) -> u32 {
     }
 }
 
+/// Classify a command for the admission gate ([`CommandKind`]). Grouped by
+/// (resource, action); index-lifecycle ops stay individual (the RBAC target).
+/// Exhaustive over `Command` so a new command must be classified here.
+fn command_kind(cmd: &Command) -> CommandKind {
+    match cmd {
+        Command::Get { .. } | Command::Mget { .. } | Command::Exists { .. } => CommandKind::KvRead,
+        Command::Set { .. }
+        | Command::Mset { .. }
+        | Command::Del { .. }
+        | Command::Incr { .. }
+        | Command::Decr { .. }
+        | Command::IncrBy { .. }
+        | Command::DecrBy { .. } => CommandKind::KvWrite,
+        Command::SkegVsearch { .. } => CommandKind::VectorRead,
+        Command::SkegVset { .. } | Command::SkegVmset { .. } | Command::SkegVdel { .. } => {
+            CommandKind::VectorWrite
+        }
+        Command::SkegVindexCreate { .. } => CommandKind::VindexCreate,
+        Command::SkegVindexDrop { .. } => CommandKind::VindexDrop,
+        Command::SkegVindexConsolidate { .. } => CommandKind::VindexConsolidate,
+        Command::SkegVindexList => CommandKind::VindexList,
+        Command::SkegQuotaSet { .. }
+        | Command::SkegQuotaGet { .. }
+        | Command::SkegQosSet { .. }
+        | Command::SkegQosGet { .. } => CommandKind::Admin,
+        Command::Hello(_)
+        | Command::Ping(_)
+        | Command::Echo(_)
+        | Command::Select { .. }
+        | Command::SkegStats
+        | Command::SkegShards
+        | Command::SkegWhoami
+        | Command::SkegAuth { .. }
+        | Command::Unknown { .. } => CommandKind::Meta,
+    }
+}
+
 async fn dispatch_command(
     cmd: Command,
     state: &mut ConnectionState,
@@ -240,10 +277,17 @@ async fn dispatch_command(
     // cap reserved in `admit` actually bounds the command's in-flight lifetime.
     let _admit = match (&cmd, tenant_backend) {
         (Command::Hello(_) | Command::SkegAuth { .. }, _) | (_, None) => None,
-        (_, Some(ctx)) => match ctx.admit(*tenant, command_cost(&cmd)) {
-            Ok(guard) => Some(guard),
-            Err(rejected) => return Frame::Error(rejected.message),
-        },
+        (_, Some(ctx)) => {
+            let admission = Admission {
+                tenant: *tenant,
+                op: command_kind(&cmd),
+                cost: command_cost(&cmd),
+            };
+            match ctx.admit(admission) {
+                Ok(guard) => Some(guard),
+                Err(rejected) => return Frame::Error(rejected.message),
+            }
+        }
     };
     match cmd {
         Command::Hello(args) => {
@@ -407,13 +451,25 @@ fn parse_backend_arg(b: &Bytes) -> Result<u8, Frame> {
 }
 
 /// `SKEG.VINDEX.CREATE name dim kind backend`. Name is scoped per tenant.
+/// Wire byte for tq2, the default tier (recall ~1.0, sub-int8 RAM). Used when
+/// `SKEG.VINDEX.CREATE` is called without an explicit kind. Mirrors
+/// `parse_kind_arg`'s `"tq2" => 4`.
+const DEFAULT_KIND_TQ2: u8 = 4;
+
 async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
-    if args.len() != 4 {
-        return Frame::Error(
-            "ERR wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim kind backend"
-                .into(),
-        );
-    }
+    // `name dim [kind] backend`: kind is optional and defaults to tq2. Arity (not
+    // token shape) disambiguates - kind and backend share numeric aliases (0/1),
+    // so a 3-arg call is always [name, dim, backend].
+    let (kind_arg, backend_arg) = match args.len() {
+        4 => (Some(&args[2]), &args[3]),
+        3 => (None, &args[2]),
+        _ => {
+            return Frame::Error(
+                "ERR wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim [kind] backend"
+                    .into(),
+            );
+        }
+    };
     let raw_name = match parse_utf8_arg(&args[0], "name") {
         Ok(s) => s,
         Err(e) => return e,
@@ -427,11 +483,14 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
         Ok(v) => v,
         Err(e) => return e,
     };
-    let kind = match parse_kind_arg(&args[2]) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let kind = match kind_arg {
+        Some(b) => match parse_kind_arg(b) {
+            Ok(v) => v,
+            Err(e) => return e,
+        },
+        None => DEFAULT_KIND_TQ2,
     };
-    let backend = match parse_backend_arg(&args[3]) {
+    let backend = match parse_backend_arg(backend_arg) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1219,6 +1278,183 @@ mod tests {
             key: Bytes::from_static(b"k"),
         };
         assert_eq!(command_cost(&cmd), 1);
+    }
+
+    #[test]
+    fn command_kind_classifies_for_rbac() {
+        let cases = [
+            (
+                Command::Get {
+                    key: Bytes::from_static(b"k"),
+                },
+                CommandKind::KvRead,
+            ),
+            (
+                Command::Set {
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"v"),
+                },
+                CommandKind::KvWrite,
+            ),
+            (
+                Command::SkegVsearch {
+                    args: args(&["i", "1", "1", "v"]),
+                },
+                CommandKind::VectorRead,
+            ),
+            (
+                Command::SkegVset {
+                    args: args(&["i", "1", "v"]),
+                },
+                CommandKind::VectorWrite,
+            ),
+            (
+                Command::SkegVindexCreate {
+                    args: args(&["i", "4", "1", "1"]),
+                },
+                CommandKind::VindexCreate,
+            ),
+            (
+                Command::SkegVindexDrop {
+                    args: args(&["i"]),
+                },
+                CommandKind::VindexDrop,
+            ),
+            (
+                Command::SkegQosSet {
+                    args: args(&["t"]),
+                },
+                CommandKind::Admin,
+            ),
+            (Command::Ping(None), CommandKind::Meta),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(command_kind(&cmd), want, "misclassified {cmd:?}");
+        }
+    }
+
+    /// A backend that records every `Admission.op` it sees and refuses
+    /// `VindexDrop` - the minimal per-command RBAC the new seam enables.
+    struct RbacBackend {
+        seen: std::sync::Mutex<Vec<CommandKind>>,
+    }
+
+    impl TenantBackend for RbacBackend {
+        fn verify_login(&self, _user: &str, _password: &[u8]) -> Option<TenantId> {
+            None
+        }
+        fn has_tenant(&self, _id: TenantId) -> bool {
+            false
+        }
+        fn admit(&self, a: Admission) -> Result<crate::AdmitGuard, crate::AdmitRejected> {
+            self.seen.lock().unwrap().push(a.op);
+            if a.op == CommandKind::VindexDrop {
+                return Err(crate::AdmitRejected {
+                    message: "FORBIDDEN drop denied".into(),
+                });
+            }
+            Ok(crate::AdmitGuard::allow())
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_refuses_command_by_kind() {
+        let (_dir, shards) = fresh_shards().await;
+        let concrete = std::sync::Arc::new(RbacBackend {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let backend: std::sync::Arc<dyn TenantBackend> = concrete.clone();
+        let mut state = ConnectionState::new(0);
+        let mut tenant = tid_from_name("t");
+
+        // VINDEX.DROP is refused at the gate, by op, before touching the shard.
+        let f = dispatch_command(
+            Command::SkegVindexDrop {
+                args: args(&["idx"]),
+            },
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("FORBIDDEN")),
+            "VINDEX.DROP must be refused by the gate, got {f:?}"
+        );
+
+        // GET passes the gate (it may then fail on a missing key, but never with
+        // the admit rejection).
+        let f = dispatch_command(
+            Command::Get {
+                key: Bytes::from_static(b"k"),
+            },
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            !matches!(&f, Frame::Error(e) if e.contains("FORBIDDEN")),
+            "GET must pass the gate, got {f:?}"
+        );
+
+        let seen = concrete.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![CommandKind::VindexDrop, CommandKind::KvRead],
+            "admit must see each command's classified op"
+        );
+    }
+
+    #[tokio::test]
+    async fn vindex_create_defaults_to_tq2_tier() {
+        // A disk VINDEX.CREATE with the kind omitted (3 args) must default to a
+        // sub-int8 tier (tq2). Verified behaviorally: same data, the default
+        // index is leaner in RAM than an explicit int8 one.
+        let (_dir, shards) = fresh_shards().await;
+        let mut state = ConnectionState::new(0);
+        let mut tenant = TenantId::ZERO;
+        let dim = 64usize;
+        let n = 2000u64;
+
+        for (name, create_args) in [
+            ("def", args(&["def", "64", "disk"])),      // 3 args -> kind defaults to tq2
+            ("i8", args(&["i8", "64", "int8", "disk"])), // 4 args -> explicit int8
+        ] {
+            let f = dispatch_command(
+                Command::SkegVindexCreate { args: create_args },
+                &mut state,
+                &mut tenant,
+                &shards,
+                None,
+            )
+            .await;
+            assert!(!matches!(f, Frame::Error(_)), "create {name} failed: {f:?}");
+            for id in 1..=n {
+                let mut v = vec![0f32; dim];
+                v[0] = id as f32;
+                v[1 + (id as usize % (dim - 1))] = 1.0;
+                shards.vset(name, id, v, 0, None, None).await.unwrap();
+            }
+            shards.vindex_consolidate(name).await.unwrap();
+        }
+
+        let stats = shards.control_handle().open_indices().await;
+        let rb = |idx: &str| {
+            stats
+                .iter()
+                .filter(|s| s.index == idx)
+                .map(|s| s.resident_bytes)
+                .sum::<usize>()
+        };
+        assert!(
+            rb("def") < rb("i8"),
+            "default tier must be leaner than int8: def={} i8={}",
+            rb("def"),
+            rb("i8")
+        );
     }
 
     #[tokio::test]

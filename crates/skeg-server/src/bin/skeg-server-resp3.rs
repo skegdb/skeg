@@ -43,9 +43,10 @@ OPTIONS:
     --data-dir <PATH>      Data directory. Default ./data. Env: SKEG_DATA_DIR.
     --mode <MODE>          'rw' (default) or 'serve' (read-only, mmap tier).
     --tier <KIND>          Quantizer for the serve tier:
-                             int8 (default) | pq | pq:M:K |
+                             tq2 (default) | int8 | pq | pq:M:K |
                              turboquant-1 | turboquant-2 | turboquant-4
-                             (aliases: tq1, tq2, tq4)
+                             (aliases: tq1, tq2, tq4). Same default applies to
+                             SKEG.VINDEX.CREATE when its kind arg is omitted.
     --speed                Opt-in early-termination in greedy walk
                              (-0.3 to -0.7% recall@10, +40-60% QPS).
                              Also: SKEG_SPEED=1.
@@ -159,8 +160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn parse_tier(arg: Option<&String>) -> QuantKind {
+    // Default (no --tier) is tq2: recall ~1.0 across 100-1024d on real embeddings
+    // (gate 2026-06), sub-int8 RAM - the recommended sweet spot. Pass --tier int8
+    // for the full-fidelity tier.
     match arg.map(String::as_str) {
-        None | Some("int8") => QuantKind::Int8,
+        None | Some("turboquant-2") | Some("tq2") => QuantKind::TurboQuant { bits: 2 },
+        Some("int8") => QuantKind::Int8,
         Some("pq") => QuantKind::Pq { m: 128, k: 256 },
         Some(s) if s.starts_with("pq:") => {
             let mut parts = s[3..].split(':');
@@ -169,11 +174,10 @@ fn parse_tier(arg: Option<&String>) -> QuantKind {
             QuantKind::Pq { m, k }
         }
         Some("turboquant-1") | Some("tq1") => QuantKind::TurboQuant { bits: 1 },
-        Some("turboquant-2") | Some("tq2") => QuantKind::TurboQuant { bits: 2 },
         Some("turboquant-4") | Some("tq4") => QuantKind::TurboQuant { bits: 4 },
         Some(other) => {
-            tracing::warn!("unknown --tier '{other}', using int8");
-            QuantKind::Int8
+            tracing::warn!("unknown --tier '{other}', using the default tq2");
+            QuantKind::TurboQuant { bits: 2 }
         }
     }
 }

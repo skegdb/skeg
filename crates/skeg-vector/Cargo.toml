@@ -94,3 +94,7 @@ workspace = true
 [[bench]]
 name = "incremental_gate"
 harness = false
+
+[[bench]]
+name = "tiering_gate"
+harness = false

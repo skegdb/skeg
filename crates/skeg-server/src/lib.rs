@@ -30,9 +30,11 @@ use handler::handle_connection;
 pub use quota::{TenantLimits, TenantQos, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
+pub use shard::{ControlHandle, IndexStat};
 use skeg_vector::QuantKind;
 pub use tenant::{
-    AdmitGuard, AdmitRejected, AnonymousPolicy, QuotaAdminError, TenantBackend, TenantId,
+    Admission, AdmitGuard, AdmitRejected, AnonymousPolicy, CommandKind, QuotaAdminError,
+    TenantBackend, TenantId,
 };
 
 pub struct Server {
@@ -213,6 +215,14 @@ impl Server {
     #[must_use]
     pub fn n_shards(&self) -> usize {
         self.shards.n_shards()
+    }
+
+    /// Control-plane handle for vindex tiering (enumerate / report RAM /
+    /// evict). An external policy crate attaches a background task to it; the
+    /// engine provides only the mechanism.
+    #[must_use]
+    pub fn control_handle(&self) -> ControlHandle {
+        self.shards.control_handle()
     }
 
     /// Accept connections and handle them until an I/O error on `accept`.

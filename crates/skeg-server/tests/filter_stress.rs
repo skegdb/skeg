@@ -16,6 +16,7 @@
 //!   - `year` : 2018 + id % 8 (SCATTERED, for ranges);
 //!   - `type` : id % 4 (SCATTERED, medium);
 //!   - `flag` : present on id % 3 == 0 (for EXISTS).
+//!
 //! Then a list of filter expressions is parsed, evaluated against the real
 //! payload index, served by the same planner the server uses (exact below the
 //! crossover, filtered walk above), and scored against the exact top-k over the

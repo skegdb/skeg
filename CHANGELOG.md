@@ -51,6 +51,32 @@ repository.
   background task folds a delta that has been stable across ticks, so an index
   is lean by default without an explicit call.
 
+- **Vindex tiering control plane (mechanism, not policy).** A new
+  `Server::control_handle()` returns a `ControlHandle` for managing resident
+  vindexes out of band: `open_indices()` enumerates every open index per shard
+  with its `IndexStat` (resident bytes, last-access, vector count, whether it is
+  evictable), `total_resident_bytes()` sums the fleet, and `evict(tenant, index)`
+  drops an index from RAM **non-destructively** - the `vindex-<name>/` files stay
+  and the next access reopens it lazily. A disk-backed index reopens off the
+  shard thread (`spawn_blocking`), so a cold-start reopen does not stall other
+  indexes on the same shard. The eviction *policy* (RAM budget, LRU, hysteresis)
+  is left to an external controller; the engine ships only the knobs.
+
+- **tq2 is now the default tier.** `SKEG.VINDEX.CREATE name dim backend` (kind
+  omitted, 3 args) builds a tq2 disk index, and `--mode serve` without `--tier`
+  serves tq2. Validated recall-neutral vs int8 across 100-784d real embeddings
+  (r@10 >= 0.999, r@100 within 0.004) at lower RAM. Pass an explicit kind / `--tier
+  int8` for the prior full-fidelity tier. Behavior change on upgrade: an existing
+  serve deployment that relied on the implicit int8 default now serves tq2
+  (recall-neutral, leaner) unless it passes `--tier int8`.
+
+- **Per-command admission carries the command kind.** `TenantBackend::admit` now
+  takes an `Admission { tenant, op, cost }` (was `(tenant, cost)`), where `op` is
+  a coarse `CommandKind`. A backend can apply command-level RBAC (e.g. refuse
+  `VINDEX.DROP` for some tenants) and per-operation metering from one gate. Both
+  types are `#[non_exhaustive]`. Single-tenant deployments and the default
+  (admit-everything) backend are unaffected.
+
 ### Changed
 
 - **Vindex RAM accounting (`VindexSizeBytes` gauge) is now tier-accurate.** Disk
@@ -67,6 +93,11 @@ repository.
   `DiskVamanaIndex::search_filtered` / `score_ids` / `live_ids`. Library code on
   these APIs must update its call sites, which is why `skeg-server` takes a minor
   version bump.
+
+- **`TenantBackend::admit` signature changed** from `admit(tenant, cost)` to
+  `admit(Admission)`. Backends that override it must update; the default
+  (admit-everything) is unchanged, so single-tenant and non-overriding backends
+  need no change.
 
 ### Versions bumped
 
