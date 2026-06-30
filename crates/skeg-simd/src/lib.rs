@@ -734,9 +734,11 @@ pub fn tq1_masked_sum_scalar(code: &[u8], q_rot: &[f32], dim: usize) -> f32 {
 /// mask in-register with `vtstq_u32` (broadcast the code byte, test against
 /// per-lane bit selectors) instead of gathering it from a memory table - the
 /// table loads were the bottleneck once the graph stopped fitting in cache.
-/// Processes 16 coords per iteration (two code bytes) across four accumulators
-/// to hide the add latency, with a scalar tail for a trailing odd byte.
-/// `dim % 8 == 0` is required (tq1 always packs whole bytes).
+/// Processes 32 coords per iteration (four code bytes) across eight independent
+/// accumulators - same shape as `tq2`/`tq4` - so the loop is bound by add
+/// throughput rather than the ~3-cycle add latency. A scalar tail covers the
+/// trailing `bytes % 4` bytes. `dim % 8 == 0` is required (tq1 packs whole
+/// bytes); the dispatcher [`tq1_masked_sum`] asserts the lengths.
 #[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn tq1_masked_sum_neon(code: &[u8], q_rot: &[f32], dim: usize) -> f32 {
@@ -745,68 +747,68 @@ pub fn tq1_masked_sum_neon(code: &[u8], q_rot: &[f32], dim: usize) -> f32 {
         vreinterpretq_f32_u32, vreinterpretq_u32_f32, vtstq_u32,
     };
     let bytes = dim / 8;
-    let pairs = bytes / 2;
-    // SAFETY: `bytes = dim/8`, `dim % 8 == 0`. The paired loop reads bytes
-    // `2p, 2p+1 < bytes <= code.len()` and four f32x4 spanning `[p*16, p*16+16)`
-    // with `p*16+16 <= pairs*16 <= dim = q_rot.len()`. Bit selectors are
-    // 16-byte stack arrays read in full by `vld1q_u32`, loaded once.
+    let quads = bytes / 4;
+    // SAFETY: `bytes = dim/8`, `dim % 8 == 0`. The quad loop reads bytes
+    // `4q..4q+4 < bytes <= code.len()` and eight f32x4 spanning `[q*32, q*32+32)`
+    // with `q*32+32 <= quads*32 <= dim = q_rot.len()`. Bit selectors are 16-byte
+    // stack arrays read in full by `vld1q_u32`, loaded once.
     let acc = unsafe {
         // Lane j tests bit j of the nibble: lo = bits 0..3, hi = bits 4..7.
         let sel_lo = vld1q_u32([1u32, 2, 4, 8].as_ptr());
         let sel_hi = vld1q_u32([16u32, 32, 64, 128].as_ptr());
-        let mut acc0 = vdupq_n_f32(0.0);
-        let mut acc1 = vdupq_n_f32(0.0);
-        let mut acc2 = vdupq_n_f32(0.0);
-        let mut acc3 = vdupq_n_f32(0.0);
-        for p in 0..pairs {
-            let b0 = vdupq_n_u32(u32::from(*code.get_unchecked(2 * p)));
-            let b1 = vdupq_n_u32(u32::from(*code.get_unchecked(2 * p + 1)));
-            let base = p * 16;
-            let q0 = vld1q_f32(q_rot.as_ptr().add(base));
-            let q1 = vld1q_f32(q_rot.as_ptr().add(base + 4));
-            let q2 = vld1q_f32(q_rot.as_ptr().add(base + 8));
-            let q3 = vld1q_f32(q_rot.as_ptr().add(base + 12));
-            let m0 = vtstq_u32(b0, sel_lo);
-            let m1 = vtstq_u32(b0, sel_hi);
-            let m2 = vtstq_u32(b1, sel_lo);
-            let m3 = vtstq_u32(b1, sel_hi);
-            acc0 = vaddq_f32(
-                acc0,
-                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(q0), m0)),
-            );
-            acc1 = vaddq_f32(
-                acc1,
-                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(q1), m1)),
-            );
-            acc2 = vaddq_f32(
-                acc2,
-                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(q2), m2)),
-            );
-            acc3 = vaddq_f32(
-                acc3,
-                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(q3), m3)),
-            );
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        for q in 0..quads {
+            let base = q * 32;
+            for (i, a) in acc.chunks_exact_mut(2).enumerate() {
+                let byte = vdupq_n_u32(u32::from(*code.get_unchecked(4 * q + i)));
+                let qlo = vld1q_f32(q_rot.as_ptr().add(base + i * 8));
+                let qhi = vld1q_f32(q_rot.as_ptr().add(base + i * 8 + 4));
+                a[0] = vaddq_f32(
+                    a[0],
+                    vreinterpretq_f32_u32(vandq_u32(
+                        vreinterpretq_u32_f32(qlo),
+                        vtstq_u32(byte, sel_lo),
+                    )),
+                );
+                a[1] = vaddq_f32(
+                    a[1],
+                    vreinterpretq_f32_u32(vandq_u32(
+                        vreinterpretq_u32_f32(qhi),
+                        vtstq_u32(byte, sel_hi),
+                    )),
+                );
+            }
         }
-        vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)))
+        let s0 = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        let s1 = vaddq_f32(vaddq_f32(acc[4], acc[5]), vaddq_f32(acc[6], acc[7]));
+        vaddvq_f32(vaddq_f32(s0, s1))
     };
-    // Tail: trailing unpaired byte (8 coords) when `bytes` is odd.
+    // Tail: the trailing `bytes % 4` bytes (8 coords each) the quad loop skipped.
     let mut tail = 0.0f32;
-    if bytes % 2 == 1 {
-        let byte = code[bytes - 1];
-        let base = (bytes - 1) * 8;
-        for b in 0..8 {
-            let bit = ((byte >> b) & 1) as f32;
-            tail += q_rot[base + b] * bit;
+    for (b, &byte) in code.iter().enumerate().skip(quads * 4) {
+        let base = b * 8;
+        for bit_pos in 0..8 {
+            let bit = ((byte >> bit_pos) & 1) as f32;
+            tail += q_rot[base + bit_pos] * bit;
         }
     }
     acc + tail
 }
 
 /// Masked sum for the tq1 asymmetric inner product, NEON on aarch64.
+///
+/// # Panics
+///
+/// Panics if `dim % 8 != 0`, `code.len() != dim / 8`, or `q_rot.len() != dim`.
+/// These are runtime asserts (not `debug_assert`) because the NEON kernel does
+/// unchecked pointer loads that rely on them - matching the `tq2_adc_i8` /
+/// `tq4_adc_i8` contract so a length mismatch can never reach the kernel in a
+/// release build.
 #[must_use]
 pub fn tq1_masked_sum(code: &[u8], q_rot: &[f32], dim: usize) -> f32 {
-    debug_assert_eq!(code.len(), dim / 8);
-    debug_assert_eq!(q_rot.len(), dim);
+    assert_eq!(dim % 8, 0, "tq1 dim must be a multiple of 8");
+    assert_eq!(code.len(), dim / 8, "tq1 code length / dim mismatch");
+    assert_eq!(q_rot.len(), dim, "tq1 q_rot length / dim mismatch");
     #[cfg(target_arch = "aarch64")]
     {
         tq1_masked_sum_neon(code, q_rot, dim)

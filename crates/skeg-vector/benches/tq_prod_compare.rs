@@ -263,7 +263,7 @@ where
 }
 
 fn run(label: &str, corpus_npy: &str, query_npy: &str) {
-    let Some((corpus, n_full, dim)) = load_npy(corpus_npy) else {
+    let Some((mut corpus, n_full, dim)) = load_npy(corpus_npy) else {
         println!("\n=== {label}: dataset missing ===");
         return;
     };
@@ -279,7 +279,9 @@ fn run(label: &str, corpus_npy: &str, query_npy: &str) {
     // Production proxy assumes unit-norm vectors (the ip clamp at 4.0 saturates
     // otherwise). skeg ingest feeds normalized embeddings; the raw npy is not
     // always unit (mxbai norms > 1), so normalize here to match production.
-    let mut corpus = corpus[..n * dim].to_vec();
+    // Normalize the loaded buffer in place (no extra copy - matters at 1M where
+    // a second 4 GB allocation can OOM); the index gets the only owned clone.
+    corpus.truncate(n * dim);
     for row in corpus.chunks_exact_mut(dim) {
         let nrm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
         if nrm > 1e-10 {
@@ -413,11 +415,13 @@ fn main() {
     println!("PRODUCTION-kernel compare: popcount-tq1 / tq1-asym / tq2");
     println!("tq2->tq2_adc_i8 NEON  tq1->tq1_adc_swar  all FastRotation");
     println!("=========================================================");
-    // Override the mxbai corpus (e.g. the 500K/1M chunked files) via
-    // SKEG_MXBAI_CORPUS; the mxbai query set works for any mxbai corpus.
-    // When set, only the mxbai run executes (MiniLM stays on its 100K file).
+    // Override corpus (and optionally query) path via SKEG_MXBAI_CORPUS /
+    // SKEG_QUERY - used for the 500K/1M chunked files and the high-dim
+    // Qwen3-Embedding (2560d) set. When the corpus is set, only that run
+    // executes. SKEG_QUERY defaults to the mxbai query set if unset.
     if let Ok(path) = std::env::var("SKEG_MXBAI_CORPUS") {
-        run("mxbai 1024d (override)", &path, MXBAI_QUERY);
+        let qpath = std::env::var("SKEG_QUERY").unwrap_or_else(|_| MXBAI_QUERY.to_string());
+        run("override corpus", &path, &qpath);
         return;
     }
     run("mxbai 1024d wiki", MXBAI_CORPUS, MXBAI_QUERY);
