@@ -130,6 +130,17 @@ pub fn decode_mget_payload(payload: &Bytes) -> Result<Vec<Bytes>, ParseError> {
         });
     }
     let n = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    // Reject impossible counts before allocating: every key costs at least its
+    // 2-byte length header, so `n` cannot exceed `(len - 4) / 2`. Without this,
+    // an attacker-controlled `n` (its own u32 field, independent of the payload
+    // size) drives `Vec::with_capacity(n)` to allocate up to ~137 GB and abort
+    // the process. The bound also caps the reservation to the real payload size.
+    let max_n = (payload.len() - 4) / 2;
+    if n > max_n {
+        return Err(ParseError::InvalidPayload {
+            msg: "mget count exceeds payload",
+        });
+    }
     let mut keys = Vec::with_capacity(n);
     let mut pos = 4usize;
     for _ in 0..n {
@@ -233,6 +244,19 @@ mod tests {
         let frame = parse_one(encode_mget(1, &[]));
         let decoded = decode_mget_payload(&frame.payload).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn decode_mget_oversized_count_rejected_not_allocated() {
+        // n = u32::MAX but only a 4-byte body: must error, never attempt the
+        // ~137 GB Vec::with_capacity that would abort the process.
+        let p = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(matches!(
+            decode_mget_payload(&p),
+            Err(ParseError::InvalidPayload {
+                msg: "mget count exceeds payload"
+            })
+        ));
     }
 
     #[test]
