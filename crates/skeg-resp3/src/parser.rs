@@ -17,6 +17,10 @@ use crate::frame::Frame;
 pub const MAX_AGGREGATE_LEN: usize = 1_048_576;
 /// Max bulk/verbatim payload size. Matches Redis `proto-max-bulk-len` default.
 pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+/// Max aggregate nesting depth. Bounds the recursive descent so a stream of
+/// nested aggregate headers (e.g. `*1\r\n` repeated) cannot overflow the stack
+/// and abort the process. Redis uses 128.
+pub const MAX_NESTING_DEPTH: usize = 128;
 
 pub type ParseResult = Result<Option<(Frame, usize)>, ParseError>;
 
@@ -32,6 +36,8 @@ pub enum ParseError {
     InvalidLength(i64),
     #[error("aggregate too large: {0}")]
     AggregateTooLarge(usize),
+    #[error("aggregate nesting too deep: {0}")]
+    NestingTooDeep(usize),
     #[error("bulk too large: {0}")]
     BulkTooLarge(usize),
     #[error("invalid boolean payload: {0:?}")]
@@ -52,8 +58,18 @@ pub enum ParseError {
 /// recognised RESP marker, and the various specific variants when a length
 /// prefix, integer, or aggregate exceeds limits or fails to parse.
 pub fn parse_frame(input: &[u8]) -> ParseResult {
+    parse_frame_depth(input, 0)
+}
+
+/// Inner parser that tracks aggregate nesting `depth`. Each level of array/map/
+/// set/push recurses with `depth + 1`; exceeding [`MAX_NESTING_DEPTH`] is a
+/// `NestingTooDeep` error rather than unbounded recursion (stack-overflow DoS).
+fn parse_frame_depth(input: &[u8], depth: usize) -> ParseResult {
     if input.is_empty() {
         return Ok(None);
+    }
+    if depth > MAX_NESTING_DEPTH {
+        return Err(ParseError::NestingTooDeep(depth));
     }
     let body = &input[1..];
     match input[0] {
@@ -62,14 +78,14 @@ pub fn parse_frame(input: &[u8]) -> ParseResult {
         b'-' => Ok(parse_line(body)?.map(|(s, n)| (Frame::Error(s), n + 1))),
         b':' => Ok(parse_integer_line(body)?.map(|(i, n)| (Frame::Integer(i), n + 1))),
         b'$' => Ok(shift(parse_bulk(body)?)),
-        b'*' => Ok(shift(parse_aggregate(body, AggKind::Array)?)),
+        b'*' => Ok(shift(parse_aggregate(body, AggKind::Array, depth)?)),
         // RESP3
         b'_' => Ok(shift(parse_null_resp3(body)?)),
         b'#' => Ok(shift(parse_boolean(body)?)),
         b',' => Ok(shift(parse_double(body)?)),
-        b'%' => Ok(shift(parse_aggregate(body, AggKind::Map)?)),
-        b'~' => Ok(shift(parse_aggregate(body, AggKind::Set)?)),
-        b'>' => Ok(shift(parse_aggregate(body, AggKind::Push)?)),
+        b'%' => Ok(shift(parse_aggregate(body, AggKind::Map, depth)?)),
+        b'~' => Ok(shift(parse_aggregate(body, AggKind::Set, depth)?)),
+        b'>' => Ok(shift(parse_aggregate(body, AggKind::Push, depth)?)),
         b'!' => Ok(shift(parse_blob_error(body)?)),
         b'=' => Ok(shift(parse_verbatim(body)?)),
         b'(' => Ok(shift(parse_big_number(body)?)),
@@ -152,7 +168,7 @@ enum AggKind {
     Map,
 }
 
-fn parse_aggregate(body: &[u8], kind: AggKind) -> ParseResult {
+fn parse_aggregate(body: &[u8], kind: AggKind, depth: usize) -> ParseResult {
     let Some(len_end) = find_crlf(body) else {
         return Ok(None);
     };
@@ -182,7 +198,7 @@ fn parse_aggregate(body: &[u8], kind: AggKind) -> ParseResult {
     let mut items = Vec::with_capacity(frame_count);
     let mut consumed = len_end + 2;
     for _ in 0..frame_count {
-        match parse_frame(&body[consumed..])? {
+        match parse_frame_depth(&body[consumed..], depth + 1)? {
             None => return Ok(None),
             Some((frame, n)) => {
                 items.push(frame);
@@ -767,5 +783,27 @@ mod tests {
         assert!((v - 0.95).abs() < 1e-9);
         assert_eq!(pairs[1].0, Frame::Simple("ok".into()));
         assert_eq!(pairs[1].1, Frame::Boolean(true));
+    }
+
+    #[test]
+    fn deep_nesting_errors_instead_of_overflowing() {
+        // A stream of nested array headers (`*1` = "array of one element", which
+        // is itself an array...) would recurse without bound. The depth limit
+        // must turn this into an error, not a stack overflow / process abort.
+        let mut raw = Vec::new();
+        for _ in 0..(MAX_NESTING_DEPTH + 16) {
+            raw.extend_from_slice(b"*1\r\n");
+        }
+        assert!(matches!(
+            parse_frame(&raw).unwrap_err(),
+            ParseError::NestingTooDeep(_)
+        ));
+        // A legitimately deep-but-bounded frame still parses.
+        let mut ok = Vec::new();
+        for _ in 0..8 {
+            ok.extend_from_slice(b"*1\r\n");
+        }
+        ok.extend_from_slice(b":7\r\n");
+        assert!(parse_frame(&ok).unwrap().is_some());
     }
 }
