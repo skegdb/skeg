@@ -45,6 +45,21 @@ fn scoped_vindex_name(tenant: TenantId, name: &str) -> String {
     }
 }
 
+/// Reject the tenant-scope separator in a client-supplied index name, then
+/// scope it. `::` is reserved for tenant scoping and is the only way a tenant
+/// prefix enters a name; without this guard an anonymous (`ZERO`) connection
+/// could pass `"<victim-tenant-hex>::idx"` and have `scoped_vindex_name` return
+/// it verbatim, reaching another tenant's index (read/write/drop). Every vector
+/// op scopes through this helper so none can forget the check.
+fn scope_vindex_or_reject(tenant: TenantId, raw_name: &str) -> Result<String, Frame> {
+    if raw_name.contains("::") {
+        return Err(Frame::Error(
+            "ERR VINDEX name must not contain '::' (reserved for tenant scoping)".into(),
+        ));
+    }
+    Ok(scoped_vindex_name(tenant, raw_name))
+}
+
 /// Bytes that have been confirmed to carry the tenant scope (or to be
 /// part of the anonymous `ZERO` namespace). Constructed only via
 /// `scope_key`; every shard call site goes through `.as_bytes()`, so
@@ -599,11 +614,6 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
         Ok(s) => s,
         Err(e) => return e,
     };
-    if raw_name.contains("::") {
-        return Frame::Error(
-            "ERR VINDEX name must not contain '::' (reserved for tenant scoping)".into(),
-        );
-    }
     let dim = match parse_u32_arg(&args[1], "dim") {
         Ok(v) => v,
         Err(e) => return e,
@@ -619,7 +629,10 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
         Ok(v) => v,
         Err(e) => return e,
     };
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     match shards.vindex_create(&scoped, dim, kind, backend).await {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
@@ -641,7 +654,10 @@ async fn skeg_vindex_drop(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -
         Ok(s) => s,
         Err(e) => return e,
     };
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     match shards.vindex_drop(&scoped, tenant_u128(tenant)).await {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
@@ -658,7 +674,10 @@ async fn skeg_vindex_consolidate(args: &[Bytes], shards: &ShardSet, tenant: Tena
         Ok(s) => s,
         Err(e) => return e,
     };
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     match shards.vindex_consolidate(&scoped).await {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
@@ -701,7 +720,10 @@ async fn skeg_vset(
     } else {
         None
     };
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     // Limit comes from the pluggable backend; `None` (no backend / unlimited)
     // skips quota enforcement entirely.
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
@@ -751,7 +773,10 @@ async fn skeg_vmset(
         items.push((id, vector, payload));
         i += 3;
     }
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
     match shards
         .vmset(&scoped, items, tenant_u128(tenant), limit)
@@ -775,7 +800,10 @@ async fn skeg_vdel(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
         Ok(v) => v,
         Err(e) => return e,
     };
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     match shards.vdel(&scoped, id, tenant_u128(tenant)).await {
         Ok(true) => Frame::Integer(1),
         Ok(false) => Frame::Integer(0),
@@ -994,7 +1022,10 @@ async fn skeg_vsearch(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fr
     span.record("k", k);
     span.record("l_search", l_search);
     span.record("vector_dim", query.len());
-    let scoped = scoped_vindex_name(tenant, raw_name);
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     match shards
         .vsearch(
             &scoped,
@@ -1422,6 +1453,31 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn anon_cannot_forge_tenant_scope_via_double_colon() {
+        // The whole cross-tenant guard: an anonymous (ZERO) connection must not
+        // be able to smuggle another tenant's `<hex>::` prefix into a name.
+        let victim = tid_from_name("victim");
+        let forged = format!("{victim}::secret"); // what an attacker would type
+        assert!(
+            scope_vindex_or_reject(TenantId::ZERO, &forged).is_err(),
+            "anon must be rejected when the name contains '::'"
+        );
+        // A plain anon name is accepted unchanged...
+        assert_eq!(
+            scope_vindex_or_reject(TenantId::ZERO, "idx").unwrap(),
+            "idx"
+        );
+        // ...and an authenticated tenant's own name gets its real prefix, which
+        // can never collide with an accepted anon name (those have no '::').
+        assert_eq!(
+            scope_vindex_or_reject(victim, "idx").unwrap(),
+            format!("{victim}::idx")
+        );
+        // A tenant also cannot inject a second scope.
+        assert!(scope_vindex_or_reject(victim, "a::b").is_err());
+    }
 
     fn args(parts: &[&str]) -> Vec<Bytes> {
         parts
