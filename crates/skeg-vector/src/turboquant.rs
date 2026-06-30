@@ -565,17 +565,10 @@ pub(crate) fn tq1_adc_swar(
     debug_assert_eq!(q_rot.len(), dim);
     debug_assert_eq!(centroids.len(), 2);
     // centroids[0] = -c, centroids[1] = +c. The asymmetric inner product
-    // reduces to `c * (2 * q_masked - q_sum)`.
+    // reduces to `c * (2 * q_masked - q_sum)`. The masked sum is the hot loop;
+    // skeg-simd dispatches it to a NEON kernel on aarch64.
     let pos_c = centroids[1];
-    let mut q_masked = 0.0f32;
-    for (byte_idx, &byte) in code.iter().enumerate() {
-        let base = byte_idx * 8;
-        // Branchless: multiply by bit-as-f32 so the loop stays FMA-friendly.
-        for b in 0..8 {
-            let bit = ((byte >> b) & 1) as f32;
-            q_masked += q_rot[base + b] * bit;
-        }
-    }
+    let q_masked = skeg_simd::tq1_masked_sum(code, q_rot, dim);
     pos_c * (2.0 * q_masked - q_sum)
 }
 

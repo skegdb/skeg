@@ -73,6 +73,18 @@ name = "tq_walk_gate"
 harness = false
 
 [[bench]]
+name = "tq1_popcount_gate"
+harness = false
+
+[[bench]]
+name = "tq1pop_vs_tq2"
+harness = false
+
+[[bench]]
+name = "tq_prod_compare"
+harness = false
+
+[[bench]]
 name = "flat_throughput"
 harness = false
 

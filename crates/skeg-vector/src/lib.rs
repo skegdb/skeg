@@ -30,7 +30,7 @@ mod visited;
 pub use flat::FlatIndex;
 pub use quant::{QuantKind, QuantizedVectors, QueryCode};
 pub use source::{InMemoryVectorSource, MmapVectorSource, VectorSource};
-pub use turboquant::{Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
+pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
 pub use vamana::{
     DiskVamanaIndex, VamanaConfig, VamanaIndex, build_phase_times_ns, reset_build_phase_times,
     set_speed_enabled,
