@@ -102,3 +102,7 @@ harness = false
 [[bench]]
 name = "tiering_gate"
 harness = false
+
+[[bench]]
+name = "tq1_dim_matrix"
+harness = false
