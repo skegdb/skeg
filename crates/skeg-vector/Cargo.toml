@@ -155,13 +155,7 @@ harness = false
 name = "scale_mxbai"
 harness = false
 
-[[bench]]
-name = "fvamana"
-harness = false
 
-[[bench]]
-name = "disk_fvamana"
-harness = false
 
 [[bench]]
 name = "ivf_probe"

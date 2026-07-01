@@ -270,7 +270,6 @@ fn greedy_search<D, N>(
     dist_to_query: D,
     neighbors: N,
     admit: Option<&dyn Fn(VecId) -> bool>,
-    acorn: bool,
     visited: &mut VisitedBitset,
     seen: &mut VisitedBitset,
     mut trace: Option<&mut Vec<VecId>>,
@@ -315,17 +314,6 @@ where
             }
             if admit.is_none_or(|a| a(nbr)) {
                 list.insert(dist_to_query(nbr), nbr);
-            } else if acorn {
-                // ACORN: `nbr` is filtered out, so it can never be a candidate,
-                // but the matching subgraph may only connect THROUGH it. Hop over
-                // it: admit its matching 2-hop neighbours so the walk stays
-                // navigable when matches are scattered. RAM-only (no disk reads);
-                // `dist_to_query` is the in-RAM proxy.
-                for nn in neighbors(nbr) {
-                    if !seen.test_and_set(nn) && admit.is_some_and(|a| a(nn)) {
-                        list.insert(dist_to_query(nn), nn);
-                    }
-                }
             }
         }
         if let Some(et) = early_term {
@@ -356,15 +344,9 @@ fn robust_prune(
     alpha: f32,
     r: usize,
     source: &dyn VectorSource,
-    labels: Option<&[u64]>,
 ) -> SmallVec<[VecId; MAX_R]> {
     candidates.retain(|&(_, id)| id != p);
     candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    // FilteredVamana (Gollapudi et al., WWW'23): p* may only prune the edge
-    // p->v if p* shares p's label - otherwise p->v is the bridge that keeps p's
-    // label subgraph navigable, so it is preserved even if geometrically
-    // redundant. `labels[x] == NO_LABEL` = unlabelled (never a bridge).
-    let p_label = labels.map(|l| l[p as usize]);
 
     let mut result: SmallVec<[VecId; MAX_R]> = SmallVec::new();
     let mut cursor = 0;
@@ -381,15 +363,7 @@ fn robust_prune(
                 continue;
             }
             let d_star = dist(p_star_vec, source.row(v));
-            // Keep v if geometrically non-redundant, OR if p and v share a real
-            // label that p* does NOT (p* can't carry that label's connectivity).
-            let label_bridge = match (p_label, labels) {
-                (Some(lp), Some(l)) => {
-                    lp != NO_LABEL && lp == l[v as usize] && lp != l[p_star as usize]
-                }
-                _ => false,
-            };
-            if alpha * d_star > d_pv || label_bridge {
+            if alpha * d_star > d_pv {
                 candidates[write] = (d_pv, v);
                 write += 1;
             }
@@ -398,9 +372,6 @@ fn robust_prune(
     }
     result
 }
-
-/// Sentinel label for an unlabelled node (not part of any filter subgraph).
-const NO_LABEL: u64 = u64::MAX;
 
 // ── build ─────────────────────────────────────────────────────────────────────
 
@@ -591,7 +562,6 @@ fn insert_point_concurrent(
     alpha: f32,
     r: usize,
     l_build: usize,
-    labels: Option<&[u64]>,
     scratch: &mut BuildScratch,
 ) {
     let p_vec = source.row(p);
@@ -602,8 +572,7 @@ fn insert_point_concurrent(
         None, // build: never early-terminate (full candidate pool for prune)
         |id| dist(p_vec, source.row(id)),
         |id| locked_neighbors(graph, id),
-        None,  // build: no filter admission
-        false, // build: no acorn
+        None, // build: no filter admission
         &mut scratch.visited,
         &mut scratch.seen,
         None,
@@ -625,7 +594,7 @@ fn insert_point_concurrent(
         }
     }
 
-    let new_neighbors = robust_prune(p, &mut scratch.candidates, alpha, r, source, labels);
+    let new_neighbors = robust_prune(p, &mut scratch.candidates, alpha, r, source);
     graph[p as usize].lock().set(&new_neighbors);
     scratch.prune_ns += t_prune.elapsed().as_nanos() as u64;
 
@@ -645,7 +614,7 @@ fn insert_point_concurrent(
                 .chain(std::iter::once(p))
                 .map(|id| (dist(j_vec, source.row(id)), id)),
         );
-        let new_j = robust_prune(j, &mut scratch.back, alpha, r, source, labels);
+        let new_j = robust_prune(j, &mut scratch.back, alpha, r, source);
         graph[j as usize].lock().set(&new_j);
     }
     scratch.backedge_ns += t_back.elapsed().as_nanos() as u64;
@@ -664,7 +633,6 @@ fn run_pass_parallel(
     r: usize,
     l_build: usize,
     seed: u64,
-    labels: Option<&[u64]>,
 ) {
     let mut order: Vec<VecId> = (0..n).collect();
     let mut rng = StdRng::seed_from_u64(seed ^ u64::from(alpha.to_bits()));
@@ -676,7 +644,7 @@ fn run_pass_parallel(
     order.par_iter().for_each_init(
         || BuildScratch::with_capacity(cap),
         |scratch, &p| {
-            insert_point_concurrent(graph, source, medoid, p, alpha, r, l_build, labels, scratch);
+            insert_point_concurrent(graph, source, medoid, p, alpha, r, l_build, scratch);
         },
     );
 }
@@ -746,11 +714,6 @@ pub struct VamanaIndex {
     medoid: VecId,
     r: usize,
     l_search: usize,
-    /// FilteredVamana: per-row label (`NO_LABEL` = unlabelled). Empty unless
-    /// built via [`build_from_source_labeled`](Self::build_from_source_labeled).
-    labels: Vec<u64>,
-    /// Per-label entry node for a filtered walk. Empty when unlabelled.
-    label_entries: AHashMap<u64, VecId>,
 }
 
 impl VamanaIndex {
@@ -788,29 +751,7 @@ impl VamanaIndex {
         ids: Vec<u64>,
         config: &VamanaConfig,
     ) -> VamanaIndex {
-        Self::build_from_source_labeled(vectors, ids, config, None)
-    }
-
-    /// Like [`build_from_source`](Self::build_from_source) but FilteredVamana:
-    /// `labels[row]` tags each vector; the build preserves per-label graph
-    /// connectivity (FilteredRobustPrune) and records a per-label entry node, so
-    /// [`search_filtered_labeled`](Self::search_filtered_labeled) is a single
-    /// navigable walk in the matching subgraph. `NO_LABEL` = unlabelled.
-    ///
-    /// # Panics
-    /// Panics if `labels` is `Some` with a length != `ids.len()`, or `ids` empty.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn build_from_source_labeled(
-        vectors: Box<dyn VectorSource>,
-        ids: Vec<u64>,
-        config: &VamanaConfig,
-        labels: Option<&[u64]>,
-    ) -> VamanaIndex {
         assert!(!ids.is_empty(), "Vamana needs at least one vector");
-        if let Some(l) = labels {
-            assert_eq!(l.len(), ids.len(), "labels/ids length mismatch");
-        }
         assert_eq!(vectors.len(), ids.len(), "source/ids length mismatch");
         let dim = vectors.dim();
         let n = ids.len() as u32;
@@ -831,7 +772,6 @@ impl VamanaIndex {
             config.r,
             config.l_build,
             config.seed,
-            labels,
         );
         run_pass_parallel(
             &graph,
@@ -842,26 +782,9 @@ impl VamanaIndex {
             config.r,
             config.l_build,
             config.seed.wrapping_add(1),
-            labels,
         );
         let mut nodes: Vec<Node> = graph.into_iter().map(Mutex::into_inner).collect();
         patch_connectivity(&mut nodes, &*vectors, n, medoid, config.r);
-
-        // Per-label entry node: the first row seen for each real label. A filtered
-        // search seeds from the entries of the matching labels, so the walk starts
-        // INSIDE each matching subgraph (the medoid may carry none of them).
-        let (labels_owned, label_entries) = match labels {
-            Some(l) => {
-                let mut entries: AHashMap<u64, VecId> = AHashMap::new();
-                for (row, &lab) in l.iter().enumerate() {
-                    if lab != NO_LABEL {
-                        entries.entry(lab).or_insert(row as VecId);
-                    }
-                }
-                (l.to_vec(), entries)
-            }
-            None => (Vec::new(), AHashMap::new()),
-        };
 
         VamanaIndex {
             dim,
@@ -872,8 +795,6 @@ impl VamanaIndex {
             medoid,
             r: config.r,
             l_search: config.l_search,
-            labels: labels_owned,
-            label_entries,
         }
     }
 
@@ -963,72 +884,6 @@ impl VamanaIndex {
             |id| dist(query, self.vectors.row(id)),
             |id| self.nodes[id as usize].slice().iter().copied().collect(),
             None, // in-RAM search: no filter admission
-            false,
-            &mut visited,
-            &mut seen,
-            None,
-        );
-        list.iter()
-            .take(k)
-            .map(|(d, id)| (self.ids[id as usize], 1.0 - d))
-            .collect()
-    }
-
-    /// FilteredVamana build over in-memory vectors, each tagged by `labels[row]`.
-    ///
-    /// # Panics
-    /// Panics as [`build`](Self::build); also if `labels.len() != ids.len()`.
-    #[must_use]
-    pub fn build_labeled(
-        vectors: Vec<f32>,
-        ids: Vec<u64>,
-        labels: Vec<u64>,
-        dim: usize,
-        config: &VamanaConfig,
-    ) -> VamanaIndex {
-        let source = InMemoryVectorSource::new(vectors, dim);
-        VamanaIndex::build_from_source_labeled(Box::new(source), ids, config, Some(&labels))
-    }
-
-    /// Single filtered walk over the FilteredVamana graph: admit only rows whose
-    /// label is in `match_labels`, seeded from those labels' entry nodes so the
-    /// walk starts inside each matching subgraph. Distances are exact f32 (the
-    /// in-memory source), so this isolates GRAPH navigability from quantization.
-    /// Returns top-`k` (id, cosine). Empty if the index was not built labelled.
-    ///
-    /// # Panics
-    /// Panics if `query.len()` != the index dimension.
-    #[must_use]
-    pub fn search_filtered_labeled(
-        &self,
-        query: &[f32],
-        k: usize,
-        match_labels: &[u64],
-        l_search: usize,
-    ) -> Vec<(u64, f32)> {
-        assert_eq!(query.len(), self.dim, "query dim mismatch");
-        if self.n == 0 || k == 0 || self.labels.is_empty() {
-            return Vec::new();
-        }
-        let list_size = l_search.max(k);
-        let mset: AHashSet<u64> = match_labels.iter().copied().collect();
-        let mut seeds: Vec<VecId> = vec![self.medoid];
-        for &lab in match_labels {
-            if let Some(&e) = self.label_entries.get(&lab) {
-                seeds.push(e);
-            }
-        }
-        let admit = |row: VecId| mset.contains(&self.labels[row as usize]);
-        let mut visited = VisitedBitset::new(self.n as usize);
-        let mut seen = VisitedBitset::new(self.n as usize);
-        let list = greedy_search(
-            &seeds,
-            list_size,
-            None,
-            |id| dist(query, self.vectors.row(id)),
-            |id| self.nodes[id as usize].slice().iter().copied().collect(),
-            Some(&admit),
-            true, // acorn: hop through non-matching nodes too
             &mut visited,
             &mut seen,
             None,
@@ -1258,21 +1113,6 @@ pub struct DiskVamanaIndex {
     // stays off DiskVamanaIndex as one pointer - else the pthread mutex inline
     // bloats skeg-server's VectorBackend enum past large_enum_variant.
     tq1: Box<Tq1Runtime>,
-    /// FilteredVamana state, Box'd to keep DiskVamanaIndex small (else the
-    /// VectorBackend enum trips large_enum_variant). In-memory only in this
-    /// increment (not persisted); the label-aware EDGES live in the graph.
-    filt: Box<FilteredState>,
-}
-
-/// Cold FilteredVamana admit-gate state (per-base-row labels + per-label entry
-/// nodes), behind a single Box on DiskVamanaIndex.
-#[derive(Default)]
-struct FilteredState {
-    /// Per-base-row label (aligned to `base` rows). Empty unless built via
-    /// [`consolidate_labeled`](DiskVamanaIndex::consolidate_labeled).
-    base_labels: Vec<u64>,
-    /// Per-label entry base-row, for seeding a single filtered walk.
-    label_entries: AHashMap<u64, VecId>,
 }
 
 /// Cold per-index tq1 online-controller state, kept behind a single `Box` on
@@ -1547,7 +1387,6 @@ impl DiskVamanaIndex {
             live_count: n as usize,
             delta_log,
             tq1: Box::default(),
-            filt: Box::default(),
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
@@ -2252,11 +2091,6 @@ impl DiskVamanaIndex {
                     dist,
                     nbrs,
                     admit,
-                    // ACORN 2-hop here was a no-op on scattered/clustered filters
-                    // (recall unchanged) and superseded by FilteredVamana's
-                    // label-aware graph. Left inert; the param stays for the
-                    // labelled single-walk path.
-                    false,
                     &mut visited,
                     &mut seen,
                     None,
@@ -2375,7 +2209,6 @@ impl DiskVamanaIndex {
                         .collect()
                 },
                 None, // trace: no filter admission
-                false,
                 &mut visited,
                 &mut seen,
                 Some(&mut trace),
@@ -2539,170 +2372,6 @@ impl DiskVamanaIndex {
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         Ok(())
     }
-
-    /// FilteredVamana consolidate: like [`consolidate`](Self::consolidate) but the
-    /// rebuilt graph is LABEL-AWARE (`label_of(id)` tags each vector; `NO_LABEL`
-    /// = unlabelled). The label-preserving edges live in the saved graph; the
-    /// per-row labels + per-label entry nodes are held in RAM for the admit gate
-    /// of [`search_filtered_labeled`](Self::search_filtered_labeled). Everything
-    /// folds into a single base (runs + delta cleared).
-    ///
-    /// # Errors
-    /// I/O error if rebuilding / saving / reopening fails.
-    pub fn consolidate_labeled(&mut self, label_of: &dyn Fn(u64) -> u64) -> io::Result<()> {
-        let dim = self.dim;
-        let segs: Vec<&Segment> = std::iter::once(&self.base)
-            .chain(self.runs.iter())
-            .collect();
-        let mut seen: AHashSet<u64> = AHashSet::new();
-        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
-        for &id in self.delta.keys() {
-            if seen.insert(id) {
-                survivors.push((id, usize::MAX, 0));
-            }
-        }
-        for (ri, run) in self.runs.iter().enumerate().rev() {
-            for row in 0..run.main_n {
-                let id = run.ids[row as usize];
-                if self.tombstones.contains(&id) || !seen.insert(id) {
-                    continue;
-                }
-                survivors.push((id, ri + 1, row));
-            }
-        }
-        for row in 0..self.base.main_n {
-            let id = self.base.ids[row as usize];
-            if self.tombstones.contains(&id) || !seen.insert(id) {
-                continue;
-            }
-            survivors.push((id, 0, row));
-        }
-        if survivors.is_empty() {
-            return Ok(());
-        }
-        survivors.sort_unstable_by_key(|&(id, _, _)| id);
-        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
-        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
-        let mut labels: Vec<u64> = Vec::with_capacity(survivors.len());
-        for (id, loc, row) in survivors {
-            if loc == usize::MAX {
-                vectors.extend_from_slice(&self.delta[&id]);
-            } else {
-                vectors.extend(self.read_vector(segs[loc], row)?);
-            }
-            ids.push(id);
-            labels.push(label_of(id));
-        }
-        let dir = self.dir.clone();
-        let tier = self.tier;
-        // Build LABEL-AWARE, then save (graph carries the label edges); reopen as
-        // usual, then re-attach the RAM-side labels aligned to the new base rows
-        // (build/save/open all preserve the input `ids` row order).
-        let rebuilt =
-            VamanaIndex::build_labeled(vectors, ids, labels.clone(), dim, &disk_build_config());
-        rebuilt.save(&dir)?;
-        self.discard_runs()?;
-        std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
-        *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
-        let mut entries: AHashMap<u64, VecId> = AHashMap::new();
-        for (row, &lab) in labels.iter().enumerate() {
-            if lab != NO_LABEL {
-                entries.entry(lab).or_insert(row as VecId);
-            }
-        }
-        self.filt.base_labels = labels;
-        self.filt.label_entries = entries;
-        Ok(())
-    }
-
-    /// Re-attach the RAM-side labels to a base that was ALREADY built label-aware
-    /// (by a prior [`consolidate_labeled`](Self::consolidate_labeled)), without a
-    /// rebuild. Lets a reopened index serve filtered walks again. (Increment 2
-    /// keeps labels in RAM; persistence is a later step.)
-    pub fn attach_labels(&mut self, label_of: &dyn Fn(u64) -> u64) {
-        let labels: Vec<u64> = (0..self.base.main_n)
-            .map(|r| label_of(self.base.ids[r as usize]))
-            .collect();
-        let mut entries: AHashMap<u64, VecId> = AHashMap::new();
-        for (row, &lab) in labels.iter().enumerate() {
-            if lab != NO_LABEL {
-                entries.entry(lab).or_insert(row as VecId);
-            }
-        }
-        self.filt.base_labels = labels;
-        self.filt.label_entries = entries;
-    }
-
-    /// Single filtered walk over the FilteredVamana base graph: admit only rows
-    /// whose label is in `match_labels`, seeded from those labels' entry nodes,
-    /// navigated with the tier proxy, then f32-reranked (`rerank` disk reads).
-    /// Base-only (call after [`consolidate_labeled`](Self::consolidate_labeled)).
-    /// Empty unless the base was built labelled.
-    ///
-    /// # Errors
-    /// I/O error if a re-rank read fails.
-    pub fn search_filtered_labeled(
-        &self,
-        query: &[f32],
-        k: usize,
-        match_labels: &[u64],
-        l_search: usize,
-        rerank: usize,
-    ) -> io::Result<Vec<(u64, f32)>> {
-        if k == 0 || self.filt.base_labels.is_empty() {
-            return Ok(Vec::new());
-        }
-        let seg = &self.base;
-        let code = seg.quant.quantize_query(&normalized(query));
-        let mset: AHashSet<u64> = match_labels.iter().copied().collect();
-        let mut seeds: Vec<VecId> = vec![seg.medoid];
-        for &lab in match_labels {
-            if let Some(&r) = self.filt.label_entries.get(&lab) {
-                seeds.push(r);
-            }
-        }
-        let admit = |row: VecId| mset.contains(&self.filt.base_labels[row as usize]);
-        let dist = |id: VecId| -(seg.quant.proxy(id as usize, &code) as f32);
-        let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
-            seg.nodes[id as usize].slice().iter().copied().collect()
-        };
-        let mut visited = VisitedBitset::new(seg.main_n as usize);
-        let mut seen = VisitedBitset::new(seg.main_n as usize);
-        let list = greedy_search(
-            &seeds,
-            l_search.max(k),
-            None,
-            dist,
-            nbrs,
-            Some(&admit),
-            false,
-            &mut visited,
-            &mut seen,
-            None,
-        );
-        // tq1 hybrid: re-score survivors with the asym proxy before the disk reads.
-        let hybrid = code.is_tq1_hybrid();
-        let mut cand: Vec<(f32, VecId)> = list
-            .iter()
-            .map(|(p, row)| {
-                let s = if hybrid {
-                    -(seg.quant.proxy_rescore(row as usize, &code) as f32)
-                } else {
-                    p
-                };
-                (s, row)
-            })
-            .collect();
-        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        let mut scored: Vec<(OrderedFloat<f32>, u64)> = Vec::new();
-        for (_, row) in cand.into_iter().take(rerank.max(k)) {
-            let v = self.read_vector(seg, row)?;
-            scored.push((OrderedFloat(cosine_f32(query, &v)), seg.ids[row as usize]));
-        }
-        scored.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
-        scored.truncate(k);
-        Ok(scored.into_iter().map(|(d, id)| (id, d.0)).collect())
-    }
 }
 
 #[cfg(test)]
@@ -2793,7 +2462,7 @@ mod tests {
             .map(|id| (dist(row(&vectors, 5, dim), row(&vectors, id, dim)), id))
             .collect();
         let src = InMemoryVectorSource::new(vectors, dim);
-        let result = robust_prune(5, &mut cand, 1.2, 8, &src, None);
+        let result = robust_prune(5, &mut cand, 1.2, 8, &src);
         assert!(
             !result.contains(&5),
             "a node must never be its own neighbour"
@@ -2816,7 +2485,7 @@ mod tests {
             .collect();
         let original: Vec<(f32, VecId)> = cand.clone();
         let src = InMemoryVectorSource::new(vectors.clone(), dim);
-        let result = robust_prune(p, &mut cand, alpha, MAX_R, &src, None);
+        let result = robust_prune(p, &mut cand, alpha, MAX_R, &src);
 
         for &(d_pv, v) in &original {
             if result.contains(&v) {
@@ -2850,7 +2519,6 @@ mod tests {
             |id| dist(&query, row(&vectors, id, dim)),
             |id| nodes[id as usize].slice().iter().copied().collect(),
             None,
-            false,
             &mut visited,
             &mut seen,
             None,
