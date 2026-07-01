@@ -125,6 +125,68 @@ impl Tq1ProxyController {
     pub fn estimates(&self) -> (Option<f32>, Option<f32>) {
         (self.ema_pop, self.ema_asym)
     }
+
+    /// Serialize the learned state to a fixed 30-byte record so it survives an
+    /// index reopen (persist alongside the vindex metadata). The controller
+    /// keeps converging from where it left off instead of cold-starting.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; Self::BYTES] {
+        let mut b = [0u8; Self::BYTES];
+        b[0] = 1; // format version
+        b[1] = mode_tag(self.mode);
+        b[2..6].copy_from_slice(&self.tolerance.to_le_bytes());
+        b[6..10].copy_from_slice(&self.alpha.to_le_bytes());
+        b[10] = u8::from(self.ema_pop.is_some());
+        b[11..15].copy_from_slice(&self.ema_pop.unwrap_or(0.0).to_le_bytes());
+        b[15] = u8::from(self.ema_asym.is_some());
+        b[16..20].copy_from_slice(&self.ema_asym.unwrap_or(0.0).to_le_bytes());
+        b[20..24].copy_from_slice(&self.samples.to_le_bytes());
+        b[24..28].copy_from_slice(&self.warmup.to_le_bytes());
+        b[28] = self.pending;
+        b[29] = self.hysteresis;
+        b
+    }
+
+    /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on a bad
+    /// length or unknown version, so the caller can fall back to a fresh
+    /// controller seeded from the dim prior.
+    #[must_use]
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::BYTES || b[0] != 1 {
+            return None;
+        }
+        let f32_at = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Some(Self {
+            mode: mode_from_tag(b[1])?,
+            tolerance: f32_at(2),
+            alpha: f32_at(6),
+            ema_pop: (b[10] == 1).then(|| f32_at(11)),
+            ema_asym: (b[15] == 1).then(|| f32_at(16)),
+            samples: u32_at(20),
+            warmup: u32_at(24),
+            pending: b[28],
+            hysteresis: b[29].max(1),
+        })
+    }
+
+    /// Serialized size of the controller state.
+    pub const BYTES: usize = 30;
+}
+
+fn mode_tag(m: Tq1ProxyMode) -> u8 {
+    match m {
+        Tq1ProxyMode::Asymmetric => 0,
+        Tq1ProxyMode::Popcount => 1,
+    }
+}
+
+fn mode_from_tag(t: u8) -> Option<Tq1ProxyMode> {
+    match t {
+        0 => Some(Tq1ProxyMode::Asymmetric),
+        1 => Some(Tq1ProxyMode::Popcount),
+        _ => None,
+    }
 }
 
 fn ema(prev: Option<f32>, x: f32, alpha: f32) -> f32 {
@@ -202,6 +264,20 @@ mod tests {
             Tq1ProxyMode::Popcount,
             "single outlier must not flip"
         );
+    }
+
+    #[test]
+    fn persist_round_trips_learned_state() {
+        let mut c = Tq1ProxyController::new(Tq1ProxyMode::Asymmetric).with_policy(0.02, 10, 2);
+        feed(&mut c, 40, 0.995, 0.999); // converged to popcount, EMAs populated
+        let restored = Tq1ProxyController::from_bytes(&c.to_bytes()).unwrap();
+        assert_eq!(restored.mode(), c.mode());
+        assert_eq!(restored.estimates(), c.estimates());
+        // A fresh controller with the same policy keeps converging identically.
+        assert_eq!(restored.mode(), Tq1ProxyMode::Popcount);
+        // Bad input -> None (caller cold-starts from the dim prior).
+        assert!(Tq1ProxyController::from_bytes(&[0u8; 4]).is_none());
+        assert!(Tq1ProxyController::from_bytes(&[9u8; Tq1ProxyController::BYTES]).is_none());
     }
 
     #[test]
