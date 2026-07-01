@@ -1785,16 +1785,23 @@ impl DiskVamanaIndex {
             .map(Tq1ProxyController::mode)
     }
 
-    /// Adaptive search. With the controller enabled it uses the learned proxy
-    /// mode; on ~1/`SHADOW_EVERY` queries it runs a shadow A/B (hybrid vs asym),
-    /// feeds the top-k agreement to the controller, and returns the asymmetric
-    /// (reference) result for that query. Falls back to plain `search` when the
-    /// controller is disabled or the tier is not tq1.
+    /// Adaptive search. With the controller enabled it serves the query with the
+    /// learned proxy mode (one full walk). On ~1/`SHADOW_EVERY` queries it ALSO
+    /// runs a cheap shadow A/B - two SHORT walks (`l_search = SHADOW_L`) of
+    /// hybrid vs asym - to measure their top-k agreement and feed the controller.
+    /// The served result is always the full-quality current-mode walk, so a
+    /// shadow query costs ~1 full walk + 2 short walks (~1.3x), not 2x: the
+    /// user's "keep the 2x cheap" constraint. The controller's EMA averages the
+    /// samples (the evaluation window), so it never reacts to one noisy query.
+    /// Falls back to plain `search` when the controller is disabled / not tq1.
     ///
     /// # Errors
     ///
     /// I/O error if a re-rank read fails.
     pub fn search_adaptive(&self, query: &[f32], k: usize) -> io::Result<Vec<(u64, f32)>> {
+        /// Short walk size for the shadow measurement - cheap so the A/B does not
+        /// double query latency; still discriminative for the proxy comparison.
+        const SHADOW_L: usize = 64;
         let decision = {
             let guard = self.tq1_ctl.lock().expect("tq1 ctl");
             guard.as_ref().map(|c| {
@@ -1807,40 +1814,37 @@ impl DiskVamanaIndex {
         let Some((mode, shadow)) = decision else {
             return self.search(query, k);
         };
-        if shadow {
-            let res_h = self.search_inner(
+        // Serve the query at full quality in the current mode (one walk).
+        let served = self.search_inner(query, k, 0, None, &[], 1.0, None, Some(mode))?;
+        if shadow && k > 0 {
+            // Cheap measurement: two short walks, compared, fed to the controller.
+            let sh = self.search_inner(
                 query,
                 k,
-                0,
+                SHADOW_L,
                 None,
                 &[],
                 1.0,
                 None,
                 Some(Tq1ProxyMode::Hybrid),
             )?;
-            let res_a = self.search_inner(
+            let sa = self.search_inner(
                 query,
                 k,
-                0,
+                SHADOW_L,
                 None,
                 &[],
                 1.0,
                 None,
                 Some(Tq1ProxyMode::Asymmetric),
             )?;
-            let set_a: AHashSet<u64> = res_a.iter().map(|(id, _)| *id).collect();
-            let agree = if k == 0 {
-                1.0
-            } else {
-                res_h.iter().filter(|(id, _)| set_a.contains(id)).count() as f32 / k as f32
-            };
+            let set_a: AHashSet<u64> = sa.iter().map(|(id, _)| *id).collect();
+            let agree = sh.iter().filter(|(id, _)| set_a.contains(id)).count() as f32 / k as f32;
             if let Some(c) = self.tq1_ctl.lock().expect("tq1 ctl").as_mut() {
                 c.record_shadow(agree, 1.0);
             }
-            Ok(res_a)
-        } else {
-            self.search_inner(query, k, 0, None, &[], 1.0, None, Some(mode))
         }
+        Ok(served)
     }
 
     /// Filtered search: only ids for which `matches` returns true enter the

@@ -198,25 +198,35 @@ fn main() {
             .iter()
             .map(|q| brute_filtered(&corpus, q, step))
             .collect();
+        // Neutral seeds: a sample of matching ids (what a payload pre-filter /
+        // skeg-rigging would surface), NOT sorted by similarity. skeg's sparse
+        // filtered walk is designed to start from these; without them a sparse
+        // filter starves the walk. Fair to provide; does not leak the true NN.
+        let seeds: Vec<u64> = (0..n as u64)
+            .step_by((step as usize).max(1) * 64)
+            .take(32)
+            .collect();
         for (name, is_tq1) in [("tq1", true), ("tq2", false)] {
-            let mut hits = 0usize;
-            let mut lats = Vec::new();
-            for _ in 0..passes {
-                for (q, t) in queries.iter().zip(&ft) {
-                    let s = std::time::Instant::now();
-                    let got = if is_tq1 { &tq1 } else { &tq2 }
-                        .search_filtered(q, K, L_SEARCH, &matches, &[], sel as f32)
-                        .unwrap();
-                    lats.push(s.elapsed().as_secs_f64() * 1e6);
-                    hits += got.iter().filter(|(id, _)| t.contains(id)).count();
+            for (slabel, sd) in [("noseed", &[][..]), ("seeded", &seeds[..])] {
+                let mut hits = 0usize;
+                let mut lats = Vec::new();
+                for _ in 0..passes {
+                    for (q, t) in queries.iter().zip(&ft) {
+                        let s = std::time::Instant::now();
+                        let got = if is_tq1 { &tq1 } else { &tq2 }
+                            .search_filtered(q, K, L_SEARCH, &matches, sd, sel as f32)
+                            .unwrap();
+                        lats.push(s.elapsed().as_secs_f64() * 1e6);
+                        hits += got.iter().filter(|(id, _)| t.contains(id)).count();
+                    }
                 }
+                let (p50, p99, qps) = pctl(lats);
+                let recall = hits as f64 / (nq * passes * K) as f64;
+                println!(
+                    "              {name:<4} {slabel:<7} {:>4.0}%  {recall:.4}    {p50:>5.0}  {p99:>5.0}  {qps:>5.0}",
+                    sel * 100.0
+                );
             }
-            let (p50, p99, qps) = pctl(lats);
-            let recall = hits as f64 / (nq * passes * K) as f64;
-            println!(
-                "              {name:<8}  {:>4.0}%  {recall:.4}    {p50:>5.0}  {p99:>5.0}  {qps:>5.0}",
-                sel * 100.0
-            );
         }
     }
 }
