@@ -126,3 +126,7 @@ harness = false
 [[bench]]
 name = "tq1_mode_study"
 harness = false
+
+[[bench]]
+name = "tq1_filtered_study"
+harness = false
