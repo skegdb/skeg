@@ -122,3 +122,7 @@ harness = false
 [[bench]]
 name = "tq1_rerank_sweep"
 harness = false
+
+[[bench]]
+name = "tq1_mode_study"
+harness = false

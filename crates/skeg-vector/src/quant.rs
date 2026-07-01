@@ -199,11 +199,30 @@ pub const TQ1_HYBRID_MIN_DIM: usize = 512;
 /// recall at a tiny extra cost, so raw popcount is never the auto-default.
 #[must_use]
 pub fn tq1_proxy_mode_for(dim: usize, bits: u8) -> Tq1ProxyMode {
-    if bits == 1 && dim >= TQ1_HYBRID_MIN_DIM {
+    if bits != 1 {
+        return Tq1ProxyMode::Asymmetric;
+    }
+    // Benchmark/tuning hook: `SKEG_TQ1_MODE=pop|hybrid|asym` forces the 1-bit
+    // proxy so the recall/latency of each can be measured on one built index.
+    // Read once (OnceLock) - zero per-query cost, no effect when unset.
+    if let Some(m) = tq1_mode_override() {
+        return m;
+    }
+    if dim >= TQ1_HYBRID_MIN_DIM {
         Tq1ProxyMode::Hybrid
     } else {
         Tq1ProxyMode::Asymmetric
     }
+}
+
+fn tq1_mode_override() -> Option<Tq1ProxyMode> {
+    static OVERRIDE: std::sync::OnceLock<Option<Tq1ProxyMode>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("SKEG_TQ1_MODE").ok().as_deref() {
+        Some("pop" | "popcount") => Some(Tq1ProxyMode::Popcount),
+        Some("hybrid") => Some(Tq1ProxyMode::Hybrid),
+        Some("asym" | "asymmetric") => Some(Tq1ProxyMode::Asymmetric),
+        _ => None,
+    })
 }
 
 #[derive(Debug)]
