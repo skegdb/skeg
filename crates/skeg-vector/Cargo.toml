@@ -138,3 +138,7 @@ harness = false
 [[bench]]
 name = "tq1_suite"
 harness = false
+
+[[bench]]
+name = "tq1ctl_vs_tq2"
+harness = false

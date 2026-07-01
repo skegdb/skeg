@@ -1079,6 +1079,19 @@ impl QuantizedVectors {
     /// Panics if `query.len()` does not equal the set dimension.
     #[must_use]
     pub fn quantize_query(&self, query: &[f32]) -> QueryCode {
+        self.quantize_query_with_mode(query, None)
+    }
+
+    /// Like [`quantize_query`](Self::quantize_query) but with an explicit tq1
+    /// proxy mode (used by the online controller to force hybrid/asym/pop per
+    /// query). `None` = the default `tq1_proxy_mode_for(dim, bits)`. Ignored for
+    /// non-tq1 tiers.
+    #[must_use]
+    pub fn quantize_query_with_mode(
+        &self,
+        query: &[f32],
+        mode_override: Option<Tq1ProxyMode>,
+    ) -> QueryCode {
         assert_eq!(query.len(), self.dim, "query dim mismatch");
         match &self.repr {
             QuantRepr::Int8 { scale, .. } => {
@@ -1111,7 +1124,8 @@ impl QuantizedVectors {
                 let mut unit = vec![0.0f32; self.dim];
                 normalize_into(query, &mut unit);
                 let q_rot = rotation.apply_alloc(&unit);
-                match tq1_proxy_mode_for(self.dim, *bits) {
+                let mode = mode_override.unwrap_or_else(|| tq1_proxy_mode_for(self.dim, *bits));
+                match mode {
                     Tq1ProxyMode::Popcount => {
                         // Same sign-bit packing as the stored codes, so a
                         // Hamming popcount counts sign disagreements.

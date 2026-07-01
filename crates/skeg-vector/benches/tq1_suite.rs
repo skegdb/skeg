@@ -61,7 +61,10 @@ const DATASETS: &[(&str, &str, &str, usize)] = &[
 ];
 
 fn env(name: &str, d: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn load_npy(path: &str) -> Option<(Vec<f32>, usize, usize)> {
@@ -131,9 +134,13 @@ fn open_or_build(dir: &Path, corpus: &[Vec<f32>], pad: usize, n: usize) -> (Disk
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
     let t = std::time::Instant::now();
-    let mut idx =
-        DiskVamanaIndex::create_empty_with_tier(dir, pad, L_BUILD, QuantKind::TurboQuant { bits: 1 })
-            .unwrap();
+    let mut idx = DiskVamanaIndex::create_empty_with_tier(
+        dir,
+        pad,
+        L_BUILD,
+        QuantKind::TurboQuant { bits: 1 },
+    )
+    .unwrap();
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
@@ -151,7 +158,13 @@ fn recall(got: &[(u64, f32)], truth: &[u64], k: usize) -> f64 {
     got.iter().take(k).filter(|(id, _)| t.contains(id)).count() as f64 / k as f64
 }
 
-fn run(label: &str, corpus_rel: &str, query_rel: &str, native_dim: usize, cfg: (usize, usize, usize, usize)) {
+fn run(
+    label: &str,
+    corpus_rel: &str,
+    query_rel: &str,
+    native_dim: usize,
+    cfg: (usize, usize, usize, usize),
+) {
     let (n_cap, nq_cap, l_search, rr) = cfg;
     let pad = native_dim.next_multiple_of(8);
     let Some((corpus, n)) = load_prep(&format!("{ROOT}/{corpus_rel}"), n_cap, pad) else {
@@ -175,7 +188,9 @@ fn run(label: &str, corpus_rel: &str, query_rel: &str, native_dim: usize, cfg: (
     for (qi, q) in queries.iter().enumerate() {
         let g10 = idx.search_with_params(q, 10, l_search, rr).unwrap();
         // recall@100 needs oversampling headroom: budget = 4*k, not k.
-        let g100 = idx.search_with_params(q, 100, l_search, rr.max(400)).unwrap();
+        let g100 = idx
+            .search_with_params(q, 100, l_search, rr.max(400))
+            .unwrap();
         r10 += recall(&g10, &truth10[qi], 10);
         r100 += recall(&g100, &truth100[qi], 100);
     }
@@ -212,13 +227,23 @@ fn main() {
         env("SKEG_SUITE_RR", 80),
     );
     let mode = std::env::var("SKEG_TQ1_MODE").unwrap_or_else(|_| "auto".into());
-    println!("=====================================================================================");
+    println!(
+        "====================================================================================="
+    );
     println!(
         "skeg tq1 suite | proxy={mode} rerank={} l_search={} N<={} nq<={} passes={} | k=10",
-        cfg.3, cfg.2, cfg.0, cfg.1, env("SKEG_PASSES", 5)
+        cfg.3,
+        cfg.2,
+        cfg.0,
+        cfg.1,
+        env("SKEG_PASSES", 5)
     );
-    println!("recall deterministic; latency = pooled single-thread us over passes; RAM = tq1 codes");
-    println!("=====================================================================================");
+    println!(
+        "recall deterministic; latency = pooled single-thread us over passes; RAM = tq1 codes"
+    );
+    println!(
+        "====================================================================================="
+    );
     println!("  dataset      dim  n       rec@10   rec@100  p50   p99   qps      RAM    bld");
     for &(label, c, q, dim) in DATASETS {
         run(label, c, q, dim, cfg);

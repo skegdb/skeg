@@ -25,8 +25,9 @@ use rayon::prelude::*;
 use skeg_simd::cosine_f32;
 use smallvec::SmallVec;
 
-use crate::quant::{QuantKind, QuantizedVectors};
+use crate::quant::{QuantKind, QuantizedVectors, Tq1ProxyMode};
 use crate::source::{InMemoryVectorSource, VectorSource};
+use crate::tq1_control::Tq1ProxyController;
 use crate::visited::VisitedBitset;
 
 /// Internal dense vector id (0..n).
@@ -1105,6 +1106,12 @@ pub struct DiskVamanaIndex {
     /// Append-only log of delta mutations, replayed on `open` so streaming
     /// inserts/deletes survive a restart. `consolidate` truncates it.
     delta_log: File,
+    /// Online tq1 proxy controller, `None` unless enabled via
+    /// [`enable_tq1_controller`](Self::enable_tq1_controller). Behind a mutex
+    /// because `search` is `&self`; only touched on shadow queries.
+    tq1_ctl: std::sync::Mutex<Option<Tq1ProxyController>>,
+    /// Query counter for deterministic shadow sampling by the controller.
+    query_ctr: std::sync::atomic::AtomicU64,
 }
 
 impl DiskVamanaIndex {
@@ -1369,6 +1376,8 @@ impl DiskVamanaIndex {
             tombstones: AHashSet::new(),
             live_count: n as usize,
             delta_log,
+            tq1_ctl: std::sync::Mutex::new(None),
+            query_ctr: std::sync::atomic::AtomicU64::new(0),
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
@@ -1725,7 +1734,7 @@ impl DiskVamanaIndex {
         k: usize,
         l_search: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, None, &[], 1.0, None)
+        self.search_inner(query, k, l_search, None, &[], 1.0, None, None)
     }
 
     /// Like [`search_with_l`](Self::search_with_l) but also overrides the re-rank
@@ -1750,7 +1759,88 @@ impl DiskVamanaIndex {
         rerank: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
         let rr = (rerank != 0).then_some(rerank);
-        self.search_inner(query, k, l_search, None, &[], 1.0, rr)
+        self.search_inner(query, k, l_search, None, &[], 1.0, rr, None)
+    }
+
+    /// Enable the online tq1 proxy controller (no-op unless the tier is tq1).
+    /// Seeds it from the dim prior; [`search_adaptive`](Self::search_adaptive)
+    /// then picks the proxy per query and learns from shadow A/B samples.
+    pub fn enable_tq1_controller(&self) {
+        if matches!(self.tier, QuantKind::TurboQuant { bits: 1 }) {
+            let prior = crate::quant::tq1_proxy_mode_for(self.dim, 1);
+            // Agreement (hybrid-vs-asym top-k overlap) is a coarse k-step signal,
+            // so a looser tolerance than the pure-recall controller default.
+            *self.tq1_ctl.lock().expect("tq1 ctl") =
+                Some(Tq1ProxyController::new(prior).with_policy(0.1, 10, 3));
+        }
+    }
+
+    /// The controller's current proxy mode, if enabled. Observability.
+    #[must_use]
+    pub fn tq1_controller_mode(&self) -> Option<Tq1ProxyMode> {
+        self.tq1_ctl
+            .lock()
+            .expect("tq1 ctl")
+            .as_ref()
+            .map(Tq1ProxyController::mode)
+    }
+
+    /// Adaptive search. With the controller enabled it uses the learned proxy
+    /// mode; on ~1/`SHADOW_EVERY` queries it runs a shadow A/B (hybrid vs asym),
+    /// feeds the top-k agreement to the controller, and returns the asymmetric
+    /// (reference) result for that query. Falls back to plain `search` when the
+    /// controller is disabled or the tier is not tq1.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if a re-rank read fails.
+    pub fn search_adaptive(&self, query: &[f32], k: usize) -> io::Result<Vec<(u64, f32)>> {
+        let decision = {
+            let guard = self.tq1_ctl.lock().expect("tq1 ctl");
+            guard.as_ref().map(|c| {
+                let ctr = self
+                    .query_ctr
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (c.mode(), c.should_shadow(ctr))
+            })
+        };
+        let Some((mode, shadow)) = decision else {
+            return self.search(query, k);
+        };
+        if shadow {
+            let res_h = self.search_inner(
+                query,
+                k,
+                0,
+                None,
+                &[],
+                1.0,
+                None,
+                Some(Tq1ProxyMode::Hybrid),
+            )?;
+            let res_a = self.search_inner(
+                query,
+                k,
+                0,
+                None,
+                &[],
+                1.0,
+                None,
+                Some(Tq1ProxyMode::Asymmetric),
+            )?;
+            let set_a: AHashSet<u64> = res_a.iter().map(|(id, _)| *id).collect();
+            let agree = if k == 0 {
+                1.0
+            } else {
+                res_h.iter().filter(|(id, _)| set_a.contains(id)).count() as f32 / k as f32
+            };
+            if let Some(c) = self.tq1_ctl.lock().expect("tq1 ctl").as_mut() {
+                c.record_shadow(agree, 1.0);
+            }
+            Ok(res_a)
+        } else {
+            self.search_inner(query, k, 0, None, &[], 1.0, None, Some(mode))
+        }
     }
 
     /// Filtered search: only ids for which `matches` returns true enter the
@@ -1776,7 +1866,16 @@ impl DiskVamanaIndex {
         seeds: &[u64],
         selectivity: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, Some(matches), seeds, selectivity, None)
+        self.search_inner(
+            query,
+            k,
+            l_search,
+            Some(matches),
+            seeds,
+            selectivity,
+            None,
+            None,
+        )
     }
 
     /// Shared search core. `matches == None` is the plain ANN search; `Some`
@@ -1794,6 +1893,7 @@ impl DiskVamanaIndex {
         seeds: &[u64],
         selectivity: f32,
         rerank_override: Option<usize>,
+        tq1_mode: Option<Tq1ProxyMode>,
     ) -> io::Result<Vec<(u64, f32)>> {
         /// Frontier blow-up for a SPARSE filtered walk, so the post-filter still
         /// leaves enough matching candidates. Capped at the main graph size.
@@ -1843,7 +1943,9 @@ impl DiskVamanaIndex {
             if seg.main_n == 0 {
                 continue;
             }
-            let code = seg.quant.quantize_query(&normalized(query));
+            let code = seg
+                .quant
+                .quantize_query_with_mode(&normalized(query), tq1_mode);
             // The base (segment 0) carries the deep beam. Runs are small and only
             // feed the global re-rank, so they walk a shallow list - this keeps
             // query latency flat as runs accumulate, instead of paying a full
