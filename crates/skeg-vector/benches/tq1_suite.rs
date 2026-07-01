@@ -174,7 +174,8 @@ fn run(label: &str, corpus_rel: &str, query_rel: &str, native_dim: usize, cfg: (
     let mut r100 = 0.0;
     for (qi, q) in queries.iter().enumerate() {
         let g10 = idx.search_with_params(q, 10, l_search, rr).unwrap();
-        let g100 = idx.search_with_params(q, 100, l_search, rr.max(100)).unwrap();
+        // recall@100 needs oversampling headroom: budget = 4*k, not k.
+        let g100 = idx.search_with_params(q, 100, l_search, rr.max(400)).unwrap();
         r10 += recall(&g10, &truth10[qi], 10);
         r100 += recall(&g100, &truth100[qi], 100);
     }
