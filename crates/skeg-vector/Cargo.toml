@@ -146,3 +146,11 @@ harness = false
 [[bench]]
 name = "filt_probe"
 harness = false
+
+[[bench]]
+name = "scale_glove"
+harness = false
+
+[[bench]]
+name = "scale_mxbai"
+harness = false
