@@ -23,6 +23,7 @@
 mod flat;
 mod quant;
 mod source;
+mod tq1_control;
 mod turboquant;
 mod vamana;
 mod visited;
@@ -32,6 +33,7 @@ pub use quant::{
     QuantKind, QuantizedVectors, QueryCode, TQ1_POPCOUNT_MIN_DIM, Tq1ProxyMode, tq1_proxy_mode_for,
 };
 pub use source::{InMemoryVectorSource, MmapVectorSource, VectorSource};
+pub use tq1_control::{SHADOW_EVERY, Tq1ProxyController};
 pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
 pub use vamana::{
     DiskVamanaIndex, VamanaConfig, VamanaIndex, build_phase_times_ns, reset_build_phase_times,

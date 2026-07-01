@@ -142,9 +142,8 @@ fn greedy_walk(
     let mut list: Vec<(f32, u32)> = vec![(proxy(medoid), medoid)];
     seen.insert(medoid);
     loop {
-        let Some((_, cur)) = list.iter().copied().find(|&(_, id)| !visited.contains(&id)) else {
-            break;
-        };
+        let next = list.iter().copied().find(|&(_, id)| !visited.contains(&id));
+        let Some((_, cur)) = next else { break };
         visited.insert(cur);
         for nbr in neighbors(cur) {
             if seen.insert(nbr) {
