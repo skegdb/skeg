@@ -134,3 +134,7 @@ harness = false
 [[bench]]
 name = "tq1_pop_deep"
 harness = false
+
+[[bench]]
+name = "tq1_suite"
+harness = false
