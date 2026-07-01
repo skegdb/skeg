@@ -1,4 +1,4 @@
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::type_complexity)]
 //! Is skeg's sparse-filtered recall a fundamental loss or a budget artifact?
 //! Opens the cached tq2 500k index and sweeps l_search at 1% selectivity. If
 //! recall climbs with the walk budget, it's budget (like the plain rerank lever),
@@ -118,7 +118,7 @@ fn main() {
             })
             .collect();
         println!("-- selectivity {:.1}% ({matchn} matches) --", sel * 100.0);
-        let mut row = |name: &str, f: &dyn Fn(&[f32]) -> Vec<(u64, f32)>| {
+        let row = |name: &str, f: &dyn Fn(&[f32]) -> Vec<(u64, f32)>| {
             let mut hits = 0usize;
             let t = std::time::Instant::now();
             for (q, tr) in queries.iter().zip(&truth) {

@@ -270,6 +270,7 @@ fn greedy_search<D, N>(
     dist_to_query: D,
     neighbors: N,
     admit: Option<&dyn Fn(VecId) -> bool>,
+    acorn: bool,
     visited: &mut VisitedBitset,
     seen: &mut VisitedBitset,
     mut trace: Option<&mut Vec<VecId>>,
@@ -314,6 +315,17 @@ where
             }
             if admit.is_none_or(|a| a(nbr)) {
                 list.insert(dist_to_query(nbr), nbr);
+            } else if acorn {
+                // ACORN: `nbr` is filtered out, so it can never be a candidate,
+                // but the matching subgraph may only connect THROUGH it. Hop over
+                // it: admit its matching 2-hop neighbours so the walk stays
+                // navigable when matches are scattered. RAM-only (no disk reads);
+                // `dist_to_query` is the in-RAM proxy.
+                for nn in neighbors(nbr) {
+                    if !seen.test_and_set(nn) && admit.is_some_and(|a| a(nn)) {
+                        list.insert(dist_to_query(nn), nn);
+                    }
+                }
             }
         }
         if let Some(et) = early_term {
@@ -344,9 +356,15 @@ fn robust_prune(
     alpha: f32,
     r: usize,
     source: &dyn VectorSource,
+    labels: Option<&[u64]>,
 ) -> SmallVec<[VecId; MAX_R]> {
     candidates.retain(|&(_, id)| id != p);
     candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    // FilteredVamana (Gollapudi et al., WWW'23): p* may only prune the edge
+    // p->v if p* shares p's label - otherwise p->v is the bridge that keeps p's
+    // label subgraph navigable, so it is preserved even if geometrically
+    // redundant. `labels[x] == NO_LABEL` = unlabelled (never a bridge).
+    let p_label = labels.map(|l| l[p as usize]);
 
     let mut result: SmallVec<[VecId; MAX_R]> = SmallVec::new();
     let mut cursor = 0;
@@ -363,7 +381,15 @@ fn robust_prune(
                 continue;
             }
             let d_star = dist(p_star_vec, source.row(v));
-            if alpha * d_star > d_pv {
+            // Keep v if geometrically non-redundant, OR if p and v share a real
+            // label that p* does NOT (p* can't carry that label's connectivity).
+            let label_bridge = match (p_label, labels) {
+                (Some(lp), Some(l)) => {
+                    lp != NO_LABEL && lp == l[v as usize] && lp != l[p_star as usize]
+                }
+                _ => false,
+            };
+            if alpha * d_star > d_pv || label_bridge {
                 candidates[write] = (d_pv, v);
                 write += 1;
             }
@@ -372,6 +398,9 @@ fn robust_prune(
     }
     result
 }
+
+/// Sentinel label for an unlabelled node (not part of any filter subgraph).
+const NO_LABEL: u64 = u64::MAX;
 
 // ── build ─────────────────────────────────────────────────────────────────────
 
@@ -562,6 +591,7 @@ fn insert_point_concurrent(
     alpha: f32,
     r: usize,
     l_build: usize,
+    labels: Option<&[u64]>,
     scratch: &mut BuildScratch,
 ) {
     let p_vec = source.row(p);
@@ -572,7 +602,8 @@ fn insert_point_concurrent(
         None, // build: never early-terminate (full candidate pool for prune)
         |id| dist(p_vec, source.row(id)),
         |id| locked_neighbors(graph, id),
-        None, // build: no filter admission
+        None,  // build: no filter admission
+        false, // build: no acorn
         &mut scratch.visited,
         &mut scratch.seen,
         None,
@@ -594,7 +625,7 @@ fn insert_point_concurrent(
         }
     }
 
-    let new_neighbors = robust_prune(p, &mut scratch.candidates, alpha, r, source);
+    let new_neighbors = robust_prune(p, &mut scratch.candidates, alpha, r, source, labels);
     graph[p as usize].lock().set(&new_neighbors);
     scratch.prune_ns += t_prune.elapsed().as_nanos() as u64;
 
@@ -614,7 +645,7 @@ fn insert_point_concurrent(
                 .chain(std::iter::once(p))
                 .map(|id| (dist(j_vec, source.row(id)), id)),
         );
-        let new_j = robust_prune(j, &mut scratch.back, alpha, r, source);
+        let new_j = robust_prune(j, &mut scratch.back, alpha, r, source, labels);
         graph[j as usize].lock().set(&new_j);
     }
     scratch.backedge_ns += t_back.elapsed().as_nanos() as u64;
@@ -633,6 +664,7 @@ fn run_pass_parallel(
     r: usize,
     l_build: usize,
     seed: u64,
+    labels: Option<&[u64]>,
 ) {
     let mut order: Vec<VecId> = (0..n).collect();
     let mut rng = StdRng::seed_from_u64(seed ^ u64::from(alpha.to_bits()));
@@ -644,7 +676,7 @@ fn run_pass_parallel(
     order.par_iter().for_each_init(
         || BuildScratch::with_capacity(cap),
         |scratch, &p| {
-            insert_point_concurrent(graph, source, medoid, p, alpha, r, l_build, scratch);
+            insert_point_concurrent(graph, source, medoid, p, alpha, r, l_build, labels, scratch);
         },
     );
 }
@@ -714,6 +746,11 @@ pub struct VamanaIndex {
     medoid: VecId,
     r: usize,
     l_search: usize,
+    /// FilteredVamana: per-row label (`NO_LABEL` = unlabelled). Empty unless
+    /// built via [`build_from_source_labeled`](Self::build_from_source_labeled).
+    labels: Vec<u64>,
+    /// Per-label entry node for a filtered walk. Empty when unlabelled.
+    label_entries: AHashMap<u64, VecId>,
 }
 
 impl VamanaIndex {
@@ -751,7 +788,29 @@ impl VamanaIndex {
         ids: Vec<u64>,
         config: &VamanaConfig,
     ) -> VamanaIndex {
+        Self::build_from_source_labeled(vectors, ids, config, None)
+    }
+
+    /// Like [`build_from_source`](Self::build_from_source) but FilteredVamana:
+    /// `labels[row]` tags each vector; the build preserves per-label graph
+    /// connectivity (FilteredRobustPrune) and records a per-label entry node, so
+    /// [`search_filtered_labeled`](Self::search_filtered_labeled) is a single
+    /// navigable walk in the matching subgraph. `NO_LABEL` = unlabelled.
+    ///
+    /// # Panics
+    /// Panics if `labels` is `Some` with a length != `ids.len()`, or `ids` empty.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn build_from_source_labeled(
+        vectors: Box<dyn VectorSource>,
+        ids: Vec<u64>,
+        config: &VamanaConfig,
+        labels: Option<&[u64]>,
+    ) -> VamanaIndex {
         assert!(!ids.is_empty(), "Vamana needs at least one vector");
+        if let Some(l) = labels {
+            assert_eq!(l.len(), ids.len(), "labels/ids length mismatch");
+        }
         assert_eq!(vectors.len(), ids.len(), "source/ids length mismatch");
         let dim = vectors.dim();
         let n = ids.len() as u32;
@@ -772,6 +831,7 @@ impl VamanaIndex {
             config.r,
             config.l_build,
             config.seed,
+            labels,
         );
         run_pass_parallel(
             &graph,
@@ -782,9 +842,26 @@ impl VamanaIndex {
             config.r,
             config.l_build,
             config.seed.wrapping_add(1),
+            labels,
         );
         let mut nodes: Vec<Node> = graph.into_iter().map(Mutex::into_inner).collect();
         patch_connectivity(&mut nodes, &*vectors, n, medoid, config.r);
+
+        // Per-label entry node: the first row seen for each real label. A filtered
+        // search seeds from the entries of the matching labels, so the walk starts
+        // INSIDE each matching subgraph (the medoid may carry none of them).
+        let (labels_owned, label_entries) = match labels {
+            Some(l) => {
+                let mut entries: AHashMap<u64, VecId> = AHashMap::new();
+                for (row, &lab) in l.iter().enumerate() {
+                    if lab != NO_LABEL {
+                        entries.entry(lab).or_insert(row as VecId);
+                    }
+                }
+                (l.to_vec(), entries)
+            }
+            None => (Vec::new(), AHashMap::new()),
+        };
 
         VamanaIndex {
             dim,
@@ -795,6 +872,8 @@ impl VamanaIndex {
             medoid,
             r: config.r,
             l_search: config.l_search,
+            labels: labels_owned,
+            label_entries,
         }
     }
 
@@ -884,6 +963,72 @@ impl VamanaIndex {
             |id| dist(query, self.vectors.row(id)),
             |id| self.nodes[id as usize].slice().iter().copied().collect(),
             None, // in-RAM search: no filter admission
+            false,
+            &mut visited,
+            &mut seen,
+            None,
+        );
+        list.iter()
+            .take(k)
+            .map(|(d, id)| (self.ids[id as usize], 1.0 - d))
+            .collect()
+    }
+
+    /// FilteredVamana build over in-memory vectors, each tagged by `labels[row]`.
+    ///
+    /// # Panics
+    /// Panics as [`build`](Self::build); also if `labels.len() != ids.len()`.
+    #[must_use]
+    pub fn build_labeled(
+        vectors: Vec<f32>,
+        ids: Vec<u64>,
+        labels: Vec<u64>,
+        dim: usize,
+        config: &VamanaConfig,
+    ) -> VamanaIndex {
+        let source = InMemoryVectorSource::new(vectors, dim);
+        VamanaIndex::build_from_source_labeled(Box::new(source), ids, config, Some(&labels))
+    }
+
+    /// Single filtered walk over the FilteredVamana graph: admit only rows whose
+    /// label is in `match_labels`, seeded from those labels' entry nodes so the
+    /// walk starts inside each matching subgraph. Distances are exact f32 (the
+    /// in-memory source), so this isolates GRAPH navigability from quantization.
+    /// Returns top-`k` (id, cosine). Empty if the index was not built labelled.
+    ///
+    /// # Panics
+    /// Panics if `query.len()` != the index dimension.
+    #[must_use]
+    pub fn search_filtered_labeled(
+        &self,
+        query: &[f32],
+        k: usize,
+        match_labels: &[u64],
+        l_search: usize,
+    ) -> Vec<(u64, f32)> {
+        assert_eq!(query.len(), self.dim, "query dim mismatch");
+        if self.n == 0 || k == 0 || self.labels.is_empty() {
+            return Vec::new();
+        }
+        let list_size = l_search.max(k);
+        let mset: AHashSet<u64> = match_labels.iter().copied().collect();
+        let mut seeds: Vec<VecId> = vec![self.medoid];
+        for &lab in match_labels {
+            if let Some(&e) = self.label_entries.get(&lab) {
+                seeds.push(e);
+            }
+        }
+        let admit = |row: VecId| mset.contains(&self.labels[row as usize]);
+        let mut visited = VisitedBitset::new(self.n as usize);
+        let mut seen = VisitedBitset::new(self.n as usize);
+        let list = greedy_search(
+            &seeds,
+            list_size,
+            None,
+            |id| dist(query, self.vectors.row(id)),
+            |id| self.nodes[id as usize].slice().iter().copied().collect(),
+            Some(&admit),
+            true, // acorn: hop through non-matching nodes too
             &mut visited,
             &mut seen,
             None,
@@ -2091,6 +2236,11 @@ impl DiskVamanaIndex {
                     dist,
                     nbrs,
                     admit,
+                    // ACORN 2-hop here was a no-op on scattered/clustered filters
+                    // (recall unchanged) and superseded by FilteredVamana's
+                    // label-aware graph. Left inert; the param stays for the
+                    // labelled single-walk path.
+                    false,
                     &mut visited,
                     &mut seen,
                     None,
@@ -2209,6 +2359,7 @@ impl DiskVamanaIndex {
                         .collect()
                 },
                 None, // trace: no filter admission
+                false,
                 &mut visited,
                 &mut seen,
                 Some(&mut trace),
@@ -2462,7 +2613,7 @@ mod tests {
             .map(|id| (dist(row(&vectors, 5, dim), row(&vectors, id, dim)), id))
             .collect();
         let src = InMemoryVectorSource::new(vectors, dim);
-        let result = robust_prune(5, &mut cand, 1.2, 8, &src);
+        let result = robust_prune(5, &mut cand, 1.2, 8, &src, None);
         assert!(
             !result.contains(&5),
             "a node must never be its own neighbour"
@@ -2485,7 +2636,7 @@ mod tests {
             .collect();
         let original: Vec<(f32, VecId)> = cand.clone();
         let src = InMemoryVectorSource::new(vectors.clone(), dim);
-        let result = robust_prune(p, &mut cand, alpha, MAX_R, &src);
+        let result = robust_prune(p, &mut cand, alpha, MAX_R, &src, None);
 
         for &(d_pv, v) in &original {
             if result.contains(&v) {
@@ -2519,6 +2670,7 @@ mod tests {
             |id| dist(&query, row(&vectors, id, dim)),
             |id| nodes[id as usize].slice().iter().copied().collect(),
             None,
+            false,
             &mut visited,
             &mut seen,
             None,

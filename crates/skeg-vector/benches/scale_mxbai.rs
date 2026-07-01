@@ -1,4 +1,4 @@
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::type_complexity)]
 //! Scale test at N = 1.18M (glove, dim 100). Builds a tq2 DiskVamana once
 //! (cached) via RW insert, then measures the filtered planner's two tiers -
 //! quantized scan vs walk - at FIXED absolute matching-set sizes. Confirms the
@@ -78,10 +78,16 @@ fn build(dir: &Path, corpus: &[Vec<f32>], n: usize) -> DiskVamanaIndex {
 }
 
 fn main() {
-    let nq = std::env::var("SKEG_NQ").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let nq = std::env::var("SKEG_NQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let (corpus, n) = prep(&format!("{ROOT}/{CORPUS}"), usize::MAX);
     let (queries, _) = prep(&format!("{ROOT}/{QUERY}"), nq);
-    println!("scale test: mxbai {n} x {PAD}, {} queries, k={K}", queries.len());
+    println!(
+        "scale test: mxbai {n} x {PAD}, {} queries, k={K}",
+        queries.len()
+    );
     let dir: PathBuf = std::env::var("SKEG_STUDY_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("skeg_tq1_study"))
@@ -105,7 +111,14 @@ fn main() {
     } else {
         Vec::new()
     };
-    println!("filter = {}", if corr { "CORRELATED (semantic cluster)" } else { "uniform id%step" });
+    println!(
+        "filter = {}",
+        if corr {
+            "CORRELATED (semantic cluster)"
+        } else {
+            "uniform id%step"
+        }
+    );
 
     for &target in &TARGET_MATCHES {
         // Sorted matching id list (both modes), + a membership set for the walk.
@@ -132,17 +145,24 @@ fn main() {
             })
             .collect();
         println!("-- ~{matchn} matches (of {n}) --");
-        let mut row = |name: &str, f: &dyn Fn(&[f32]) -> Vec<(u64, f32)>| {
+        let row = |name: &str, f: &dyn Fn(&[f32]) -> Vec<(u64, f32)>| {
             let mut hits = 0usize;
             let t = std::time::Instant::now();
             for (q, tr) in queries.iter().zip(&truth) {
                 hits += f(q).iter().filter(|(id, _)| tr.contains(id)).count();
             }
             let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
-            println!("   {name:<12} recall {:.4}   {ms:.2} ms/q", hits as f64 / (queries.len() * K) as f64);
+            println!(
+                "   {name:<12} recall {:.4}   {ms:.2} ms/q",
+                hits as f64 / (queries.len() * K) as f64
+            );
         };
         let sel = matchn as f32 / n as f32;
-        row("walk L1500", &|q| idx.search_filtered(q, K, 1500, &matches, &[], sel).unwrap());
-        row("qscan rr80", &|q| idx.score_ids_quantized(q, &ids, K, 80).unwrap());
+        row("walk L1500", &|q| {
+            idx.search_filtered(q, K, 1500, &matches, &[], sel).unwrap()
+        });
+        row("qscan rr80", &|q| {
+            idx.score_ids_quantized(q, &ids, K, 80).unwrap()
+        });
     }
 }

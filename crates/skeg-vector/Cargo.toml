@@ -154,3 +154,7 @@ harness = false
 [[bench]]
 name = "scale_mxbai"
 harness = false
+
+[[bench]]
+name = "fvamana"
+harness = false
