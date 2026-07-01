@@ -270,13 +270,21 @@ impl VectorBackend {
         s: &[u64],
     ) -> std::io::Result<Vec<(u64, f32)>> {
         // `s` is the SORTED matching id list (from `Filter::evaluate`), already
-        // per-shard (the vindex is sharded, so a 50k-match filter is ~6k per shard
-        // at 8 shards). Exact scan costs ~1 disk read per id (~3us); above ~2k the
-        // selectivity-adaptive walk wins, so scan only the genuinely small filters.
-        const FILTER_EXACT_MAX: usize = 2_048;
+        // per-shard. Small/medium filters take the QUANTIZED scan: proxy-score
+        // every match in RAM (NEON-fast) then f32-rerank only `k*8` from disk -
+        // disk reads bounded regardless of |s|, recall ~1.0. Measured crossover:
+        // qscan wins to ~30k matches (recall 1.0: 1k→0.9ms, 25k→7.9ms), beating
+        // both the walk (sparse two-walk is 20-30ms there) AND qdrant; above ~30k
+        // the O(|s|) proxy scan loses to the walk (dense single walk ~5ms). The
+        // crossover is in ABSOLUTE matches, so it holds at any N (the scaling
+        // property). See benches/filt_probe.rs.
+        const FILTER_SCAN_MAX: usize = 32_768;
+        const SCAN_RERANK: usize = 8;
         match self {
             VectorBackend::Flat(i) => Ok(i.score_ids(query, s, k)),
-            VectorBackend::Disk(i) if s.len() <= FILTER_EXACT_MAX => i.score_ids(query, s, k),
+            VectorBackend::Disk(i) if s.len() <= FILTER_SCAN_MAX => {
+                i.score_ids_quantized(query, s, k, (k * SCAN_RERANK).max(64))
+            }
             VectorBackend::Disk(i) => {
                 // Seed the walk from a spread of matching ids so it can reach a
                 // cluster that sits away from the query (multi-seed).

@@ -53,11 +53,21 @@ fn prep(path: &str, cap: usize) -> (Vec<Vec<f32>>, usize) {
 }
 
 fn main() {
-    let n = std::env::var("SKEG_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(500_000);
-    let nq = std::env::var("SKEG_NQ").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let n = std::env::var("SKEG_BENCH_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000);
+    let nq = std::env::var("SKEG_NQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let (corpus, n) = prep(&format!("{ROOT}/{CORPUS}"), n);
     let (queries, _) = prep(&format!("{ROOT}/{QUERY}"), nq);
-    let bits: u8 = if std::env::var("SKEG_TIER").as_deref() == Ok("tq1") { 1 } else { 2 };
+    let bits: u8 = if std::env::var("SKEG_TIER").as_deref() == Ok("tq1") {
+        1
+    } else {
+        2
+    };
     let dir: PathBuf = std::env::var("SKEG_STUDY_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("skeg_tq1_study"))
@@ -66,7 +76,7 @@ fn main() {
         .expect("cached index (run tq1ctl_vs_tq2 first)");
     println!("== tier tq{bits} ==");
 
-    for &sel in &[0.01_f64, 0.10] {
+    for &sel in &[0.01_f64, 0.025, 0.05, 0.10, 0.20] {
         let step = (1.0 / sel).round() as u64;
         let matches = move |id: u64| id % step == 0;
         let truth: Vec<AHashSet<u64>> = queries
@@ -82,16 +92,28 @@ fn main() {
                 s.iter().take(K).map(|&(_, id)| id).collect()
             })
             .collect();
-        println!("-- selectivity {:.0}% --", sel * 100.0);
-        for &l in &[300usize, 800, 1500, 4000] {
+        let matchn = n / step as usize;
+        println!("-- selectivity {:.1}% ({matchn} matches) --", sel * 100.0);
+        let mut row = |name: &str, f: &dyn Fn(&[f32]) -> Vec<(u64, f32)>| {
             let mut hits = 0usize;
             let t = std::time::Instant::now();
             for (q, tr) in queries.iter().zip(&truth) {
-                let got = idx.search_filtered(q, K, l, &matches, &[], sel as f32).unwrap();
-                hits += got.iter().filter(|(id, _)| tr.contains(id)).count();
+                hits += f(q).iter().filter(|(id, _)| tr.contains(id)).count();
             }
             let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
-            println!("   L{l:<5} recall {:.4}   {ms:.2} ms/q", hits as f64 / (queries.len() * K) as f64);
-        }
+            println!(
+                "   {name:<12} recall {:.4}   {ms:.2} ms/q",
+                hits as f64 / (queries.len() * K) as f64
+            );
+        };
+        // WALK (best budget) vs QSCAN (proxy scan + f32 rerank). Crossover map.
+        row("walk L1500", &|q| {
+            idx.search_filtered(q, K, 1500, &matches, &[], sel as f32)
+                .unwrap()
+        });
+        let ids: Vec<u64> = (0..n as u64).filter(|id| id % step == 0).collect();
+        row("qscan rr80", &|q| {
+            idx.score_ids_quantized(q, &ids, K, 80).unwrap()
+        });
     }
 }

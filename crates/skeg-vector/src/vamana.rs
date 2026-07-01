@@ -1631,6 +1631,85 @@ impl DiskVamanaIndex {
         Ok(scored)
     }
 
+    /// Score an explicit id set with the in-RAM quantized proxy, then f32-rerank
+    /// the top `rerank` survivors. Unlike [`score_ids`](Self::score_ids) (exact
+    /// f32 scan = one disk read per id) this reads only `rerank` vectors from
+    /// disk regardless of `|ids|`, so it scales to large matching sets (broad
+    /// filters): the proxy scan is in-RAM and NEON-fast, the disk cost is bounded.
+    /// Recall is the proxy's ranking into the rerank window - the same model as
+    /// the ANN walk, without the navigation. `rerank` is the disk-read budget
+    /// (e.g. `k*8`).
+    ///
+    /// # Errors
+    ///
+    /// I/O error if a re-rank read from `vectors.bin` fails.
+    pub fn score_ids_quantized(
+        &self,
+        query: &[f32],
+        ids: &[u64],
+        k: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        // Per-segment query code; proxy_rescore gives the asym-quality ordering.
+        let base_code = self.base.quant.quantize_query(query);
+        let run_codes: Vec<_> = self
+            .runs
+            .iter()
+            .map(|r| r.quant.quantize_query(query))
+            .collect();
+        // (proxy score, seg_idx: 0=base / 1.. = run, row). Delta ids are f32 in
+        // RAM already, so they go straight to the finalist list.
+        let mut cand: Vec<(i32, usize, VecId)> = Vec::new();
+        let mut scored: Vec<(f32, u64)> = Vec::new();
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        for &id in ids {
+            if self.tombstones.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            if let Some(v) = self.delta.get(&id) {
+                scored.push((cosine_f32(query, v), id));
+                continue;
+            }
+            // Newest run wins, then base (matches consolidate precedence).
+            if let Some((ri, &row)) = self
+                .runs
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(ri, r)| r.id_to_main_row.get(&id).map(|row| (ri, row)))
+            {
+                let p = self.runs[ri]
+                    .quant
+                    .proxy_rescore(row as usize, &run_codes[ri]);
+                cand.push((p, ri + 1, row));
+            } else if let Some(&row) = self.base.id_to_main_row.get(&id) {
+                let p = self.base.quant.proxy_rescore(row as usize, &base_code);
+                cand.push((p, 0, row));
+            }
+        }
+        // Keep the top `rerank` by proxy (higher = closer), then f32-rerank them.
+        let take = rerank.max(k);
+        if cand.len() > take {
+            cand.select_nth_unstable_by(take, |a, b| b.0.cmp(&a.0));
+            cand.truncate(take);
+        }
+        for (_p, seg_idx, row) in cand {
+            let seg = if seg_idx == 0 {
+                &self.base
+            } else {
+                &self.runs[seg_idx - 1]
+            };
+            let v = self.read_vector(seg, row)?;
+            scored.push((cosine_f32(query, &v), seg.ids[row as usize]));
+        }
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(s, id)| (id, s)).collect())
+    }
+
     /// Insert or overwrite the vector for `id`. The vector lands in the in-RAM
     /// delta and is appended to the WAL; [`consolidate`](Self::consolidate)
     /// folds it into the graph.
