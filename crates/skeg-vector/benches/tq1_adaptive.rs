@@ -160,7 +160,8 @@ fn walk_recall(
     truth: &AHashSet<u32>,
     proxy: impl Fn(u32) -> f32,
 ) -> f32 {
-    let ordered = greedy_walk(medoid, index, proxy, l_search().max(K));
+    // `proxy` is "greater = closer"; greedy_walk wants "smaller = closer".
+    let ordered = greedy_walk(medoid, index, |id| -proxy(id), l_search().max(K));
     let w = RERANK_W.min(ordered.len());
     let mut rr: Vec<(f32, u32)> = ordered[..w]
         .iter()
