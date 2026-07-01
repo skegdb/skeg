@@ -1258,6 +1258,21 @@ pub struct DiskVamanaIndex {
     // stays off DiskVamanaIndex as one pointer - else the pthread mutex inline
     // bloats skeg-server's VectorBackend enum past large_enum_variant.
     tq1: Box<Tq1Runtime>,
+    /// FilteredVamana state, Box'd to keep DiskVamanaIndex small (else the
+    /// VectorBackend enum trips large_enum_variant). In-memory only in this
+    /// increment (not persisted); the label-aware EDGES live in the graph.
+    filt: Box<FilteredState>,
+}
+
+/// Cold FilteredVamana admit-gate state (per-base-row labels + per-label entry
+/// nodes), behind a single Box on DiskVamanaIndex.
+#[derive(Default)]
+struct FilteredState {
+    /// Per-base-row label (aligned to `base` rows). Empty unless built via
+    /// [`consolidate_labeled`](DiskVamanaIndex::consolidate_labeled).
+    base_labels: Vec<u64>,
+    /// Per-label entry base-row, for seeding a single filtered walk.
+    label_entries: AHashMap<u64, VecId>,
 }
 
 /// Cold per-index tq1 online-controller state, kept behind a single `Box` on
@@ -1532,6 +1547,7 @@ impl DiskVamanaIndex {
             live_count: n as usize,
             delta_log,
             tq1: Box::default(),
+            filt: Box::default(),
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
@@ -2522,6 +2538,170 @@ impl DiskVamanaIndex {
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         Ok(())
+    }
+
+    /// FilteredVamana consolidate: like [`consolidate`](Self::consolidate) but the
+    /// rebuilt graph is LABEL-AWARE (`label_of(id)` tags each vector; `NO_LABEL`
+    /// = unlabelled). The label-preserving edges live in the saved graph; the
+    /// per-row labels + per-label entry nodes are held in RAM for the admit gate
+    /// of [`search_filtered_labeled`](Self::search_filtered_labeled). Everything
+    /// folds into a single base (runs + delta cleared).
+    ///
+    /// # Errors
+    /// I/O error if rebuilding / saving / reopening fails.
+    pub fn consolidate_labeled(&mut self, label_of: &dyn Fn(u64) -> u64) -> io::Result<()> {
+        let dim = self.dim;
+        let segs: Vec<&Segment> = std::iter::once(&self.base)
+            .chain(self.runs.iter())
+            .collect();
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        for &id in self.delta.keys() {
+            if seen.insert(id) {
+                survivors.push((id, usize::MAX, 0));
+            }
+        }
+        for (ri, run) in self.runs.iter().enumerate().rev() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                survivors.push((id, ri + 1, row));
+            }
+        }
+        for row in 0..self.base.main_n {
+            let id = self.base.ids[row as usize];
+            if self.tombstones.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            survivors.push((id, 0, row));
+        }
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        survivors.sort_unstable_by_key(|&(id, _, _)| id);
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
+        let mut labels: Vec<u64> = Vec::with_capacity(survivors.len());
+        for (id, loc, row) in survivors {
+            if loc == usize::MAX {
+                vectors.extend_from_slice(&self.delta[&id]);
+            } else {
+                vectors.extend(self.read_vector(segs[loc], row)?);
+            }
+            ids.push(id);
+            labels.push(label_of(id));
+        }
+        let dir = self.dir.clone();
+        let tier = self.tier;
+        // Build LABEL-AWARE, then save (graph carries the label edges); reopen as
+        // usual, then re-attach the RAM-side labels aligned to the new base rows
+        // (build/save/open all preserve the input `ids` row order).
+        let rebuilt =
+            VamanaIndex::build_labeled(vectors, ids, labels.clone(), dim, &disk_build_config());
+        rebuilt.save(&dir)?;
+        self.discard_runs()?;
+        std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
+        *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
+        let mut entries: AHashMap<u64, VecId> = AHashMap::new();
+        for (row, &lab) in labels.iter().enumerate() {
+            if lab != NO_LABEL {
+                entries.entry(lab).or_insert(row as VecId);
+            }
+        }
+        self.filt.base_labels = labels;
+        self.filt.label_entries = entries;
+        Ok(())
+    }
+
+    /// Re-attach the RAM-side labels to a base that was ALREADY built label-aware
+    /// (by a prior [`consolidate_labeled`](Self::consolidate_labeled)), without a
+    /// rebuild. Lets a reopened index serve filtered walks again. (Increment 2
+    /// keeps labels in RAM; persistence is a later step.)
+    pub fn attach_labels(&mut self, label_of: &dyn Fn(u64) -> u64) {
+        let labels: Vec<u64> = (0..self.base.main_n)
+            .map(|r| label_of(self.base.ids[r as usize]))
+            .collect();
+        let mut entries: AHashMap<u64, VecId> = AHashMap::new();
+        for (row, &lab) in labels.iter().enumerate() {
+            if lab != NO_LABEL {
+                entries.entry(lab).or_insert(row as VecId);
+            }
+        }
+        self.filt.base_labels = labels;
+        self.filt.label_entries = entries;
+    }
+
+    /// Single filtered walk over the FilteredVamana base graph: admit only rows
+    /// whose label is in `match_labels`, seeded from those labels' entry nodes,
+    /// navigated with the tier proxy, then f32-reranked (`rerank` disk reads).
+    /// Base-only (call after [`consolidate_labeled`](Self::consolidate_labeled)).
+    /// Empty unless the base was built labelled.
+    ///
+    /// # Errors
+    /// I/O error if a re-rank read fails.
+    pub fn search_filtered_labeled(
+        &self,
+        query: &[f32],
+        k: usize,
+        match_labels: &[u64],
+        l_search: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        if k == 0 || self.filt.base_labels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seg = &self.base;
+        let code = seg.quant.quantize_query(&normalized(query));
+        let mset: AHashSet<u64> = match_labels.iter().copied().collect();
+        let mut seeds: Vec<VecId> = vec![seg.medoid];
+        for &lab in match_labels {
+            if let Some(&r) = self.filt.label_entries.get(&lab) {
+                seeds.push(r);
+            }
+        }
+        let admit = |row: VecId| mset.contains(&self.filt.base_labels[row as usize]);
+        let dist = |id: VecId| -(seg.quant.proxy(id as usize, &code) as f32);
+        let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
+            seg.nodes[id as usize].slice().iter().copied().collect()
+        };
+        let mut visited = VisitedBitset::new(seg.main_n as usize);
+        let mut seen = VisitedBitset::new(seg.main_n as usize);
+        let list = greedy_search(
+            &seeds,
+            l_search.max(k),
+            None,
+            dist,
+            nbrs,
+            Some(&admit),
+            false,
+            &mut visited,
+            &mut seen,
+            None,
+        );
+        // tq1 hybrid: re-score survivors with the asym proxy before the disk reads.
+        let hybrid = code.is_tq1_hybrid();
+        let mut cand: Vec<(f32, VecId)> = list
+            .iter()
+            .map(|(p, row)| {
+                let s = if hybrid {
+                    -(seg.quant.proxy_rescore(row as usize, &code) as f32)
+                } else {
+                    p
+                };
+                (s, row)
+            })
+            .collect();
+        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut scored: Vec<(OrderedFloat<f32>, u64)> = Vec::new();
+        for (_, row) in cand.into_iter().take(rerank.max(k)) {
+            let v = self.read_vector(seg, row)?;
+            scored.push((OrderedFloat(cosine_f32(query, &v)), seg.ids[row as usize]));
+        }
+        scored.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(d, id)| (id, d.0)).collect())
     }
 }
 

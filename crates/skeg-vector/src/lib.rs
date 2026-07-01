@@ -21,6 +21,7 @@
 //! The Vamana graph is layered on top of the same vector storage.
 
 mod flat;
+mod ivf_router;
 mod quant;
 mod source;
 mod tq1_control;
@@ -29,6 +30,7 @@ mod vamana;
 mod visited;
 
 pub use flat::FlatIndex;
+pub use ivf_router::IvfRouter;
 pub use quant::{
     QuantKind, QuantizedVectors, QueryCode, TQ1_HYBRID_MIN_DIM, Tq1ProxyMode, tq1_proxy_mode_for,
 };
