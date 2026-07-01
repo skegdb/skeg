@@ -1881,8 +1881,19 @@ impl DiskVamanaIndex {
                 let walk_early = if dense { None } else { early };
                 cand.extend(walk(&seed_rows, None, walk_early).iter());
             }
+            // tq1 hybrid: the walk navigated with the cheap popcount proxy, but
+            // the candidate ordering here gates the bounded disk-read rerank
+            // budget below. Re-score the survivors with the asymmetric proxy
+            // (in-RAM, no disk) so the reads land on the best candidates. Other
+            // modes keep the walk's proxy value at zero extra cost.
+            let hybrid = code.is_tq1_hybrid();
             for (proxy, row) in cand {
-                all_cand.push((proxy, seg_idx, row));
+                let score = if hybrid {
+                    -(seg.quant.proxy_rescore(row as usize, &code) as f32)
+                } else {
+                    proxy
+                };
+                all_cand.push((score, seg_idx, row));
             }
         }
         // Global re-rank: best-by-proxy first across every segment, bounded disk

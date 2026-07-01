@@ -178,6 +178,7 @@ fn mode_tag(m: Tq1ProxyMode) -> u8 {
     match m {
         Tq1ProxyMode::Asymmetric => 0,
         Tq1ProxyMode::Popcount => 1,
+        Tq1ProxyMode::Hybrid => 2,
     }
 }
 
@@ -185,6 +186,7 @@ fn mode_from_tag(t: u8) -> Option<Tq1ProxyMode> {
     match t {
         0 => Some(Tq1ProxyMode::Asymmetric),
         1 => Some(Tq1ProxyMode::Popcount),
+        2 => Some(Tq1ProxyMode::Hybrid),
         _ => None,
     }
 }

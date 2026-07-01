@@ -256,7 +256,7 @@ fn sweep_hybrid(
             let mut ordered = greedy_walk(
                 medoid,
                 |id| index.neighbors(id).to_vec(),
-                |id| (hamming_binary(&qb, &codes[id as usize * cb..(id as usize + 1) * cb]) as f32),
+                |id| hamming_binary(&qb, &codes[id as usize * cb..(id as usize + 1) * cb]) as f32,
                 l_search().max(K),
             );
             // Pass 2: asym re-score the survivors and re-sort (greater = closer).

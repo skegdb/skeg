@@ -135,6 +135,29 @@ pub enum QueryCode {
     /// codes). Scored by Hamming popcount against a stored code. Produced only
     /// when the index's tq1 proxy mode is [`Tq1ProxyMode::Popcount`].
     TurboQuant1Popcount { q_bits: Vec<u8> },
+    /// TurboQuant 1-bit hybrid query: carries BOTH the sign bits (for the cheap
+    /// popcount walk) and the rotated f32 query + `q_sum` (for the asymmetric
+    /// re-score of the walk's survivors). The walk uses [`proxy`](QuantizedVectors::proxy)
+    /// (popcount, fast navigation); the candidate list is then reordered by
+    /// [`proxy_rescore`](QuantizedVectors::proxy_rescore) (asymmetric, in-RAM)
+    /// before the exact rerank, so the limited f32/disk rerank budget is spent
+    /// on the asymmetrically-best candidates. Produced for [`Tq1ProxyMode::Hybrid`].
+    TurboQuant1Hybrid {
+        q_bits: Vec<u8>,
+        q_rot: Vec<f32>,
+        q_sum: f32,
+    },
+}
+
+impl QueryCode {
+    /// True if this is a tq1 hybrid query, i.e. the post-walk candidate list
+    /// should be re-scored via [`QuantizedVectors::proxy_rescore`] before the
+    /// exact rerank. Lets the search gate the re-score without importing the
+    /// variant or paying it for other modes.
+    #[must_use]
+    pub fn is_tq1_hybrid(&self) -> bool {
+        matches!(self, QueryCode::TurboQuant1Hybrid { .. })
+    }
 }
 
 /// Which proxy the 1-bit TurboQuant tier uses during the graph walk. Both modes
@@ -152,22 +175,32 @@ pub enum Tq1ProxyMode {
     /// Query binarized to sign bits; Hamming popcount, scale ignored. ~2x faster
     /// per candidate, but sign-only recall is only competitive at high dim.
     Popcount,
+    /// Popcount for the walk (cheap navigation), then the survivors are
+    /// re-scored by the asymmetric proxy in-RAM before the exact rerank. Recovers
+    /// ~90% of popcount's recall gap (it is mostly ranking, not navigation) for
+    /// a small fraction of the asymmetric walk cost - and spends the disk rerank
+    /// budget on the better candidates. The preferred fast tier: it dominates
+    /// pure popcount on recall at a tiny extra cost.
+    Hybrid,
 }
 
-/// Minimum dimension at which the symmetric popcount tq1 proxy is selected.
-/// Below it, sign-only Hamming loses too much recall for the rerank to recover
-/// (geometric: sign agreement concentrates only in high dim). Chosen from the
-/// real-embedding sweep recall@16x = 0.89 / 0.97 / 0.996 at dim 384 / 1024 /
-/// 2560. A design constant, not a per-index calibration.
-pub const TQ1_POPCOUNT_MIN_DIM: usize = 1024;
+/// Minimum dimension at which the fast tq1 path (hybrid) is selected. Below it,
+/// even the asym re-score can't recover popcount's navigation loss (glove-104
+/// recovers only 63% vs 88-96% at dim >= 384), so the safe asymmetric proxy is
+/// used. The hybrid recovers ~90% of the popcount gap from dim 384 up, so the
+/// fast path is viable far below the pure-popcount threshold; 512 is a
+/// conservative floor. A design constant, not a per-index calibration.
+pub const TQ1_HYBRID_MIN_DIM: usize = 512;
 
 /// Pick the tq1 proxy mode from the static index parameters alone - decided at
 /// `VINDEX.CREATE` from `dim`, before any insert, with no reads. Only 1-bit has
-/// a choice; 2/4-bit always report `Asymmetric`.
+/// a choice; 2/4-bit always report `Asymmetric`. At/above the floor the hybrid
+/// (popcount walk + asym re-score) is chosen: it dominates pure popcount on
+/// recall at a tiny extra cost, so raw popcount is never the auto-default.
 #[must_use]
 pub fn tq1_proxy_mode_for(dim: usize, bits: u8) -> Tq1ProxyMode {
-    if bits == 1 && dim >= TQ1_POPCOUNT_MIN_DIM {
-        Tq1ProxyMode::Popcount
+    if bits == 1 && dim >= TQ1_HYBRID_MIN_DIM {
+        Tq1ProxyMode::Hybrid
     } else {
         Tq1ProxyMode::Asymmetric
     }
@@ -1067,6 +1100,18 @@ impl QuantizedVectors {
                         pack_signs(&q_rot, &mut q_bits);
                         QueryCode::TurboQuant1Popcount { q_bits }
                     }
+                    Tq1ProxyMode::Hybrid => {
+                        // Carry both: sign bits for the popcount walk, q_rot/q_sum
+                        // for the asym re-score of the survivors.
+                        let mut q_bits = vec![0u8; self.dim.div_ceil(8)];
+                        pack_signs(&q_rot, &mut q_bits);
+                        let q_sum = q_rot.iter().sum();
+                        QueryCode::TurboQuant1Hybrid {
+                            q_bits,
+                            q_rot,
+                            q_sum,
+                        }
+                    }
                     Tq1ProxyMode::Asymmetric => {
                         let q_sum = q_rot.iter().sum();
                         QueryCode::TurboQuant { q_rot, q_sum }
@@ -1160,7 +1205,55 @@ impl QuantizedVectors {
                 let h = hamming_binary(q_bits, code);
                 -i32::try_from(h).expect("hamming distance fits i32")
             }
+            (
+                QuantRepr::TurboQuant {
+                    codes, code_bytes, ..
+                },
+                QueryCode::TurboQuant1Hybrid { q_bits, .. },
+            ) => {
+                // Hybrid walk: cheap popcount navigation. The asymmetric re-score
+                // of the survivors happens in `proxy_rescore`, not here.
+                let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
+                let h = hamming_binary(q_bits, code);
+                -i32::try_from(h).expect("hamming distance fits i32")
+            }
             _ => panic!("query code does not match index quantization"),
+        }
+    }
+
+    /// Re-score `row` for the final ordering that gates the exact rerank. Same as
+    /// [`proxy`](Self::proxy) for every mode EXCEPT tq1 hybrid, where the walk
+    /// used the cheap popcount proxy but the candidate list should be ranked by
+    /// the more accurate asymmetric inner product (in-RAM, no disk) so the
+    /// limited rerank budget lands on the best candidates. Callers can always
+    /// route the post-walk candidate ordering through this uniformly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row` is out of range or `code` does not match the set.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn proxy_rescore(&self, row: usize, code: &QueryCode) -> i32 {
+        match (&self.repr, code) {
+            (
+                QuantRepr::TurboQuant {
+                    codes,
+                    scales,
+                    centroids,
+                    code_bytes,
+                    bits: 1,
+                    ..
+                },
+                QueryCode::TurboQuant1Hybrid { q_rot, q_sum, .. },
+            ) => {
+                assert!(row < self.n, "row out of range");
+                let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
+                let acc = tq1_adc_swar(code, centroids, q_rot, self.dim, *q_sum);
+                let ip = scales[row] * acc;
+                (ip.clamp(-4.0, 4.0) * TQ_PROXY_SCALE) as i32
+            }
+            // Every non-hybrid mode ranks by the same proxy it walked with.
+            _ => self.proxy(row, code),
         }
     }
 
@@ -1210,28 +1303,31 @@ mod tests {
             QueryCode::TurboQuant { .. }
         ));
 
-        // At/above the threshold: popcount, sign-bit query code.
+        // At/above the floor: hybrid, dual query code (sign bits + q_rot).
         for dim in [1024usize, 2560] {
             let data = unit_rows(8, dim);
             let qv = QuantizedVectors::build(&data, dim, QuantKind::TurboQuant { bits: 1 });
             assert_eq!(
                 qv.tq1_proxy_mode(),
-                Some(Tq1ProxyMode::Popcount),
-                "dim {dim} should select popcount"
+                Some(Tq1ProxyMode::Hybrid),
+                "dim {dim} should select hybrid"
             );
             let code = qv.quantize_query(&data[3 * dim..4 * dim]);
-            assert!(matches!(code, QueryCode::TurboQuant1Popcount { .. }));
-            // The popcount proxy must rank a vector highest against itself.
-            let scores: Vec<i32> = (0..8).map(|r| qv.proxy(r, &code)).collect();
-            let best = scores
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &s)| s)
-                .unwrap()
-                .0;
+            assert!(matches!(code, QueryCode::TurboQuant1Hybrid { .. }));
+            // Both the popcount walk proxy and the asymmetric re-score must rank
+            // a vector highest against itself.
+            let self_best = |f: &dyn Fn(usize) -> i32| {
+                (0..8).map(f).enumerate().max_by_key(|&(_, s)| s).unwrap().0
+            };
             assert_eq!(
-                best, 3,
-                "popcount proxy should self-rank highest at dim {dim}"
+                self_best(&|r| qv.proxy(r, &code)),
+                3,
+                "walk proxy self-rank"
+            );
+            assert_eq!(
+                self_best(&|r| qv.proxy_rescore(r, &code)),
+                3,
+                "asym re-score self-rank"
             );
         }
 

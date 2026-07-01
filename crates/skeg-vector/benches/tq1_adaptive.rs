@@ -275,6 +275,7 @@ fn mode_str(m: Tq1ProxyMode) -> &'static str {
     match m {
         Tq1ProxyMode::Popcount => "POP",
         Tq1ProxyMode::Asymmetric => "ASYM",
+        Tq1ProxyMode::Hybrid => "HYB",
     }
 }
 
