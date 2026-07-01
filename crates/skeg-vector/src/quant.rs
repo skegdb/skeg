@@ -130,6 +130,47 @@ pub enum QueryCode {
     /// not recompute it per ADC call (6400 ADC/query x dim adds saved on
     /// the tq1 path). The 4/2-bit kernels ignore `q_sum`.
     TurboQuant { q_rot: Vec<f32>, q_sum: f32 },
+    /// TurboQuant 1-bit symmetric query: the rotated unit query reduced to its
+    /// sign bits (`dim.div_ceil(8)` bytes, same LSB-first packing as the stored
+    /// codes). Scored by Hamming popcount against a stored code. Produced only
+    /// when the index's tq1 proxy mode is [`Tq1ProxyMode::Popcount`].
+    TurboQuant1Popcount { q_bits: Vec<u8> },
+}
+
+/// Which proxy the 1-bit TurboQuant tier uses during the graph walk. Both modes
+/// read the *same* stored codes (rotated sign bits); only the query encoding and
+/// kernel differ, so this is a pure query-time choice with no storage cost.
+///
+/// It is a deterministic function of `(dim, bits)` (see [`tq1_proxy_mode_for`]),
+/// so it is recomputed on load rather than persisted - nothing to migrate, and
+/// it never drifts under streaming inserts (the rotation is data-oblivious).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tq1ProxyMode {
+    /// Query stays f32; masked-sum ADC times the per-vector scale. Robust recall
+    /// at any dimension. The safe default (still half the RAM of tq2).
+    Asymmetric,
+    /// Query binarized to sign bits; Hamming popcount, scale ignored. ~2x faster
+    /// per candidate, but sign-only recall is only competitive at high dim.
+    Popcount,
+}
+
+/// Minimum dimension at which the symmetric popcount tq1 proxy is selected.
+/// Below it, sign-only Hamming loses too much recall for the rerank to recover
+/// (geometric: sign agreement concentrates only in high dim). Chosen from the
+/// real-embedding sweep recall@16x = 0.89 / 0.97 / 0.996 at dim 384 / 1024 /
+/// 2560. A design constant, not a per-index calibration.
+pub const TQ1_POPCOUNT_MIN_DIM: usize = 1024;
+
+/// Pick the tq1 proxy mode from the static index parameters alone - decided at
+/// `VINDEX.CREATE` from `dim`, before any insert, with no reads. Only 1-bit has
+/// a choice; 2/4-bit always report `Asymmetric`.
+#[must_use]
+pub fn tq1_proxy_mode_for(dim: usize, bits: u8) -> Tq1ProxyMode {
+    if bits == 1 && dim >= TQ1_POPCOUNT_MIN_DIM {
+        Tq1ProxyMode::Popcount
+    } else {
+        Tq1ProxyMode::Asymmetric
+    }
 }
 
 #[derive(Debug)]
@@ -1014,12 +1055,23 @@ impl QuantizedVectors {
                 }
                 QueryCode::Pq(lut)
             }
-            QuantRepr::TurboQuant { rotation, .. } => {
+            QuantRepr::TurboQuant { rotation, bits, .. } => {
                 let mut unit = vec![0.0f32; self.dim];
                 normalize_into(query, &mut unit);
                 let q_rot = rotation.apply_alloc(&unit);
-                let q_sum = q_rot.iter().sum();
-                QueryCode::TurboQuant { q_rot, q_sum }
+                match tq1_proxy_mode_for(self.dim, *bits) {
+                    Tq1ProxyMode::Popcount => {
+                        // Same sign-bit packing as the stored codes, so a
+                        // Hamming popcount counts sign disagreements.
+                        let mut q_bits = vec![0u8; self.dim.div_ceil(8)];
+                        pack_signs(&q_rot, &mut q_bits);
+                        QueryCode::TurboQuant1Popcount { q_bits }
+                    }
+                    Tq1ProxyMode::Asymmetric => {
+                        let q_sum = q_rot.iter().sum();
+                        QueryCode::TurboQuant { q_rot, q_sum }
+                    }
+                }
             }
         }
     }
@@ -1093,7 +1145,33 @@ impl QuantizedVectors {
                 // |ip| <= 1, the clamp at 4.0 leaves ample headroom.
                 (ip.clamp(-4.0, 4.0) * TQ_PROXY_SCALE) as i32
             }
+            (
+                QuantRepr::TurboQuant {
+                    codes, code_bytes, ..
+                },
+                QueryCode::TurboQuant1Popcount { q_bits },
+            ) => {
+                // Symmetric 1-bit proxy: the stored code is the vector's rotated
+                // sign bits, q_bits the query's; Hamming counts sign
+                // disagreements. Fewer = closer, so negate for "greater =
+                // closer". Hamming <= dim, always fits i32. Scale is unused
+                // (magnitude is exactly what the symmetric path drops).
+                let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
+                let h = hamming_binary(q_bits, code);
+                -i32::try_from(h).expect("hamming distance fits i32")
+            }
             _ => panic!("query code does not match index quantization"),
+        }
+    }
+
+    /// The tq1 proxy mode this set will use, or `None` if it is not a 1-bit
+    /// TurboQuant set. Derived from `(dim, bits)`; observability for the
+    /// auto-selection (e.g. logging which proxy a vindex picked at create).
+    #[must_use]
+    pub fn tq1_proxy_mode(&self) -> Option<Tq1ProxyMode> {
+        match &self.repr {
+            QuantRepr::TurboQuant { bits: 1, .. } => Some(tq1_proxy_mode_for(self.dim, 1)),
+            _ => None,
         }
     }
 }
@@ -1101,6 +1179,66 @@ impl QuantizedVectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic pseudo-random unit vectors, `n` of dimension `dim`.
+    fn unit_rows(n: usize, dim: usize) -> Vec<f32> {
+        let mut data = vec![0.0f32; n * dim];
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        for row in data.chunks_exact_mut(dim) {
+            for x in row.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *x = (s >> 11) as f32 / (1u64 << 53) as f32 - 0.5;
+            }
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn tq1_auto_proxy_picks_by_dim() {
+        // Below the threshold: asymmetric (safe default), f32 query code.
+        let lo = unit_rows(4, 384);
+        let q_lo = QuantizedVectors::build(&lo, 384, QuantKind::TurboQuant { bits: 1 });
+        assert_eq!(q_lo.tq1_proxy_mode(), Some(Tq1ProxyMode::Asymmetric));
+        assert!(matches!(
+            q_lo.quantize_query(&lo[..384]),
+            QueryCode::TurboQuant { .. }
+        ));
+
+        // At/above the threshold: popcount, sign-bit query code.
+        for dim in [1024usize, 2560] {
+            let data = unit_rows(8, dim);
+            let qv = QuantizedVectors::build(&data, dim, QuantKind::TurboQuant { bits: 1 });
+            assert_eq!(
+                qv.tq1_proxy_mode(),
+                Some(Tq1ProxyMode::Popcount),
+                "dim {dim} should select popcount"
+            );
+            let code = qv.quantize_query(&data[3 * dim..4 * dim]);
+            assert!(matches!(code, QueryCode::TurboQuant1Popcount { .. }));
+            // The popcount proxy must rank a vector highest against itself.
+            let scores: Vec<i32> = (0..8).map(|r| qv.proxy(r, &code)).collect();
+            let best = scores
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &s)| s)
+                .unwrap()
+                .0;
+            assert_eq!(
+                best, 3,
+                "popcount proxy should self-rank highest at dim {dim}"
+            );
+        }
+
+        // 2-bit/4-bit never report a tq1 mode.
+        let q2 = QuantizedVectors::build(&lo, 384, QuantKind::TurboQuant { bits: 2 });
+        assert_eq!(q2.tq1_proxy_mode(), None);
+    }
 
     #[test]
     fn validate_dim_turboquant_packing() {

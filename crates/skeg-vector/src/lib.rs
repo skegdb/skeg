@@ -28,7 +28,9 @@ mod vamana;
 mod visited;
 
 pub use flat::FlatIndex;
-pub use quant::{QuantKind, QuantizedVectors, QueryCode};
+pub use quant::{
+    QuantKind, QuantizedVectors, QueryCode, TQ1_POPCOUNT_MIN_DIM, Tq1ProxyMode, tq1_proxy_mode_for,
+};
 pub use source::{InMemoryVectorSource, MmapVectorSource, VectorSource};
 pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
 pub use vamana::{
