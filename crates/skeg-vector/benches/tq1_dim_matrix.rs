@@ -442,13 +442,13 @@ fn dial_hdr() -> String {
 
 fn main() {
     println!("=====================================================================");
-    println!("tq1 proxy matrix: popcount vs asymmetric across dims");
+    println!("tq1 proxy matrix: popcount vs hybrid vs asymmetric across dims");
     println!(
         "N={} (SKEG_BENCH_N)  L_search={} (SKEG_LSEARCH)  k={K}",
         cap_n(),
         l_search()
     );
-    println!("gap16 = popcount@16x - asymmetric@16x  (>=~-0.01 => popcount safe)");
+    println!("recall along the rerank dial + per-candidate kernel latency + RAM");
     println!("=====================================================================");
     for &(label, c, q, dim) in DATASETS {
         run_dataset(label, c, q, dim);

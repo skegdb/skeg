@@ -110,3 +110,7 @@ harness = false
 [[bench]]
 name = "tq1_adaptive"
 harness = false
+
+[[bench]]
+name = "tq1_hybrid_e2e"
+harness = false
