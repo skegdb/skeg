@@ -118,3 +118,7 @@ harness = false
 [[bench]]
 name = "tq1_lsweep"
 harness = false
+
+[[bench]]
+name = "tq1_rerank_sweep"
+harness = false

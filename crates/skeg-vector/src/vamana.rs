@@ -1725,7 +1725,32 @@ impl DiskVamanaIndex {
         k: usize,
         l_search: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, None, &[], 1.0)
+        self.search_inner(query, k, l_search, None, &[], 1.0, None)
+    }
+
+    /// Like [`search_with_l`](Self::search_with_l) but also overrides the re-rank
+    /// budget - the number of candidates read from disk and scored with exact
+    /// f32 (the recall/disk-read knob). `0` uses the default (`k*4`). Higher =
+    /// more disk reads, higher recall; with the tq1 hybrid the candidates are
+    /// asym-ordered so each extra read is well spent. Query-time only: does not
+    /// touch the write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a re-rank read from `vectors.bin` fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not equal the index dimension.
+    pub fn search_with_params(
+        &self,
+        query: &[f32],
+        k: usize,
+        l_search: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        let rr = (rerank != 0).then_some(rerank);
+        self.search_inner(query, k, l_search, None, &[], 1.0, rr)
     }
 
     /// Filtered search: only ids for which `matches` returns true enter the
@@ -1751,7 +1776,7 @@ impl DiskVamanaIndex {
         seeds: &[u64],
         selectivity: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_inner(query, k, l_search, Some(matches), seeds, selectivity)
+        self.search_inner(query, k, l_search, Some(matches), seeds, selectivity, None)
     }
 
     /// Shared search core. `matches == None` is the plain ANN search; `Some`
@@ -1768,6 +1793,7 @@ impl DiskVamanaIndex {
         matches: Option<&dyn Fn(u64) -> bool>,
         seeds: &[u64],
         selectivity: f32,
+        rerank_override: Option<usize>,
     ) -> io::Result<Vec<(u64, f32)>> {
         /// Frontier blow-up for a SPARSE filtered walk, so the post-filter still
         /// leaves enough matching candidates. Capped at the main graph size.
@@ -1795,14 +1821,22 @@ impl DiskVamanaIndex {
             .collect();
         // Global re-rank budget (disk reads). Bounded so latency tracks `k`, not
         // the corpus size or the segment count.
-        let rerank = if filtered {
+        let rerank = if let Some(r) = rerank_override {
+            r.max(k)
+        } else if filtered {
             if dense {
                 ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
             } else {
                 (k * 8).max(64)
             }
         } else {
-            (k * 4).max(32)
+            // Default disk-rerank budget. k*8 (not k*4): the rerank budget, not
+            // L_search or l_build, was the recall ceiling - across every
+            // embedding set, k*4=40 capped recall at ~0.94-0.98 while k*8=80
+            // lifts it to 0.99+ for +10-30% latency (it saturates by ~k*16), and
+            // it is query-time only so writes and RAM are untouched. Override
+            // per query with `search_with_params`.
+            (k * 8).max(64)
         };
         let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
         for (seg_idx, seg) in segs.iter().enumerate() {
