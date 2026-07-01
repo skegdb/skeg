@@ -25,6 +25,7 @@ use rayon::prelude::*;
 use skeg_simd::cosine_f32;
 use smallvec::SmallVec;
 
+use crate::ivf_router::IvfRouter;
 use crate::quant::{QuantKind, QuantizedVectors, Tq1ProxyMode};
 use crate::source::{InMemoryVectorSource, VectorSource};
 use crate::tq1_control::Tq1ProxyController;
@@ -1113,6 +1114,10 @@ pub struct DiskVamanaIndex {
     // stays off DiskVamanaIndex as one pointer - else the pthread mutex inline
     // bloats skeg-server's VectorBackend enum past large_enum_variant.
     tq1: Box<Tq1Runtime>,
+    /// Coarse IVF router: the "cells" branch of hybrid filtered search (sparse /
+    /// medium filters). `None` until built via [`build_ivf`](Self::build_ivf).
+    /// Boxed to keep DiskVamanaIndex small (VectorBackend large_enum_variant).
+    ivf: Option<Box<IvfRouter>>,
 }
 
 /// Cold per-index tq1 online-controller state, kept behind a single `Box` on
@@ -1387,6 +1392,7 @@ impl DiskVamanaIndex {
             live_count: n as usize,
             delta_log,
             tq1: Box::default(),
+            ivf: None,
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
@@ -2371,6 +2377,83 @@ impl DiskVamanaIndex {
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         Ok(())
+    }
+
+    /// Build the coarse IVF router over the base segment (the "cells" branch of
+    /// hybrid filtered search). In-memory; rebuild after a `consolidate`. Reads
+    /// the base vectors once for k-means. `n_cells == 0` picks ~√n.
+    ///
+    /// # Errors
+    /// I/O error if a base vector read fails.
+    pub fn build_ivf(&mut self, n_cells: usize, iters: usize) -> io::Result<()> {
+        let n = self.base.main_n;
+        if n == 0 {
+            self.ivf = None;
+            return Ok(());
+        }
+        let dim = self.dim;
+        let mut all = vec![0.0f32; n as usize * dim];
+        for r in 0..n {
+            let v = self.read_vector(&self.base, r)?;
+            all[r as usize * dim..r as usize * dim + dim].copy_from_slice(&v);
+        }
+        let n_cells = if n_cells == 0 {
+            IvfRouter::cells_for(n as usize)
+        } else {
+            n_cells
+        };
+        let row = |r: u32| all[r as usize * dim..r as usize * dim + dim].to_vec();
+        self.ivf = Some(Box::new(IvfRouter::build(&row, n, dim, n_cells, iters)));
+        Ok(())
+    }
+
+    /// Hybrid filtered search over the base. `s` = the filter's SORTED matching
+    /// external ids. Planner by |s|: tiny -> exact quantized scan of `s`; larger
+    /// -> IVF-routed shortlist (query-nearest S-cells) then quantized scan +
+    /// f32 rerank. Falls back to a plain quantized scan of `s` if the router is
+    /// not built. `rerank` = disk-read budget (e.g. k*8).
+    ///
+    /// # Errors
+    /// I/O error if a re-rank read fails.
+    pub fn search_filtered_hybrid(
+        &self,
+        query: &[f32],
+        s: &[u64],
+        k: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        /// Below this many matches, an exact scan of `s` is cheaper than the IVF
+        /// route (measured: at 5k, qscan 0.9ms vs routed 1.9ms; the route wins
+        /// from ~10k up, where qscan goes O(|S|)).
+        const SCAN_MAX: usize = 12_288;
+        /// Candidate budget the router narrows `s` down to before scoring.
+        const SHORTLIST: usize = 4_096;
+        if k == 0 || s.is_empty() {
+            return Ok(Vec::new());
+        }
+        match &self.ivf {
+            Some(router) if s.len() > SCAN_MAX => {
+                // Map external ids -> base rows (skip ids not in the base: delta
+                // ids fall through to a direct scan of the whole `s`).
+                let s_rows: Vec<u64> = s
+                    .iter()
+                    .filter_map(|id| self.base.id_to_main_row.get(id).map(|&r| u64::from(r)))
+                    .collect();
+                if s_rows.len() < s.len() {
+                    // Some matches are outside the base (delta): can't route them
+                    // reliably, so scan all of `s` exactly.
+                    return self.score_ids_quantized(query, s, k, rerank);
+                }
+                let q = normalized(query);
+                let short_rows = router.probe(&q, &s_rows, SHORTLIST.max(rerank));
+                let shortlist: Vec<u64> = short_rows
+                    .iter()
+                    .map(|&r| self.base.ids[r as usize])
+                    .collect();
+                self.score_ids_quantized(query, &shortlist, k, rerank)
+            }
+            _ => self.score_ids_quantized(query, s, k, rerank),
+        }
     }
 }
 

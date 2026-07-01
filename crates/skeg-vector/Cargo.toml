@@ -160,3 +160,7 @@ harness = false
 [[bench]]
 name = "ivf_probe"
 harness = false
+
+[[bench]]
+name = "disk_hybrid"
+harness = false
