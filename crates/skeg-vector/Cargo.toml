@@ -114,3 +114,7 @@ harness = false
 [[bench]]
 name = "tq1_hybrid_e2e"
 harness = false
+
+[[bench]]
+name = "tq1_lsweep"
+harness = false
