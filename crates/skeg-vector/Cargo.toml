@@ -142,3 +142,7 @@ harness = false
 [[bench]]
 name = "tq1ctl_vs_tq2"
 harness = false
+
+[[bench]]
+name = "filt_probe"
+harness = false

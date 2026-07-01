@@ -1109,9 +1109,19 @@ pub struct DiskVamanaIndex {
     /// Online tq1 proxy controller, `None` unless enabled via
     /// [`enable_tq1_controller`](Self::enable_tq1_controller). Behind a mutex
     /// because `search` is `&self`; only touched on shadow queries.
-    tq1_ctl: std::sync::Mutex<Option<Tq1ProxyController>>,
-    /// Query counter for deterministic shadow sampling by the controller.
-    query_ctr: std::sync::atomic::AtomicU64,
+    // ponytail: Box the whole tq1 runtime (mutex + counter) so this cold state
+    // stays off DiskVamanaIndex as one pointer - else the pthread mutex inline
+    // bloats skeg-server's VectorBackend enum past large_enum_variant.
+    tq1: Box<Tq1Runtime>,
+}
+
+/// Cold per-index tq1 online-controller state, kept behind a single `Box` on
+/// `DiskVamanaIndex`. `ctl` is `None` unless
+/// [`enable_tq1_controller`](DiskVamanaIndex::enable_tq1_controller) is called.
+#[derive(Default)]
+struct Tq1Runtime {
+    ctl: std::sync::Mutex<Option<Tq1ProxyController>>,
+    ctr: std::sync::atomic::AtomicU64,
 }
 
 impl DiskVamanaIndex {
@@ -1376,8 +1386,7 @@ impl DiskVamanaIndex {
             tombstones: AHashSet::new(),
             live_count: n as usize,
             delta_log,
-            tq1_ctl: std::sync::Mutex::new(None),
-            query_ctr: std::sync::atomic::AtomicU64::new(0),
+            tq1: Box::default(),
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
@@ -1770,7 +1779,7 @@ impl DiskVamanaIndex {
             let prior = crate::quant::tq1_proxy_mode_for(self.dim, 1);
             // Agreement (hybrid-vs-asym top-k overlap) is a coarse k-step signal,
             // so a looser tolerance than the pure-recall controller default.
-            *self.tq1_ctl.lock().expect("tq1 ctl") =
+            *self.tq1.ctl.lock().expect("tq1 ctl") =
                 Some(Tq1ProxyController::new(prior).with_policy(0.1, 10, 3));
         }
     }
@@ -1778,7 +1787,8 @@ impl DiskVamanaIndex {
     /// The controller's current proxy mode, if enabled. Observability.
     #[must_use]
     pub fn tq1_controller_mode(&self) -> Option<Tq1ProxyMode> {
-        self.tq1_ctl
+        self.tq1
+            .ctl
             .lock()
             .expect("tq1 ctl")
             .as_ref()
@@ -1803,10 +1813,11 @@ impl DiskVamanaIndex {
         /// double query latency; still discriminative for the proxy comparison.
         const SHADOW_L: usize = 64;
         let decision = {
-            let guard = self.tq1_ctl.lock().expect("tq1 ctl");
+            let guard = self.tq1.ctl.lock().expect("tq1 ctl");
             guard.as_ref().map(|c| {
                 let ctr = self
-                    .query_ctr
+                    .tq1
+                    .ctr
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 (c.mode(), c.should_shadow(ctr))
             })
@@ -1840,7 +1851,7 @@ impl DiskVamanaIndex {
             )?;
             let set_a: AHashSet<u64> = sa.iter().map(|(id, _)| *id).collect();
             let agree = sh.iter().filter(|(id, _)| set_a.contains(id)).count() as f32 / k as f32;
-            if let Some(c) = self.tq1_ctl.lock().expect("tq1 ctl").as_mut() {
+            if let Some(c) = self.tq1.ctl.lock().expect("tq1 ctl").as_mut() {
                 c.record_shadow(agree, 1.0);
             }
         }
