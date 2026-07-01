@@ -228,6 +228,84 @@ where
     mean
 }
 
+/// Hybrid: popcount walks (cheap navigation), then the L_search survivors are
+/// re-scored by the asymmetric proxy (in-RAM, no disk) and re-sorted before the
+/// rerank window. Recovers the ranking-loss part of popcount's gap at ~L extra
+/// asym evals instead of the ~6400 the full asym walk pays.
+fn sweep_hybrid(
+    corpus: &[f32],
+    queries: &[f32],
+    n: usize,
+    dim: usize,
+    nq: usize,
+    index: &VamanaIndex,
+    rot: &FastRotation,
+    codes: &[u8],
+    scales: &[f32],
+    pos_c: f32,
+    cb: usize,
+) -> [f32; RERANK_DIAL.len()] {
+    let medoid = index.medoid();
+    let per: Vec<[f32; RERANK_DIAL.len()]> = (0..nq)
+        .into_par_iter()
+        .map(|qi| {
+            let q = &queries[qi * dim..(qi + 1) * dim];
+            let truth = brute_top_k(corpus, n, dim, q, K);
+            // Pass 1: popcount walk.
+            let qb = rot_signs(rot, q, dim);
+            let mut ordered = greedy_walk(
+                medoid,
+                |id| index.neighbors(id).to_vec(),
+                |id| (hamming_binary(&qb, &codes[id as usize * cb..(id as usize + 1) * cb]) as f32),
+                l_search().max(K),
+            );
+            // Pass 2: asym re-score the survivors and re-sort (greater = closer).
+            let qr = rot.apply_alloc(q);
+            let qs: f32 = qr.iter().sum();
+            ordered.sort_by(|&a, &b| {
+                let sa = scales[a as usize]
+                    * pos_c
+                    * (2.0
+                        * tq1_masked_sum(&codes[a as usize * cb..(a as usize + 1) * cb], &qr, dim)
+                        - qs);
+                let sb = scales[b as usize]
+                    * pos_c
+                    * (2.0
+                        * tq1_masked_sum(&codes[b as usize * cb..(b as usize + 1) * cb], &qr, dim)
+                        - qs);
+                sb.total_cmp(&sa)
+            });
+            let mut r = [0.0f32; RERANK_DIAL.len()];
+            for (slot, &m) in RERANK_DIAL.iter().enumerate() {
+                let w = (m * K).min(ordered.len());
+                let mut rr: Vec<(f32, u32)> = ordered[..w]
+                    .iter()
+                    .map(|&id| {
+                        (
+                            cosine_f32(q, &corpus[id as usize * dim..(id as usize + 1) * dim]),
+                            id,
+                        )
+                    })
+                    .collect();
+                rr.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+                let approx: Vec<u32> = rr.iter().take(K).map(|&(_, id)| id).collect();
+                r[slot] = recall_at_k(&approx, &truth, K);
+            }
+            r
+        })
+        .collect();
+    let mut mean = [0.0f32; RERANK_DIAL.len()];
+    for r in &per {
+        for (a, b) in mean.iter_mut().zip(r) {
+            *a += b;
+        }
+    }
+    for a in &mut mean {
+        *a /= nq as f32;
+    }
+    mean
+}
+
 fn run_dataset(label: &str, corpus_rel: &str, query_rel: &str, native_dim: usize) {
     let pad = native_dim.next_multiple_of(8);
     let n_cap = cap_n();
@@ -301,16 +379,26 @@ fn run_dataset(label: &str, corpus_rel: &str, query_rel: &str, native_dim: usize
         },
     );
 
-    // Report @8x and @16x plus the popcount-minus-asym gap at 16x.
+    // Hybrid: popcount walk + asym re-score of the shortlist.
+    let r_hyb = sweep_hybrid(
+        &corpus, &queries, n, dim, nq, &index, &rot, &codes, &scales, pos_c, cb,
+    );
+
+    // Report @8x plus how much of the pop->asym gap the hybrid recovers at 8x.
     let i8x = RERANK_DIAL.iter().position(|&m| m == 8).unwrap();
-    let i16 = RERANK_DIAL.iter().position(|&m| m == 16).unwrap();
+    let gap = r_asym[i8x] - r_pop[i8x];
+    let recovered = if gap > 1e-6 {
+        (r_hyb[i8x] - r_pop[i8x]) / gap * 100.0
+    } else {
+        100.0
+    };
     println!(
-        "  {label:<12} dim {dim:<4} (nat {native_dim:<4}) n={n:<6}  pop[8x {:.3} 16x {:.3}]  asym[8x {:.3} 16x {:.3}]  gap16 {:+.3}",
+        "  {label:<12} dim {dim:<4} n={n:<6}  pop {:.3}  hybrid {:.3}  asym {:.3}   gap {:+.3}  hybrid recovers {:.0}%",
         r_pop[i8x],
-        r_pop[i16],
+        r_hyb[i8x],
         r_asym[i8x],
-        r_asym[i16],
-        r_pop[i16] - r_asym[i16],
+        r_pop[i8x] - r_asym[i8x],
+        recovered,
     );
 }
 
