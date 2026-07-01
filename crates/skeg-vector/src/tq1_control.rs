@@ -35,7 +35,7 @@ pub struct Tq1ProxyController {
     /// EMA weight for new shadow samples.
     alpha: f32,
     /// Exponential moving averages of each arm's measured recall.
-    ema_pop: Option<f32>,
+    ema_fast: Option<f32>,
     ema_asym: Option<f32>,
     /// Shadow samples seen; data-driven flips are gated until `>= warmup`.
     samples: u32,
@@ -54,7 +54,7 @@ impl Tq1ProxyController {
             mode: prior,
             tolerance: 0.01,
             alpha: 0.2,
-            ema_pop: None,
+            ema_fast: None,
             ema_asym: None,
             samples: 0,
             warmup: 20,
@@ -91,21 +91,21 @@ impl Tq1ProxyController {
     /// Feed one shadow A/B measurement: the recall each proxy achieved on the
     /// same query (from the caller's union rerank). Updates the estimates and
     /// may flip the active mode.
-    pub fn record_shadow(&mut self, recall_pop: f32, recall_asym: f32) {
+    pub fn record_shadow(&mut self, recall_fast: f32, recall_asym: f32) {
         self.samples = self.samples.saturating_add(1);
-        self.ema_pop = Some(ema(self.ema_pop, recall_pop, self.alpha));
+        self.ema_fast = Some(ema(self.ema_fast, recall_fast, self.alpha));
         self.ema_asym = Some(ema(self.ema_asym, recall_asym, self.alpha));
 
         // Not enough evidence yet: stay on the prior.
         if self.samples < self.warmup {
             return;
         }
-        let (Some(p), Some(a)) = (self.ema_pop, self.ema_asym) else {
+        let (Some(p), Some(a)) = (self.ema_fast, self.ema_asym) else {
             return;
         };
-        // Prefer popcount (faster) while it stays within tolerance of asym.
+        // Prefer the fast arm (hybrid) while it stays within tolerance of asym.
         let target = if p >= a - self.tolerance {
-            Tq1ProxyMode::Popcount
+            Tq1ProxyMode::Hybrid
         } else {
             Tq1ProxyMode::Asymmetric
         };
@@ -123,7 +123,7 @@ impl Tq1ProxyController {
     /// Current recall estimates `(popcount, asymmetric)`, if sampled yet.
     #[must_use]
     pub fn estimates(&self) -> (Option<f32>, Option<f32>) {
-        (self.ema_pop, self.ema_asym)
+        (self.ema_fast, self.ema_asym)
     }
 
     /// Serialize the learned state to a fixed 30-byte record so it survives an
@@ -136,8 +136,8 @@ impl Tq1ProxyController {
         b[1] = mode_tag(self.mode);
         b[2..6].copy_from_slice(&self.tolerance.to_le_bytes());
         b[6..10].copy_from_slice(&self.alpha.to_le_bytes());
-        b[10] = u8::from(self.ema_pop.is_some());
-        b[11..15].copy_from_slice(&self.ema_pop.unwrap_or(0.0).to_le_bytes());
+        b[10] = u8::from(self.ema_fast.is_some());
+        b[11..15].copy_from_slice(&self.ema_fast.unwrap_or(0.0).to_le_bytes());
         b[15] = u8::from(self.ema_asym.is_some());
         b[16..20].copy_from_slice(&self.ema_asym.unwrap_or(0.0).to_le_bytes());
         b[20..24].copy_from_slice(&self.samples.to_le_bytes());
@@ -161,7 +161,7 @@ impl Tq1ProxyController {
             mode: mode_from_tag(b[1])?,
             tolerance: f32_at(2),
             alpha: f32_at(6),
-            ema_pop: (b[10] == 1).then(|| f32_at(11)),
+            ema_fast: (b[10] == 1).then(|| f32_at(11)),
             ema_asym: (b[15] == 1).then(|| f32_at(16)),
             samples: u32_at(20),
             warmup: u32_at(24),
@@ -222,12 +222,12 @@ mod tests {
     }
 
     #[test]
-    fn converges_to_popcount_when_recall_matches() {
-        // Prior says asymmetric, but data shows popcount is basically as good
-        // (high dim) -> switch to the faster arm.
+    fn converges_to_hybrid_when_recall_matches() {
+        // Prior says asymmetric, but data shows the fast arm (hybrid) is
+        // basically as good -> switch to it.
         let mut c = Tq1ProxyController::new(Tq1ProxyMode::Asymmetric);
         feed(&mut c, 40, 0.995, 0.999); // deficit 0.004 < tolerance 0.01
-        assert_eq!(c.mode(), Tq1ProxyMode::Popcount);
+        assert_eq!(c.mode(), Tq1ProxyMode::Hybrid);
     }
 
     #[test]
@@ -259,11 +259,11 @@ mod tests {
         // Settle on popcount, then one bad sample must not flip immediately.
         let mut c = Tq1ProxyController::new(Tq1ProxyMode::Asymmetric);
         feed(&mut c, 40, 0.999, 0.999);
-        assert_eq!(c.mode(), Tq1ProxyMode::Popcount);
+        assert_eq!(c.mode(), Tq1ProxyMode::Hybrid);
         c.record_shadow(0.5, 0.99); // one outlier
         assert_eq!(
             c.mode(),
-            Tq1ProxyMode::Popcount,
+            Tq1ProxyMode::Hybrid,
             "single outlier must not flip"
         );
     }
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(restored.mode(), c.mode());
         assert_eq!(restored.estimates(), c.estimates());
         // A fresh controller with the same policy keeps converging identically.
-        assert_eq!(restored.mode(), Tq1ProxyMode::Popcount);
+        assert_eq!(restored.mode(), Tq1ProxyMode::Hybrid);
         // Bad input -> None (caller cold-starts from the dim prior).
         assert!(Tq1ProxyController::from_bytes(&[0u8; 4]).is_none());
         assert!(Tq1ProxyController::from_bytes(&[9u8; Tq1ProxyController::BYTES]).is_none());

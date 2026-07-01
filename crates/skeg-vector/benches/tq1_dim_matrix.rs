@@ -384,22 +384,60 @@ fn run_dataset(label: &str, corpus_rel: &str, query_rel: &str, native_dim: usize
         &corpus, &queries, n, dim, nq, &index, &rot, &codes, &scales, pos_c, cb,
     );
 
-    // Report @8x plus how much of the pop->asym gap the hybrid recovers at 8x.
-    let i8x = RERANK_DIAL.iter().position(|&m| m == 8).unwrap();
-    let gap = r_asym[i8x] - r_pop[i8x];
-    let recovered = if gap > 1e-6 {
-        (r_hyb[i8x] - r_pop[i8x]) / gap * 100.0
-    } else {
-        100.0
+    // Per-candidate kernel latency (ns): popcount (walk) vs asym (rescore).
+    let q0 = &queries[0..dim];
+    let qb0 = rot_signs(&rot, q0, dim);
+    let qr0 = rot.apply_alloc(q0);
+    let qs0: f32 = qr0.iter().sum();
+    let pop_ns = kernel_ns(n, |i| {
+        hamming_binary(&qb0, &codes[i * cb..(i + 1) * cb]) as f32
+    });
+    let asym_ns = kernel_ns(n, |i| {
+        scales[i] * pos_c * (2.0 * tq1_masked_sum(&codes[i * cb..(i + 1) * cb], &qr0, dim) - qs0)
+    });
+    let ram_mb = cb as f64 * n as f64 / 1e6;
+
+    let row = |r: &[f32; RERANK_DIAL.len()]| -> String {
+        r.iter().map(|v| format!("{v:>7.3}")).collect()
     };
     println!(
-        "  {label:<12} dim {dim:<4} n={n:<6}  pop {:.3}  hybrid {:.3}  asym {:.3}   gap {:+.3}  hybrid recovers {:.0}%",
-        r_pop[i8x],
-        r_hyb[i8x],
-        r_asym[i8x],
-        r_pop[i8x] - r_asym[i8x],
-        recovered,
+        "\n[{label}]  dim {dim} (nat {native_dim})  n={n}  tq1 RAM {ram_mb:.1} MB  ({cb} B/vec)"
     );
+    println!("    recall@   {}", dial_hdr());
+    println!("    popcount {}", row(&r_pop));
+    println!("    hybrid   {}", row(&r_hyb));
+    println!("    asym     {}", row(&r_asym));
+    println!(
+        "    kernel ns/candidate:  popcount {pop_ns:.1}   asym {asym_ns:.1}   (hybrid walk=popcount, rescore=asym x L_search)"
+    );
+}
+
+/// Per-candidate kernel latency in ns: score all `n` rows against one fixed
+/// pre-encoded query, timed after a warmup, `black_box`ed against DCE.
+fn kernel_ns<F: Fn(usize) -> f32>(n: usize, score: F) -> f64 {
+    use std::hint::black_box;
+    let reps = (5_000_000 / n.max(1)).max(1);
+    let mut acc = 0.0f32;
+    for i in 0..n {
+        acc += score(i);
+    }
+    black_box(acc);
+    let t = std::time::Instant::now();
+    let mut acc = 0.0f32;
+    for _ in 0..reps {
+        for i in 0..n {
+            acc += black_box(score(i));
+        }
+    }
+    black_box(acc);
+    t.elapsed().as_secs_f64() * 1e9 / (n * reps) as f64
+}
+
+fn dial_hdr() -> String {
+    RERANK_DIAL
+        .iter()
+        .map(|m| format!("{:>7}", format!("{m}x")))
+        .collect()
 }
 
 fn main() {
