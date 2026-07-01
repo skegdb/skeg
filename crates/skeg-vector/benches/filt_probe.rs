@@ -57,12 +57,14 @@ fn main() {
     let nq = std::env::var("SKEG_NQ").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
     let (corpus, n) = prep(&format!("{ROOT}/{CORPUS}"), n);
     let (queries, _) = prep(&format!("{ROOT}/{QUERY}"), nq);
+    let bits: u8 = if std::env::var("SKEG_TIER").as_deref() == Ok("tq1") { 1 } else { 2 };
     let dir: PathBuf = std::env::var("SKEG_STUDY_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("skeg_tq1_study"))
-        .join(format!("rw_tq2_n{n}"));
-    let idx = DiskVamanaIndex::open_with_tier(&dir, QuantKind::TurboQuant { bits: 2 })
-        .expect("cached tq2 index (run tq1ctl_vs_tq2 first)");
+        .join(format!("rw_tq{bits}_n{n}"));
+    let idx = DiskVamanaIndex::open_with_tier(&dir, QuantKind::TurboQuant { bits })
+        .expect("cached index (run tq1ctl_vs_tq2 first)");
+    println!("== tier tq{bits} ==");
 
     for &sel in &[0.01_f64, 0.10] {
         let step = (1.0 / sel).round() as u64;
