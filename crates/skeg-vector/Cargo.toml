@@ -164,3 +164,11 @@ harness = false
 [[bench]]
 name = "disk_hybrid"
 harness = false
+
+[[bench]]
+name = "consolidate_timing"
+harness = false
+
+[[bench]]
+name = "l_build_sweep"
+harness = false

@@ -412,10 +412,13 @@ impl Default for VamanaConfig {
 }
 
 /// Build config for DiskVamana's internal rebuilds (flush, consolidate). The
-/// `SKEG_L_BUILD` env var overrides `l_build` for benchmarking/tuning; otherwise
-/// the validated default (64) is used.
+/// Disk-path build width. Default 48 (down from the in-RAM default 64): the
+/// l_build sweep (benches/l_build_sweep.rs, mxbai 100k tq2) showed 48 holds
+/// recall@10 (0.994 vs 0.9955 at 64) while cutting the graph build ~24% - and
+/// the build dominates consolidate/ingest (~90%, measured). `SKEG_L_BUILD`
+/// overrides it (32 -> 0.991 recall, ~40% faster; for build-critical loads).
 fn disk_build_config() -> VamanaConfig {
-    let mut cfg = VamanaConfig::default();
+    let mut cfg = VamanaConfig { l_build: 48, ..Default::default() };
     if let Some(l) = std::env::var("SKEG_L_BUILD")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2372,8 +2375,14 @@ impl DiskVamanaIndex {
         }
         let dir = self.dir.clone();
         let tier = self.tier;
+        // ponytail: env-gated phase timing to find the real consolidate cost
+        // before optimizing it. Off unless SKEG_CONSOLIDATE_TIMING is set.
+        let timing = std::env::var("SKEG_CONSOLIDATE_TIMING").is_ok();
+        let t = std::time::Instant::now();
         let rebuilt = VamanaIndex::build(vectors, ids, dim, &disk_build_config());
+        let build_ms = t.elapsed().as_millis();
         rebuilt.save(&dir)?;
+        let save_ms = t.elapsed().as_millis();
         self.discard_runs()?;
         // The delta + runs are now folded into the graph: the WAL must start
         // empty so the reopen below does not replay stale records.
@@ -2386,6 +2395,14 @@ impl DiskVamanaIndex {
         // search falls back to the exact scan (correct, just O(|s|)).
         let _ = std::fs::remove_file(dir.join(IVF_FILE));
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
+        if timing {
+            let reopen_ms = t.elapsed().as_millis() - save_ms;
+            eprintln!(
+                "consolidate n={} build={build_ms}ms save={}ms reopen(reread+requant)={reopen_ms}ms",
+                self.base.main_n,
+                save_ms - build_ms,
+            );
+        }
         Ok(())
     }
 
