@@ -172,3 +172,11 @@ harness = false
 [[bench]]
 name = "l_build_sweep"
 harness = false
+
+[[bench]]
+name = "tq1_r100_sweep"
+harness = false
+
+[[bench]]
+name = "recall100_compare"
+harness = false
