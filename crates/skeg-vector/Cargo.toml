@@ -192,3 +192,7 @@ harness = false
 [[bench]]
 name = "recall_full"
 harness = false
+
+[[bench]]
+name = "tq1_salvage_k10"
+harness = false
