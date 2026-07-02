@@ -196,3 +196,11 @@ harness = false
 [[bench]]
 name = "tq1_salvage_k10"
 harness = false
+
+[[bench]]
+name = "tq1_ivf_recall"
+harness = false
+
+[[bench]]
+name = "tier_mmap"
+harness = false
