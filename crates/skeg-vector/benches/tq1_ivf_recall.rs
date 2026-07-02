@@ -23,9 +23,15 @@ fn load(path: &str, cap: usize) -> (Vec<Vec<f32>>, usize) {
     let sh = header.find("'shape':").unwrap();
     let lp = header[sh..].find('(').unwrap() + sh + 1;
     let rp = header[lp..].find(')').unwrap() + lp;
-    let dims: Vec<usize> = header[lp..rp].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let dims: Vec<usize> = header[lp..rp]
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     let (rows, dim) = (dims[0], dims[1]);
-    let data: Vec<f32> = bytes[10 + hl..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let data: Vec<f32> = bytes[10 + hl..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     let n = cap.min(rows);
     let out = (0..n)
         .map(|i| {
@@ -42,7 +48,9 @@ fn build(corpus: &[Vec<f32>], dim: usize, bits: u8) -> DiskVamanaIndex {
     let tmp = std::env::temp_dir().join(format!("skeg_ivfrec_{bits}"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let mut idx = DiskVamanaIndex::create_empty_with_tier(&tmp, dim, 300, QuantKind::TurboQuant { bits }).unwrap();
+    let mut idx =
+        DiskVamanaIndex::create_empty_with_tier(&tmp, dim, 300, QuantKind::TurboQuant { bits })
+            .unwrap();
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
@@ -51,39 +59,72 @@ fn build(corpus: &[Vec<f32>], dim: usize, bits: u8) -> DiskVamanaIndex {
 }
 
 fn main() {
-    let n_cap = std::env::var("SKEG_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(500_000);
-    let nq = std::env::var("SKEG_NQ").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let cpath = std::env::var("SKEG_CORPUS").unwrap_or_else(|_| format!("{ROOT}/skeg/bench-compare/embeddings_cache/corpus_mxbai-wiki.npy"));
-    let qpath = std::env::var("SKEG_QUERY").unwrap_or_else(|_| format!("{ROOT}/skeg/bench-compare/embeddings_cache/queries_mxbai-wiki_200.npy"));
+    let n_cap = std::env::var("SKEG_BENCH_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000);
+    let nq = std::env::var("SKEG_NQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let cpath = std::env::var("SKEG_CORPUS").unwrap_or_else(|_| {
+        format!("{ROOT}/skeg/bench-compare/embeddings_cache/corpus_mxbai-wiki.npy")
+    });
+    let qpath = std::env::var("SKEG_QUERY").unwrap_or_else(|_| {
+        format!("{ROOT}/skeg/bench-compare/embeddings_cache/queries_mxbai-wiki_200.npy")
+    });
     let (corpus, dim) = load(&cpath, n_cap);
     let (queries, _) = load(&qpath, nq);
     let n = corpus.len();
     let t100: Vec<AHashSet<u64>> = queries
         .par_iter()
         .map(|q| {
-            let mut t: Vec<(f32, u64)> = corpus.iter().enumerate().map(|(i, v)| (cosine_f32(q, v), i as u64)).collect();
+            let mut t: Vec<(f32, u64)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (cosine_f32(q, v), i as u64))
+                .collect();
             t.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
             t.iter().take(100).map(|&(_, id)| id).collect()
         })
         .collect();
     let all_ids: Vec<u64> = (0..n as u64).collect();
-    println!("tq1 IVF-rescue recall@100: {n} x {dim}, {} queries", queries.len());
+    println!(
+        "tq1 IVF-rescue recall@100: {n} x {dim}, {} queries",
+        queries.len()
+    );
 
     let walk = |idx: &DiskVamanaIndex, ls: usize, rr: usize| -> (f64, f64) {
         let mut h = 0usize;
         let t = std::time::Instant::now();
         for (q, tr) in queries.iter().zip(&t100) {
-            h += idx.search_with_params(q, 100, ls, rr).unwrap().iter().filter(|(id, _)| tr.contains(id)).count();
+            h += idx
+                .search_with_params(q, 100, ls, rr)
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| tr.contains(id))
+                .count();
         }
-        (h as f64 / (queries.len() * 100) as f64, t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64)
+        (
+            h as f64 / (queries.len() * 100) as f64,
+            t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64,
+        )
     };
     let ivf = |idx: &DiskVamanaIndex, rr: usize| -> (f64, f64) {
         let mut h = 0usize;
         let t = std::time::Instant::now();
         for (q, tr) in queries.iter().zip(&t100) {
-            h += idx.search_filtered_hybrid(q, &all_ids, 100, rr).unwrap().iter().filter(|(id, _)| tr.contains(id)).count();
+            h += idx
+                .search_filtered_hybrid(q, &all_ids, 100, rr)
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| tr.contains(id))
+                .count();
         }
-        (h as f64 / (queries.len() * 100) as f64, t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64)
+        (
+            h as f64 / (queries.len() * 100) as f64,
+            t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64,
+        )
     };
 
     let tq2 = build(&corpus, dim, 2);
@@ -98,7 +139,11 @@ fn main() {
     println!("  tq1 walk  l=600            recall@100 {r:.4}  {m:.2} ms/q");
     let tb = std::time::Instant::now();
     tq1.build_ivf(0, 8).unwrap();
-    println!("  (build_ivf: {:.0}s, {} cells)", tb.elapsed().as_secs_f64(), 0);
+    println!(
+        "  (build_ivf: {:.0}s, {} cells)",
+        tb.elapsed().as_secs_f64(),
+        0
+    );
     for &rr in &[800usize, 2000, 4000] {
         let (r, m) = ivf(&tq1, rr);
         println!("  tq1 IVF   rerank={rr:<5}     recall@100 {r:.4}  {m:.2} ms/q");

@@ -19,9 +19,15 @@ fn load(path: &str, cap: usize) -> (Vec<Vec<f32>>, usize) {
     let sh = header.find("'shape':").unwrap();
     let lp = header[sh..].find('(').unwrap() + sh + 1;
     let rp = header[lp..].find(')').unwrap() + lp;
-    let dims: Vec<usize> = header[lp..rp].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let dims: Vec<usize> = header[lp..rp]
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     let (rows, dim) = (dims[0], dims[1]);
-    let data: Vec<f32> = bytes[10 + hl..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let data: Vec<f32> = bytes[10 + hl..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     let n = cap.min(rows);
     let out = (0..n)
         .map(|i| {
@@ -56,9 +62,17 @@ fn dir_for(bits: u8) -> std::path::PathBuf {
 }
 
 fn main() {
-    let n_cap = std::env::var("SKEG_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(500_000);
-    let nq = std::env::var("SKEG_NQ").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let qpath = std::env::var("SKEG_QUERY").unwrap_or_else(|_| format!("{ROOT}/skeg/bench-compare/embeddings_cache/queries_mxbai-wiki_200.npy"));
+    let n_cap = std::env::var("SKEG_BENCH_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000);
+    let nq = std::env::var("SKEG_NQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let qpath = std::env::var("SKEG_QUERY").unwrap_or_else(|_| {
+        format!("{ROOT}/skeg/bench-compare/embeddings_cache/queries_mxbai-wiki_200.npy")
+    });
 
     // MEASURE mode: open a PRE-BUILT index (never load the corpus) so RSS reflects
     // the index only. `SKEG_MEASURE=<bits> SKEG_MMAP=<0|1>`.
@@ -91,7 +105,9 @@ fn main() {
 
     // BUILD mode (default): build tq2 + tq1 to fixed dirs, print recall (needs the
     // corpus), then exit so the corpus memory is gone before any MEASURE run.
-    let cpath = std::env::var("SKEG_CORPUS").unwrap_or_else(|_| format!("{ROOT}/skeg/bench-compare/embeddings_cache/corpus_mxbai-wiki.npy"));
+    let cpath = std::env::var("SKEG_CORPUS").unwrap_or_else(|_| {
+        format!("{ROOT}/skeg/bench-compare/embeddings_cache/corpus_mxbai-wiki.npy")
+    });
     let (corpus, dim) = load(&cpath, n_cap);
     let (queries, _) = load(&qpath, nq);
     let n = corpus.len();
@@ -99,7 +115,11 @@ fn main() {
         queries
             .par_iter()
             .map(|q| {
-                let mut t: Vec<(f32, u64)> = corpus.iter().enumerate().map(|(i, v)| (cosine_f32(q, v), i as u64)).collect();
+                let mut t: Vec<(f32, u64)> = corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (cosine_f32(q, v), i as u64))
+                    .collect();
                 t.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
                 t.iter().take(k).map(|&(_, id)| id).collect()
             })
@@ -112,7 +132,9 @@ fn main() {
         let dir = dir_for(bits);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut idx = DiskVamanaIndex::create_empty_with_tier(&dir, dim, 300, QuantKind::TurboQuant { bits }).unwrap();
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(&dir, dim, 300, QuantKind::TurboQuant { bits })
+                .unwrap();
         for (id, v) in corpus.iter().enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
@@ -121,10 +143,20 @@ fn main() {
         let mut h10 = 0usize;
         let mut h100 = 0usize;
         for (q, tr) in queries.iter().zip(&t10) {
-            h10 += idx.search_with_params(q, 10, 300, 80).unwrap().iter().filter(|(id, _)| tr.contains(id)).count();
+            h10 += idx
+                .search_with_params(q, 10, 300, 80)
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| tr.contains(id))
+                .count();
         }
         for (q, tr) in queries.iter().zip(&t100) {
-            h100 += idx.search_with_params(q, 100, 300, 800).unwrap().iter().filter(|(id, _)| tr.contains(id)).count();
+            h100 += idx
+                .search_with_params(q, 100, 300, 800)
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| tr.contains(id))
+                .count();
         }
         println!(
             "  tq{bits} built (codes {} MiB)  recall@10 {:.4}  recall@100 {:.4}",
