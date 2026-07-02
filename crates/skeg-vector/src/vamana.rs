@@ -2378,6 +2378,17 @@ impl DiskVamanaIndex {
         }
         let dir = self.dir.clone();
         let tier = self.tier;
+        // Drop the persisted router FIRST: this consolidate reorders the base
+        // rows, so the old sidecar's cell_of is about to be invalid. Removing it
+        // before save() means a crash anywhere below leaves NO sidecar (open
+        // rebuilds none, the idle task builds a fresh one) rather than a stale
+        // one that a length-only load guard could accept against reordered rows.
+        // We do NOT rebuild the IVF here - consolidate runs INLINE on the ingest
+        // path (shard auto-consolidates when delta >= main); an inline IVF build
+        // (re-read all vectors + k-means) stalls ingest. The background
+        // idle-consolidate rebuilds it off the request path; until then filtered
+        // search falls back to the exact scan (correct, just O(|s|)).
+        let _ = std::fs::remove_file(dir.join(IVF_FILE));
         // ponytail: env-gated phase timing to find the real consolidate cost
         // before optimizing it. Off unless SKEG_CONSOLIDATE_TIMING is set.
         let timing = std::env::var("SKEG_CONSOLIDATE_TIMING").is_ok();
@@ -2390,13 +2401,6 @@ impl DiskVamanaIndex {
         // The delta + runs are now folded into the graph: the WAL must start
         // empty so the reopen below does not replay stale records.
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
-        // The row order changed, so the persisted router is now stale: drop it.
-        // We do NOT rebuild the IVF here - consolidate runs INLINE on the ingest
-        // path (shard auto-consolidates when delta >= main), and an inline IVF
-        // build (re-read all vectors + k-means) stalls ingest. The background
-        // idle-consolidate rebuilds it off the request path; until then filtered
-        // search falls back to the exact scan (correct, just O(|s|)).
-        let _ = std::fs::remove_file(dir.join(IVF_FILE));
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         if timing {
             let reopen_ms = t.elapsed().as_millis() - save_ms;
@@ -2498,6 +2502,13 @@ impl DiskVamanaIndex {
                     // reliably, so scan all of `s` exactly.
                     return self.score_ids_quantized(query, s, k, rerank);
                 }
+                // NOTE (bounded, transient): a match that IS in the base but was
+                // re-inserted into a run/delta is routed here by its stale base
+                // vector, so an updated id whose new vector is a true top-k hit
+                // can be dropped from the shortlist (recall only - surviving ids
+                // are still scored against their newest vector by
+                // score_ids_quantized). Self-heals at the next consolidate, which
+                // folds runs/delta and rebuilds the router.
                 let q = normalized(query);
                 let short_rows = router.probe(&q, &s_rows, SHORTLIST.max(rerank));
                 let shortlist: Vec<u64> = short_rows

@@ -189,11 +189,20 @@ impl IvfRouter {
         }
         let rd = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
         let (n_cells, dim, n) = (rd(0), rd(4), rd(8));
-        let cent_len = n_cells * dim;
-        let need = 12 + cent_len * 4 + n * 4;
+        if n_cells == 0 || dim == 0 {
+            return None;
+        }
+        // Checked arithmetic: a corrupt header must not overflow `need` (which in
+        // release would wrap and could pass the length check on a short buffer).
+        let need = n_cells
+            .checked_mul(dim)
+            .and_then(|c| c.checked_mul(4))
+            .and_then(|c| c.checked_add(n.checked_mul(4)?))
+            .and_then(|c| c.checked_add(12))?;
         if b.len() != need {
             return None;
         }
+        let cent_len = n_cells * dim;
         let centroids: Vec<f32> = (0..cent_len)
             .map(|i| {
                 let o = 12 + i * 4;
@@ -207,6 +216,11 @@ impl IvfRouter {
                 u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
             })
             .collect();
+        // Reject a corrupt-but-right-length sidecar whose assignments point past
+        // the centroid table (would OOB-panic in `probe`).
+        if cell_of.iter().any(|&c| c as usize >= n_cells) {
+            return None;
+        }
         Some(IvfRouter {
             centroids,
             dim,

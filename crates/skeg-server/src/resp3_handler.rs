@@ -335,20 +335,20 @@ fn command_kind(cmd: &Command) -> CommandKind {
 /// pipelined connection loop). Everything else - HELLO/AUTH (mutate tenant),
 /// SELECT, index lifecycle, admin - is a serial barrier.
 fn is_pipelineable(cmd: &Command) -> bool {
+    // ONLY commands whose intra-connection reordering is semantically invisible.
+    // The scalar KV verbs (Get/Set/Del/Incr/... ) are DELIBERATELY excluded: two
+    // pipelined ops on the same key must apply in submission order (SET a;SET b,
+    // INCR atomicity, SET;GET read-after-write), but concurrent tasks reach the
+    // shard mailbox in scheduler order, not submission order - so they stay serial
+    // barriers. The vector write path (the batching target) is keyed by a distinct
+    // id per bulk-ingest row; two writes to the SAME id in one pipeline are
+    // last-write-wins (an upsert, acceptable). VSEARCH is read-only.
     matches!(
         cmd,
         Command::SkegVset { .. }
             | Command::SkegVmset { .. }
             | Command::SkegVsearch { .. }
             | Command::SkegVdel { .. }
-            | Command::Get { .. }
-            | Command::Set { .. }
-            | Command::Del { .. }
-            | Command::Exists { .. }
-            | Command::Mget { .. }
-            | Command::Mset { .. }
-            | Command::Incr { .. }
-            | Command::Decr { .. }
             | Command::Ping(_)
             | Command::Echo(_)
     )
@@ -381,23 +381,10 @@ async fn exec_pipelined(
         Command::SkegVmset { args } => skeg_vmset(&args, &shards, tenant, be).await,
         Command::SkegVsearch { args } => skeg_vsearch(&args, &shards, tenant).await,
         Command::SkegVdel { args } => skeg_vdel(&args, &shards, tenant).await,
-        Command::Get { key } => kv_get(std::slice::from_ref(&key), &shards, tenant, be).await,
-        Command::Set { key, value } => kv_set(&[key, value], &shards, tenant, be).await,
-        Command::Del { keys } => kv_del(&keys, &shards, tenant, be).await,
-        Command::Exists { keys } => kv_exists(&keys, &shards, tenant, be).await,
-        Command::Mget { keys } => kv_mget(&keys, &shards, tenant, be).await,
-        Command::Mset { pairs } => {
-            let args: Vec<Bytes> = pairs.into_iter().flat_map(|(k, v)| [k, v]).collect();
-            kv_mset(&args, &shards, tenant, be).await
-        }
-        Command::Incr { key } => {
-            kv_incr_by(std::slice::from_ref(&key), &shards, 1, tenant, be).await
-        }
-        Command::Decr { key } => {
-            kv_incr_by(std::slice::from_ref(&key), &shards, -1, tenant, be).await
-        }
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
+        // Unreachable: the connection loop only routes `is_pipelineable` commands
+        // here, and this match covers exactly that set.
         _ => Frame::Error("ERR command not pipelineable".into()),
     }
 }
@@ -1383,6 +1370,48 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
+    use super::{Command, is_pipelineable};
+    use bytes::Bytes;
+
+    /// Safety guard: order-dependent commands must NEVER be pipelined
+    /// (concurrent dispatch would reorder their effects on a shared key -
+    /// lost INCR updates, non-deterministic SET, stale read-after-write).
+    /// The vector write path is keyed by distinct ids (upsert semantics) and
+    /// VSEARCH is read-only, so those stay concurrent.
+    #[test]
+    fn only_order_independent_commands_are_pipelineable() {
+        let k = || Bytes::from_static(b"k");
+        // Must be barriers (serial): every scalar KV verb.
+        for cmd in [
+            Command::Get { key: k() },
+            Command::Set {
+                key: k(),
+                value: k(),
+            },
+            Command::Del { keys: vec![k()] },
+            Command::Exists { keys: vec![k()] },
+            Command::Mget { keys: vec![k()] },
+            Command::Mset {
+                pairs: vec![(k(), k())],
+            },
+            Command::Incr { key: k() },
+            Command::Decr { key: k() },
+        ] {
+            assert!(!is_pipelineable(&cmd), "{cmd:?} must be a serial barrier");
+        }
+        // Safe to pipeline.
+        for cmd in [
+            Command::SkegVset { args: vec![k()] },
+            Command::SkegVmset { args: vec![k()] },
+            Command::SkegVsearch { args: vec![k()] },
+            Command::SkegVdel { args: vec![k()] },
+            Command::Ping(None),
+            Command::Echo(k()),
+        ] {
+            assert!(is_pipelineable(&cmd), "{cmd:?} should pipeline");
+        }
+    }
+
     /// Local deterministic tenant id from a string. Mirrors what the
     /// real tenant backend does (xxh3_128 of the name) for tests that
     /// need stable ids without pulling in a full backend impl.
