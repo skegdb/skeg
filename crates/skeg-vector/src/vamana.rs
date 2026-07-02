@@ -418,7 +418,10 @@ impl Default for VamanaConfig {
 /// the build dominates consolidate/ingest (~90%, measured). `SKEG_L_BUILD`
 /// overrides it (32 -> 0.991 recall, ~40% faster; for build-critical loads).
 fn disk_build_config() -> VamanaConfig {
-    let mut cfg = VamanaConfig { l_build: 48, ..Default::default() };
+    let mut cfg = VamanaConfig {
+        l_build: 48,
+        ..Default::default()
+    };
     if let Some(l) = std::env::var("SKEG_L_BUILD")
         .ok()
         .and_then(|s| s.parse().ok())

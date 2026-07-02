@@ -332,6 +332,10 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
     if batch.is_empty() {
         return;
     }
+    // ponytail: env-gated batch-size probe (device-global committer).
+    if std::env::var("SKEG_COMMIT_DEBUG").is_ok() {
+        eprintln!("shared-commit batch: {} entries", batch.len());
+    }
 
     // Group by file_id, preserving append order within each file.
     let mut by_file: HashMap<FileId, Vec<PendingItem>> = HashMap::new();

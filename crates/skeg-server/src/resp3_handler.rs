@@ -16,6 +16,7 @@
 //! Out of scope here (later v0.1 / v0.2): SET options (EX/PX/NX/XX), EXPIRE/TTL,
 //! INFO/STATS/DBSIZE/COMMAND, SHUTDOWN, vector ops, async maintenance, AUTH model.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -160,18 +161,97 @@ pub async fn handle_connection_resp3(
     let mut decoder = FrameDecoder::new();
     let mut out = BytesMut::with_capacity(4096);
 
-    loop {
-        let frame = match decoder.decode() {
-            Ok(Some(f)) => f,
-            Ok(None) => match stream.read_buf(decoder.buf_mut()).await {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(e) => {
-                    warn!(?peer, "read error: {e}");
-                    break;
+    // Pipelined dispatch: data-plane commands from one connection run
+    // concurrently (bounded window, responses emitted in submission order) so a
+    // client's pipelined VSET burst feeds the vLog group-committer concurrently
+    // instead of one-blob-per-200µs-timer serially. Session-state commands
+    // (HELLO/AUTH/... - see `is_pipelineable`) are a barrier: all in-flight
+    // responses are flushed in order before the barrier runs serially, so the
+    // request/response ordering the client sees is unchanged.
+    const PIPELINE_WINDOW: usize = 128;
+    let mut inflight: VecDeque<tokio::task::JoinHandle<Frame>> = VecDeque::new();
+    // Await the oldest in-flight command and write its response in order.
+    // Returns false on write failure (caller must stop).
+    macro_rules! emit_front {
+        () => {{
+            let mut ok = true;
+            if let Some(h) = inflight.pop_front() {
+                let resp = h
+                    .await
+                    .unwrap_or_else(|_| Frame::Error("ERR internal task failure".into()));
+                out.clear();
+                encode_frame(&resp, state.version, &mut out);
+                ok = stream.write_all(&out).await.is_ok();
+            }
+            ok
+        }};
+    }
+
+    'conn: loop {
+        match decoder.decode() {
+            Ok(Some(frame)) => match parse_command(frame) {
+                Ok(cmd) if is_pipelineable(&cmd) => {
+                    let (sh, be, t) = (shards.clone(), tenant_backend.clone(), tenant);
+                    inflight.push_back(tokio::spawn(exec_pipelined(cmd, t, sh, be)));
+                    if inflight.len() >= PIPELINE_WINDOW && !emit_front!() {
+                        break 'conn;
+                    }
+                }
+                other => {
+                    // Barrier (session-state command) or parse error: drain the
+                    // pipeline in order, then run this one serially.
+                    while !inflight.is_empty() {
+                        if !emit_front!() {
+                            break 'conn;
+                        }
+                    }
+                    let response = match other {
+                        Ok(cmd) => {
+                            dispatch_command(
+                                cmd,
+                                &mut state,
+                                &mut tenant,
+                                &shards,
+                                tenant_backend.as_ref(),
+                            )
+                            .await
+                        }
+                        Err(e) => Frame::Error(format!("ERR {e}")),
+                    };
+                    out.clear();
+                    encode_frame(&response, state.version, &mut out);
+                    if stream.write_all(&out).await.is_err() {
+                        break 'conn;
+                    }
                 }
             },
+            Ok(None) => {
+                // Buffer drained: emit the in-flight burst (bounds latency + lets
+                // its payload writes group-commit together), then read more.
+                while !inflight.is_empty() {
+                    if !emit_front!() {
+                        break 'conn;
+                    }
+                }
+                // Pull a large chunk per syscall so a pipelined burst buffers
+                // many frames at once (the default 4 KiB spare = one ~4 KiB VSET
+                // frame, which would serialize the pipeline one-frame-per-read).
+                decoder.buf_mut().reserve(256 * 1024);
+                match stream.read_buf(decoder.buf_mut()).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!(?peer, "read error: {e}");
+                        break;
+                    }
+                }
+            }
             Err(e) => {
+                while !inflight.is_empty() {
+                    if !emit_front!() {
+                        break 'conn;
+                    }
+                }
                 warn!(?peer, "RESP3 parse error: {e}");
                 let err = Frame::Error(format!("ERR protocol: {e}"));
                 out.clear();
@@ -179,25 +259,11 @@ pub async fn handle_connection_resp3(
                 let _ = stream.write_all(&out).await;
                 break;
             }
-        };
-
-        let response = match parse_command(frame) {
-            Ok(cmd) => {
-                dispatch_command(
-                    cmd,
-                    &mut state,
-                    &mut tenant,
-                    &shards,
-                    tenant_backend.as_ref(),
-                )
-                .await
-            }
-            Err(e) => Frame::Error(format!("ERR {e}")),
-        };
-
-        out.clear();
-        encode_frame(&response, state.version, &mut out);
-        if stream.write_all(&out).await.is_err() {
+        }
+    }
+    // Drain anything still in flight on close.
+    while !inflight.is_empty() {
+        if !emit_front!() {
             break;
         }
     }
@@ -261,6 +327,78 @@ fn command_kind(cmd: &Command) -> CommandKind {
         | Command::SkegWhoami
         | Command::SkegAuth { .. }
         | Command::Unknown { .. } => CommandKind::Meta,
+    }
+}
+
+/// Data-plane commands that read the session tenant but never mutate session
+/// state, so they can be dispatched concurrently on one connection (see the
+/// pipelined connection loop). Everything else - HELLO/AUTH (mutate tenant),
+/// SELECT, index lifecycle, admin - is a serial barrier.
+fn is_pipelineable(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::SkegVset { .. }
+            | Command::SkegVmset { .. }
+            | Command::SkegVsearch { .. }
+            | Command::SkegVdel { .. }
+            | Command::Get { .. }
+            | Command::Set { .. }
+            | Command::Del { .. }
+            | Command::Exists { .. }
+            | Command::Mget { .. }
+            | Command::Mset { .. }
+            | Command::Incr { .. }
+            | Command::Decr { .. }
+            | Command::Ping(_)
+            | Command::Echo(_)
+    )
+}
+
+/// Run one pipelineable command with owned inputs so it can be driven
+/// concurrently with its neighbours. Admission gate + the command's handler;
+/// same behaviour as the matching `dispatch_command` arm, minus the `&mut`
+/// session borrow. Only ever called for [`is_pipelineable`] commands.
+async fn exec_pipelined(
+    cmd: Command,
+    tenant: TenantId,
+    shards: ShardSet,
+    backend: Option<Arc<dyn TenantBackend>>,
+) -> Frame {
+    let _admit = match backend.as_ref() {
+        None => None,
+        Some(ctx) => match ctx.admit(Admission {
+            tenant,
+            op: command_kind(&cmd),
+            cost: command_cost(&cmd),
+        }) {
+            Ok(guard) => Some(guard),
+            Err(rejected) => return Frame::Error(rejected.message),
+        },
+    };
+    let be = backend.as_ref();
+    match cmd {
+        Command::SkegVset { args } => skeg_vset(&args, &shards, tenant, be).await,
+        Command::SkegVmset { args } => skeg_vmset(&args, &shards, tenant, be).await,
+        Command::SkegVsearch { args } => skeg_vsearch(&args, &shards, tenant).await,
+        Command::SkegVdel { args } => skeg_vdel(&args, &shards, tenant).await,
+        Command::Get { key } => kv_get(std::slice::from_ref(&key), &shards, tenant, be).await,
+        Command::Set { key, value } => kv_set(&[key, value], &shards, tenant, be).await,
+        Command::Del { keys } => kv_del(&keys, &shards, tenant, be).await,
+        Command::Exists { keys } => kv_exists(&keys, &shards, tenant, be).await,
+        Command::Mget { keys } => kv_mget(&keys, &shards, tenant, be).await,
+        Command::Mset { pairs } => {
+            let args: Vec<Bytes> = pairs.into_iter().flat_map(|(k, v)| [k, v]).collect();
+            kv_mset(&args, &shards, tenant, be).await
+        }
+        Command::Incr { key } => {
+            kv_incr_by(std::slice::from_ref(&key), &shards, 1, tenant, be).await
+        }
+        Command::Decr { key } => {
+            kv_incr_by(std::slice::from_ref(&key), &shards, -1, tenant, be).await
+        }
+        Command::Ping(msg) => handle_ping(msg),
+        Command::Echo(msg) => handle_echo(msg),
+        _ => Frame::Error("ERR command not pipelineable".into()),
     }
 }
 
