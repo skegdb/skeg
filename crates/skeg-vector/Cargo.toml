@@ -180,3 +180,7 @@ harness = false
 [[bench]]
 name = "recall100_compare"
 harness = false
+
+[[bench]]
+name = "tq1_risk_oracle"
+harness = false
