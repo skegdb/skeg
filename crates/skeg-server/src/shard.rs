@@ -245,6 +245,23 @@ impl VectorBackend {
         }
     }
 
+    /// True if the disk index would benefit from (and lacks) an IVF router.
+    /// The background idle-consolidate builds it off the ingest path.
+    fn wants_ivf(&self) -> bool {
+        match self {
+            VectorBackend::Flat(_) => false,
+            VectorBackend::Disk(i) => i.wants_ivf(),
+        }
+    }
+
+    /// Build the IVF router (background only - never on the inline ingest path).
+    fn build_ivf(&mut self) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.build_ivf(0, 8),
+        }
+    }
+
     /// Un-consolidated streaming inserts (the in-RAM delta that a bulk load
     /// leaves behind). 0 for flat. Drives the idle-consolidate trigger.
     fn delta_len(&self) -> usize {
@@ -899,10 +916,17 @@ fn run_shard(
                                     let a = arc.clone();
                                     let nm = name.clone();
                                     let _ = tokio::task::spawn_blocking(move || {
-                                        if let Err(e) = a.write().backend.consolidate() {
+                                        let mut g = a.write();
+                                        if let Err(e) = g.backend.consolidate() {
                                             error!(
                                                 "shard {shard_id}: idle consolidate '{nm}': {e}"
                                             );
+                                        } else if g.backend.wants_ivf() {
+                                            // Build the routed-filtered-search index
+                                            // off the request path, now that we are idle.
+                                            if let Err(e) = g.backend.build_ivf() {
+                                                error!("shard {shard_id}: idle ivf '{nm}': {e}");
+                                            }
                                         }
                                     })
                                     .await;

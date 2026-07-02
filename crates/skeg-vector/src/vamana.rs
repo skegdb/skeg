@@ -2378,18 +2378,25 @@ impl DiskVamanaIndex {
         // The delta + runs are now folded into the graph: the WAL must start
         // empty so the reopen below does not replay stale records.
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
-        // The row order changed, so the persisted router is stale: drop it, then
-        // rebuild iff the index had one before this consolidate.
-        let had_ivf = self.ivf.is_some();
+        // The row order changed, so the persisted router is now stale: drop it.
+        // We do NOT rebuild the IVF here - consolidate runs INLINE on the ingest
+        // path (shard auto-consolidates when delta >= main), and an inline IVF
+        // build (re-read all vectors + k-means) stalls ingest. The background
+        // idle-consolidate rebuilds it off the request path; until then filtered
+        // search falls back to the exact scan (correct, just O(|s|)).
         let _ = std::fs::remove_file(dir.join(IVF_FILE));
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
-        // Auto-build the IVF router for indexes big enough to benefit (below this
-        // an exact scan of the match set is already cheap).
-        const IVF_MIN: u32 = 50_000;
-        if had_ivf || self.base.main_n >= IVF_MIN {
-            self.build_ivf(0, 8)?;
-        }
         Ok(())
+    }
+
+    /// True if this index is large enough to benefit from a routed filtered
+    /// search (below it, an exact scan of the match set is already cheap). Used
+    /// by the background idle-consolidate to decide whether to build the router.
+    #[must_use]
+    pub fn wants_ivf(&self) -> bool {
+        /// Base size at/above which the IVF router pays for itself.
+        const IVF_MIN: u32 = 50_000;
+        self.ivf.is_none() && self.base.main_n >= IVF_MIN
     }
 
     /// Build the coarse IVF router over the base segment (the "cells" branch of
