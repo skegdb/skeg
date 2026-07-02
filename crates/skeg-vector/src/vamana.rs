@@ -932,6 +932,8 @@ const GRAPH_FILE: &str = "graph.vmn";
 const VECTORS_FILE: &str = "vectors.bin";
 /// Append-only WAL of delta inserts/deletes (replayed on open).
 const DELTA_LOG_FILE: &str = "delta.log";
+/// Persisted IVF router sidecar (centroids + cell assignment).
+const IVF_FILE: &str = "ivf.bin";
 /// Persists which tier-1 quantiser a read-write disk index rebuilds at `open`
 /// and `consolidate`. Absent => `Int8` (the historical default). Only the KIND
 /// is stored, not codes: every tier here is deterministic from `vectors.bin`
@@ -1399,6 +1401,7 @@ impl DiskVamanaIndex {
         // already put their vectors back in L0, so the stale dirs are redundant
         // (and would collide with `run-0` of this session). See the flush ADR.
         index.clean_stale_runs();
+        index.load_ivf();
         Ok(index)
     }
 
@@ -2375,7 +2378,17 @@ impl DiskVamanaIndex {
         // The delta + runs are now folded into the graph: the WAL must start
         // empty so the reopen below does not replay stale records.
         std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
+        // The row order changed, so the persisted router is stale: drop it, then
+        // rebuild iff the index had one before this consolidate.
+        let had_ivf = self.ivf.is_some();
+        let _ = std::fs::remove_file(dir.join(IVF_FILE));
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
+        // Auto-build the IVF router for indexes big enough to benefit (below this
+        // an exact scan of the match set is already cheap).
+        const IVF_MIN: u32 = 50_000;
+        if had_ivf || self.base.main_n >= IVF_MIN {
+            self.build_ivf(0, 8)?;
+        }
         Ok(())
     }
 
@@ -2402,9 +2415,23 @@ impl DiskVamanaIndex {
         } else {
             n_cells
         };
-        let row = |r: u32| all[r as usize * dim..r as usize * dim + dim].to_vec();
-        self.ivf = Some(Box::new(IvfRouter::build(&row, n, dim, n_cells, iters)));
+        let router = IvfRouter::build(&all, n, dim, n_cells, iters);
+        let _ = std::fs::write(self.dir.join(IVF_FILE), router.to_bytes());
+        self.ivf = Some(Box::new(router));
         Ok(())
+    }
+
+    /// Load the persisted IVF router, if present + consistent with the base.
+    /// Best-effort: a missing / stale sidecar just leaves the router unbuilt.
+    fn load_ivf(&mut self) {
+        let Ok(bytes) = std::fs::read(self.dir.join(IVF_FILE)) else {
+            return;
+        };
+        if let Some(r) = IvfRouter::from_bytes(&bytes)
+            && r.len() == self.base.main_n as usize
+        {
+            self.ivf = Some(Box::new(r));
+        }
     }
 
     /// Hybrid filtered search over the base. `s` = the filter's SORTED matching

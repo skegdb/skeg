@@ -254,58 +254,24 @@ impl VectorBackend {
         }
     }
 
-    /// Top-`k` for a payload filter whose matching id set is `s`. The planner's
-    /// choice between exact scan and the filtered ANN walk:
-    /// - flat is already brute-force, so an exact scan over `s` is always best;
-    /// - on disk, a selective filter (small `s`) scans `s` exactly, while a
-    ///   low-selectivity filter (large `s`) takes the filtered walk, which visits
-    ///   far fewer nodes than `|s|` disk reads.
-    ///
-    /// `FILTER_EXACT_MAX` is a heuristic crossover, to be tuned by a bench.
+    /// Top-`k` for a payload filter whose matching id set is `s` (SORTED, from
+    /// `Filter::evaluate`, already per-shard). Flat is brute-force. On disk, the
+    /// hybrid planner ([`search_filtered_hybrid`]): a tiny filter is an exact
+    /// quantized scan of `s`; a larger one is IVF-routed to the query-nearest
+    /// matching cells (sub-linear, scales to 1M/10M), then f32-reranked. Both
+    /// bound the disk reads to `k*8`, unlike a raw scan that goes O(|s|).
     fn filtered_search(
         &self,
         query: &[f32],
         k: usize,
-        l_search: u32,
+        _l_search: u32,
         s: &[u64],
     ) -> std::io::Result<Vec<(u64, f32)>> {
-        // `s` is the SORTED matching id list (from `Filter::evaluate`), already
-        // per-shard. Small/medium filters take the QUANTIZED scan: proxy-score
-        // every match in RAM (NEON-fast) then f32-rerank only `k*8` from disk -
-        // disk reads bounded regardless of |s|, recall ~1.0. Measured crossover:
-        // qscan wins to ~30k matches (recall 1.0: 1k→0.9ms, 25k→7.9ms), beating
-        // both the walk (sparse two-walk is 20-30ms there) AND qdrant; above ~30k
-        // the O(|s|) proxy scan loses to the walk (dense single walk ~5ms). The
-        // crossover is in ABSOLUTE matches, so it holds at any N (the scaling
-        // property). See benches/filt_probe.rs.
-        const FILTER_SCAN_MAX: usize = 32_768;
-        const SCAN_RERANK: usize = 8;
+        const RERANK: usize = 8;
+        let rerank = (k * RERANK).max(64);
         match self {
             VectorBackend::Flat(i) => Ok(i.score_ids(query, s, k)),
-            VectorBackend::Disk(i) if s.len() <= FILTER_SCAN_MAX => {
-                i.score_ids_quantized(query, s, k, (k * SCAN_RERANK).max(64))
-            }
-            VectorBackend::Disk(i) => {
-                // Seed the walk from a spread of matching ids so it can reach a
-                // cluster that sits away from the query (multi-seed).
-                const SEEDS: usize = 32;
-                let step = (s.len() / SEEDS).max(1);
-                let seeds: Vec<u64> = s.iter().copied().step_by(step).take(SEEDS).collect();
-                // Membership is checked once per edge traversed (~1e5/query on a
-                // broad filter). `s` is sorted, so a binary search over the
-                // contiguous slice is the lookup - no per-query HashSet to build.
-                // Selectivity picks the walk plan: a dense filter (matches near the
-                // query) takes a cheap single walk, a sparse one the robust two-walk.
-                let selectivity = s.len() as f32 / (i.len().max(1)) as f32;
-                i.search_filtered(
-                    query,
-                    k,
-                    l_search as usize,
-                    &|id| s.binary_search(&id).is_ok(),
-                    &seeds,
-                    selectivity,
-                )
-            }
+            VectorBackend::Disk(i) => i.search_filtered_hybrid(query, s, k, rerank),
         }
     }
 

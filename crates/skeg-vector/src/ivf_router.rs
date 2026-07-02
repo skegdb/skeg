@@ -13,6 +13,7 @@
 //! (validated: correlated 1% recall 0.69 -> ~1.0 vs query-centric probing).
 
 use ahash::AHashMap;
+use rayon::prelude::*;
 use skeg_simd::cosine_f32;
 
 /// A coarse k-means partition + per-vector cell assignment. RAM-resident and
@@ -39,47 +40,67 @@ impl IvfRouter {
     /// # Panics
     /// Panics if `n == 0` or `dim == 0`.
     #[must_use]
-    pub fn build(
-        row: &dyn Fn(u32) -> Vec<f32>,
-        n: u32,
-        dim: usize,
-        n_cells: usize,
-        iters: usize,
-    ) -> IvfRouter {
+    pub fn build(data: &[f32], n: u32, dim: usize, n_cells: usize, iters: usize) -> IvfRouter {
         assert!(n > 0 && dim > 0, "ivf build needs vectors");
+        assert_eq!(data.len(), n as usize * dim, "data/n/dim mismatch");
         let n_cells = n_cells.min(n as usize).max(1);
+        let vec_at = |r: usize| &data[r * dim..r * dim + dim];
+        // k-means on a bounded SAMPLE (Lloyd iters); a full-corpus refit adds
+        // little for coarse routing and would dominate the build. The final
+        // assignment (below) still covers every vector.
+        let sample: usize = (n as usize).min(50_000).max(n_cells);
+        let sstep = (n as usize / sample).max(1);
         let step = (n as usize / n_cells).max(1);
         let mut cent = vec![0.0f32; n_cells * dim];
         for c in 0..n_cells {
-            let src = row(((c * step) as u32) % n);
-            cent[c * dim..c * dim + dim].copy_from_slice(&src);
+            cent[c * dim..c * dim + dim].copy_from_slice(vec_at((c * step) % n as usize));
         }
-        let mut cell_of = vec![0u32; n as usize];
-        for it in 0..iters {
-            let mut sums = vec![0.0f32; n_cells * dim];
-            let mut counts = vec![0u32; n_cells];
-            for r in 0..n {
-                let v = row(r);
-                let c = nearest(&cent, n_cells, dim, &v);
-                cell_of[r as usize] = c as u32;
-                let s = &mut sums[c * dim..c * dim + dim];
-                for j in 0..dim {
-                    s[j] += v[j];
-                }
-                counts[c] += 1;
-            }
-            // Update centroids (skip empty cells). Last iter only assigns.
-            if it + 1 < iters {
-                for c in 0..n_cells {
-                    if counts[c] > 0 {
-                        let inv = 1.0 / counts[c] as f32;
+        for _ in 0..iters {
+            // Parallel assign+accumulate over the sample.
+            let (sums, counts) = (0..sample)
+                .into_par_iter()
+                .map(|si| {
+                    let r = (si * sstep) % n as usize;
+                    let c = nearest(&cent, n_cells, dim, vec_at(r));
+                    (c, r)
+                })
+                .fold(
+                    || (vec![0.0f32; n_cells * dim], vec![0u32; n_cells]),
+                    |(mut s, mut cnt), (c, r)| {
+                        let v = vec_at(r);
                         for j in 0..dim {
-                            cent[c * dim + j] = sums[c * dim + j] * inv;
+                            s[c * dim + j] += v[j];
                         }
+                        cnt[c] += 1;
+                        (s, cnt)
+                    },
+                )
+                .reduce(
+                    || (vec![0.0f32; n_cells * dim], vec![0u32; n_cells]),
+                    |(mut sa, mut ca), (sb, cb)| {
+                        for i in 0..n_cells * dim {
+                            sa[i] += sb[i];
+                        }
+                        for c in 0..n_cells {
+                            ca[c] += cb[c];
+                        }
+                        (sa, ca)
+                    },
+                );
+            for c in 0..n_cells {
+                if counts[c] > 0 {
+                    let inv = 1.0 / counts[c] as f32;
+                    for j in 0..dim {
+                        cent[c * dim + j] = sums[c * dim + j] * inv;
                     }
                 }
             }
         }
+        // Final assignment of EVERY vector, in parallel.
+        let cell_of: Vec<u32> = (0..n as usize)
+            .into_par_iter()
+            .map(|r| nearest(&cent, n_cells, dim, vec_at(r)) as u32)
+            .collect();
         IvfRouter {
             centroids: cent,
             dim,
@@ -129,6 +150,70 @@ impl IvfRouter {
     pub fn n_cells(&self) -> usize {
         self.n_cells
     }
+
+    /// Number of assigned vectors (rows).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cell_of.len()
+    }
+
+    /// True if no vectors are assigned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cell_of.is_empty()
+    }
+
+    /// Serialise to bytes: `[n_cells u32][dim u32][n u32][centroids f32...][cell_of u32...]`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n = self.cell_of.len();
+        let mut b = Vec::with_capacity(12 + self.centroids.len() * 4 + n * 4);
+        b.extend_from_slice(&(self.n_cells as u32).to_le_bytes());
+        b.extend_from_slice(&(self.dim as u32).to_le_bytes());
+        b.extend_from_slice(&(n as u32).to_le_bytes());
+        for &x in &self.centroids {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        for &c in &self.cell_of {
+            b.extend_from_slice(&c.to_le_bytes());
+        }
+        b
+    }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes). Returns `None` on a malformed or
+    /// truncated buffer.
+    #[must_use]
+    pub fn from_bytes(b: &[u8]) -> Option<IvfRouter> {
+        if b.len() < 12 {
+            return None;
+        }
+        let rd = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+        let (n_cells, dim, n) = (rd(0), rd(4), rd(8));
+        let cent_len = n_cells * dim;
+        let need = 12 + cent_len * 4 + n * 4;
+        if b.len() != need {
+            return None;
+        }
+        let centroids: Vec<f32> = (0..cent_len)
+            .map(|i| {
+                let o = 12 + i * 4;
+                f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+            })
+            .collect();
+        let base = 12 + cent_len * 4;
+        let cell_of: Vec<u32> = (0..n)
+            .map(|i| {
+                let o = base + i * 4;
+                u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+            })
+            .collect();
+        Some(IvfRouter {
+            centroids,
+            dim,
+            n_cells,
+            cell_of,
+        })
+    }
 }
 
 fn nearest(cent: &[f32], n_cells: usize, dim: usize, v: &[f32]) -> usize {
@@ -165,7 +250,8 @@ mod tests {
         let dim = 16;
         let n = 4000u32;
         let row = |r: u32| spread(r, dim);
-        let ivf = IvfRouter::build(&row, n, dim, IvfRouter::cells_for(n as usize), 6);
+        let data: Vec<f32> = (0..n).flat_map(|r| spread(r, dim)).collect();
+        let ivf = IvfRouter::build(&data, n, dim, IvfRouter::cells_for(n as usize), 6);
         let s: Vec<u64> = (0..n as u64).filter(|id| id % 4 == 0).collect(); // 25%
         let query = spread(123_456, dim);
         let shortlist = ivf.probe(&query, &s, 120);
@@ -188,8 +274,8 @@ mod tests {
 
     #[test]
     fn probe_returns_all_when_budget_exceeds_s() {
-        let row = |r: u32| spread(r, 8);
-        let ivf = IvfRouter::build(&row, 500, 8, 64, 4);
+        let data: Vec<f32> = (0..500u32).flat_map(|r| spread(r, 8)).collect();
+        let ivf = IvfRouter::build(&data, 500, 8, 64, 4);
         let s: Vec<u64> = (0..50).collect();
         assert_eq!(ivf.probe(&spread(1, 8), &s, 1000).len(), 50);
     }
