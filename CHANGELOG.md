@@ -7,6 +7,68 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.6.0] - 2026-07-02
+
+### Added
+
+- **Filtered search that scales.** A filtered query no longer scores every
+  matching vector. Its matching set is routed by a coarse k-means IVF index to
+  the query-nearest cells that actually contain matches (predicate-aware, so a
+  filter whose matches sit away from the query is still found), then quantized
+  scored and f32 re-ranked. A tiny match set still takes an exact quantized scan;
+  a large one takes the routed path, which stays sub-linear as the corpus grows.
+  On mxbai 500k a 10% filter drops from ~15 ms (scan every match) to ~2.6 ms at
+  the same recall. The router is built off the request path during the idle
+  consolidate and persisted next to the graph, so it survives a restart.
+
+- **`skeg-bench`, a unified benchmark tool.** One binary that reports recall@10
+  and recall@100 (both from real k-searches against brute-force truth), build
+  time, RSS, p50/p99 and QPS, per dataset and tier. RSS is read in a subprocess
+  that opens the index but never loads the corpus, so the number is the index's
+  footprint, not the harness's. Replaces the pile of ad-hoc benches.
+
+- **Memory-mapped tier (`--tier-mmap`, `SKEG_TIER_MMAP=1`).** The TurboQuant
+  codes can be backed by a file instead of owned RAM, so the OS can reclaim them
+  under memory pressure and drop them when an index goes idle. Latency is
+  unchanged while the codes are hot (they stay in the page cache).
+
+### Changed
+
+- **Payload ingest is much faster.** The RESP3 connection now dispatches a
+  client's pipelined data-plane commands concurrently (bounded window, replies
+  still in order), so the payload blob writes reach the vLog group committer in
+  batches instead of one blob per commit. Streaming 100k vectors with payloads
+  went from ~260 s to ~26 s.
+
+- **Faster graph builds.** The on-disk build width defaults to `l_build = 48`
+  (was 64): recall-neutral on the tested corpora, ~24% less build work. The
+  graph build dominates consolidate, so this shortens ingest too. `SKEG_L_BUILD`
+  still overrides it.
+
+- **Leaner consolidate.** The IVF router is no longer built inline during the
+  ingest-triggered consolidate (which stalled ingest); it is built in the
+  background idle consolidate instead.
+
+### Fixed
+
+- **Pipeline command ordering.** Only the vector commands and read-only commands
+  run concurrently within a single connection. The scalar KV verbs
+  (`GET/SET/DEL/INCR/...`) are serial again, so a pipelined `SET k a; SET k b`
+  and `INCR` keep their guaranteed order and atomicity.
+
+- **IVF sidecar crash consistency.** The persisted router is dropped before the
+  consolidate rewrites the base, so a crash cannot leave a stale router that a
+  length-only load check would accept against reordered rows. `from_bytes` also
+  rejects a corrupt-but-right-length file.
+
+### Notes
+
+- Tier guidance: `tq2` (2-bit) is the default and holds recall@10 and recall@100
+  nearly flat as the corpus grows. `tq1` (1-bit) is faster and about half the
+  RAM, but recall@100 falls off with scale; it fits small tenants and workloads
+  that only need recall@10. Both keep the full f32 re-rank, so the top result is
+  exact either way.
+
 ## [0.5.0] - 2026-06-22
 
 ### Added
