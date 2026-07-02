@@ -110,10 +110,24 @@ pages to the OS through jemalloc decay timers. A resident quantized tier drives
 the graph walk, and re-ranking against the full-precision vectors on disk
 recovers the accuracy quantization gives up.
 
+**Filtered search scales.** A filter with many matches does not score every
+match. Its matching set is routed by a coarse k-means index to the query-nearest
+cells that hold matches, then a short list is re-ranked, so the cost stays
+sub-linear as the corpus grows. See [`docs/filtered-search.md`](docs/filtered-search.md).
+
 Five tiers trade memory for precision: `int8`, Product Quantization (128×256),
-and TurboQuant at 1/2/4 bits per coordinate. **tq2 is the sweet spot** - quarter
-the bytes of int8, recall ~1.0, latency on par. TurboQuant needs no trained
-codebook, so the lean tiers work under live writes, not just at serve time.
+and TurboQuant at 1/2/4 bits per coordinate. **tq2 (2-bit) is the default**:
+quarter the bytes of int8, latency on par, and recall stays nearly flat as the
+corpus grows. **tq1 (1-bit)** is faster and about half the RAM again, a good fit
+for small tenants and workloads that only need the top handful of results, but
+its recall@100 falls off at scale. Both keep the full f32 re-rank, so the top
+result is exact either way. TurboQuant needs no trained codebook, so the lean
+tiers work under live writes, not just at serve time.
+
+**Memory follows the workload.** With `--tier-mmap` the quantized codes are
+backed by a file, so the OS reclaims them when an index goes cold or memory gets
+tight, and pages them back in on demand. Latency is unchanged while an index is
+hot.
 
 The design and the eleven falsifications behind it are written up in
 [the series on the project blog](https://amanitaproject.com/).

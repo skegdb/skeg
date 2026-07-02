@@ -88,18 +88,28 @@ source EXISTS
 The planner picks the cheapest correct strategy from the size of the matching
 set:
 
-- **Selective filter** (few matches): the matching ids are scored exactly,
-  full-precision, over just that set. Exact, no recall loss.
-- **Broad filter** (many matches): a filtered graph search. Two complementary
-  walks are merged so recall holds regardless of how the matching vectors sit in
-  the embedding space: one walk explores only the matching subgraph (good when a
-  filter selects a topic that clusters together, the common case), the other
-  navigates the whole graph and filters at re-rank (good when the matches are
-  scattered). The result is re-ranked exactly.
+- **Selective filter** (few matches, up to a few thousand): the matching ids are
+  scored with the in-RAM quantized proxy and the top handful are re-ranked from
+  disk at full precision. The disk reads are bounded, so this is fast and exact
+  on the result, and it beats any graph walk when the match set is small.
+- **Broad filter** (many matches): the matching set is routed by a coarse
+  k-means index (an IVF partition of the corpus) to the query-nearest cells that
+  actually contain matches, then the routed shortlist is proxy-scored and
+  f32 re-ranked. The routing is *predicate-aware*: it ranks only the cells that
+  hold matches, so a filter whose matches sit far from the query is still found.
+  The work is proportional to the shortlist, not to the size of the match set, so
+  it stays sub-linear as the corpus grows.
 
-On real 1024-dim embeddings this holds recall@10 between 0.98 and 1.00 across
-selectivities and metadata shapes, at query time, with no extra index build
-cost.
+The routing index is built off the request path during the background idle
+consolidate and persisted in a sidecar next to the graph, so it survives a
+restart and adds nothing to query latency. Until it exists (a freshly ingested
+index), a broad filter falls back to the exact quantized scan of the match set:
+correct, just linear in the number of matches.
+
+On mxbai 500k a 10% filter drops from ~15 ms (score every match) to ~2.6 ms on
+the routed path at the same recall, and the routed cost stays flat as the corpus
+grows where the plain scan grows with it. Recall stays high (0.95 to 1.00) across
+selectivities and metadata shapes; the final result is always f32-exact.
 
 ## Scope
 
