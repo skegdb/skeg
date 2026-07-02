@@ -184,3 +184,11 @@ harness = false
 [[bench]]
 name = "tq1_risk_oracle"
 harness = false
+
+[[bench]]
+name = "recall100_all"
+harness = false
+
+[[bench]]
+name = "recall_full"
+harness = false
