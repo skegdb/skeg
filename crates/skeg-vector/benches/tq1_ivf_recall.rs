@@ -1,4 +1,4 @@
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::doc_lazy_continuation)]
 //! Does the IVF router (proxy-INDEPENDENT candidate generation via f32 centroids)
 //! rescue tq1's recall@100? The graph walk navigates via the weak 1-bit proxy and
 //! misses the true top-100 at a narrow beam; IVF gathers candidates from the

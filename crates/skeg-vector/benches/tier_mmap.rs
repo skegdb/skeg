@@ -1,4 +1,4 @@
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::doc_lazy_continuation)]
 //! tq2 tier-mmap: does mmap'ing the TurboQuant codes lower RSS, and what does it
 //! cost in latency (page faults during the walk)? In-process (no server, no serve
 //! mode): build once, drop the corpus, then open the SAME index twice - codes
