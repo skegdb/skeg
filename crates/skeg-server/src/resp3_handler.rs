@@ -1434,8 +1434,17 @@ mod tests {
     fn vindex_name_rejects_traversal_and_scope_escape() {
         let t = TenantId::ZERO;
         for bad in [
-            "../x", "../../tmp/x", "a/b", "a\\b", "..", ".", "",
-            "victimhex::idx", "x\0y", "a b", "name.with/slash",
+            "../x",
+            "../../tmp/x",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+            "",
+            "victimhex::idx",
+            "x\0y",
+            "a b",
+            "name.with/slash",
         ] {
             assert!(
                 scope_vindex_or_reject(t, bad).is_err(),
@@ -1443,10 +1452,7 @@ mod tests {
             );
         }
         for ok in ["myindex", "idx_1", "docs-v2", "a.b.c", "A9_-."] {
-            assert!(
-                scope_vindex_or_reject(t, ok).is_ok(),
-                "must accept {ok:?}"
-            );
+            assert!(scope_vindex_or_reject(t, ok).is_ok(), "must accept {ok:?}");
         }
     }
 

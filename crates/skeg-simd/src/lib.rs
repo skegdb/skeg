@@ -133,6 +133,85 @@ pub fn hamming_binary_neon(a: &[u8], b: &[u8]) -> u32 {
     sum
 }
 
+/// tq1 bit-plane proxy: `(sum_p 2^p * popcount(plane_p AND code), popcount(code))`.
+/// `b+1` AND-popcount passes over `bytes`-byte masks (the tq1 default nav kernel).
+#[must_use]
+pub fn tq1_bitplane_score_scalar(planes: &[u8], b: u8, bytes: usize, code: &[u8]) -> (u64, u32) {
+    let code_pc: u32 = code.iter().map(|c| c.count_ones()).sum();
+    let mut weighted = 0u64;
+    for p in 0..b as usize {
+        let plane = &planes[p * bytes..(p + 1) * bytes];
+        let pc: u64 = plane
+            .iter()
+            .zip(code)
+            .map(|(&pl, &cd)| u64::from((pl & cd).count_ones()))
+            .sum();
+        weighted += pc << p;
+    }
+    (weighted, code_pc)
+}
+
+/// `popcount(a AND b)` over equal-length byte slices, NEON. Same shape as
+/// [`hamming_binary_neon`] with `vandq_u8` instead of `veorq_u8`.
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+fn and_popcnt_neon(a: &[u8], b: &[u8]) -> u32 {
+    use std::arch::aarch64::{
+        vaddlvq_u16, vaddq_u16, vandq_u8, vcntq_u8, vdupq_n_u16, vld1q_u8, vpadalq_u8,
+    };
+    let n = a.len();
+    let block = n - (n % 64);
+    let mut i = 0;
+    // SAFETY: each `vld1q_u8` reads 16 bytes at `i + k*16 < block <= n`, in
+    // bounds for both slices (`a.len() == b.len()`, asserted by the caller).
+    // Read-only. Each u16 lane gains <= 32 per 64-byte iter, no overflow for
+    // code sizes far below 256 KiB.
+    let mut sum: u32 = unsafe {
+        let mut acc = [vdupq_n_u16(0); 4];
+        while i < block {
+            for (k, acc_k) in acc.iter_mut().enumerate() {
+                let va = vld1q_u8(a.as_ptr().add(i + k * 16));
+                let vb = vld1q_u8(b.as_ptr().add(i + k * 16));
+                *acc_k = vpadalq_u8(*acc_k, vcntq_u8(vandq_u8(va, vb)));
+            }
+            i += 64;
+        }
+        let acc = vaddq_u16(vaddq_u16(acc[0], acc[1]), vaddq_u16(acc[2], acc[3]));
+        vaddlvq_u16(acc)
+    };
+    for i in i..n {
+        sum += (a[i] & b[i]).count_ones();
+    }
+    sum
+}
+
+/// tq1 bit-plane proxy, NEON. One AND-popcount kernel serves both terms:
+/// `popcount(code) == popcount(code AND code)`.
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn tq1_bitplane_score_neon(planes: &[u8], b: u8, bytes: usize, code: &[u8]) -> (u64, u32) {
+    let code_pc = and_popcnt_neon(code, code);
+    let mut weighted = 0u64;
+    for p in 0..b as usize {
+        let plane = &planes[p * bytes..(p + 1) * bytes];
+        weighted += u64::from(and_popcnt_neon(plane, code)) << p;
+    }
+    (weighted, code_pc)
+}
+
+/// tq1 bit-plane proxy: dispatches to NEON on aarch64, scalar elsewhere.
+#[must_use]
+pub fn tq1_bitplane_score(planes: &[u8], b: u8, bytes: usize, code: &[u8]) -> (u64, u32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        tq1_bitplane_score_neon(planes, b, bytes, code)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        tq1_bitplane_score_scalar(planes, b, bytes, code)
+    }
+}
+
 /// Dot product of i8 slices, NEON. 64 i8 per iteration over 4 independent
 /// accumulators to hide `vpadalq` latency.
 ///
@@ -1048,6 +1127,25 @@ mod tests {
                 (neon - scalar).abs() / denom < 1e-3,
                 "tq4_adc_i8 neon {} scalar {} dim {}",
                 neon, scalar, dim,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        fn prop_tq1_bitplane_neon_matches_scalar(
+            // bytes = 8..64 covers the 64-byte SWAR block + tail; b = 1..=8 bit-planes.
+            bytes in 8usize..=64,
+            b in 1u8..=8,
+            seed in proptest::collection::vec(proptest::num::u8::ANY, 0..640),
+        ) {
+            let mut code = seed.clone();
+            code.resize(bytes, 0);
+            let mut planes = seed;
+            planes.resize(bytes * b as usize, 0);
+            // Integer kernel: must match exactly.
+            proptest::prop_assert_eq!(
+                tq1_bitplane_score_neon(&planes, b, bytes, &code),
+                tq1_bitplane_score_scalar(&planes, b, bytes, &code),
             );
         }
     }

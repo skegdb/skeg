@@ -716,18 +716,8 @@ fn tq1_aniso_enabled() -> bool {
 /// Bit-plane inner-product primitive: returns `(sum_p 2^p*popcount(plane_p AND
 /// code), popcount(code))`. `b+1` popcount passes over `bytes`-byte masks.
 fn tq1_bitplane_score(planes: &[u8], b: u8, bytes: usize, code: &[u8]) -> (u64, u32) {
-    let code_pc: u32 = code.iter().map(|c| c.count_ones()).sum();
-    let mut weighted = 0u64;
-    for p in 0..b as usize {
-        let plane = &planes[p * bytes..(p + 1) * bytes];
-        let pc: u64 = plane
-            .iter()
-            .zip(code)
-            .map(|(&pl, &cd)| u64::from((pl & cd).count_ones()))
-            .sum();
-        weighted += pc << p;
-    }
-    (weighted, code_pc)
+    // NEON vcntq_u8/vandq_u8 kernel on aarch64, scalar elsewhere.
+    skeg_simd::tq1_bitplane_score(planes, b, bytes, code)
 }
 
 /// Map a coordinate to its `2^bits` bucket index using sorted boundaries.
