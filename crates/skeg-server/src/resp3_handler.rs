@@ -51,10 +51,33 @@ fn scoped_vindex_name(tenant: TenantId, name: &str) -> String {
 /// could pass `"<victim-tenant-hex>::idx"` and have `scoped_vindex_name` return
 /// it verbatim, reaching another tenant's index (read/write/drop). Every vector
 /// op scopes through this helper so none can forget the check.
+/// Longest accepted index name. Generous, but bounds the on-disk `vindex-<name>`
+/// path and the registry key.
+const MAX_VINDEX_NAME_LEN: usize = 255;
+
 fn scope_vindex_or_reject(tenant: TenantId, raw_name: &str) -> Result<String, Frame> {
     if raw_name.contains("::") {
         return Err(Frame::Error(
             "ERR VINDEX name must not contain '::' (reserved for tenant scoping)".into(),
+        ));
+    }
+    // The name flows into `dir.join(format!("vindex-{name}"))` for create /
+    // File::create / remove_dir_all. Without this, a crafted name escapes the
+    // data dir: VINDEX.CREATE "../../x" writes outside it and VINDEX.DROP
+    // "../../victim" would recursively delete an arbitrary writable dir. Allow
+    // only a safe filename charset; reject empties, over-long, and any path
+    // separator, parent ref, or control byte.
+    let ok = !raw_name.is_empty()
+        && raw_name.len() <= MAX_VINDEX_NAME_LEN
+        && raw_name != "."
+        && raw_name != ".."
+        && !raw_name.contains("..")
+        && raw_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if !ok {
+        return Err(Frame::Error(
+            "ERR VINDEX name: 1-255 chars, [A-Za-z0-9._-] only, no '..'".into(),
         ));
     }
     Ok(scoped_vindex_name(tenant, raw_name))
@@ -1401,8 +1424,31 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, is_pipelineable};
+    use super::{Command, TenantId, is_pipelineable, scope_vindex_or_reject};
     use bytes::Bytes;
+
+    /// Path-traversal / cross-tenant guard: the index name flows into a
+    /// filesystem path (`vindex-<name>`) and must never carry `..`, a path
+    /// separator, or the `::` scope marker.
+    #[test]
+    fn vindex_name_rejects_traversal_and_scope_escape() {
+        let t = TenantId::ZERO;
+        for bad in [
+            "../x", "../../tmp/x", "a/b", "a\\b", "..", ".", "",
+            "victimhex::idx", "x\0y", "a b", "name.with/slash",
+        ] {
+            assert!(
+                scope_vindex_or_reject(t, bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        for ok in ["myindex", "idx_1", "docs-v2", "a.b.c", "A9_-."] {
+            assert!(
+                scope_vindex_or_reject(t, ok).is_ok(),
+                "must accept {ok:?}"
+            );
+        }
+    }
 
     /// Safety guard: order-dependent commands must NEVER be pipelined
     /// (concurrent dispatch would reorder their effects on a shared key -
