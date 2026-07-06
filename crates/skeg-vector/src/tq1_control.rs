@@ -179,6 +179,7 @@ fn mode_tag(m: Tq1ProxyMode) -> u8 {
         Tq1ProxyMode::Asymmetric => 0,
         Tq1ProxyMode::Popcount => 1,
         Tq1ProxyMode::Hybrid => 2,
+        Tq1ProxyMode::BitPlane => 3,
     }
 }
 
@@ -187,6 +188,7 @@ fn mode_from_tag(t: u8) -> Option<Tq1ProxyMode> {
         0 => Some(Tq1ProxyMode::Asymmetric),
         1 => Some(Tq1ProxyMode::Popcount),
         2 => Some(Tq1ProxyMode::Hybrid),
+        3 => Some(Tq1ProxyMode::BitPlane),
         _ => None,
     }
 }

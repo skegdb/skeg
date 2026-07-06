@@ -54,6 +54,26 @@ const TQ_PROXY_SCALE: f32 = 1e7;
 /// deterministic from `(dim, bits, TQ_ROTATION_SEED)`.
 const TQ_ROTATION_SEED: u64 = 0xC0DE_BEEF;
 
+/// Low-dim tq1 auto dim-expansion: a 1-bit code at native dim `d` gives only `d`
+/// bits of discrimination, too few below ~256 (glove-100: recall@100 0.79). The
+/// rotation is data-oblivious, so zero-padding the unit vector up to
+/// [`TQ1_EXPAND_TO`] before rotating projects the `d` real coords onto more
+/// random sign bits (a JL-style richer signature) - glove-100 -> 0.99 @ 1M, +~50
+/// bits RAM/vector, f32 stays native on disk. Only the 1-bit codes grow.
+const TQ1_EXPAND_BELOW: usize = 256;
+const TQ1_EXPAND_TO: usize = 512;
+
+/// Working (rotation/code) dimension for a TurboQuant tier: native `dim`, except
+/// low-dim 1-bit which expands to [`TQ1_EXPAND_TO`] for more code bits.
+#[must_use]
+fn tq_code_dim(dim: usize, bits: u8) -> usize {
+    if bits == 1 && dim < TQ1_EXPAND_BELOW {
+        TQ1_EXPAND_TO
+    } else {
+        dim
+    }
+}
+
 /// How a vector set is quantized for the flat scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantKind {
@@ -129,7 +149,17 @@ pub enum QueryCode {
     /// `c * (2 * masked_sum - q_sum)`, precomputed here so the walk does
     /// not recompute it per ADC call (6400 ADC/query x dim adds saved on
     /// the tq1 path). The 4/2-bit kernels ignore `q_sum`.
-    TurboQuant { q_rot: Vec<f32>, q_sum: f32 },
+    ///
+    /// With 1-bit anisotropy compensation, `q_rot` holds the *compensated*
+    /// query `q_rot[d]*inv_scale[d]`, `q_sum` its sum, and `qm = sum(q_raw*shift)`
+    /// the scalar shift correction (`E_hat = c*(2*masked - q_sum) - qm`). `qm = 0`
+    /// and `q_rot` unchanged when compensation is off (identity), so the kernel
+    /// contract is unchanged.
+    TurboQuant {
+        q_rot: Vec<f32>,
+        q_sum: f32,
+        qm: f32,
+    },
     /// TurboQuant 1-bit symmetric query: the rotated unit query reduced to its
     /// sign bits (`dim.div_ceil(8)` bytes, same LSB-first packing as the stored
     /// codes). Scored by Hamming popcount against a stored code. Produced only
@@ -146,6 +176,22 @@ pub enum QueryCode {
         q_bits: Vec<u8>,
         q_rot: Vec<f32>,
         q_sum: f32,
+        qm: f32,
+    },
+    /// TurboQuant 1-bit bit-plane query: the rotated query scalar-quantized to
+    /// `b` bits and transposed into `b` bit-planes (`planes[p]` is one
+    /// `dim.div_ceil(8)`-byte mask). Scored against a stored sign code by
+    /// `b + 1` integer popcounts. `m` (min), `sq` (quant step), `sum_q`
+    /// (sum of quantized levels) are the query scalars for the exact
+    /// reconstruction `q_i ~= m + sq*Q_i`. Produced for [`Tq1ProxyMode::BitPlane`].
+    TurboQuant1BitPlane {
+        planes: Vec<u8>,
+        b: u8,
+        bytes: usize,
+        m: f32,
+        sq: f32,
+        sum_q: f32,
+        qm: f32,
     },
 }
 
@@ -157,6 +203,20 @@ impl QueryCode {
     #[must_use]
     pub fn is_tq1_hybrid(&self) -> bool {
         matches!(self, QueryCode::TurboQuant1Hybrid { .. })
+    }
+
+    /// True when the proxy score is on the cosine scale (`ip * TQ_PROXY_SCALE`,
+    /// i.e. `-pscore/1e7 ~= cosine`): the asymmetric and bit-plane tq1 arms. The
+    /// adaptive rerank bound relies on this - popcount (Hamming), int8 (raw
+    /// dot), and PQ scores are NOT cosine-scaled, so the bound must not prune
+    /// them (it would compare a ~1e-3 or negative estimate to a ~0.8 threshold
+    /// and skip every remaining candidate).
+    #[must_use]
+    pub fn is_cosine_scale_proxy(&self) -> bool {
+        matches!(
+            self,
+            QueryCode::TurboQuant1BitPlane { .. } | QueryCode::TurboQuant { .. }
+        )
     }
 }
 
@@ -182,6 +242,24 @@ pub enum Tq1ProxyMode {
     /// budget on the better candidates. The preferred fast tier: it dominates
     /// pure popcount on recall at a tiny extra cost.
     Hybrid,
+    /// Asymmetric-but-integer: the query is scalar-quantized to `B` bits and
+    /// transposed into `B` bit-planes; the inner product against a stored sign
+    /// code is `B+1` integer popcounts (no f32 per candidate). Recovers most of
+    /// the asymmetric recall at a fraction of the f32-ADC latency (TurboQuant
+    /// "multi-bit query x 1-bit code"). `B` from `SKEG_TQ1_BITPLANE_B` (default 4).
+    BitPlane,
+}
+
+/// Bit-width for the [`Tq1ProxyMode::BitPlane`] query. `SKEG_TQ1_BITPLANE_B`, 1..=8, default 4.
+fn tq1_bitplane_bits() -> u8 {
+    static B: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("SKEG_TQ1_BITPLANE_B")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|b| (1..=8).contains(b))
+            .unwrap_or(4)
+    })
 }
 
 /// Minimum dimension at which the fast tq1 path (hybrid) is selected. Below it,
@@ -194,25 +272,23 @@ pub const TQ1_HYBRID_MIN_DIM: usize = 512;
 
 /// Pick the tq1 proxy mode from the static index parameters alone - decided at
 /// `VINDEX.CREATE` from `dim`, before any insert, with no reads. Only 1-bit has
-/// a choice; 2/4-bit always report `Asymmetric`. At/above the floor the hybrid
-/// (popcount walk + asym re-score) is chosen: it dominates pure popcount on
-/// recall at a tiny extra cost, so raw popcount is never the auto-default.
+/// a choice; 2/4-bit always report `Asymmetric`. The 1-bit default is BitPlane
+/// (B-bit integer asymmetric ADC): it matches asymmetric recall at ~40% lower
+/// p50 and dominates the old dim-gated popcount/hybrid switch at every dim, so
+/// it is a single mode with no dimensional special-casing.
 #[must_use]
 pub fn tq1_proxy_mode_for(dim: usize, bits: u8) -> Tq1ProxyMode {
+    let _ = dim; // no longer dimension-gated; kept for API/signature stability
     if bits != 1 {
         return Tq1ProxyMode::Asymmetric;
     }
-    // Benchmark/tuning hook: `SKEG_TQ1_MODE=pop|hybrid|asym` forces the 1-bit
-    // proxy so the recall/latency of each can be measured on one built index.
-    // Read once (OnceLock) - zero per-query cost, no effect when unset.
+    // Benchmark/tuning hook: `SKEG_TQ1_MODE=pop|hybrid|asym|bitplane` forces the
+    // 1-bit proxy so each can be measured on one built index. Read once
+    // (OnceLock) - zero per-query cost, no effect when unset.
     if let Some(m) = tq1_mode_override() {
         return m;
     }
-    if dim >= TQ1_HYBRID_MIN_DIM {
-        Tq1ProxyMode::Hybrid
-    } else {
-        Tq1ProxyMode::Asymmetric
-    }
+    Tq1ProxyMode::BitPlane
 }
 
 fn tq1_mode_override() -> Option<Tq1ProxyMode> {
@@ -221,6 +297,7 @@ fn tq1_mode_override() -> Option<Tq1ProxyMode> {
         Some("pop" | "popcount") => Some(Tq1ProxyMode::Popcount),
         Some("hybrid") => Some(Tq1ProxyMode::Hybrid),
         Some("asym" | "asymmetric") => Some(Tq1ProxyMode::Asymmetric),
+        Some("bitplane" | "bp") => Some(Tq1ProxyMode::BitPlane),
         _ => None,
     })
 }
@@ -271,6 +348,9 @@ enum QuantRepr {
         bits: u8,
         /// Bytes per stored code = `dim * bits / 8`.
         code_bytes: usize,
+        /// 1-bit anisotropy compensation `(shift, inv_scale)`; identity (empty)
+        /// unless `SKEG_TQ1_ANISO` is set and `bits == 1`.
+        aniso: Tq1Aniso,
     },
 }
 
@@ -321,6 +401,32 @@ fn normalize_into(v: &[f32], out: &mut [f32]) {
             *o = x / norm;
         }
     }
+}
+
+/// QuIVer: rotated-sign metric vectors for graph construction. Each row is the
+/// tq1 sign pattern (`+/-1`) of `FastRotation(unit(v))` - the *same* signs the
+/// 1-bit code stores. Squared-L2 on `{+/-1}` vectors is `4*Hamming`, so f32
+/// cosine/L2 distance on these ranks monotone in the popcount distance the
+/// 1-bit walk navigates with. Building the Vamana graph on this metric (instead
+/// of exact f32) co-designs the topology with the quantizer, so the cheap
+/// popcount walk can actually follow its edges (QuIVer, arXiv 2605.02171).
+/// Data-oblivious rotation (seed [`TQ_ROTATION_SEED`]) - no dependence on the
+/// quant tier, computed straight from the f32 rows at build time.
+#[must_use]
+pub fn tq1_sign_metric_vectors(vectors: &[f32], n: usize, dim: usize) -> Vec<f32> {
+    let rotation = FastRotation::new(dim, TQ_ROTATION_SEED);
+    let mut out = vec![0.0f32; n * dim];
+    out.par_chunks_mut(dim)
+        .zip(vectors.par_chunks(dim))
+        .for_each(|(o, row)| {
+            let mut unit = vec![0.0f32; dim];
+            normalize_into(row, &mut unit);
+            let rot = rotation.apply_alloc(&unit);
+            for (oi, &r) in o.iter_mut().zip(&rot) {
+                *oi = if r >= 0.0 { 1.0 } else { -1.0 };
+            }
+        });
+    out
 }
 
 /// Lloyd's k-means over `n` rows of `dim` (flat `points`), `k` centroids,
@@ -466,6 +572,164 @@ fn turboquant_levels(dim: usize, bits: u8) -> (Vec<f32>, Vec<f32>) {
     (centroids, boundaries)
 }
 
+/// Anisotropy compensation for 1-bit TurboQuant: per-coordinate `(shift,
+/// inv_scale)` learned from a bounded sample of rotated coords. Empty vecs =
+/// identity (the legacy path).
+///
+/// MEASURED NULL RESULT (2026-07-04, `SKEG_TQ1_MODE=asym`, mxbai-100k /
+/// qwen3-20k): full shift+scale collapses recall (qwen3 0.966->0.022 - the
+/// shift term drives the per-vector renorm `inner` toward zero on mean-heavy
+/// data). Scale-only is stable but flat/negative (mxbai 0.970->0.970, qwen3
+/// 0.966->0.953). The article's +6-9pp assume an 8-bit *quantized* query;
+/// skeg's asym path already uses an f32 query + `norm/inner` renorm, so the
+/// headroom compensation would fill is already filled. Kept flag-gated
+/// (`SKEG_TQ1_ANISO`, `SKEG_TQ1_SHIFT`) for reproducibility; do not enable
+/// expecting a win on the f32-asym path. `inv_scale[d] = 1/scale[d] = sqrt(dim)*sigma_d`;
+/// stored as the reciprocal so the query hot-path multiplies. Applied ONLY on
+/// the encode self-inner and the asymmetric query (never the popcount walk -
+/// per-coord weights break the uniform-weight Hamming). See the article's
+/// "Trick 3": on N(0,1/dim) data it collapses to identity, adding no noise.
+#[derive(Debug, Default, Clone)]
+pub struct Tq1Aniso {
+    shift: Vec<f32>,
+    inv_scale: Vec<f32>,
+    /// Pre-rotation mean (unit-vector space). Non-empty => subtract from the
+    /// unit vector BEFORE rotation on both encode and query (Pleshkov-style
+    /// centering on the RAW distribution, where the mean is meaningful - unlike
+    /// the post-rotation shift). Decoupled from shift/inv_scale.
+    center: Vec<f32>,
+}
+
+impl Tq1Aniso {
+    #[must_use]
+    fn is_identity(&self) -> bool {
+        self.inv_scale.is_empty()
+    }
+    #[must_use]
+    fn has_center(&self) -> bool {
+        !self.center.is_empty()
+    }
+    fn bytes(&self) -> usize {
+        (self.shift.len() + self.inv_scale.len() + self.center.len()) * 4
+    }
+}
+
+/// `sqrt(2/pi)` - the standardized 1-bit Lloyd-Max level; `Phi(+/-C_STD)` gives
+/// the codebook-edge quantile probabilities used for calibration.
+const TQ1_C_STD: f32 = 0.797_884_6;
+const TQ1_P_LO: f32 = 0.212_47; // Phi(-C_STD)
+const TQ1_P_HI: f32 = 0.787_53; // Phi(+C_STD)
+const TQ1_CALIB_SAMPLE: usize = 8192;
+const TQ1_CALIB_MIN: usize = 256; // below -> identity (too few to calibrate)
+const TQ1_INV_MIN: f32 = 0.125;
+const TQ1_INV_MAX: f32 = 8.0;
+
+/// Interpolated order statistic of a pre-sorted slice.
+fn quantile_sorted(sorted: &[f32], p: f32) -> f32 {
+    let n = sorted.len();
+    let h = (n as f32 - 1.0) * p;
+    let i = h.floor() as usize;
+    let frac = h - h.floor();
+    if i + 1 >= n {
+        sorted[n - 1]
+    } else {
+        sorted[i] + (sorted[i + 1] - sorted[i]) * frac
+    }
+}
+
+/// Calibrate `(shift, inv_scale)` from `sample` rows of ROTATED coords (each
+/// `dim`). Codebook-edge quantiles per coordinate; collapses to identity on
+/// isotropic N(0,1/dim). Returns identity `Tq1Aniso` if the sample is too small.
+fn calibrate_tq1(sample: &[f32], n_rows: usize, dim: usize) -> Tq1Aniso {
+    if n_rows < TQ1_CALIB_MIN {
+        return Tq1Aniso::default();
+    }
+    let c_outer = TQ1_C_STD / (dim as f32).sqrt();
+    let mut shift = vec![0.0f32; dim];
+    let mut inv_scale = vec![1.0f32; dim];
+    let mut col = vec![0.0f32; n_rows];
+    for d in 0..dim {
+        for (r, c) in col.iter_mut().enumerate() {
+            *c = sample[r * dim + d];
+        }
+        col.sort_unstable_by(f32::total_cmp);
+        let q_lo = quantile_sorted(&col, TQ1_P_LO);
+        let q_hi = quantile_sorted(&col, TQ1_P_HI);
+        let range = q_hi - q_lo;
+        if range < 1e-6 {
+            inv_scale[d] = 0.0; // dead coord: drop from E_hat and qm
+            continue;
+        }
+        inv_scale[d] = (range / (2.0 * c_outer)).clamp(TQ1_INV_MIN, TQ1_INV_MAX);
+        // Shift (mean removal) is opt-in: folding it into the per-vector renorm
+        // `scale = norm/inner` can drive `inner` toward zero on mean-heavy /
+        // extreme-anisotropy data (qwen3), which blows up the scale and wrecks
+        // recall. Scale-only compensation keeps `inner` strictly positive and is
+        // the stable default; SKEG_TQ1_SHIFT=on re-enables the shift term.
+        if tq1_shift_enabled() {
+            shift[d] = -0.5 * (q_lo + q_hi);
+        }
+    }
+    Tq1Aniso {
+        shift,
+        inv_scale,
+        center: Vec::new(),
+    }
+}
+
+/// Opt-in for the anisotropy *shift* term (mean removal). Off by default -
+/// scale-only compensation is numerically stable; shift can destabilize the
+/// per-vector renorm on mean-heavy data.
+fn tq1_shift_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_SHIFT").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+    })
+}
+
+/// Opt-in for pre-rotation mean centering (subtract corpus mean in unit space
+/// before rotation, both sides). Off by default. First-pass ranking experiment.
+fn tq1_center_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_CENTER").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+    })
+}
+
+/// Read the SKEG_TQ1_ANISO opt-in once. Off by default.
+fn tq1_aniso_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_ANISO").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+    })
+}
+
+/// Bit-plane inner-product primitive: returns `(sum_p 2^p*popcount(plane_p AND
+/// code), popcount(code))`. `b+1` popcount passes over `bytes`-byte masks.
+fn tq1_bitplane_score(planes: &[u8], b: u8, bytes: usize, code: &[u8]) -> (u64, u32) {
+    let code_pc: u32 = code.iter().map(|c| c.count_ones()).sum();
+    let mut weighted = 0u64;
+    for p in 0..b as usize {
+        let plane = &planes[p * bytes..(p + 1) * bytes];
+        let pc: u64 = plane
+            .iter()
+            .zip(code)
+            .map(|(&pl, &cd)| u64::from((pl & cd).count_ones()))
+            .sum();
+        weighted += pc << p;
+    }
+    (weighted, code_pc)
+}
+
 /// Map a coordinate to its `2^bits` bucket index using sorted boundaries.
 /// For 1-bit (`boundaries.is_empty()`) the threshold is exactly zero.
 fn turboquant_bucket(x: f32, boundaries: &[f32]) -> usize {
@@ -501,19 +765,50 @@ fn turboquant_encode_vec(
     rotation: &FastRotation,
     centroids: &[f32],
     boundaries: &[f32],
+    aniso: &Tq1Aniso,
 ) -> (Vec<u8>, f32) {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let inv = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+    // Raw-space centering (Pleshkov): subtract the corpus mean mu from the RAW
+    // vector, THEN normalize - removes the dominant embedding-mean direction
+    // before it hits the sphere. Bits then land on the discriminative residual.
+    // Without centering this is the plain unit-normalize.
     let mut unit = vec![0.0f32; dim];
-    for (u, &x) in unit.iter_mut().zip(v.iter()) {
-        *u = x * inv;
+    if aniso.has_center() {
+        for ((u, &x), &m) in unit.iter_mut().zip(v.iter()).zip(aniso.center.iter()) {
+            *u = x - m;
+        }
+    } else {
+        unit.copy_from_slice(v);
     }
-    let rotated = rotation.apply_alloc(&unit);
+    let norm = unit.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let inv = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+    for u in &mut unit {
+        *u *= inv;
+    }
+    // Low-dim expansion: zero-pad the unit vector up to the rotation's working
+    // dim (zeros don't change the norm) before rotating. No-op when equal.
+    let rotated = if rotation.dim() == dim {
+        rotation.apply_alloc(&unit)
+    } else {
+        let mut padded = vec![0.0f32; rotation.dim()];
+        padded[..dim].copy_from_slice(&unit);
+        rotation.apply_alloc(&padded)
+    };
     let mut code = vec![0u8; code_bytes];
     let mut inner = 0.0f32;
+    // 1-bit + compensation: the stored bit stays sign(r). The per-vector scale
+    // uses the SCALE-only reconstruction r_est = c_outer*sign(r)*inv_scale, i.e.
+    // inner = c_outer*sum(|r|*inv_scale). The shift (mean removal) is a
+    // QUERY-side scalar (qm) only, decoupled from the renorm - folding it into
+    // `inner` drives it toward zero on mean-heavy data (Pleshkov's method keeps
+    // the stored scale as the plain RaBitQ renorm).
+    let comp = bits == 1 && !aniso.is_identity();
     for (i, &r) in rotated.iter().enumerate() {
         let bucket = turboquant_bucket(r, boundaries);
-        inner += r * centroids[bucket];
+        if comp {
+            inner += r.abs() * centroids[1] * aniso.inv_scale[i];
+        } else {
+            inner += r * centroids[bucket];
+        }
         turboquant_pack(&mut code, i, bucket, bits);
     }
     let inner = inner.max(1e-10);
@@ -535,10 +830,47 @@ fn build_turboquant(f32_data: &[f32], dim: usize, bits: u8) -> QuantRepr {
         bits
     );
     let n = f32_data.len() / dim;
-    let code_bytes = dim * (bits as usize) / 8;
-    let rotation = Box::new(FastRotation::new(dim, TQ_ROTATION_SEED));
-    let (centroids, boundaries) = turboquant_levels(dim, bits);
+    // Low-dim 1-bit expands the working dim: rotation, codes, and Lloyd-Max
+    // levels all operate at `rot_dim`; only the input rows stay native `dim`
+    // (padded per-vector in encode). rot_dim == dim for the normal path.
+    let rot_dim = tq_code_dim(dim, bits);
+    let code_bytes = rot_dim * (bits as usize) / 8;
+    let rotation = Box::new(FastRotation::new(rot_dim, TQ_ROTATION_SEED));
+    let (centroids, boundaries) = turboquant_levels(rot_dim, bits);
     let (centroids_i8, i8_scale) = quantise_tq_centroids(&centroids, bits);
+    let mut aniso = if bits == 1 && tq1_aniso_enabled() && tq_code_dim(dim, bits) == dim {
+        let s = n.min(TQ1_CALIB_SAMPLE);
+        let step = (n / s.max(1)).max(1);
+        let mut sample = vec![0.0f32; s * dim];
+        let mut unit = vec![0.0f32; dim];
+        for j in 0..s {
+            normalize_into(
+                &f32_data[(j * step) * dim..(j * step) * dim + dim],
+                &mut unit,
+            );
+            let rot = rotation.apply_alloc(&unit);
+            sample[j * dim..(j + 1) * dim].copy_from_slice(&rot);
+        }
+        calibrate_tq1(&sample, s, dim)
+    } else {
+        Tq1Aniso::default()
+    };
+    // Raw-space centering: mu = mean of the corpus RAW vectors (sampled).
+    if bits == 1 && n >= TQ1_CALIB_MIN && tq1_center_enabled() {
+        let s = n.min(TQ1_CALIB_SAMPLE);
+        let step = (n / s.max(1)).max(1);
+        let mut mean = vec![0.0f32; dim];
+        for j in 0..s {
+            let row = &f32_data[(j * step) * dim..(j * step) * dim + dim];
+            for (m, &x) in mean.iter_mut().zip(row.iter()) {
+                *m += x;
+            }
+        }
+        for m in &mut mean {
+            *m /= s as f32;
+        }
+        aniso.center = mean;
+    }
 
     let encoded: Vec<(Vec<u8>, f32)> = (0..n)
         .into_par_iter()
@@ -551,6 +883,7 @@ fn build_turboquant(f32_data: &[f32], dim: usize, bits: u8) -> QuantRepr {
                 &rotation,
                 &centroids,
                 &boundaries,
+                &aniso,
             )
         })
         .collect();
@@ -570,6 +903,7 @@ fn build_turboquant(f32_data: &[f32], dim: usize, bits: u8) -> QuantRepr {
         i8_scale,
         bits,
         code_bytes,
+        aniso,
     }
 }
 
@@ -849,9 +1183,11 @@ impl QuantizedVectors {
             codes_per_byte,
             bits
         );
-        let code_bytes = dim * (bits as usize) / 8;
-        let rotation = Box::new(FastRotation::new(dim, TQ_ROTATION_SEED));
-        let (centroids, boundaries) = turboquant_levels(dim, bits);
+        // Low-dim 1-bit expands the working dim (see `build_turboquant`).
+        let rot_dim = tq_code_dim(dim, bits);
+        let code_bytes = rot_dim * (bits as usize) / 8;
+        let rotation = Box::new(FastRotation::new(rot_dim, TQ_ROTATION_SEED));
+        let (centroids, boundaries) = turboquant_levels(rot_dim, bits);
         let (centroids_i8, i8_scale) = quantise_tq_centroids(&centroids, bits);
         if n == 0 {
             return Ok(QuantizedVectors {
@@ -867,15 +1203,13 @@ impl QuantizedVectors {
                     i8_scale,
                     bits,
                     code_bytes,
+                    aniso: Tq1Aniso::default(),
                 },
             });
         }
         let mut codes_buf: Vec<u8> = Vec::with_capacity(n * code_bytes);
         let mut scales: Vec<f32> = Vec::with_capacity(n);
-        // Single pass: encode each row as it arrives. No training pass needed
-        // (data-oblivious). Sequential because the input stream is sequential;
-        // parallelism would require buffering all rows.
-        for_each_row(&mut |row| {
+        let enc = |row: &[f32], aniso: &Tq1Aniso, codes: &mut Vec<u8>, scales: &mut Vec<f32>| {
             let (c, s) = turboquant_encode_vec(
                 row,
                 dim,
@@ -884,10 +1218,63 @@ impl QuantizedVectors {
                 &rotation,
                 &centroids,
                 &boundaries,
+                aniso,
             );
-            codes_buf.extend_from_slice(&c);
+            codes.extend_from_slice(&c);
             scales.push(s);
-        })?;
+        };
+        let aniso = if bits == 1 && tq1_aniso_enabled() && tq_code_dim(dim, bits) == dim {
+            // Buffered single pass: collect rows until the calibration sample is
+            // full, calibrate, encode the buffered rows, then encode the rest on
+            // the fly. Bounded extra RAM = TQ1_CALIB_SAMPLE * dim f32.
+            let sample_rows = n.min(TQ1_CALIB_SAMPLE);
+            let mut buf: Vec<f32> = Vec::with_capacity(sample_rows * dim);
+            let mut sample: Vec<f32> = Vec::with_capacity(sample_rows * dim);
+            let mut unit = vec![0.0f32; dim];
+            let mut calib: Option<Tq1Aniso> = None;
+            for_each_row(&mut |row| {
+                if let Some(a) = &calib {
+                    enc(row, a, &mut codes_buf, &mut scales);
+                } else {
+                    buf.extend_from_slice(row);
+                    normalize_into(row, &mut unit);
+                    sample.extend_from_slice(&rotation.apply_alloc(&unit));
+                    if buf.len() / dim >= sample_rows {
+                        let a = calibrate_tq1(&sample, buf.len() / dim, dim);
+                        for j in 0..buf.len() / dim {
+                            enc(
+                                &buf[j * dim..(j + 1) * dim],
+                                &a,
+                                &mut codes_buf,
+                                &mut scales,
+                            );
+                        }
+                        buf.clear();
+                        calib = Some(a);
+                    }
+                }
+            })?;
+            // Stream ended before the sample filled (n <= sample never triggers
+            // the mid-loop flush): calibrate and encode whatever was buffered.
+            if calib.is_none() {
+                let rows = buf.len() / dim;
+                let a = calibrate_tq1(&sample, rows, dim);
+                for j in 0..rows {
+                    enc(
+                        &buf[j * dim..(j + 1) * dim],
+                        &a,
+                        &mut codes_buf,
+                        &mut scales,
+                    );
+                }
+                calib = Some(a);
+            }
+            calib.unwrap_or_default()
+        } else {
+            let identity = Tq1Aniso::default();
+            for_each_row(&mut |row| enc(row, &identity, &mut codes_buf, &mut scales))?;
+            identity
+        };
         debug_assert_eq!(scales.len(), n, "streamed row count disagrees with n");
         Ok(QuantizedVectors {
             dim,
@@ -902,6 +1289,7 @@ impl QuantizedVectors {
                 i8_scale,
                 bits,
                 code_bytes,
+                aniso,
             },
         })
     }
@@ -932,6 +1320,7 @@ impl QuantizedVectors {
                 scales,
                 centroids,
                 boundaries,
+                aniso,
                 ..
             } => {
                 // FastRotation stores only three dim-bit sign masks and a
@@ -943,6 +1332,7 @@ impl QuantizedVectors {
                     + centroids.len() * 4
                     + boundaries.len() * 4
                     + rot_bytes
+                    + aniso.bytes()
             }
         }
     }
@@ -1041,6 +1431,20 @@ impl QuantizedVectors {
         }
     }
 
+    /// 1-bit reconstruction quality g = inner/v = 1/scale for a row (RaBitQ
+    /// per-vector confidence; high g = code aligns well, tight error bound).
+    #[must_use]
+    pub fn tq1_recon_g(&self, row: usize) -> Option<f32> {
+        match &self.repr {
+            QuantRepr::TurboQuant {
+                bits: 1, scales, ..
+            } => scales
+                .get(row)
+                .map(|s| if *s > 0.0 { 1.0 / *s } else { 0.0 }),
+            _ => None,
+        }
+    }
+
     /// Row-major 4-bit codes (dim/2 bytes per vector). Caller is
     /// responsible for interleaving them into the block layout via
     /// `skeg_simd::interleave_tq4_codes` before scoring.
@@ -1120,34 +1524,115 @@ impl QuantizedVectors {
                 }
                 QueryCode::Pq(lut)
             }
-            QuantRepr::TurboQuant { rotation, bits, .. } => {
+            QuantRepr::TurboQuant {
+                rotation,
+                bits,
+                aniso,
+                ..
+            } => {
                 let mut unit = vec![0.0f32; self.dim];
-                normalize_into(query, &mut unit);
-                let q_rot = rotation.apply_alloc(&unit);
+                if aniso.has_center() {
+                    // Raw-space centering: subtract mu from the raw query, THEN
+                    // normalize (mirrors encode).
+                    for ((u, &x), &m) in unit.iter_mut().zip(query.iter()).zip(aniso.center.iter())
+                    {
+                        *u = x - m;
+                    }
+                    let n = unit.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let inv = if n > 1e-10 { 1.0 / n } else { 0.0 };
+                    for u in &mut unit {
+                        *u *= inv;
+                    }
+                } else {
+                    normalize_into(query, &mut unit);
+                }
+                // Low-dim expansion: zero-pad the unit query to the rotation's
+                // working dim before rotating (mirrors encode). No-op when equal.
+                let q_rot = if rotation.dim() == self.dim {
+                    rotation.apply_alloc(&unit)
+                } else {
+                    let mut padded = vec![0.0f32; rotation.dim()];
+                    padded[..self.dim].copy_from_slice(&unit);
+                    rotation.apply_alloc(&padded)
+                };
+                // Anisotropy compensation folds onto the ASYMMETRIC query only:
+                // q_plus[d] = q_rot[d]*inv_scale[d], qm = sum(q_rot*shift). The
+                // popcount sign bits use the RAW q_rot (walk stays uncompensated).
+                // Identity when compensation is off -> byte-identical legacy query.
+                let compensate = |q_rot: &[f32]| -> (Vec<f32>, f32, f32) {
+                    if aniso.is_identity() {
+                        return (q_rot.to_vec(), q_rot.iter().sum(), 0.0);
+                    }
+                    let mut qp = vec![0.0f32; q_rot.len()];
+                    let (mut s, mut qm) = (0.0f32, 0.0f32);
+                    for d in 0..q_rot.len() {
+                        qp[d] = q_rot[d] * aniso.inv_scale[d];
+                        s += qp[d];
+                        qm += q_rot[d] * aniso.shift[d];
+                    }
+                    (qp, s, qm)
+                };
                 let mode = mode_override.unwrap_or_else(|| tq1_proxy_mode_for(self.dim, *bits));
                 match mode {
                     Tq1ProxyMode::Popcount => {
                         // Same sign-bit packing as the stored codes, so a
                         // Hamming popcount counts sign disagreements.
-                        let mut q_bits = vec![0u8; self.dim.div_ceil(8)];
+                        let mut q_bits = vec![0u8; rotation.dim().div_ceil(8)];
                         pack_signs(&q_rot, &mut q_bits);
                         QueryCode::TurboQuant1Popcount { q_bits }
                     }
                     Tq1ProxyMode::Hybrid => {
-                        // Carry both: sign bits for the popcount walk, q_rot/q_sum
-                        // for the asym re-score of the survivors.
-                        let mut q_bits = vec![0u8; self.dim.div_ceil(8)];
+                        // Sign bits (raw) for the popcount walk; compensated
+                        // q_plus/q_sum/qm for the asym re-score of survivors.
+                        let mut q_bits = vec![0u8; rotation.dim().div_ceil(8)];
                         pack_signs(&q_rot, &mut q_bits);
-                        let q_sum = q_rot.iter().sum();
+                        let (q_plus, q_sum, qm) = compensate(&q_rot);
                         QueryCode::TurboQuant1Hybrid {
                             q_bits,
-                            q_rot,
+                            q_rot: q_plus,
                             q_sum,
+                            qm,
                         }
                     }
                     Tq1ProxyMode::Asymmetric => {
-                        let q_sum = q_rot.iter().sum();
-                        QueryCode::TurboQuant { q_rot, q_sum }
+                        let (q_plus, q_sum, qm) = compensate(&q_rot);
+                        QueryCode::TurboQuant {
+                            q_rot: q_plus,
+                            q_sum,
+                            qm,
+                        }
+                    }
+                    Tq1ProxyMode::BitPlane => {
+                        // Scalar-quantize the (optionally compensated) query to
+                        // b bits and transpose into b sign-aligned bit-planes.
+                        let (q_plus, _, qm) = compensate(&q_rot);
+                        let b = tq1_bitplane_bits();
+                        let bytes = rotation.dim().div_ceil(8);
+                        let levels = ((1u32 << b) - 1) as f32;
+                        let m = q_plus.iter().copied().fold(f32::INFINITY, f32::min);
+                        let mx = q_plus.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let sq = (mx - m).max(1e-20) / levels;
+                        let mut planes = vec![0u8; b as usize * bytes];
+                        let mut sum_q = 0.0f32;
+                        for (i, &q) in q_plus.iter().enumerate() {
+                            let qi = (((q - m) / sq).round() as i32).clamp(0, levels as i32) as u32;
+                            sum_q += qi as f32;
+                            let (byte, bit) = (i / 8, i % 8);
+                            for p in 0..b as usize {
+                                if (qi >> p) & 1 == 1 {
+                                    planes[p * bytes + byte] |= 1u8 << bit;
+                                }
+                            }
+                        }
+                        QueryCode::TurboQuant1BitPlane {
+                            planes,
+                            b,
+                            bytes,
+                            m,
+                            sq,
+                            sum_q,
+                            qm,
+                        }
                     }
                 }
             }
@@ -1198,7 +1683,7 @@ impl QuantizedVectors {
                     code_bytes,
                     ..
                 },
-                QueryCode::TurboQuant { q_rot, q_sum },
+                QueryCode::TurboQuant { q_rot, q_sum, qm },
             ) => {
                 // Asymmetric inner product: for each coord, multiply the
                 // rotated query coord by the Lloyd-Max centroid keyed by the
@@ -1209,19 +1694,23 @@ impl QuantizedVectors {
                     // 4-bit and 2-bit: NEON `vqtbl1q_s8` kernel - 16
                     // parallel centroid lookups + f32x4 FMA per chunk.
                     // Centroid i8 quantization introduces ~1.5% MSE, gated.
-                    4 => tq4_adc_i8(code, centroids_i8, *i8_scale, q_rot, self.dim),
-                    2 => tq2_adc_i8(code, centroids_i8, *i8_scale, q_rot, self.dim),
+                    // q_rot.len() = working (rotation) dim: == self.dim except
+                    // low-dim 1-bit expansion where the code is wider.
+                    4 => tq4_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
+                    2 => tq2_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
                     // 1-bit: algebraic reduction `c * (2*masked - q_sum)`.
                     // q_sum precomputed at query time; SWAR scalar inner.
-                    1 => tq1_adc_swar(code, centroids, q_rot, self.dim, *q_sum),
+                    1 => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),
                     // `build_turboquant` asserts bits in {1, 2, 4}.
                     _ => unreachable!("TurboQuant bits must be in {{1, 2, 4}}"),
                 };
-                let ip = scales[row] * acc;
-                // Greater inner product = closer. Clamp into a safe range so
-                // adversarial scales never overflow i32 - unit vectors give
-                // |ip| <= 1, the clamp at 4.0 leaves ample headroom.
-                (ip.clamp(-4.0, 4.0) * TQ_PROXY_SCALE) as i32
+                // `qm` is the anisotropy shift correction (0 without it, so the
+                // legacy path is unchanged); E_hat = acc - qm.
+                let ip = scales[row] * (acc - qm);
+                // Greater inner product = closer. Clamp wide enough for
+                // compensated queries (inv_scale up to 8 lifts |ip| past 1);
+                // 32*1e7 << i32::MAX so no overflow.
+                (ip.clamp(-32.0, 32.0) * TQ_PROXY_SCALE) as i32
             }
             (
                 QuantRepr::TurboQuant {
@@ -1237,6 +1726,38 @@ impl QuantizedVectors {
                 let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
                 let h = hamming_binary(q_bits, code);
                 -i32::try_from(h).expect("hamming distance fits i32")
+            }
+            (
+                QuantRepr::TurboQuant {
+                    codes,
+                    scales,
+                    centroids,
+                    code_bytes,
+                    bits: 1,
+                    ..
+                },
+                QueryCode::TurboQuant1BitPlane {
+                    planes,
+                    b,
+                    bytes,
+                    m,
+                    sq,
+                    sum_q,
+                    qm,
+                },
+            ) => {
+                // Asymmetric integer ADC: <q, s> reconstructed from b bit-planes.
+                // <q,s> = m*(2*pc(code)-dim) + sq*(2*weighted - sum_q); decoded
+                // level is c_outer = centroids[1]. Matches tq1_adc_swar as b->inf.
+                // qm = anisotropy shift correction (0 without it); E_hat = c*dot - qm.
+                let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
+                let (weighted, code_pc) = tq1_bitplane_score(planes, *b, *bytes, code);
+                // code_bytes*8 = working (rotation) dim (wider than self.dim
+                // under low-dim 1-bit expansion); code_pc counts over it.
+                let dot = m * (2.0 * code_pc as f32 - (code_bytes * 8) as f32)
+                    + sq * (2.0 * weighted as f32 - sum_q);
+                let ip = scales[row] * (centroids[1] * dot - qm);
+                (ip.clamp(-32.0, 32.0) * TQ_PROXY_SCALE) as i32
             }
             (
                 QuantRepr::TurboQuant {
@@ -1277,13 +1798,15 @@ impl QuantizedVectors {
                     bits: 1,
                     ..
                 },
-                QueryCode::TurboQuant1Hybrid { q_rot, q_sum, .. },
+                QueryCode::TurboQuant1Hybrid {
+                    q_rot, q_sum, qm, ..
+                },
             ) => {
                 assert!(row < self.n, "row out of range");
                 let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
-                let acc = tq1_adc_swar(code, centroids, q_rot, self.dim, *q_sum);
-                let ip = scales[row] * acc;
-                (ip.clamp(-4.0, 4.0) * TQ_PROXY_SCALE) as i32
+                let acc = tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum);
+                let ip = scales[row] * (acc - qm);
+                (ip.clamp(-32.0, 32.0) * TQ_PROXY_SCALE) as i32
             }
             // Every non-hybrid mode ranks by the same proxy it walked with.
             _ => self.proxy(row, code),
@@ -1306,6 +1829,83 @@ impl QuantizedVectors {
 mod tests {
     use super::*;
 
+    /// Anisotropy calibration must collapse to identity on N(0,1/dim) and
+    /// up-weight (not down-weight) a high-variance coordinate.
+    #[test]
+    fn calibrate_collapses_to_identity_and_scales_variance() {
+        let dim = 256;
+        let rows = 8192;
+        // Box-Muller N(0, 1/dim) samples (post-rotation target variance).
+        let sd = 1.0 / (dim as f32).sqrt();
+        let mut s: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut nrm = || {
+            let mut u = |b: u32| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (((s >> b) & 0xFF_FFFF) as f32) / (0x100_0000 as f32)
+            };
+            let (u1, u2) = (u(8).max(1e-9), u(32));
+            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+        };
+        let mut sample = vec![0.0f32; rows * dim];
+        for v in &mut sample {
+            *v = sd * nrm();
+        }
+        let a = calibrate_tq1(&sample, rows, dim);
+        // isotropic -> identity (shift~0, inv_scale~1)
+        for d in 0..dim {
+            assert!(
+                a.shift[d].abs() < 0.05 * sd,
+                "shift[{d}]={} too large",
+                a.shift[d]
+            );
+            assert!(
+                (a.inv_scale[d] - 1.0).abs() < 0.15,
+                "inv_scale[{d}]={}",
+                a.inv_scale[d]
+            );
+        }
+        // Double one coord's std -> inv_scale ~ 2.0 (UP-weight; 0.5 = inverted bug).
+        for r in 0..rows {
+            sample[r * dim + 7] *= 2.0;
+        }
+        let a2 = calibrate_tq1(&sample, rows, dim);
+        assert!(
+            (a2.inv_scale[7] - 2.0).abs() < 0.3,
+            "2x-std inv_scale={} (want ~2.0)",
+            a2.inv_scale[7]
+        );
+        // too-small sample -> identity
+        assert!(calibrate_tq1(&sample, TQ1_CALIB_MIN - 1, dim).is_identity());
+    }
+
+    /// The bit-plane primitive must reconstruct `sum_{code_i=1} Q_i` exactly:
+    /// that is what makes `<q,s> = m*(2*pc-dim) + sq*(2*weighted - sum_q)` equal
+    /// the asymmetric ADC. A wrong plane/AND alignment would corrupt ranking.
+    #[test]
+    fn bitplane_score_reconstructs_masked_sum() {
+        let dim = 8;
+        let b = 3u8;
+        let bytes = 1;
+        // Stored sign code: coords 0, 2, 5 are "positive" (bit set).
+        let code = [0b0010_0101u8];
+        // Per-coord 3-bit query levels.
+        let q = [5u32, 1, 3, 4, 6, 7, 2, 0];
+        let mut planes = vec![0u8; b as usize * bytes];
+        for (i, &qi) in q.iter().enumerate() {
+            for p in 0..b as usize {
+                if (qi >> p) & 1 == 1 {
+                    planes[p * bytes] |= 1u8 << i;
+                }
+            }
+        }
+        let (weighted, code_pc) = tq1_bitplane_score(&planes, b, bytes, &code);
+        // sum over set coords {0,2,5}: 5 + 3 + 7 = 15; popcount(code) = 3.
+        assert_eq!(weighted, 15, "weighted masked sum");
+        assert_eq!(code_pc, 3, "code popcount");
+    }
+
     /// Deterministic pseudo-random unit vectors, `n` of dimension `dim`.
     fn unit_rows(n: usize, dim: usize) -> Vec<f32> {
         let mut data = vec![0.0f32; n * dim];
@@ -1326,47 +1926,56 @@ mod tests {
     }
 
     #[test]
-    fn tq1_auto_proxy_picks_by_dim() {
-        // Below the threshold: asymmetric (safe default), f32 query code.
-        let lo = unit_rows(4, 384);
-        let q_lo = QuantizedVectors::build(&lo, 384, QuantKind::TurboQuant { bits: 1 });
-        assert_eq!(q_lo.tq1_proxy_mode(), Some(Tq1ProxyMode::Asymmetric));
-        assert!(matches!(
-            q_lo.quantize_query(&lo[..384]),
-            QueryCode::TurboQuant { .. }
-        ));
-
-        // At/above the floor: hybrid, dual query code (sign bits + q_rot).
-        for dim in [1024usize, 2560] {
+    fn tq1_auto_proxy_is_bitplane_at_every_dim() {
+        // 1-bit default is BitPlane at every dim (no dimensional switch), with
+        // the integer bit-plane query code. Each dim's proxy ranks a vector
+        // highest against itself.
+        for dim in [384usize, 1024, 2560] {
             let data = unit_rows(8, dim);
             let qv = QuantizedVectors::build(&data, dim, QuantKind::TurboQuant { bits: 1 });
             assert_eq!(
                 qv.tq1_proxy_mode(),
-                Some(Tq1ProxyMode::Hybrid),
-                "dim {dim} should select hybrid"
+                Some(Tq1ProxyMode::BitPlane),
+                "dim {dim} should select bit-plane"
             );
             let code = qv.quantize_query(&data[3 * dim..4 * dim]);
-            assert!(matches!(code, QueryCode::TurboQuant1Hybrid { .. }));
-            // Both the popcount walk proxy and the asymmetric re-score must rank
-            // a vector highest against itself.
-            let self_best = |f: &dyn Fn(usize) -> i32| {
-                (0..8).map(f).enumerate().max_by_key(|&(_, s)| s).unwrap().0
-            };
-            assert_eq!(
-                self_best(&|r| qv.proxy(r, &code)),
-                3,
-                "walk proxy self-rank"
-            );
-            assert_eq!(
-                self_best(&|r| qv.proxy_rescore(r, &code)),
-                3,
-                "asym re-score self-rank"
-            );
+            assert!(matches!(code, QueryCode::TurboQuant1BitPlane { .. }));
+            let self_best = (0..8)
+                .map(|r| qv.proxy(r, &code))
+                .enumerate()
+                .max_by_key(|&(_, s)| s)
+                .unwrap()
+                .0;
+            assert_eq!(self_best, 3, "bit-plane proxy self-rank at dim {dim}");
         }
 
         // 2-bit/4-bit never report a tq1 mode.
+        let lo = unit_rows(4, 384);
         let q2 = QuantizedVectors::build(&lo, 384, QuantKind::TurboQuant { bits: 2 });
         assert_eq!(q2.tq1_proxy_mode(), None);
+    }
+
+    #[test]
+    fn tq1_low_dim_expands_and_stays_consistent() {
+        // dim < TQ1_EXPAND_BELOW: the 1-bit code expands to TQ1_EXPAND_TO bits.
+        // Encode and query must pad identically so a vector still ranks highest
+        // against itself (the padding-mismatch guard: a wrong rot_dim anywhere
+        // in the proxy/query breaks self-rank).
+        let dim = 128;
+        assert!(dim < TQ1_EXPAND_BELOW);
+        let data = unit_rows(8, dim);
+        let qv = QuantizedVectors::build(&data, dim, QuantKind::TurboQuant { bits: 1 });
+        assert_eq!(qv.tq1_proxy_mode(), Some(Tq1ProxyMode::BitPlane));
+        for probe in 0..8 {
+            let code = qv.quantize_query(&data[probe * dim..(probe + 1) * dim]);
+            let best = (0..8)
+                .map(|r| qv.proxy(r, &code))
+                .enumerate()
+                .max_by_key(|&(_, s)| s)
+                .unwrap()
+                .0;
+            assert_eq!(best, probe, "expanded self-rank probe {probe}");
+        }
     }
 
     #[test]

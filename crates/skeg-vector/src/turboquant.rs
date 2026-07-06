@@ -11,7 +11,7 @@
 //!
 //! Distance to query `q`:
 //!   - Rotate query once: q' = Q * q
-//!   - Estimated <v, q> ≈ scale * sum_i q'[i] * centroid[code[i]]
+//!   - Estimated <v, q> ~= scale * sum_i q'[i] * centroid[code[i]]
 //!
 //! Approximations vs the turbovec reference:
 //!   - Lloyd-Max levels: Gaussian N(0,1) (Joel Max 1960) scaled 1/sqrt(d-1).
@@ -310,7 +310,7 @@ fn bucketize(x: f32, boundaries: &[f32]) -> usize {
     bucket
 }
 
-// ── Fast rotation: block Walsh-Hadamard + signed diagonals ───────────────────
+// -- Fast rotation: block Walsh-Hadamard + signed diagonals -------------------
 
 /// Random orthogonal transform via block Walsh-Hadamard with random sign
 /// diagonal masks. `O(d log b)` per apply (where `b` is the block size,
@@ -374,6 +374,13 @@ impl FastRotation {
             sign_masks,
             pass_scale,
         }
+    }
+
+    /// The transform's working dimension (may exceed the index's native dim
+    /// when low-dim tq1 is zero-padded up for more code bits).
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
     /// Apply the transform to `x`, writing into `out`.
@@ -455,7 +462,7 @@ fn fwht_inplace(x: &mut [f32]) {
     }
 }
 
-// ── SWAR ADC inner accumulators (stable Rust, no `unsafe`) ───────────────────
+// -- SWAR ADC inner accumulators (stable Rust, no `unsafe`) -------------------
 //
 // The walk calls `proxy(row, query)` ~6400 times per query. Each call boils
 // down to `sum_i q_rot[i] * centroid[code[i]]` where `code[i]` is `bits` wide
@@ -546,7 +553,7 @@ pub(crate) fn tq2_adc_swar(code: &[u8], centroids: &[f32], q_rot: &[f32], dim: u
 }
 
 /// Inner accumulator for `bits=1`: 64 coords per 8-byte SWAR chunk.
-/// Uses the symmetry of the 2-level Lloyd-Max levels (`centroids = ±c`) to
+/// Uses the symmetry of the 2-level Lloyd-Max levels (`centroids = +/-c`) to
 /// reduce the kernel to `c * (2 * sum_{bit=1} q[i] - sum_i q[i])` - a single
 /// masked partial sum plus a query-independent term. Branchless multiply by
 /// the bit-as-f32 keeps the inner loop FMA-friendly.
@@ -572,7 +579,7 @@ pub(crate) fn tq1_adc_swar(
     pos_c * (2.0 * q_masked - q_sum)
 }
 
-// ── TurboQuant 1-bit ─────────────────────────────────────────────────────────
+// -- TurboQuant 1-bit ---------------------------------------------------------
 
 const TQ1_LEVELS: usize = 2;
 
@@ -686,7 +693,7 @@ impl TurboQuant1 {
     }
 }
 
-// ── TurboQuant 2-bit ─────────────────────────────────────────────────────────
+// -- TurboQuant 2-bit ---------------------------------------------------------
 
 const TQ2_BITS: usize = 2;
 const TQ2_LEVELS: usize = 1 << TQ2_BITS;
@@ -1071,7 +1078,7 @@ mod tests {
             let q_rot = tq.rotate_query(&v);
             let (code, scale) = tq.encode(&v);
             let approx = tq.approx_inner(&code, scale, &q_rot);
-            // approx ≈ <v, v> = 1 for a unit vector
+            // approx ~= <v, v> = 1 for a unit vector
             total_err += (1.0 - approx).abs();
         }
         let mean_err = total_err / n as f32;

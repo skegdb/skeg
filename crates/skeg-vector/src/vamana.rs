@@ -53,7 +53,7 @@ fn normalized(v: &[f32]) -> Vec<f32> {
     }
 }
 
-// ── graph node ────────────────────────────────────────────────────────────────
+// -- graph node ----------------------------------------------------------------
 
 /// One graph node: a bounded out-edge list.
 ///
@@ -115,7 +115,7 @@ impl Node {
     }
 }
 
-// ── search list ───────────────────────────────────────────────────────────────
+// -- search list ---------------------------------------------------------------
 
 /// Bounded sorted candidate list for `GreedySearch`: keeps the `capacity`
 /// entries closest to the target, ascending by distance, with a cursor over
@@ -168,7 +168,7 @@ impl SearchList {
     }
 }
 
-// ── greedy search ─────────────────────────────────────────────────────────────
+// -- greedy search -------------------------------------------------------------
 
 /// Early-termination policy for the greedy walk. When the top-`k` of the
 /// search list does not
@@ -333,7 +333,7 @@ where
     list
 }
 
-// ── robust prune ──────────────────────────────────────────────────────────────
+// -- robust prune --------------------------------------------------------------
 
 /// `RobustPrune`: from `candidates` (distances measured to `p`), select up to
 /// `r` out-neighbors for `p`. A candidate `v` is dropped once a closer-picked
@@ -374,7 +374,7 @@ fn robust_prune(
     result
 }
 
-// ── build ─────────────────────────────────────────────────────────────────────
+// -- build ---------------------------------------------------------------------
 
 /// Tunables for [`VamanaIndex::build`].
 #[derive(Debug, Clone, Copy)]
@@ -417,6 +417,93 @@ impl Default for VamanaConfig {
 /// recall@10 (0.994 vs 0.9955 at 64) while cutting the graph build ~24% - and
 /// the build dominates consolidate/ingest (~90%, measured). `SKEG_L_BUILD`
 /// overrides it (32 -> 0.991 recall, ~40% faster; for build-critical loads).
+/// DIAGNOSTIC ONLY - do NOT ship. Navigates the walk with EXACT f32 distances
+/// (read from vectors.bin) instead of the tq1 proxy. It PROVED the true
+/// neighbours are reachable in the graph (glove r@100 0.58->0.95) - the 1-bit
+/// proxy just can't steer to them at low dim. But it VIOLATES the whole point of
+/// tq1 (minimal RAM): navigating on f32 means either holding f32 in RAM or one
+/// positioned read per walked node (the ~5-6x latency measured). The
+/// RAM-preserving fix for low-dim is `wide` (deep walk - costs latency, not
+/// RAM), not this. Kept flag-gated (`SKEG_TQ1_NAV_F32`) purely as a measurement.
+/// Opt-in adaptive rerank (efficiency knob, off by default). In best-by-proxy
+/// order, skip a candidate's disk read when its proxy-estimated cosine plus a
+/// per-vector RaBitQ bound `C*sqrt(1-g^2)` (g = code reconstruction quality, 1/scale)
+/// can't beat the current k-th exact cosine. Measured +20-100% QPS at ~0 recall
+/// loss on the median; it does NOT cut the 1M p99 tail (hard queries have nothing
+/// to prune), so it stays opt-in, not a serving default. Env
+/// `SKEG_TQ1_ADAPTIVE_RR=on`, coefficient from `SKEG_ADAPTIVE_MARGIN` (default 0.02).
+fn adaptive_rr() -> Option<f32> {
+    static M: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_ADAPTIVE_RR").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+        .then(|| {
+            std::env::var("SKEG_ADAPTIVE_MARGIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.02f32)
+        })
+    })
+}
+
+/// Diagnostic: rank by the quantized proxy alone, no f32 rerank (blog-comparable).
+fn no_rerank() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_NO_RERANK").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+    })
+}
+
+fn nav_f32_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_NAV_F32").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+    })
+}
+
+/// QuIVer opt-in: build the 1-bit tq1 graph on the popcount metric. Off by
+/// default (exact-f32 build). Env `SKEG_TQ1_QUIVER=on|1`. Read once.
+///
+/// MEASURED NULL RESULT (2026-07-04, mxbai-100k / qwen3-20k, hybrid default):
+/// recall@100 moved 0.8934->0.8915 and 0.9383->0.9388 - within noise, no gain.
+/// skeg's f32 graph is already popcount-navigable; the recall@100 limiter is
+/// the popcount metric mis-RANKING candidates in the beam (fixed by asymmetric
+/// navigation), not the topology (which QuIVer co-designs). Kept flag-gated for
+/// reproducibility; do not enable expecting a win.
+fn quiver_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ1_QUIVER").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+    })
+}
+
+/// Pick the graph builder for a disk rebuild: QuIVer popcount-metric build when
+/// enabled and the tier is 1-bit tq1, else the exact-f32 build.
+fn build_disk_graph(
+    tier: QuantKind,
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    dim: usize,
+    config: &VamanaConfig,
+) -> VamanaIndex {
+    if quiver_enabled() && matches!(tier, QuantKind::TurboQuant { bits: 1 }) {
+        VamanaIndex::build_quiver_tq1(vectors, ids, dim, config)
+    } else {
+        VamanaIndex::build(vectors, ids, dim, config)
+    }
+}
+
 fn disk_build_config() -> VamanaConfig {
     let mut cfg = VamanaConfig {
         l_build: 48,
@@ -478,7 +565,7 @@ fn locked_neighbors(graph: &[Mutex<Node>], id: VecId) -> SmallVec<[VecId; MAX_R]
     graph[id as usize].lock().slice().iter().copied().collect()
 }
 
-// ── build profiling ───────────────────────────────────────────────────────────
+// -- build profiling -----------------------------------------------------------
 //
 // Cumulative nanoseconds per build phase, summed across worker threads. Each
 // worker accumulates into its `BuildScratch` (no contention) and flushes to
@@ -708,7 +795,7 @@ fn patch_connectivity(
     }
 }
 
-// ── public index ──────────────────────────────────────────────────────────────
+// -- public index --------------------------------------------------------------
 
 /// A Vamana graph index. The graph lives in RAM; the f32 vectors are drawn
 /// from a [`VectorSource`] - an owned `Vec` or a memory-mapped file.
@@ -743,6 +830,24 @@ impl VamanaIndex {
         VamanaIndex::build_from_source(Box::new(source), ids, config)
     }
 
+    /// QuIVer build for the 1-bit TurboQuant tier: construct the graph on the
+    /// popcount metric (rotated sign vectors) so the cheap popcount walk can
+    /// follow its edges, while keeping the f32 `vectors` for rerank. Falls back
+    /// to identical topology as [`build`](Self::build) only in the sense that
+    /// storage is unchanged; the edges differ (that is the point).
+    #[must_use]
+    pub fn build_quiver_tq1(
+        vectors: Vec<f32>,
+        ids: Vec<u64>,
+        dim: usize,
+        config: &VamanaConfig,
+    ) -> VamanaIndex {
+        let metric = crate::quant::tq1_sign_metric_vectors(&vectors, ids.len(), dim);
+        let storage: Box<dyn VectorSource> = Box::new(InMemoryVectorSource::new(vectors, dim));
+        let metric_src: Box<dyn VectorSource> = Box::new(InMemoryVectorSource::new(metric, dim));
+        VamanaIndex::build_from_source_with_metric(storage, Some(metric_src), ids, config)
+    }
+
     /// Build a Vamana index, drawing the f32 vectors from `source`. The source
     /// is kept by the index so [`save`](Self::save) and [`search`](Self::search)
     /// can read vectors after the build, without ever copying the dataset into
@@ -758,21 +863,44 @@ impl VamanaIndex {
         ids: Vec<u64>,
         config: &VamanaConfig,
     ) -> VamanaIndex {
+        Self::build_from_source_with_metric(vectors, None, ids, config)
+    }
+
+    /// Like [`build_from_source`](Self::build_from_source) but the graph is
+    /// constructed using distances from `metric` (when `Some`) rather than the
+    /// stored `vectors`. `metric` must have the same length/order as `vectors`.
+    /// The index still holds `vectors` for `save`/rerank; only edge selection
+    /// uses `metric`. This is the hook for QuIVer (build on the 1-bit popcount
+    /// metric via [`build_quiver_tq1`](Self::build_quiver_tq1)); passing `None`
+    /// reproduces the exact-f32 build.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn build_from_source_with_metric(
+        vectors: Box<dyn VectorSource>,
+        metric: Option<Box<dyn VectorSource>>,
+        ids: Vec<u64>,
+        config: &VamanaConfig,
+    ) -> VamanaIndex {
         assert!(!ids.is_empty(), "Vamana needs at least one vector");
         assert_eq!(vectors.len(), ids.len(), "source/ids length mismatch");
+        if let Some(m) = &metric {
+            assert_eq!(m.len(), ids.len(), "metric/ids length mismatch");
+        }
         let dim = vectors.dim();
         let n = ids.len() as u32;
+        // Edge selection reads `metric_src`; the index keeps `vectors` for rerank.
+        let metric_src: &dyn VectorSource = metric.as_deref().unwrap_or(&*vectors);
 
         let mut plain = vec![Node::new(); n as usize];
         init_random_graph(&mut plain, n, config.r, config.seed);
-        let medoid = approximate_medoid(&*vectors, n, config.medoid_sample, config.seed);
+        let medoid = approximate_medoid(metric_src, n, config.medoid_sample, config.seed);
 
         // Both passes run in parallel across the rayon pool; the graph is a
         // Vec<Mutex<Node>> for the duration of the build, then unwrapped.
         let graph: Vec<Mutex<Node>> = plain.into_iter().map(Mutex::new).collect();
         run_pass_parallel(
             &graph,
-            &*vectors,
+            metric_src,
             n,
             medoid,
             config.alpha1,
@@ -782,7 +910,7 @@ impl VamanaIndex {
         );
         run_pass_parallel(
             &graph,
-            &*vectors,
+            metric_src,
             n,
             medoid,
             config.alpha2,
@@ -791,7 +919,8 @@ impl VamanaIndex {
             config.seed.wrapping_add(1),
         );
         let mut nodes: Vec<Node> = graph.into_iter().map(Mutex::into_inner).collect();
-        patch_connectivity(&mut nodes, &*vectors, n, medoid, config.r);
+        patch_connectivity(&mut nodes, metric_src, n, medoid, config.r);
+        drop(metric);
 
         VamanaIndex {
             dim,
@@ -924,7 +1053,7 @@ impl VamanaIndex {
     }
 }
 
-// ── on-disk format ────────────────────────────────────────────────────────────
+// -- on-disk format ------------------------------------------------------------
 //
 // graph.vmn   : 64-byte header, then n u64 ids, then n nodes
 //               (each: degree u32 + MAX_R neighbour u32s).
@@ -2091,7 +2220,19 @@ impl DiskVamanaIndex {
                     seed_rows.push(r);
                 }
             }
-            let dist = |id: VecId| -(seg.quant.proxy(id as usize, &code) as f32);
+            // Prototype nav: exact f32 (read from disk) steers the walk when
+            // enabled; otherwise the cheap tq1 proxy. Storage is tq1 either way.
+            let nav_f32 = nav_f32_enabled();
+            let dist = |id: VecId| -> f32 {
+                if nav_f32 {
+                    match self.read_vector(seg, id) {
+                        Ok(v) => -cosine_f32(query, &v),
+                        Err(_) => -(seg.quant.proxy(id as usize, &code) as f32),
+                    }
+                } else {
+                    -(seg.quant.proxy(id as usize, &code) as f32)
+                }
+            };
             let nbrs = |id: VecId| -> SmallVec<[VecId; MAX_R]> {
                 seg.nodes[id as usize].slice().iter().copied().collect()
             };
@@ -2152,7 +2293,20 @@ impl DiskVamanaIndex {
         let _rg = rerank_span.enter();
         let mut disk_reads: usize = 0;
         let mut reranked_ids: AHashSet<u64> = AHashSet::new();
-        for (_, seg_idx, row) in all_cand {
+        // Adaptive rerank (prototype): min-heap of the k best exact cosines gives
+        // the current k-th threshold; a candidate whose proxy-estimated cosine +
+        // margin can't reach it (and, in best-first order, neither can the rest)
+        // stops the disk reads early. Off => read the full `rerank` budget.
+        // Adaptive only when the pscore is cosine-scaled: tq1 asym-family
+        // (bit-plane / asym / hybrid-rescore). Popcount is Hamming, and int8/PQ/
+        // tq2/tq4 report no tq1 mode - for those the bound would compare a
+        // wrong-scale estimate to the k-th cosine and skip every candidate.
+        let adaptive = adaptive_rr().filter(
+            |_| matches!(self.base.quant.tq1_proxy_mode(), Some(m) if m != Tq1ProxyMode::Popcount),
+        );
+        let mut topk: std::collections::BinaryHeap<std::cmp::Reverse<OrderedFloat<f32>>> =
+            std::collections::BinaryHeap::new();
+        for (pscore, seg_idx, row) in all_cand {
             if disk_reads >= rerank {
                 break;
             }
@@ -2169,9 +2323,38 @@ impl DiskVamanaIndex {
             if !reranked_ids.insert(id) {
                 continue;
             }
+            // ponytail: no-rerank mode = rank by the proxy estimate alone, zero
+            // disk reads. For apples-to-apples vs the TurboQuant blog (pure
+            // quantized recall, no f32 rerank). pscore = -(proxy i32).
+            if no_rerank() {
+                disk_reads += 1; // counts as "candidate considered", bounds by rerank
+                scored.push((OrderedFloat(-pscore / 1.0e7), id));
+                continue;
+            }
+            if let Some(c) = adaptive
+                && topk.len() >= k
+            {
+                // Per-vector RaBitQ-style bound: err = C*sqrt(1-g^2), g = code
+                // reconstruction quality (1/scale). Good code => tight => stop
+                // sooner; poor code => loose => keep reading. pscore = -(proxy i32).
+                let cos_est = -pscore / 1.0e7;
+                let g = seg.quant.tq1_recon_g(row as usize).unwrap_or(0.0);
+                let margin = c * (1.0 - g * g).max(0.0).sqrt();
+                let tau = topk.peek().map(|r| r.0.0).unwrap_or(f32::MIN);
+                if cos_est + margin < tau {
+                    continue; // provably can't enter top-k; skip its disk read
+                }
+            }
             let v = self.read_vector(seg, row)?;
             disk_reads += 1;
-            scored.push((OrderedFloat(cosine_f32(query, &v)), id));
+            let c = cosine_f32(query, &v);
+            if adaptive.is_some() {
+                topk.push(std::cmp::Reverse(OrderedFloat(c)));
+                if topk.len() > k {
+                    topk.pop();
+                }
+            }
+            scored.push((OrderedFloat(c), id));
         }
         rerank_span.record("disk_reads", disk_reads);
 
@@ -2291,7 +2474,7 @@ impl DiskVamanaIndex {
         }
         let run_dir = self.dir.join(format!("run-{}", self.run_seq));
         self.run_seq += 1;
-        let rebuilt = VamanaIndex::build(vectors, ids, self.dim, &disk_build_config());
+        let rebuilt = build_disk_graph(self.tier, vectors, ids, self.dim, &disk_build_config());
         rebuilt.save(&run_dir)?;
         // Open the run with this index's tier and keep only its base segment; the
         // rest of the opened index (an empty delta/WAL over the run dir) is dropped.
@@ -2393,7 +2576,7 @@ impl DiskVamanaIndex {
         // before optimizing it. Off unless SKEG_CONSOLIDATE_TIMING is set.
         let timing = std::env::var("SKEG_CONSOLIDATE_TIMING").is_ok();
         let t = std::time::Instant::now();
-        let rebuilt = VamanaIndex::build(vectors, ids, dim, &disk_build_config());
+        let rebuilt = build_disk_graph(tier, vectors, ids, dim, &disk_build_config());
         let build_ms = t.elapsed().as_millis();
         rebuilt.save(&dir)?;
         let save_ms = t.elapsed().as_millis();
@@ -2425,7 +2608,7 @@ impl DiskVamanaIndex {
 
     /// Build the coarse IVF router over the base segment (the "cells" branch of
     /// hybrid filtered search). In-memory; rebuild after a `consolidate`. Reads
-    /// the base vectors once for k-means. `n_cells == 0` picks ~√n.
+    /// the base vectors once for k-means. `n_cells == 0` picks ~sqrtn.
     ///
     /// # Errors
     /// I/O error if a base vector read fails.
