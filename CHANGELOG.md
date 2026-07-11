@@ -7,6 +7,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [Unreleased]
+
+### Fixed
+
+- **Auth store file permissions.** `auth.kdb` (usernames plus argon2id password
+  hashes) is now created `0600` on Unix instead of inheriting the process umask,
+  so other local users on a shared machine cannot read it. Thanks to Simone
+  Zannini and Matteo Cese ([devop.sbs](https://www.devop.sbs/it)) for the report.
+
 ## [0.6.0] - 2026-07-11
 
 ### Added
