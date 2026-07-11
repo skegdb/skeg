@@ -13,7 +13,8 @@ repository.
 
 - **Auth store file permissions.** `auth.kdb` (usernames plus argon2id password
   hashes) is now created `0600` on Unix instead of inheriting the process umask,
-  so other local users on a shared machine cannot read it.
+  so other local users on a shared machine cannot read it. Thanks to Simone
+  Zannini and Matteo Cese ([devop.sbs](https://www.devop.sbs/it)) for the report.
 
 ## [0.6.0] - 2026-07-11
 
