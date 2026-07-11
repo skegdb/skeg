@@ -70,6 +70,15 @@ density and container-OOM runs, and a cost calculator live on the dashboard:
 workload at $4/GB-month that lands at ~$930/year against Qdrant's ~$9,647, at the
 same recall.
 
+**Where it doesn't win.** skeg is not the lowest-latency *single-query* engine:
+Qdrant is comparable on p99 and raw hnswlib is faster still. A single process
+saturates around 780 QPS at 1024-dim (more at lower dimensions); past that you
+scale out with processes, not cores. Cold bulk-loading a fresh index is
+rebuild-based, trading build time for the lean serving footprint. Release
+binaries are aarch64 (Apple Silicon, Linux ARM); the source builds on x86_64 but
+AVX2/AVX-512 tuning and native Linux validation are [on the
+roadmap](docs/roadmap.md), not done.
+
 ## Multi-tenancy
 
 Multi-tenancy is first-class, not a filter convention:
@@ -158,23 +167,6 @@ companion setup lives in [`docker-compose.example.yml`](docker-compose.example.y
 
 Then follow [`docs/getting-started.md`](docs/getting-started.md) to run it and
 issue the first commands.
-
-## Status
-
-**Shipping today.** KV and vector ops on both protocols; filtered vector search
-with the full filter grammar; first-class multi-tenancy with quotas and fair
-eviction; three durability tiers (relaxed / kernel / power-loss); Prometheus
-metrics and OTLP tracing; a workspace test suite that's clean under
-`cargo clippy --workspace --all-targets`.
-
-**Honest about the edges.** skeg is not the lowest-latency *single-query* engine.
-Qdrant is comparable on p99 and raw hnswlib is faster still. A single process
-saturates around 780 QPS at 1024-dim (more at lower dimensions); past that you
-scale out with processes, not cores. Cold bulk-loading a fresh index is
-rebuild-based and trades build time for the lean serving footprint. Release
-binaries are aarch64 (Apple Silicon, Linux ARM); the source builds on x86_64 but
-AVX2/AVX-512 tuning and native Linux validation are [on the
-roadmap](docs/roadmap.md), not done.
 
 ## Documentation
 
