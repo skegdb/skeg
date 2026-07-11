@@ -64,20 +64,16 @@ M1 Pro (16 GiB). The index stays on SSD, the resident set stays flat:
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
-The full matrix (engine x scale x tier, p50/p99, recall, RSS), the multi-tenant
-density and container-OOM runs, and a cost calculator live on the dashboard:
-[`skegdb.github.io/bench`](https://skegdb.github.io/bench/). On a 50M-vector
-workload at $4/GB-month that lands at ~$930/year against Qdrant's ~$9,647, at the
-same recall.
+The full matrix and the multi-tenant and container-OOM runs are on the
+[dashboard](https://skegdb.github.io/bench/).
 
-**Where it doesn't win.** skeg is not the lowest-latency *single-query* engine:
-Qdrant is comparable on p99 and raw hnswlib is faster still. A single process
-saturates around 780 QPS at 1024-dim (more at lower dimensions); past that you
-scale out with processes, not cores. Cold bulk-loading a fresh index is
-rebuild-based, trading build time for the lean serving footprint. Release
-binaries are aarch64 (Apple Silicon, Linux ARM); the source builds on x86_64 but
-AVX2/AVX-512 tuning and native Linux validation are [on the
-roadmap](docs/roadmap.md), not done.
+**Where it stands.** skeg wins on the axes most stores trade away: recall 1.0 at
+a fraction of the RAM, filtered search that stays sub-linear as the corpus grows,
+and per-tenant isolation that is leak-free by construction. It is not the
+lowest-latency *single-query* engine (Qdrant is comparable on p99, raw hnswlib is
+faster), one process saturates near 780 QPS at 1024-dim before you scale out with
+processes, and cold bulk-loads rebuild the index. Release binaries are aarch64;
+x86_64 AVX tuning is [on the roadmap](docs/roadmap.md).
 
 ## Multi-tenancy
 
