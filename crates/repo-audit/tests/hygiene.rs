@@ -112,7 +112,11 @@ fn no_internal_codes_or_non_english() {
     // prose legitimately uses words the source-code rules (slice/tier/Q-codes)
     // would flag, so those stay `.rs`-only.
     let workspace_root = crates_dir.parent().expect("workspace root");
-    let em_dash = Regex::new("\u{2014}").unwrap();
+    // Em-dash in any form: the Unicode char plus the HTML entities that render
+    // as one (`&mdash;`, `&#8212;`). Markdown passes raw HTML through, so the
+    // entity forms slip past a bare `\u{2014}` scan. En-dash stays allowed:
+    // numeric ranges (`9-17x`, `p50/p99`) use it legitimately.
+    let em_dash = Regex::new(r"\u{2014}|&mdash;|&#8212;").unwrap();
     let mut md = Vec::new();
     md_files(workspace_root, &mut md);
     for f in &md {

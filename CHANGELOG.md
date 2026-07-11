@@ -118,7 +118,7 @@ repository.
   vindexes out of band: `open_indices()` enumerates every open index per shard
   with its `IndexStat` (resident bytes, last-access, vector count, whether it is
   evictable), `total_resident_bytes()` sums the fleet, and `evict(tenant, index)`
-  drops an index from RAM **non-destructively** - the `vindex-<name>/` files stay
+  drops an index from RAM non-destructively: the `vindex-<name>/` files stay
   and the next access reopens it lazily. A disk-backed index reopens off the
   shard thread (`spawn_blocking`), so a cold-start reopen does not stall other
   indexes on the same shard. The eviction *policy* (RAM budget, LRU, hysteresis)
@@ -600,7 +600,7 @@ repository.
   - `skeg_vindex_vectors` and `skeg_vindex_size_bytes` are aggregated
     on `STATS` from the shard's vindex set; the size approximation is
     `n * dim * 4` for flat indexes and `n * dim` for disk (tier-1
-    int8 codes only - the graph and full f32 vectors live on disk and
+    int8 codes only; the graph and full f32 vectors live on disk and
     are not counted as RAM).
 - `skeg_telemetry::incr_gauge` / `decr_gauge` / `add_gauge` for
   delta-style updates on gauges (used by the compaction RAII guard).

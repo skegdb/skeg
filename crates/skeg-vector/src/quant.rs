@@ -1875,7 +1875,6 @@ mod tests {
     /// the asymmetric ADC. A wrong plane/AND alignment would corrupt ranking.
     #[test]
     fn bitplane_score_reconstructs_masked_sum() {
-        let dim = 8;
         let b = 3u8;
         let bytes = 1;
         // Stored sign code: coords 0, 2, 5 are "positive" (bit set).

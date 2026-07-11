@@ -5,7 +5,7 @@
 
 <p align="center">
   <strong>The vector database that fits.</strong><br>
-  Multi-tenant, disk-first, RAM-frugal &mdash; recall 1.0 at a fraction of the memory.
+  Multi-tenant, disk-first, RAM-frugal. Recall 1.0 at a fraction of the memory.
 </p>
 
 <p align="center">
@@ -23,7 +23,7 @@
 Vector search where RAM is contested: a SaaS packing thousands of tenants on one
 box, a RAG service paying for memory by the gigabyte, an agent sharing a machine
 with the model it serves. skeg keeps the full vectors on SSD and only a small,
-quantized working set in RAM - so it serves at **recall 1.0** on a memory
+quantized working set in RAM, so it serves at **recall 1.0** on a memory
 footprint the RAM-resident engines can't touch.
 
 Key-value and vectors in one engine. Redis-compatible wire protocol. First-class
@@ -39,7 +39,7 @@ The same 50M-vector workload, RAM provisioned at $4/GB-month:
 | Qdrant (HNSW, f32) | 201 GiB | $9,647 |
 
 **90% less memory, same recall.** That gap is a larger model, a longer context,
-a second service - or a smaller bill. Run the numbers for your workload with
+a second service, or a smaller bill. Run the numbers for your workload with
 [`skeg-bench`](https://github.com/skegdb/skeg-bench)'s cost calculator.
 
 ## Benchmarks
@@ -61,12 +61,12 @@ fair fight):
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Every other engine gives up at least one axis - RAM, recall, or latency. skeg is
+Every other engine gives up at least one axis: RAM, recall, or latency. skeg is
 the only one that is leanest, most accurate, *and* fast at once. The Pareto
 across all six is in [`skeg-bench`](https://github.com/skegdb/skeg-bench).
 
 **Multi-tenant density.** Pack tenants of 100K vectors on one box. skeg's RAM is
-bounded by the *largest tenant*, not the total - it stays flat as tenants grow:
+bounded by the *largest tenant*, not the total. It stays flat as tenants grow:
 
 | 5 tenants × 100K | peak RAM | recall | cross-tenant leaks |
 | --- | ---: | ---: | ---: |
@@ -74,7 +74,7 @@ bounded by the *largest tenant*, not the total - it stays flat as tenants grow:
 | Qdrant (collection per tenant) | 1,818 MB | 0.996 | 0 |
 | Qdrant (shared + filter) | 3,494 MB | 0.957 | 0 |
 
-That's **9–17× less RAM at higher recall** - and isolation that holds under an
+That's **9–17× less RAM at higher recall**, with isolation that holds under an
 adversarial leak-fuzz (query a tenant's index with another tenant's exact
 vector: zero rows cross the boundary, every time).
 
@@ -86,7 +86,7 @@ vector: zero rows cross the boundary, every time).
 | Qdrant (f32) | 473 MB | ❌ OOM-killed |
 
 **Co-resident with a model.** A 3B LLM answering RAG over 1M vectors, both on one
-M1 Pro (16 GiB) - the index stays on SSD, the resident set stays flat:
+M1 Pro (16 GiB). The index stays on SSD, the resident set stays flat:
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
@@ -115,14 +115,16 @@ match. Its matching set is routed by a coarse k-means index to the query-nearest
 cells that hold matches, then a short list is re-ranked, so the cost stays
 sub-linear as the corpus grows. See [`docs/filtered-search.md`](docs/filtered-search.md).
 
-Five tiers trade memory for precision: `int8`, Product Quantization (128×256),
-and TurboQuant at 1/2/4 bits per coordinate. **tq2 (2-bit) is the default**:
-quarter the bytes of int8, latency on par, and recall stays nearly flat as the
-corpus grows. **tq1 (1-bit)** is faster and about half the RAM again, a good fit
-for small tenants and workloads that only need the top handful of results, but
-its recall@100 falls off at scale. Both keep the full f32 re-rank, so the top
-result is exact either way. TurboQuant needs no trained codebook, so the lean
-tiers work under live writes, not just at serve time.
+The index kinds trade memory for precision: `f32`, `int8`, `binary`, and
+TurboQuant at 1, 2, or 4 bits per coordinate (`tq1`/`tq2`/`tq4`). **tq2 (2-bit)
+is the default**: quarter the bytes of int8, latency on par, and recall stays
+nearly flat as the corpus grows. **tq1 (1-bit)** is faster and about half the RAM
+again, a good fit for small tenants and workloads that only need the top handful
+of results, but its recall@100 falls off at scale. Both keep the full f32
+re-rank, so the top result is exact either way. TurboQuant needs no trained
+codebook, so the lean tiers work under live writes, not just at serve time.
+Product Quantization (128×256) is serve-only (it needs a trained codebook); it
+backs the co-residence benchmark above but is not a live-writable kind.
 
 **Memory follows the workload.** With `--tier-mmap` the quantized codes are
 backed by a file, so the OS reclaims them when an index goes cold or memory gets
@@ -136,12 +138,12 @@ The design and the eleven falsifications behind it are written up in
 
 Multi-tenancy is first-class, not a filter convention:
 
-- **Isolation by construction** - one index per tenant, so a query physically
+- **Isolation by construction:** one index per tenant, so a query physically
   cannot reach another tenant's vectors. No filter to misconfigure, no leak path.
-- **Hard quotas** - `max_vectors`, `max_disk_bytes`, set and read at runtime via
+- **Hard quotas:** `max_vectors`, `max_disk_bytes`, set and read at runtime via
   `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`.
-- **Fair eviction** - a noisy tenant can't starve a quiet one out of the cache.
-- **Authentication** - `HELLO 3 AUTH user pass` (argon2id), prefix-routed namespaces.
+- **Fair eviction:** a noisy tenant can't starve a quiet one out of the cache.
+- **Authentication:** `HELLO 3 AUTH user pass` (argon2id), prefix-routed namespaces.
 
 Shipped in the `skeg-tenant`, `skeg-server-tenant`, and `skeg-multi-tenant`
 crates. See [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
@@ -276,10 +278,10 @@ eviction; three durability tiers (relaxed / kernel / power-loss); Prometheus
 metrics and OTLP tracing; a workspace test suite that's clean under
 `cargo clippy --workspace --all-targets`.
 
-**Honest about the edges.** skeg is not the lowest-latency *single-query* engine
-- Qdrant is comparable on p99 and raw hnswlib is faster still. A single process
+**Honest about the edges.** skeg is not the lowest-latency *single-query* engine.
+Qdrant is comparable on p99 and raw hnswlib is faster still. A single process
 saturates around 780 QPS at 1024-dim (more at lower dimensions); past that you
-scale out with processes, not cores - measure your own with `runner.py
+scale out with processes, not cores. Measure your own with `runner.py
 throughput` in [`skeg-bench`](https://github.com/skegdb/skeg-bench). Cold
 bulk-loading a fresh index is rebuild-based and trades build time for the lean
 serving footprint.
@@ -294,29 +296,21 @@ Long-form design and benchmark write-ups on the [project blog](https://amanitapr
 
 Operational guides in [`docs/`](docs/):
 
-- [`docs/multi-tenancy.md`](docs/multi-tenancy.md) - tenants, key scoping, quotas, fair eviction.
-- [`docs/filtered-search.md`](docs/filtered-search.md) - payloads, filter grammar, the planner.
-- [`docs/observability.md`](docs/observability.md) - Prometheus, OTel, tracing.
-- [`docs/ecosystem.md`](docs/ecosystem.md) - federation (hansa) and ingest pipelines.
+- [`docs/multi-tenancy.md`](docs/multi-tenancy.md): tenants, key scoping, quotas, fair eviction.
+- [`docs/filtered-search.md`](docs/filtered-search.md): payloads, filter grammar, the planner.
+- [`docs/observability.md`](docs/observability.md): Prometheus, OTel, tracing.
+- [`docs/ecosystem.md`](docs/ecosystem.md): federation (hansa) and ingest pipelines.
+- [`docs/roadmap.md`](docs/roadmap.md): what's planned, what's conditional, what's deliberately not.
 
 Reproducible benchmark suite: [`skeg-bench`](https://github.com/skegdb/skeg-bench).
 Live dashboard: [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
-
-## Roadmap
-
-Driven by what real workloads ask for first:
-
-- x86_64 native tuning (AVX2 / AVX-512) and native Linux validation.
-- Incremental insert to close the cold-build gap.
-- Child spans for the VSEARCH internals through the OTLP exporter.
-- GPU acceleration for the kernels, once the host environment makes it sensible.
 
 ## Contributing
 
 Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
 --workspace` before opening a PR. A pre-push hook at `.githooks/pre-push` runs
-the same three locally - enable with `git config core.hooksPath .githooks`
+the same three locally. Enable with `git config core.hooksPath .githooks`
 (bypass a docs-only push with `SKIP_PREPUSH=1`).
 
 ## Security
