@@ -228,11 +228,18 @@ impl AuthStore {
         let bytes = self.encode();
         let tmp = self.path.with_extension("kdb.tmp");
         {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).truncate(true).write(true);
+            // The store holds password hashes and the user/tenant list. Create
+            // the file 0600 so other local users cannot read it; the atomic
+            // rename below carries these perms onto `auth.kdb`. Without this the
+            // file inherits the process umask (often world-readable).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
@@ -320,6 +327,22 @@ mod tests {
         let s2 = AuthStore::open(&path).unwrap();
         let rec = s2.get("alice").unwrap();
         assert_eq!(rec.tenant, alice);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let path = d.path().join("auth.kdb");
+        let mut s = AuthStore::open(&path).unwrap();
+        s.upsert("alice", TenantId::from_name("alice"), mk_hash(b"hunter2"));
+        s.save().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auth.kdb holds password hashes; must be 0600, got {mode:o}"
+        );
     }
 
     #[test]
