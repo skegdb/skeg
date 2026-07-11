@@ -7,7 +7,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
-## [Unreleased]
+## [0.6.1] - 2026-07-11
 
 ### Fixed
 
@@ -739,7 +739,7 @@ repository.
   `VINDEX.CREATE docs DIM 1024 METRIC cosine` form that the previous
   README implied.
 
-## [Unreleased] - pre-release v0.1.0
+## [0.6.1] - 2026-07-11 - pre-release v0.1.0
 
 ### Added
 
