@@ -209,3 +209,7 @@ harness = false
 [[bench]]
 name = "tier_mmap"
 harness = false
+
+[[bench]]
+name = "churn_gate"
+harness = false

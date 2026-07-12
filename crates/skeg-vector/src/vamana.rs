@@ -1222,6 +1222,58 @@ struct Segment {
     vectors_file: File,
 }
 
+/// The snapshot a background consolidate builds from. Produced by
+/// [`DiskVamanaIndex::consolidate_begin`] (short, exclusive), consumed by
+/// [`ConsolidateJob::build`] on any thread (long, no lock on the index),
+/// finished by [`DiskVamanaIndex::consolidate_finish`] (short, exclusive).
+/// Owns everything it needs: the surviving vectors, ids, and the WAL offset
+/// separating pre-snapshot records (folded) from post-snapshot ones (replayed).
+pub struct ConsolidateJob {
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    dim: usize,
+    tier: QuantKind,
+    run_seq_high: u64,
+    wal_offset: u64,
+}
+
+/// The output of [`ConsolidateJob::build`]: a freshly built base graph saved in
+/// a sidecar directory, ready for [`DiskVamanaIndex::consolidate_finish`] to
+/// swap in.
+pub struct ConsolidateBuilt {
+    tmp: PathBuf,
+    run_seq_high: u64,
+    wal_offset: u64,
+}
+
+impl ConsolidateJob {
+    /// Build the consolidated graph. CPU-heavy; run it on a background thread.
+    /// Writes into `<index dir>/consolidating/`, never touching the files the
+    /// live index serves from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the sidecar files fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<ConsolidateBuilt> {
+        let tmp = index_dir.join("consolidating");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let rebuilt = build_disk_graph(
+            self.tier,
+            self.vectors,
+            self.ids,
+            self.dim,
+            &disk_build_config(),
+        );
+        rebuilt.save(&tmp)?;
+        Ok(ConsolidateBuilt {
+            tmp,
+            run_seq_high: self.run_seq_high,
+            wal_offset: self.wal_offset,
+        })
+    }
+}
+
 pub struct DiskVamanaIndex {
     dim: usize,
     l_search: usize,
@@ -1683,6 +1735,14 @@ impl DiskVamanaIndex {
     #[must_use]
     pub fn main_len(&self) -> usize {
         self.base.main_n as usize
+    }
+
+    /// Number of flushed LSM runs currently searched alongside the base.
+    /// Each run adds a (shallow) graph walk per query, so a growing count is
+    /// the signal that a consolidate is due.
+    #[must_use]
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
     }
 
     /// Graph entry point (the approximate medoid). Used by an external walk
@@ -2596,6 +2656,104 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
+    /// Begin a background consolidate: the short, exclusive phase.
+    ///
+    /// Flushes the delta into a run (so the snapshot is over immutable segments
+    /// only), collects the surviving vectors (tombstone-masked, newest-wins, id
+    /// order), and records the WAL high-water offset. Everything appended to the
+    /// WAL after this point (inserts, deletes, and any runs they flush) is NOT
+    /// in the snapshot and survives [`consolidate_finish`](Self::consolidate_finish)
+    /// via WAL-suffix replay.
+    ///
+    /// Returns `None` when there is nothing to fold. At most one job should be
+    /// outstanding per index; the caller enforces that (the engine does not).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the flush or a vector read fails.
+    pub fn consolidate_begin(&mut self) -> io::Result<Option<ConsolidateJob>> {
+        self.flush()?;
+        let segs: Vec<&Segment> = std::iter::once(&self.base)
+            .chain(self.runs.iter())
+            .collect();
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        for (ri, run) in self.runs.iter().enumerate().rev() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                survivors.push((id, ri + 1, row));
+            }
+        }
+        for row in 0..self.base.main_n {
+            let id = self.base.ids[row as usize];
+            if self.tombstones.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            survivors.push((id, 0, row));
+        }
+        if survivors.is_empty() {
+            return Ok(None);
+        }
+        // Same id-order rule as the inline consolidate: near-neighbours land at
+        // nearby vectors.bin rows so the re-rank stays cache-local at scale.
+        survivors.sort_unstable_by_key(|&(id, _, _)| id);
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * self.dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
+        for (id, loc, row) in survivors {
+            vectors.extend(self.read_vector(segs[loc], row)?);
+            ids.push(id);
+        }
+        let wal_offset = self.delta_log.metadata()?.len();
+        Ok(Some(ConsolidateJob {
+            vectors,
+            ids,
+            dim: self.dim,
+            tier: self.tier,
+            run_seq_high: self.run_seq,
+            wal_offset,
+        }))
+    }
+
+    /// Finish a background consolidate: the short, exclusive swap phase.
+    ///
+    /// Replaces the base with the graph the job built, discards every run
+    /// (post-begin runs are rebuilt from the WAL suffix), rewrites the WAL to
+    /// hold only the records appended after `consolidate_begin`, and reopens.
+    /// Post-begin inserts land back in the delta (re-flushing if large) and
+    /// post-begin deletes land back in the tombstone set, so no write that
+    /// raced the background build is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a file move, the WAL rewrite, or the reopen fails.
+    pub fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> io::Result<()> {
+        let dir = self.dir.clone();
+        let tier = self.tier;
+        // The rebuild reorders base rows: drop the router sidecar first, exactly
+        // like the inline consolidate (crash below leaves no sidecar, not a
+        // stale one).
+        let _ = std::fs::remove_file(dir.join(IVF_FILE));
+        // WAL suffix = everything appended after begin. Copy it out before the
+        // reopen truncates.
+        let wal_path = dir.join(DELTA_LOG_FILE);
+        let wal = std::fs::read(&wal_path)?;
+        let suffix_start = usize::try_from(built.wal_offset).unwrap_or(wal.len());
+        let suffix = wal.get(suffix_start..).unwrap_or(&[]).to_vec();
+        // Swap in the built base, drop every run dir (pre-begin runs are folded
+        // into the new base; post-begin runs replay from the WAL suffix).
+        std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
+        std::fs::rename(built.tmp.join(VECTORS_FILE), dir.join(VECTORS_FILE))?;
+        let _ = std::fs::remove_dir_all(&built.tmp);
+        self.run_seq = built.run_seq_high.max(self.run_seq);
+        self.discard_runs()?;
+        std::fs::write(&wal_path, &suffix)?;
+        *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
+        Ok(())
+    }
+
     /// True if this index is large enough to benefit from a routed filtered
     /// search (below it, an exact scan of the match set is already cheap). Used
     /// by the background idle-consolidate to decide whether to build the router.
@@ -3446,5 +3604,122 @@ mod tests {
         let index = VamanaIndex::build(vectors, ids, dim, &VamanaConfig::default());
         let hits = index.search(&vec![0.2f32; dim], 100);
         assert!(hits.len() <= 10, "k > n returns at most n results");
+    }
+
+    /// The background split (begin/build/finish) must land on the same state as
+    /// the inline consolidate for the same operation history.
+    #[test]
+    fn background_consolidate_matches_inline() {
+        let dim = 16;
+        let n = 300;
+        let vecs = random_vectors(n, dim, 11);
+        let mk = |tmp: &std::path::Path| {
+            let mut idx = DiskVamanaIndex::create_empty(tmp, dim, 64).unwrap();
+            for (i, v) in vecs.chunks_exact(dim).enumerate() {
+                idx.insert(i as u64, v).unwrap();
+            }
+            for id in 0..40u64 {
+                idx.delete(id * 3).unwrap(); // scattered deletes
+            }
+            idx
+        };
+        let t_inline = tempfile::TempDir::new().unwrap();
+        let mut inline = mk(t_inline.path());
+        inline.consolidate().unwrap();
+
+        let t_bg = tempfile::TempDir::new().unwrap();
+        let mut bg = mk(t_bg.path());
+        let job = bg.consolidate_begin().unwrap().expect("non-empty");
+        let built = job.build(t_bg.path()).unwrap();
+        bg.consolidate_finish(built).unwrap();
+
+        assert_eq!(bg.len(), inline.len(), "same live count");
+        assert_eq!(bg.run_count(), 0, "runs folded");
+        assert_eq!(bg.delta_len(), 0, "no post-begin writes -> empty delta");
+        let q = &vecs[..dim];
+        let a = inline.search(q, 10).unwrap();
+        let b = bg.search(q, 10).unwrap();
+        assert_eq!(
+            a.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            b.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "same top-k"
+        );
+    }
+
+    /// Writes that race the background build (inserts, deletes of snapshot ids,
+    /// deletes of post-begin ids) must all survive the finish swap, in RAM and
+    /// across a restart.
+    #[test]
+    fn writes_during_background_build_survive() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        let vecs = random_vectors(200, dim, 7);
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let job = idx.consolidate_begin().unwrap().expect("non-empty");
+
+        // Race the build: new inserts, a delete of a folded id, and an
+        // insert-then-delete entirely inside the window.
+        idx.insert(1000, &vec![0.25f32; dim]).unwrap();
+        idx.insert(1001, &vec![0.35f32; dim]).unwrap();
+        assert!(idx.delete(5).unwrap(), "folded id was live");
+        idx.insert(1002, &vec![0.45f32; dim]).unwrap();
+        assert!(idx.delete(1002).unwrap(), "post-begin id was live");
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.consolidate_finish(built).unwrap();
+
+        assert_eq!(idx.len(), 200 + 2 - 1, "200 folded + 2 new - 1 deleted");
+        assert!(idx.get(1000).unwrap().is_some(), "post-begin insert kept");
+        assert!(idx.get(1001).unwrap().is_some(), "post-begin insert kept");
+        assert!(
+            idx.get(5).unwrap().is_none(),
+            "post-begin delete of folded id holds"
+        );
+        assert!(
+            idx.get(1002).unwrap().is_none(),
+            "insert+delete in window stays dead"
+        );
+
+        // The same must hold from disk alone (WAL suffix replay).
+        drop(idx);
+        let reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(reopened.len(), 201);
+        assert!(reopened.get(1000).unwrap().is_some());
+        assert!(reopened.get(5).unwrap().is_none());
+        assert!(reopened.get(1002).unwrap().is_none());
+    }
+
+    /// A flush that fires during the background window (delta reaching FLUSH)
+    /// creates post-begin runs; finish discards their dirs and the WAL suffix
+    /// replays them, so nothing is lost and no stale run dir survives.
+    #[test]
+    fn post_begin_flush_survives_finish() {
+        let dim = 8;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for i in 0..100u64 {
+            idx.insert(i, &vec![0.1f32 + i as f32 * 1e-3; dim]).unwrap();
+        }
+        let job = idx.consolidate_begin().unwrap().expect("non-empty");
+        // Enough post-begin inserts to cross FLUSH and mint a run mid-window.
+        for i in 1000..(1000 + DiskVamanaIndex::FLUSH as u64 + 10) {
+            idx.insert(i, &vec![0.2f32 + (i as f32) * 1e-6; dim])
+                .unwrap();
+        }
+        assert!(idx.run_count() > 0, "a post-begin run exists");
+        let built = job.build(tmp.path()).unwrap();
+        idx.consolidate_finish(built).unwrap();
+        assert_eq!(
+            idx.len(),
+            100 + DiskVamanaIndex::FLUSH + 10,
+            "folded + post-begin (replayed through the WAL suffix)"
+        );
+        assert!(
+            idx.get(1000).unwrap().is_some(),
+            "post-begin run content kept"
+        );
     }
 }
