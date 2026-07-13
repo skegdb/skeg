@@ -1229,8 +1229,18 @@ struct Segment {
 /// Owns everything it needs: the surviving vectors, ids, and the WAL offset
 /// separating pre-snapshot records (folded) from post-snapshot ones (replayed).
 pub struct ConsolidateJob {
-    vectors: Vec<f32>,
-    ids: Vec<u64>,
+    /// Newest layer: the delta captured directly at `begin` (no flush, no graph
+    /// build on the caller). Row-major, paired with `delta_ids`.
+    delta_vectors: Vec<f32>,
+    delta_ids: Vec<u64>,
+    /// Base/run survivors, read OFF-THREAD in `build` from `seg_files`.
+    /// `(id, seg_index, row)`; seg_index 0 = base, 1.. = runs.
+    survivors: Vec<(u64, usize, u32)>,
+    /// Duplicated `vectors.bin` handles [base, run0, run1, ...]. `try_clone`
+    /// dups the fd (O(1)); the reads happen off the caller in `build`. A
+    /// concurrent consolidate/flush may rename these files, but an open fd keeps
+    /// the inode, so the snapshot stays readable.
+    seg_files: Vec<File>,
     dim: usize,
     tier: QuantKind,
     run_seq_high: u64,
@@ -1259,13 +1269,48 @@ impl ConsolidateJob {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
         let ConsolidateJob {
-            vectors,
-            ids,
+            delta_vectors,
+            delta_ids,
+            survivors,
+            seg_files,
             dim,
             tier,
             run_seq_high,
             wal_offset,
         } = self;
+        // Assemble the survivor set in id order (near-neighbours land at nearby
+        // rows so the re-rank stays cache-local). Reads happen HERE, off-thread:
+        // delta from RAM, base/run survivors from the duped `vectors.bin` fds.
+        enum Src {
+            Delta(usize),
+            Seg(usize, u32),
+        }
+        let total = delta_ids.len() + survivors.len();
+        let mut items: Vec<(u64, Src)> = Vec::with_capacity(total);
+        for (i, &id) in delta_ids.iter().enumerate() {
+            items.push((id, Src::Delta(i)));
+        }
+        for (id, seg, row) in survivors {
+            items.push((id, Src::Seg(seg, row)));
+        }
+        items.sort_unstable_by_key(|&(id, _)| id);
+        let mut vectors: Vec<f32> = Vec::with_capacity(total * dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(total);
+        let mut buf = vec![0u8; dim * 4];
+        for (id, src) in items {
+            match src {
+                Src::Delta(i) => vectors.extend_from_slice(&delta_vectors[i * dim..(i + 1) * dim]),
+                Src::Seg(seg, row) => {
+                    let off = HEADER_LEN as u64 + u64::from(row) * dim as u64 * 4;
+                    seg_files[seg].read_exact_at(&mut buf, off)?;
+                    vectors.extend(
+                        buf.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                    );
+                }
+            }
+            ids.push(id);
+        }
         let cfg = disk_build_config();
         // Cap the build's rayon parallelism. The consolidate runs off the request
         // path on a background thread, but `build_disk_graph` fans out over the
@@ -2947,11 +2992,21 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if the flush or a vector read fails.
     pub fn consolidate_begin(&mut self) -> io::Result<Option<ConsolidateJob>> {
-        self.flush()?;
-        let segs: Vec<&Segment> = std::iter::once(&self.base)
-            .chain(self.runs.iter())
-            .collect();
+        // Cheap snapshot: NO flush (which would build a graph from the delta) and
+        // NO O(live) vector reads. The delta is the newest layer, captured in
+        // RAM; base/run survivors are recorded as (seg, row) locations and read
+        // off-thread in `build`. All the heavy work moves to the background.
         let mut seen: AHashSet<u64> = AHashSet::new();
+        let mut delta_ids: Vec<u64> = Vec::with_capacity(self.delta.len());
+        let mut delta_vectors: Vec<f32> = Vec::with_capacity(self.delta.len() * self.dim);
+        for (&id, v) in &self.delta {
+            // (a tombstoned id is already removed from the delta by apply_delete)
+            if seen.insert(id) {
+                delta_ids.push(id);
+                delta_vectors.extend_from_slice(v);
+            }
+        }
+        // Base/runs, newest run first; delta already shadows via `seen`.
         let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
         for (ri, run) in self.runs.iter().enumerate().rev() {
             for row in 0..run.main_n {
@@ -2969,22 +3024,21 @@ impl DiskVamanaIndex {
             }
             survivors.push((id, 0, row));
         }
-        if survivors.is_empty() {
+        if survivors.is_empty() && delta_ids.is_empty() {
             return Ok(None);
         }
-        // Same id-order rule as the inline consolidate: near-neighbours land at
-        // nearby vectors.bin rows so the re-rank stays cache-local at scale.
-        survivors.sort_unstable_by_key(|&(id, _, _)| id);
-        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * self.dim);
-        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
-        for (id, loc, row) in survivors {
-            vectors.extend(self.read_vector(segs[loc], row)?);
-            ids.push(id);
+        // Dup the vectors.bin fds [base, run0, ...] for off-thread reads (O(1)).
+        let mut seg_files: Vec<File> = Vec::with_capacity(1 + self.runs.len());
+        seg_files.push(self.base.vectors_file.try_clone()?);
+        for run in &self.runs {
+            seg_files.push(run.vectors_file.try_clone()?);
         }
         let wal_offset = self.delta_log.metadata()?.len();
         Ok(Some(ConsolidateJob {
-            vectors,
-            ids,
+            delta_vectors,
+            delta_ids,
+            survivors,
+            seg_files,
             dim: self.dim,
             tier: self.tier,
             run_seq_high: self.run_seq,
