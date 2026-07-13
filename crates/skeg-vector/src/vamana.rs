@@ -1375,6 +1375,162 @@ impl RunMergeJob {
     }
 }
 
+/// Snapshot for a background delete-patch of the base graph. Removes the base
+/// rows that are dead at `begin` (tombstoned, or shadowed by a newer copy in a
+/// run) by re-pruning only the nodes that pointed at a removed node - the
+/// FreshDiskANN lazy-deletion rule - instead of rebuilding the whole graph
+/// from scratch. Cost is O(#nodes touching a deleted node), not O(live-set), so
+/// it reclaims dead base rows far cheaper than a full consolidate. Runs are left
+/// intact: the insert side is handled by a run-merge / flush, not here.
+pub struct DeletePatchJob {
+    /// Every base row's f32 vector, row-major in old-row order.
+    vectors: Vec<f32>,
+    /// Base id by old row.
+    ids: Vec<u64>,
+    /// Base adjacency by old row (owned copy of the served graph).
+    adj: Vec<Node>,
+    /// old row -> removed at this patch.
+    dead: Vec<bool>,
+    /// Old-row medoid.
+    medoid: VecId,
+    dim: usize,
+    l_search: usize,
+}
+
+/// Output of [`DeletePatchJob::build`]: the patched base graph in a sidecar
+/// dir, ready for [`DiskVamanaIndex::delete_patch_finish`] to swap in.
+pub struct DeletePatchBuilt {
+    tmp: PathBuf,
+}
+
+impl DeletePatchJob {
+    /// Apply the delete-patch. CPU-bounded but O(affected), far cheaper than a
+    /// full consolidate's greedy rebuild; run it on a background thread. Writes
+    /// into `<index dir>/patching/`, never touching the served files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the sidecar files fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<DeletePatchBuilt> {
+        let tmp = index_dir.join("patching");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let DeletePatchJob {
+            vectors,
+            ids,
+            adj,
+            dead,
+            medoid,
+            dim,
+            l_search,
+        } = self;
+        let cfg = disk_build_config();
+        // Same rayon cap as the consolidate: keep a background patch from
+        // starving the foreground of every core while it runs.
+        let patched = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => {
+                pool.install(|| patch_graph(vectors, ids, adj, &dead, medoid, dim, l_search, &cfg))
+            }
+            None => patch_graph(vectors, ids, adj, &dead, medoid, dim, l_search, &cfg),
+        };
+        patched.save(&tmp)?;
+        Ok(DeletePatchBuilt { tmp })
+    }
+}
+
+/// FreshDiskANN lazy-delete patch: drop the `dead` rows and re-wire only the
+/// survivors that pointed at one. A node whose out-list held no dead neighbour
+/// keeps its edges verbatim (just row-remapped); a node that lost a neighbour
+/// gets a fresh candidate set - its live neighbours plus the live neighbours of
+/// its dead ones (bridging the gap) - and a single `robust_prune` back down to
+/// `R`. No greedy search, so the cost is the pruning of affected nodes only.
+fn patch_graph(
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    adj: Vec<Node>,
+    dead: &[bool],
+    old_medoid: VecId,
+    dim: usize,
+    l_search: usize,
+    cfg: &VamanaConfig,
+) -> VamanaIndex {
+    let n_old = ids.len();
+    // old row -> new row (u32::MAX = removed).
+    let mut remap = vec![u32::MAX; n_old];
+    let mut new_ids: Vec<u64> = Vec::new();
+    let mut new_vectors: Vec<f32> = Vec::new();
+    let mut survivors: Vec<u32> = Vec::new();
+    for row in 0..n_old {
+        if !dead[row] {
+            remap[row] = new_ids.len() as u32;
+            new_ids.push(ids[row]);
+            new_vectors.extend_from_slice(&vectors[row * dim..(row + 1) * dim]);
+            survivors.push(row as u32);
+        }
+    }
+    let n_new = new_ids.len();
+    assert!(n_new > 0, "delete-patch left no survivors");
+    // Distances during pruning are measured over the OLD row space (candidates
+    // are old rows), so prune against a source indexed by old row.
+    let old_src = InMemoryVectorSource::new(vectors, dim);
+    let new_nodes: Vec<Node> = survivors
+        .par_iter()
+        .map(|&p| {
+            let out = adj[p as usize].slice();
+            let touches_dead = out.iter().any(|&w| dead[w as usize]);
+            let mut node = Node::new();
+            if !touches_dead {
+                // Fast path: edges intact, just remap to new rows.
+                let kept: SmallVec<[VecId; MAX_R]> =
+                    out.iter().map(|&w| remap[w as usize]).collect();
+                node.set(&kept);
+                return node;
+            }
+            // Bridge over dead neighbours, then prune back to R.
+            let mut cand: AHashSet<VecId> = AHashSet::new();
+            for &w in out {
+                if !dead[w as usize] {
+                    cand.insert(w);
+                } else {
+                    for &x in adj[w as usize].slice() {
+                        if x != p && !dead[x as usize] {
+                            cand.insert(x);
+                        }
+                    }
+                }
+            }
+            let pv = old_src.row(p);
+            let mut scored: Vec<(f32, VecId)> =
+                cand.iter().map(|&c| (dist(pv, old_src.row(c)), c)).collect();
+            let picked = robust_prune(p, &mut scored, cfg.alpha2, cfg.r, &old_src);
+            let remapped: SmallVec<[VecId; MAX_R]> =
+                picked.iter().map(|&w| remap[w as usize]).collect();
+            node.set(&remapped);
+            node
+        })
+        .collect();
+    drop(old_src);
+
+    let new_src = InMemoryVectorSource::new(new_vectors, dim);
+    let medoid = if old_medoid != u32::MAX && !dead[old_medoid as usize] {
+        remap[old_medoid as usize]
+    } else {
+        approximate_medoid(&new_src, n_new as u32, cfg.medoid_sample, cfg.seed)
+    };
+    VamanaIndex {
+        dim,
+        n: n_new as u32,
+        vectors: Box::new(new_src),
+        ids: new_ids,
+        nodes: new_nodes,
+        medoid,
+        r: cfg.r,
+        l_search,
+    }
+}
+
 pub struct DiskVamanaIndex {
     dim: usize,
     l_search: usize,
@@ -2956,6 +3112,94 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
+    /// Snapshot for a background delete-patch of the base graph (short,
+    /// exclusive). Flushes the delta, then marks every base row that is dead -
+    /// tombstoned, or shadowed by a newer copy in a run - and captures the base
+    /// adjacency + vectors so [`DeletePatchJob::build`] can re-prune only the
+    /// survivors that lost a neighbour (O(affected), no greedy rebuild).
+    /// Returns `None` when there is nothing to reclaim, or when the patch would
+    /// empty the base (a full `consolidate` is the right tool then).
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the flush or a base-vector read fails.
+    pub fn delete_patch_begin(&mut self) -> io::Result<Option<DeletePatchJob>> {
+        self.flush()?;
+        let n = self.base.main_n as usize;
+        if n == 0 {
+            return Ok(None);
+        }
+        // Ids that live in a surviving run shadow the base copy of the same id.
+        let mut in_run: AHashSet<u64> = AHashSet::new();
+        for run in &self.runs {
+            for &id in &run.ids {
+                in_run.insert(id);
+            }
+        }
+        let mut dead = vec![false; n];
+        let mut dead_count = 0usize;
+        for row in 0..n {
+            let id = self.base.ids[row];
+            if self.tombstones.contains(&id) || in_run.contains(&id) {
+                dead[row] = true;
+                dead_count += 1;
+            }
+        }
+        if dead_count == 0 || n - dead_count == 0 {
+            return Ok(None);
+        }
+        let adj: Vec<Node> = (0..n).map(|r| self.base.nodes[r]).collect();
+        let mut vectors: Vec<f32> = Vec::with_capacity(n * self.dim);
+        for row in 0..n as u32 {
+            vectors.extend(self.read_vector(&self.base, row)?);
+        }
+        Ok(Some(DeletePatchJob {
+            vectors,
+            ids: self.base.ids.clone(),
+            adj,
+            dead,
+            medoid: self.base.medoid,
+            dim: self.dim,
+            l_search: self.l_search,
+        }))
+    }
+
+    /// Swap the patched base in (short, exclusive). The patch touched only the
+    /// base graph, so - unlike `consolidate_finish` - runs, delta, tombstones,
+    /// and the WAL are all left as they are. That is safe across a restart: every
+    /// row the patch removed was either tombstoned (the WAL still re-tombstones
+    /// it) or shadowed by a run (the WAL still holds the newer copy), so a plain
+    /// reopen reconstructs the same live set. The patched base's `vectors.bin`
+    /// fd, opened via the sidecar, keeps pointing at the renamed inode.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the sidecar open or the file renames fail.
+    pub fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> io::Result<()> {
+        let dir = self.dir.clone();
+        // Load the patched base from the sidecar (an index with no runs/WAL),
+        // then move its files over the live base files.
+        let new_base = DiskVamanaIndex::open_with_tier(&built.tmp, self.tier)?.base;
+        // The patch reordered base rows: drop the stale router sidecar.
+        let _ = std::fs::remove_file(dir.join(IVF_FILE));
+        std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
+        std::fs::rename(built.tmp.join(VECTORS_FILE), dir.join(VECTORS_FILE))?;
+        let _ = std::fs::remove_dir_all(&built.tmp);
+        self.base = new_base;
+        self.ivf = None;
+        // Drop tombstones that no longer cover anything (their only copy was a
+        // base row we just removed); the WAL still carries them for a restart,
+        // and the next consolidate clears them for good. Keeps the live filter
+        // from growing without bound under sustained delete-patching.
+        let mut present: AHashSet<u64> = AHashSet::with_capacity(self.base.ids.len());
+        present.extend(self.base.ids.iter().copied());
+        for run in &self.runs {
+            present.extend(run.ids.iter().copied());
+        }
+        self.tombstones.retain(|id| present.contains(id));
+        Ok(())
+    }
+
     /// True if this index is large enough to benefit from a routed filtered
     /// search (below it, an exact scan of the match set is already cheap). Used
     /// by the background idle-consolidate to decide whether to build the router.
@@ -3997,5 +4241,96 @@ mod tests {
         assert_eq!(re.len(), live_before);
         assert!(re.get(90_000).unwrap().is_some());
         assert!(re.get(1).unwrap().is_none());
+    }
+
+    /// Delete-patch removes the tombstoned rows from the base graph in place
+    /// (O(deleted), no full rebuild) while keeping the survivors searchable.
+    #[test]
+    fn delete_patch_removes_deleted_and_preserves_search() {
+        let dim = 16;
+        let n = 400usize;
+        let vecs = random_vectors(n, dim, 31);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap(); // land every vector in the base
+        let base_before = idx.main_len();
+        assert_eq!(base_before, n, "all rows in base");
+
+        let deleted: Vec<u64> = (0..n as u64).step_by(5).collect();
+        for &id in &deleted {
+            idx.delete(id).unwrap();
+        }
+        let live_before = idx.len();
+
+        let job = idx.delete_patch_begin().unwrap().expect("dead rows to reclaim");
+        let built = job.build(tmp.path()).unwrap();
+        idx.delete_patch_finish(built).unwrap();
+
+        assert_eq!(idx.main_len(), n - deleted.len(), "base shrank by the deletes");
+        assert_eq!(idx.len(), live_before, "live set unchanged by the patch");
+        for &id in &deleted {
+            assert!(idx.get(id).unwrap().is_none(), "deleted id {id} stays gone");
+        }
+        // The rewired graph still reaches its survivors: top-1 self-match on a
+        // broad sample.
+        let mut self_hits = 0usize;
+        let survivors: Vec<u64> = (0..n as u64).filter(|id| id % 5 != 0).collect();
+        for &id in &survivors {
+            let q = &vecs[id as usize * dim..(id as usize + 1) * dim];
+            if idx.search(q, 1).unwrap().first().is_some_and(|h| h.0 == id) {
+                self_hits += 1;
+            }
+        }
+        let frac = self_hits as f64 / survivors.len() as f64;
+        assert!(frac >= 0.90, "patched graph stays connected: {frac:.3} self-match");
+    }
+
+    /// Writes that race a background delete-patch survive, and the result is
+    /// correct from disk alone after a reopen - the patch leaves runs/delta/WAL
+    /// untouched, so the removed rows (tombstoned or run-shadowed) still replay.
+    #[test]
+    fn delete_patch_survives_race_and_reopen() {
+        let dim = 16;
+        let n = 300usize;
+        let vecs = random_vectors(n, dim, 32);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        for id in (0..n as u64).step_by(5) {
+            idx.delete(id).unwrap(); // dead-at-begin base rows
+        }
+        let live_before = idx.len();
+
+        let job = idx.delete_patch_begin().unwrap().expect("dead rows to reclaim");
+        // Race the off-thread build.
+        idx.insert(90_000, &vec![0.11f32; dim]).unwrap(); // new live
+        assert!(idx.delete(1).unwrap(), "delete a survivor mid-patch"); // 1 % 5 != 0
+        idx.insert(90_001, &vec![0.22f32; dim]).unwrap();
+        assert!(idx.delete(90_001).unwrap(), "insert+delete in the window");
+        let built = job.build(tmp.path()).unwrap();
+        idx.delete_patch_finish(built).unwrap();
+
+        // +1 (90000 live), -1 (id 1 deleted). Deletes of already-dead rows n/a.
+        assert_eq!(idx.len(), live_before + 1 - 1);
+        assert!(idx.get(90_000).unwrap().is_some(), "post-begin insert kept");
+        assert!(idx.get(1).unwrap().is_none(), "post-begin delete of a survivor holds");
+        assert!(idx.get(90_001).unwrap().is_none(), "insert+delete in window stays dead");
+        assert!(idx.get(0).unwrap().is_none(), "pre-begin delete stays gone");
+
+        // Reopen from disk: base is patched, WAL replays the full history.
+        drop(idx);
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live_before, "live count identical from disk");
+        assert!(re.get(90_000).unwrap().is_some());
+        assert!(re.get(1).unwrap().is_none());
+        assert!(re.get(0).unwrap().is_none());
+        let survivor = 2u64;
+        assert!(re.get(survivor).unwrap().is_some(), "a survivor is still present");
     }
 }
