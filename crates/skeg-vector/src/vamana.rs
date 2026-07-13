@@ -1247,10 +1247,13 @@ pub struct ConsolidateJob {
     wal_offset: u64,
 }
 
-/// The output of [`ConsolidateJob::build`]: a freshly built base graph saved in
-/// a sidecar directory, ready for [`DiskVamanaIndex::consolidate_finish`] to
-/// swap in.
+/// The output of [`ConsolidateJob::build`]: a freshly built base segment,
+/// already OPENED off-thread (graph parsed + quant tier built), plus its sidecar
+/// dir for the file rename. [`DiskVamanaIndex::consolidate_finish`] swaps the
+/// segment in without a reopen, so the O(live) tier rebuild never lands on the
+/// shard thread.
 pub struct ConsolidateBuilt {
+    base: Segment,
     tmp: PathBuf,
     run_seq_high: u64,
     wal_offset: u64,
@@ -1325,7 +1328,13 @@ impl ConsolidateJob {
             None => build_disk_graph(tier, vectors, ids, dim, &cfg),
         };
         rebuilt.save(&tmp)?;
+        // Open the freshly-saved base HERE (still off-thread): this is where the
+        // O(live) quant-tier build happens now - not on the shard thread in
+        // finish. The vectors.bin fd survives the finish rename (inode), so the
+        // returned segment stays valid after the file moves into place.
+        let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
         Ok(ConsolidateBuilt {
+            base,
             tmp,
             run_seq_high,
             wal_offset,
@@ -1365,8 +1374,12 @@ fn consolidate_thread_cap() -> Option<usize> {
 /// correctly. Cheap (O(runs), not O(live-set)), so it can run often enough to
 /// keep the run count bounded under fast churn.
 pub struct RunMergeJob {
-    vectors: Vec<f32>,
+    /// (seg_index, row) survivor locations, id-sorted; read OFF-THREAD in build
+    /// from the duped fds. seg_index parallels `seg_files`.
+    survivors: Vec<(usize, u32)>,
     ids: Vec<u64>,
+    /// Duped vectors.bin fds for the folded runs (O(1) each at begin).
+    seg_files: Vec<File>,
     dim: usize,
     tier: QuantKind,
     merged_seq: u64,
@@ -1374,10 +1387,11 @@ pub struct RunMergeJob {
     old_dirs: Vec<u64>,
 }
 
-/// Output of [`RunMergeJob::build`]: the merged run on disk, ready for
-/// [`DiskVamanaIndex::merge_runs_finish`] to slot in.
+/// Output of [`RunMergeJob::build`]: the merged run already OPENED off-thread
+/// (graph + quant tier built), ready for [`DiskVamanaIndex::merge_runs_finish`]
+/// to splice in without a reopen on the shard thread.
 pub struct RunMergeBuilt {
-    merged_dir: PathBuf,
+    merged: Segment,
     merged_seq: u64,
     n_merged: usize,
     old_dirs: Vec<u64>,
@@ -1393,8 +1407,9 @@ impl RunMergeJob {
     /// Returns an I/O error if writing the run fails.
     pub fn build(self, index_dir: &Path) -> io::Result<RunMergeBuilt> {
         let RunMergeJob {
-            vectors,
+            survivors,
             ids,
+            seg_files,
             dim,
             tier,
             merged_seq,
@@ -1403,6 +1418,17 @@ impl RunMergeJob {
         } = self;
         let dir = index_dir.join(format!("run-{merged_seq}"));
         let _ = std::fs::remove_dir_all(&dir);
+        // Read survivor vectors OFF-THREAD from the duped run fds.
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
+        let mut buf = vec![0u8; dim * 4];
+        for (seg, row) in survivors {
+            let off = HEADER_LEN as u64 + u64::from(row) * dim as u64 * 4;
+            seg_files[seg].read_exact_at(&mut buf, off)?;
+            vectors.extend(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
         let cfg = disk_build_config();
         let rebuilt = match consolidate_thread_cap()
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
@@ -1411,8 +1437,11 @@ impl RunMergeJob {
             None => build_disk_graph(tier, vectors, ids, dim, &cfg),
         };
         rebuilt.save(&dir)?;
+        // Open the merged run HERE (off-thread): the quant-tier build for the
+        // merged run happens now, not on the shard thread in finish.
+        let merged = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
         Ok(RunMergeBuilt {
-            merged_dir: dir,
+            merged,
             merged_seq,
             n_merged,
             old_dirs,
@@ -3079,7 +3108,24 @@ impl DiskVamanaIndex {
         self.run_seq = built.run_seq_high.max(self.run_seq);
         self.discard_runs()?;
         std::fs::write(&wal_path, &suffix)?;
-        *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
+        // Surgical swap: install the prebuilt base (tier already built off-thread)
+        // and reconstruct the in-RAM state the way `open` would, then replay the
+        // WAL suffix - WITHOUT a full reopen, so the O(live) tier rebuild does not
+        // run here on the shard thread. `tier` is unused now (the segment carries
+        // its own quant); keep the arg-free reopen out of the hot path.
+        let _ = tier;
+        let delta_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
+        self.base = built.base;
+        self.delta.clear();
+        self.tombstones.clear();
+        self.live_count = self.base.main_n as usize;
+        self.delta_log = delta_log;
+        self.tq1 = Box::default();
+        self.ivf = None;
+        self.replay_wal(&suffix);
         Ok(())
     }
 
@@ -3132,18 +3178,23 @@ impl DiskVamanaIndex {
         }
         // id order for re-rank cache locality, same rule as consolidate.
         survivors.sort_unstable_by_key(|&(ri, row)| self.runs[ri].ids[row as usize]);
-        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * self.dim);
-        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
-        for (ri, row) in survivors {
-            vectors.extend(self.read_vector(&self.runs[ri], row)?);
-            ids.push(self.runs[ri].ids[row as usize]);
+        let ids: Vec<u64> = survivors
+            .iter()
+            .map(|&(ri, row)| self.runs[ri].ids[row as usize])
+            .collect();
+        // Dup the folded runs' vectors.bin fds (O(1)); the reads happen off-thread
+        // in build. seg_index in `survivors` is the run index 0..n_merged.
+        let mut seg_files: Vec<File> = Vec::with_capacity(n_merged);
+        for ri in 0..n_merged {
+            seg_files.push(self.runs[ri].vectors_file.try_clone()?);
         }
         let old_dirs = self.run_dirs[..n_merged].to_vec();
         let merged_seq = self.run_seq;
         self.run_seq += 1;
         Ok(Some(RunMergeJob {
-            vectors,
+            survivors,
             ids,
+            seg_files,
             dim: self.dim,
             tier: self.tier,
             merged_seq,
@@ -3162,10 +3213,10 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if opening the merged run or deleting a dir fails.
     pub fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> io::Result<()> {
-        let merged = DiskVamanaIndex::open_with_tier(&built.merged_dir, self.tier)?.base;
+        // The merged run was already opened off-thread in build; splice it in.
         let keep_runs = self.runs.split_off(built.n_merged);
         let keep_dirs = self.run_dirs.split_off(built.n_merged);
-        self.runs = std::iter::once(merged).chain(keep_runs).collect();
+        self.runs = std::iter::once(built.merged).chain(keep_runs).collect();
         self.run_dirs = std::iter::once(built.merged_seq).chain(keep_dirs).collect();
         for seq in built.old_dirs {
             let d = self.dir.join(format!("run-{seq}"));
