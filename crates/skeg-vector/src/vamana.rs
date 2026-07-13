@@ -1518,11 +1518,13 @@ pub struct DeletePatchJob {
     medoid: VecId,
     dim: usize,
     l_search: usize,
+    tier: QuantKind,
 }
 
 /// Output of [`DeletePatchJob::build`]: the patched base graph in a sidecar
 /// dir, ready for [`DiskVamanaIndex::delete_patch_finish`] to swap in.
 pub struct DeletePatchBuilt {
+    base: Segment,
     tmp: PathBuf,
 }
 
@@ -1546,6 +1548,7 @@ impl DeletePatchJob {
             medoid,
             dim,
             l_search,
+            tier,
         } = self;
         let cfg = disk_build_config();
         // Same rayon cap as the consolidate: keep a background patch from
@@ -1559,7 +1562,10 @@ impl DeletePatchJob {
             None => patch_graph(vectors, ids, adj, &dead, medoid, dim, l_search, &cfg),
         };
         patched.save(&tmp)?;
-        Ok(DeletePatchBuilt { tmp })
+        // Open the patched base HERE (off-thread): the O(live) tier rebuild
+        // happens off the shard thread, not in finish.
+        let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
+        Ok(DeletePatchBuilt { base, tmp })
     }
 }
 
@@ -3425,6 +3431,7 @@ impl DiskVamanaIndex {
             medoid: self.base.medoid,
             dim: self.dim,
             l_search: self.l_search,
+            tier: self.tier,
         }))
     }
 
@@ -3441,9 +3448,8 @@ impl DiskVamanaIndex {
     /// I/O error if the sidecar open or the file renames fail.
     pub fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> io::Result<()> {
         let dir = self.dir.clone();
-        // Load the patched base from the sidecar (an index with no runs/WAL),
-        // then move its files over the live base files.
-        let new_base = DiskVamanaIndex::open_with_tier(&built.tmp, self.tier)?.base;
+        // The patched base was already opened off-thread in build; swap it in.
+        let new_base = built.base;
         // The patch reordered base rows: drop the stale router sidecar.
         let _ = std::fs::remove_file(dir.join(IVF_FILE));
         std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
