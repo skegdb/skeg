@@ -36,7 +36,10 @@ fn uvec(dim: usize, s: &mut u64) -> Vec<f32> {
 }
 
 fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) {
@@ -79,7 +82,10 @@ fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) {
                 job = Some(std::thread::spawn(move || jb.build(&d)));
             }
         }
-        if job.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+        if job
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
             let built = job.take().unwrap().join().unwrap().unwrap();
             idx.consolidate_finish(built).unwrap();
             let dt = fold_start.elapsed();
@@ -123,7 +129,9 @@ fn main() {
     let tier = QuantKind::TurboQuant { bits };
     println!("# scale_churn: turns={turns} dim={dim} max_runs={max_runs} tq{bits}");
     println!("# retract/s = sustained; max_runs = peak run count (bounded => fold keeps pace);");
-    println!("# fold_busy = fraction of wall time a fold was in flight (~1.0 => fold is the bottleneck)");
+    println!(
+        "# fold_busy = fraction of wall time a fold was in flight (~1.0 => fold is the bottleneck)"
+    );
     println!("| live    | T | retr/s | maxR | endR | folds | build_s | busy |");
     println!("|---------|---|-------:|-----:|-----:|------:|--------:|-----:|");
     for &n in &sizes {

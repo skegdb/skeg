@@ -1258,20 +1258,58 @@ impl ConsolidateJob {
         let tmp = index_dir.join("consolidating");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
-        let rebuilt = build_disk_graph(
-            self.tier,
-            self.vectors,
-            self.ids,
-            self.dim,
-            &disk_build_config(),
-        );
+        let ConsolidateJob {
+            vectors,
+            ids,
+            dim,
+            tier,
+            run_seq_high,
+            wal_offset,
+        } = self;
+        let cfg = disk_build_config();
+        // Cap the build's rayon parallelism. The consolidate runs off the request
+        // path on a background thread, but `build_disk_graph` fans out over the
+        // GLOBAL rayon pool (all cores), so while it runs it starves the
+        // foreground - streaming inserts and queries - of every core, collapsing
+        // sustained ingest throughput (measured: churn drops ~10x during a fold).
+        // Confine it to a bounded pool so the foreground keeps making progress.
+        let rebuilt = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
         rebuilt.save(&tmp)?;
         Ok(ConsolidateBuilt {
             tmp,
-            run_seq_high: self.run_seq_high,
-            wal_offset: self.wal_offset,
+            run_seq_high,
+            wal_offset,
         })
     }
+}
+
+/// Rayon thread cap for a background consolidate build, or `None` to use every
+/// core. Default: a fixed FRACTION of the machine's cores (three quarters),
+/// reserving the rest for the foreground (streaming writes and queries) so a
+/// background rebuild does not collapse ingest throughput while it runs. Being
+/// proportional means it scales with any core count (4 cores -> 3 build / 1
+/// foreground; 64 -> 48 / 16) rather than a fixed reserve that starves either
+/// side at the extremes. Override the fraction's numerator with
+/// `SKEG_CONSOLIDATE_THREADS` (an absolute thread count; 0 or >= parallelism
+/// means "all cores"). Machines with 1-2 cores are left uncapped.
+fn consolidate_thread_cap() -> Option<usize> {
+    /// Cores the build takes, out of every 4 available; the other 1/4 stays free
+    /// for the foreground.
+    const BUILD_NUM: usize = 3;
+    const BUILD_DEN: usize = 4;
+    let avail = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let n = std::env::var("SKEG_CONSOLIDATE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| (avail * BUILD_NUM / BUILD_DEN).max(1));
+    (n >= 1 && n < avail).then_some(n)
 }
 
 pub struct DiskVamanaIndex {

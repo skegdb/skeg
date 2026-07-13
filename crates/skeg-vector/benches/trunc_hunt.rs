@@ -35,7 +35,11 @@ fn uvec(dim: usize, s: &mut u64) -> Vec<f32> {
 fn check_vbin(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 16 {
-        return Some(format!("{}: {} bytes (< header)", path.display(), bytes.len()));
+        return Some(format!(
+            "{}: {} bytes (< header)",
+            path.display(),
+            bytes.len()
+        ));
     }
     let n = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as u64;
     let dim = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as u64;
@@ -59,7 +63,10 @@ fn check_dir(dir: &Path) -> Vec<String> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run-")) {
+            if p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("run-"))
+            {
                 if let Some(m) = check_vbin(&p.join("vectors.bin")) {
                     bad.push(format!("RUN  {m}"));
                 }
@@ -69,7 +76,15 @@ fn check_dir(dir: &Path) -> Vec<String> {
     bad
 }
 
-fn build_churned(background: bool, max_runs: usize, n: usize, churn: usize, dim: usize, tier: QuantKind, dir: &Path) {
+fn build_churned(
+    background: bool,
+    max_runs: usize,
+    n: usize,
+    churn: usize,
+    dim: usize,
+    tier: QuantKind,
+    dir: &Path,
+) {
     let _ = std::fs::remove_dir_all(dir);
     let mut idx = DiskVamanaIndex::create_empty_with_tier(dir, dim, 300, tier).unwrap();
     let mut s = 0xDEAD_BEEF_1234u64 ^ (dim as u64);
@@ -95,8 +110,12 @@ fn build_churned(background: bool, max_runs: usize, n: usize, churn: usize, dim:
                     job = Some(std::thread::spawn(move || jb.build(&d)));
                 }
             }
-            if job.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
-                idx.consolidate_finish(job.take().unwrap().join().unwrap().unwrap()).unwrap();
+            if job
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                idx.consolidate_finish(job.take().unwrap().join().unwrap().unwrap())
+                    .unwrap();
             }
         } else if idx.delta_len() >= idx.main_len().max(4096) {
             idx.consolidate().unwrap();
@@ -110,7 +129,10 @@ fn build_churned(background: bool, max_runs: usize, n: usize, churn: usize, dim:
 }
 
 fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
