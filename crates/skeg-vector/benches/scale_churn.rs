@@ -17,6 +17,62 @@ use std::time::Instant;
 
 use skeg_vector::{ConsolidateBuilt, DiskVamanaIndex, QuantKind, RunMergeBuilt};
 
+/// L3 reclaim A/B: build a base of `n`, delete `del_frac` of it, then time the
+/// two ways to reclaim the dead rows - a full consolidate (O(live) greedy
+/// rebuild) vs a delete-patch (O(deleted) in-place prune). Two independent
+/// indices built from the same seed so the workloads are identical.
+fn run_l3(n: usize, del_frac: f64, dim: usize, tier: QuantKind) {
+    let build = |tag: &str| -> (DiskVamanaIndex, Vec<u64>) {
+        let dir = std::env::temp_dir().join(format!("skeg_l3_{tag}_{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(&dir, dim, 300, tier).unwrap();
+        let mut s = 0xD00D_1234u64 ^ (n as u64);
+        for i in 0..n as u64 {
+            idx.insert(i, &uvec(dim, &mut s)).unwrap();
+        }
+        idx.consolidate().unwrap();
+        // Deterministic delete set (same for both indices).
+        let d = (n as f64 * del_frac) as usize;
+        let mut r = 0xBEEF_5678u64 ^ (n as u64);
+        let mut deleted = Vec::with_capacity(d);
+        for _ in 0..d {
+            let id = (xs(&mut r) as usize % n) as u64;
+            idx.delete(id).unwrap();
+            deleted.push(id);
+        }
+        (idx, deleted)
+    };
+
+    let (mut a, _) = build("cons");
+    let t = Instant::now();
+    a.consolidate().unwrap();
+    let cons_s = t.elapsed().as_secs_f64();
+    let base_a = a.main_len();
+    let dir_a = std::env::temp_dir().join(format!("skeg_l3_cons_{n}"));
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir_a);
+
+    let (mut b, _) = build("patch");
+    let dir_b = std::env::temp_dir().join(format!("skeg_l3_patch_{n}"));
+    let t = Instant::now();
+    let patch_s = if let Some(job) = b.delete_patch_begin().unwrap() {
+        let built = job.build(&dir_b).unwrap();
+        b.delete_patch_finish(built).unwrap();
+        t.elapsed().as_secs_f64()
+    } else {
+        0.0
+    };
+    let base_b = b.main_len();
+    drop(b);
+    let _ = std::fs::remove_dir_all(&dir_b);
+
+    let speedup = if patch_s > 0.0 { cons_s / patch_s } else { 0.0 };
+    println!(
+        "| {n:>7} | {:>4.0} | {cons_s:>8.2} | {patch_s:>8.2} | {speedup:>6.1}x | {base_a:>7} | {base_b:>7} |",
+        del_frac * 100.0,
+    );
+}
+
 fn xs(s: &mut u64) -> u64 {
     *s ^= *s << 13;
     *s ^= *s >> 7;
@@ -251,6 +307,17 @@ fn main() {
     let bits: u8 = env("SKEG_BITS", 2);
     let tier = QuantKind::TurboQuant { bits };
     let mode = std::env::var("SKEG_MODE").unwrap_or_else(|_| "full".into());
+    if mode == "l3" {
+        let del: f64 = env("SKEG_DELFRAC", 0.4);
+        println!("# scale_churn L3 reclaim: dim={dim} tq{bits} | consolidate O(live) vs delete-patch O(deleted)");
+        println!("# del% deleted before reclaim; cons/patch = reclaim wall seconds; base = rows after");
+        println!("| live    | del% | cons_s   | patch_s  | speedup | base_c  | base_p  |");
+        println!("|---------|-----:|---------:|---------:|--------:|--------:|--------:|");
+        for &n in &sizes {
+            run_l3(n, del, dim, tier);
+        }
+        return;
+    }
     println!("# scale_churn: mode={mode} turns={turns} dim={dim} max_runs={max_runs} tq{bits}");
     println!("# retract/s = sustained; maxR = peak run count (bounded => fold keeps pace);");
     if mode == "l2" {
