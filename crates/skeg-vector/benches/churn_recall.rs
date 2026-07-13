@@ -120,7 +120,7 @@ fn build_gold(
 }
 
 fn build_churned(
-    background: bool,
+    mode: &str,
     max_runs: usize,
     n: usize,
     ops: &[(u64, u64)],
@@ -136,31 +136,74 @@ fn build_churned(
         idx.insert(r, &vat(corpus, r, dim)).unwrap();
     }
     idx.consolidate().unwrap();
-    let mut job: Option<std::thread::JoinHandle<std::io::Result<skeg_vector::ConsolidateBuilt>>> =
+    let mut base_job: Option<
+        std::thread::JoinHandle<std::io::Result<skeg_vector::ConsolidateBuilt>>,
+    > = None;
+    let mut merge_job: Option<std::thread::JoinHandle<std::io::Result<skeg_vector::RunMergeBuilt>>> =
         None;
-    for &(succ, victim) in ops {
+    let mut next_base = n; // op index for the next rare base rebuild (l2)
+    for (op, &(succ, victim)) in ops.iter().enumerate() {
         idx.insert(succ, &vat(corpus, succ, dim)).unwrap();
         idx.delete(victim).unwrap();
-        if background {
-            if job.is_none() && idx.run_count() >= max_runs {
-                if let Some(jb) = idx.consolidate_begin().unwrap() {
-                    let d = dir.clone();
-                    job = Some(std::thread::spawn(move || jb.build(&d)));
+        match mode {
+            "bg" => {
+                if base_job.is_none() && idx.run_count() >= max_runs {
+                    if let Some(jb) = idx.consolidate_begin().unwrap() {
+                        let d = dir.clone();
+                        base_job = Some(std::thread::spawn(move || jb.build(&d)));
+                    }
+                }
+                if base_job
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    let built = base_job.take().unwrap().join().unwrap().unwrap();
+                    idx.consolidate_finish(built).unwrap();
                 }
             }
-            if job
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-            {
-                let built = job.take().unwrap().join().unwrap().unwrap();
-                idx.consolidate_finish(built).unwrap();
+            "l2" => {
+                // Two-tier: frequent runs-merge, rare base rebuild, one slot, off-thread.
+                if base_job
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    let built = base_job.take().unwrap().join().unwrap().unwrap();
+                    idx.consolidate_finish(built).unwrap();
+                } else if merge_job
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    let built = merge_job.take().unwrap().join().unwrap().unwrap();
+                    idx.merge_runs_finish(built).unwrap();
+                }
+                if base_job.is_none() && merge_job.is_none() {
+                    if op >= next_base {
+                        if let Some(jb) = idx.consolidate_begin().unwrap() {
+                            let d = dir.clone();
+                            base_job = Some(std::thread::spawn(move || jb.build(&d)));
+                            next_base += n;
+                        }
+                    } else if idx.run_count() >= max_runs {
+                        if let Some(jb) = idx.merge_runs_begin().unwrap() {
+                            let d = dir.clone();
+                            merge_job = Some(std::thread::spawn(move || jb.build(&d)));
+                        }
+                    }
+                }
             }
-        } else if idx.delta_len() >= idx.main_len().max(4096) {
-            idx.consolidate().unwrap();
+            _ => {
+                // "inline": the server's delta-size-triggered consolidate.
+                if idx.delta_len() >= idx.main_len().max(4096) {
+                    idx.consolidate().unwrap();
+                }
+            }
         }
     }
-    if let Some(h) = job.take() {
+    if let Some(h) = base_job.take() {
         idx.consolidate_finish(h.join().unwrap().unwrap()).unwrap();
+    }
+    if let Some(h) = merge_job.take() {
+        idx.merge_runs_finish(h.join().unwrap().unwrap()).unwrap();
     }
     idx
 }
@@ -242,11 +285,15 @@ fn main() {
         ("gold", build_gold(&live_rows, &corpus, dim, tier, "g")),
         (
             "inline",
-            build_churned(false, max_runs, n, &ops, &corpus, dim, tier, "i"),
+            build_churned("inline", max_runs, n, &ops, &corpus, dim, tier, "i"),
         ),
         (
             "bg",
-            build_churned(true, max_runs, n, &ops, &corpus, dim, tier, "b"),
+            build_churned("bg", max_runs, n, &ops, &corpus, dim, tier, "b"),
+        ),
+        (
+            "l2",
+            build_churned("l2", max_runs, n, &ops, &corpus, dim, tier, "l"),
         ),
     ];
     for (label, idx) in &modes {
@@ -261,7 +308,7 @@ fn main() {
     for (_, idx) in modes {
         drop(idx);
     }
-    for tag in ["g", "i", "b"] {
+    for tag in ["g", "i", "b", "l"] {
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("skeg_cr_gold_{tag}")));
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("skeg_cr_{tag}")));
     }
