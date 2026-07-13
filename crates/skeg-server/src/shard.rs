@@ -134,12 +134,6 @@ type VindexSet = HashMap<String, VectorEntry>;
 /// Query-time search list size for a disk Vamana index.
 const VAMANA_L_SEARCH: usize = 100;
 
-/// A disk Vamana index folds its delta into the graph once it reaches
-/// `max(main / 20, MIN)` pending inserts: a flat floor at small sizes, then
-/// 5%-of-main so the consolidation count stays roughly logarithmic in N
-/// rather than linear (a fixed threshold would make bulk growth O(N^2)).
-const DISK_CONSOLIDATE_MIN: usize = 4096;
-
 /// A VINDEX is backed either by an in-RAM `FlatIndex` or by an on-disk
 /// Vamana graph (`DiskVamanaIndex`) - f32 vectors on disk, graph + int8
 /// tier in RAM. The choice is made at `VINDEX CREATE`.
@@ -219,12 +213,10 @@ impl VectorBackend {
                 Ok(())
             }
             VectorBackend::Disk(i) => {
-                i.insert(id, vector)?;
-                let threshold = i.main_len().max(DISK_CONSOLIDATE_MIN);
-                if i.delta_len() >= threshold {
-                    i.consolidate()?;
-                }
-                Ok(())
+                // Append only. The geometric fold (delta >= built size) runs
+                // OFF-THREAD in the background maintenance loop (with the cheap
+                // consolidate_begin), so ingest never blocks the shard on a fold.
+                i.insert(id, vector)
             }
         }
     }
@@ -1077,12 +1069,45 @@ fn run_shard(
                                 let idle = prev.insert(name.clone(), delta) == Some(delta);
                                 let vdir = kdir.join(format!("vindex-{name}"));
 
-                                // Priority, cheapest first. runs-merge (L2) and
-                                // delete-patch (L3) fire on their own triggers -
-                                // bounded, off-thread, two short locks - even while
-                                // writes continue. The heavy full consolidate (L1)
-                                // stays idle-gated. One op per vindex per tick.
-                                if runs >= RUNS_MERGE_TRIGGER {
+                                // The geometric fold (delta caught up to the built
+                                // base) now runs here off-thread - with the cheap
+                                // consolidate_begin, begin no longer stalls the
+                                // shard. Priority:
+                                //   1. consolidate - delta >= base (bounds delta +
+                                //      the per-query flat scan, resets runs), or a
+                                //      small idle delta for leanness.
+                                //   2. runs-merge (L2) - runs piling, delta ok.
+                                //   3. delete-patch (L3) - reclaim dead base rows.
+                                // One op per vindex per tick, all off-thread.
+                                let geometric = delta >= base.max(IDLE_CONSOLIDATE_MIN);
+                                if geometric || (idle && delta >= IDLE_CONSOLIDATE_MIN) {
+                                    let d = vdir.clone();
+                                    let ran = off_thread_maintenance(
+                                        &arc,
+                                        "consolidate",
+                                        shard_id,
+                                        |b| b.consolidate_begin(),
+                                        move |job| job.build(&d),
+                                        |b, built| b.consolidate_finish(built),
+                                    )
+                                    .await;
+                                    if ran {
+                                        // Base changed: (re)build the IVF router off
+                                        // the request path.
+                                        let a = arc.clone();
+                                        let nm = name.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            let mut g = a.write();
+                                            if g.backend.wants_ivf()
+                                                && let Err(e) = g.backend.build_ivf()
+                                            {
+                                                error!("shard {shard_id}: idle ivf '{nm}': {e}");
+                                            }
+                                        })
+                                        .await;
+                                    }
+                                    prev.insert(name, 0); // folded
+                                } else if runs >= RUNS_MERGE_TRIGGER {
                                     let d = vdir.clone();
                                     off_thread_maintenance(
                                         &arc,
@@ -1106,33 +1131,6 @@ fn run_shard(
                                         |b, built| b.delete_patch_finish(built),
                                     )
                                     .await;
-                                } else if idle && delta >= IDLE_CONSOLIDATE_MIN {
-                                    let d = vdir.clone();
-                                    let ran = off_thread_maintenance(
-                                        &arc,
-                                        "consolidate",
-                                        shard_id,
-                                        |b| b.consolidate_begin(),
-                                        move |job| job.build(&d),
-                                        |b, built| b.consolidate_finish(built),
-                                    )
-                                    .await;
-                                    if ran {
-                                        // Base changed and we are idle: (re)build the
-                                        // IVF router off the request path.
-                                        let a = arc.clone();
-                                        let nm = name.clone();
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            let mut g = a.write();
-                                            if g.backend.wants_ivf()
-                                                && let Err(e) = g.backend.build_ivf()
-                                            {
-                                                error!("shard {shard_id}: idle ivf '{nm}': {e}");
-                                            }
-                                        })
-                                        .await;
-                                    }
-                                    prev.insert(name, 0); // folded
                                 }
                             }
                         }
