@@ -2144,6 +2144,15 @@ impl DiskVamanaIndex {
         self.runs.len()
     }
 
+    /// Total rows across all flushed runs. With the off-thread flush the delta
+    /// stays small (flushed at `FLUSH`), so this - not `delta_len` - is what a
+    /// server watches to decide when a full consolidate (fold runs into base +
+    /// truncate the WAL) is due.
+    #[must_use]
+    pub fn run_rows(&self) -> usize {
+        self.runs.iter().map(|r| r.main_n as usize).sum()
+    }
+
     /// Live tombstones (deleted ids not yet reclaimed). A cheap gate for the
     /// delete-patch trigger: `tombstone_count() / main_len()` approximates the
     /// dead fraction of the base without the O(base) scan `delete_patch_begin`

@@ -44,6 +44,11 @@ fn idle_maint_interval() -> Duration {
 /// scan is cheap and a rebuild would churn the graph for little gain.
 const IDLE_CONSOLIDATE_MIN: usize = 4096;
 
+/// Flush the delta (L0) into a run off-thread once it reaches this many rows.
+/// The server disables the engine's inline auto-flush and drives it here, so
+/// ingest never blocks on a run build.
+const FLUSH_ROWS: usize = 4096;
+
 /// Fold the LSM runs into one (cheap, O(runs), base untouched) once the run
 /// count reaches this. Keeps per-query walk cost bounded under churn without
 /// waiting for a full consolidate. Fires regardless of idle - it is cheap and
@@ -65,7 +70,7 @@ use skeg_core::{Durability, VLog};
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{
     ConsolidateBuilt, ConsolidateJob, DeletePatchBuilt, DeletePatchJob, DiskVamanaIndex, FlatIndex,
-    QuantKind, RunMergeBuilt, RunMergeJob,
+    FlushBuilt, FlushJob, QuantKind, RunMergeBuilt, RunMergeJob,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -276,6 +281,30 @@ impl VectorBackend {
         match self {
             VectorBackend::Flat(_) => 0,
             VectorBackend::Disk(i) => i.run_count(),
+        }
+    }
+
+    /// Total rows in flushed runs (0 for flat). Drives the consolidate trigger.
+    fn run_rows(&self) -> usize {
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.run_rows(),
+        }
+    }
+
+    /// Flush (L0): snapshot the delta into a run off-thread. `None` if empty /
+    /// already flushing / flat.
+    fn flush_begin(&mut self) -> std::io::Result<Option<FlushJob>> {
+        match self {
+            VectorBackend::Flat(_) => Ok(None),
+            VectorBackend::Disk(i) => i.flush_begin(),
+        }
+    }
+
+    fn flush_finish(&mut self, built: FlushBuilt) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.flush_finish(built),
         }
     }
 
@@ -803,7 +832,8 @@ fn recover_vindexes(
     for (name, _dim) in read_registry(dir) {
         let vdir = dir.join(format!("vindex-{name}"));
         match DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph) {
-            Ok(idx) => {
+            Ok(mut idx) => {
+                idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
                 set.insert(
                     name,
                     Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx)))),
@@ -866,7 +896,7 @@ async fn get_or_reopen(
         DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph)
     })
     .await;
-    let idx = match opened {
+    let mut idx = match opened {
         Ok(Ok(idx)) => idx,
         Ok(Err(e)) => {
             error!("reopening evicted vindex '{name}' failed: {e}");
@@ -886,6 +916,7 @@ async fn get_or_reopen(
         entry.read().touch();
         return Some(entry);
     }
+    idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
     let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx))));
     entry.read().touch();
     w.insert(name.to_owned(), entry.clone());
@@ -1056,11 +1087,12 @@ fn run_shard(
                                 g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
                             };
                             for (name, arc) in snap {
-                                let (delta, runs, tombs, base) = {
+                                let (delta, runs, run_rows, tombs, base) = {
                                     let g = arc.read();
                                     (
                                         g.backend.delta_len(),
                                         g.backend.run_count(),
+                                        g.backend.run_rows(),
                                         g.backend.tombstone_count(),
                                         g.backend.main_len(),
                                     )
@@ -1069,18 +1101,31 @@ fn run_shard(
                                 let idle = prev.insert(name.clone(), delta) == Some(delta);
                                 let vdir = kdir.join(format!("vindex-{name}"));
 
-                                // The geometric fold (delta caught up to the built
-                                // base) now runs here off-thread - with the cheap
-                                // consolidate_begin, begin no longer stalls the
-                                // shard. Priority:
-                                //   1. consolidate - delta >= base (bounds delta +
-                                //      the per-query flat scan, resets runs), or a
-                                //      small idle delta for leanness.
-                                //   2. runs-merge (L2) - runs piling, delta ok.
-                                //   3. delete-patch (L3) - reclaim dead base rows.
-                                // One op per vindex per tick, all off-thread.
-                                let geometric = delta >= base.max(IDLE_CONSOLIDATE_MIN);
-                                if geometric || (idle && delta >= IDLE_CONSOLIDATE_MIN) {
+                                // Everything off-thread now (flush too). Priority,
+                                // cheapest/most-frequent first:
+                                //   1. flush (L0) - delta >= FLUSH_ROWS. The common
+                                //      case under ingest; keeps the flat delta scan
+                                //      small. No graph build on the shard thread.
+                                //   2. consolidate - runs accumulated to ~base size
+                                //      (geometric), or an idle cleanup. Folds runs +
+                                //      delta into a fresh base and truncates the WAL.
+                                //   3. runs-merge (L2) - runs piling, base ok.
+                                //   4. delete-patch (L3) - reclaim dead base rows.
+                                // One op per vindex per tick.
+                                let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN)
+                                    || (idle && delta + run_rows >= IDLE_CONSOLIDATE_MIN);
+                                if delta >= FLUSH_ROWS {
+                                    let d = vdir.clone();
+                                    off_thread_maintenance(
+                                        &arc,
+                                        "flush",
+                                        shard_id,
+                                        |b| b.flush_begin(),
+                                        move |job| job.build(&d),
+                                        |b, built| b.flush_finish(built),
+                                    )
+                                    .await;
+                                } else if consolidate_due {
                                     let d = vdir.clone();
                                     let ran = off_thread_maintenance(
                                         &arc,
@@ -1308,7 +1353,8 @@ async fn process(
                             VAMANA_L_SEARCH,
                             tier,
                         ) {
-                            Ok(idx) => {
+                            Ok(mut idx) => {
+                                idx.set_auto_flush(false); // flushed off-thread by the loop
                                 e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(
                                     idx,
                                 )))));
