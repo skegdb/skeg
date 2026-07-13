@@ -3769,6 +3769,67 @@ mod tests {
         );
     }
 
+    // Filtered search stays exactly correct across sustained churn + periodic
+    // consolidation - the maintenance path this branch refactored (cheap begin,
+    // prebuilt-segment finish). After each consolidate a filtered query must
+    // return EXACTLY the live matching set: no dead id, no wrong-group leak,
+    // none missing.
+    #[tokio::test]
+    async fn filtered_search_correct_under_churn_and_consolidate() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        shards.vindex_create("idx", 64, 4, 1).await.unwrap(); // tq2 disk
+        let grp = |id: u64| id % 8;
+        let put = |id: u64| {
+            let s = &shards;
+            async move {
+                let g = grp(id);
+                s.vset("idx", id, tvec(id + 1), 0, None, Some(Bytes::from(format!("g={g}"))))
+                    .await
+                    .unwrap();
+            }
+        };
+        let seed = 2000u64;
+        let mut live: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for id in 0..seed {
+            put(id).await;
+            live.insert(id, grp(id));
+        }
+        shards.vindex_consolidate("idx").await.unwrap();
+
+        let mut next = seed;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for step in 0..3000u64 {
+            put(next).await;
+            live.insert(next, grp(next));
+            next += 1;
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let keys: Vec<u64> = live.keys().copied().collect();
+            let victim = keys[(rng as usize) % keys.len()];
+            shards.vdel("idx", victim, 0).await.unwrap();
+            live.remove(&victim);
+
+            if step % 500 == 499 {
+                // Fold delta + runs into base (exercises the refactored path).
+                shards.vindex_consolidate("idx").await.unwrap();
+                let want: BTreeSet<u64> =
+                    live.iter().filter(|&(_, &g)| g == 3).map(|(&id, _)| id).collect();
+                // k covers every match, so the exact-scan filter returns all of them.
+                let got = shards
+                    .vsearch("idx", tvec(3), want.len() + 50, 0, 0, false, flt("g = 3"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ids_of(&got),
+                    want,
+                    "filtered g=3 must equal the live g=3 set after churn+consolidate (step {step})"
+                );
+            }
+        }
+    }
+
     // VDEL drops an id from the payload index, so a later filtered search no
     // longer returns it; an overwrite VSET replaces the id's fields.
     #[tokio::test]
