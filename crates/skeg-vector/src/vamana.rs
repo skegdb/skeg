@@ -1506,8 +1506,10 @@ impl FlushJob {
 /// it reclaims dead base rows far cheaper than a full consolidate. Runs are left
 /// intact: the insert side is handled by a run-merge / flush, not here.
 pub struct DeletePatchJob {
-    /// Every base row's f32 vector, row-major in old-row order.
-    vectors: Vec<f32>,
+    /// Duped base `vectors.bin` fd: the O(live) row reads happen OFF-THREAD in
+    /// `build`, not on the caller. `n_rows` rows, row-major.
+    seg_file: File,
+    n_rows: usize,
     /// Base id by old row.
     ids: Vec<u64>,
     /// Base adjacency by old row (owned copy of the served graph).
@@ -1541,7 +1543,8 @@ impl DeletePatchJob {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
         let DeletePatchJob {
-            vectors,
+            seg_file,
+            n_rows,
             ids,
             adj,
             dead,
@@ -1550,6 +1553,17 @@ impl DeletePatchJob {
             l_search,
             tier,
         } = self;
+        // O(live) vector read, OFF-THREAD (was on the shard thread in begin).
+        let mut vectors: Vec<f32> = Vec::with_capacity(n_rows * dim);
+        let mut buf = vec![0u8; dim * 4];
+        for row in 0..n_rows as u64 {
+            let off = HEADER_LEN as u64 + row * dim as u64 * 4;
+            seg_file.read_exact_at(&mut buf, off)?;
+            vectors.extend(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
         let cfg = disk_build_config();
         // Same rayon cap as the consolidate: keep a background patch from
         // starving the foreground of every core while it runs.
@@ -3418,13 +3432,13 @@ impl DiskVamanaIndex {
         if dead_count == 0 || n - dead_count == 0 {
             return Ok(None);
         }
+        // Copy the adjacency (fast memcpy of the Node array) but DEFER the
+        // O(live) vector reads to build via a duped fd.
         let adj: Vec<Node> = (0..n).map(|r| self.base.nodes[r]).collect();
-        let mut vectors: Vec<f32> = Vec::with_capacity(n * self.dim);
-        for row in 0..n as u32 {
-            vectors.extend(self.read_vector(&self.base, row)?);
-        }
+        let seg_file = self.base.vectors_file.try_clone()?;
         Ok(Some(DeletePatchJob {
-            vectors,
+            seg_file,
+            n_rows: n,
             ids: self.base.ids.clone(),
             adj,
             dead,
