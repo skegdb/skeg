@@ -1449,6 +1449,55 @@ impl RunMergeJob {
     }
 }
 
+/// Snapshot for an OFF-THREAD flush of the delta into a run. `flush_begin` moves
+/// the delta aside (into the index's `flushing` staging buffer, still searched)
+/// and hands the vectors here; `build` builds the run graph + opens it, all off
+/// the caller; `flush_finish` splices the run and clears the staging. The delta
+/// batch never blocks the caller on a graph build.
+pub struct FlushJob {
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    dim: usize,
+    tier: QuantKind,
+    seq: u64,
+}
+
+/// Output of [`FlushJob::build`]: the run already opened off-thread, ready for
+/// [`DiskVamanaIndex::flush_finish`] to splice in.
+pub struct FlushBuilt {
+    run: Segment,
+    seq: u64,
+}
+
+impl FlushJob {
+    /// Build the run graph and open it - off the caller's thread.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if writing or opening the run fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<FlushBuilt> {
+        let FlushJob {
+            vectors,
+            ids,
+            dim,
+            tier,
+            seq,
+        } = self;
+        let dir = index_dir.join(format!("run-{seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = disk_build_config();
+        let rebuilt = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
+        rebuilt.save(&dir)?;
+        let run = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
+        Ok(FlushBuilt { run, seq })
+    }
+}
+
 /// Snapshot for a background delete-patch of the base graph. Removes the base
 /// rows that are dead at `begin` (tombstoned, or shadowed by a newer copy in a
 /// run) by re-pruning only the nodes that pointed at a removed node - the
@@ -1625,6 +1674,15 @@ pub struct DiskVamanaIndex {
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
+    /// Staging buffer for an in-flight OFF-THREAD flush: the delta entries moved
+    /// aside by `flush_begin` while their run is built off-thread. Searched with
+    /// precedence `delta > flushing > runs > base`, so the batch stays visible
+    /// during the build; `flush_finish` clears it once the run is spliced in.
+    /// Empty except during an off-thread flush.
+    flushing: AHashMap<u64, Vec<f32>>,
+    /// When true (default), `insert` flushes the delta into a run inline once it
+    /// fills. A server turns this off and flushes off-thread instead.
+    auto_flush: bool,
     /// Tombstoned external ids (covers both main and delta).
     tombstones: AHashSet<u64>,
     live_count: usize,
@@ -1913,6 +1971,8 @@ impl DiskVamanaIndex {
             run_seq: 0,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
+            flushing: AHashMap::new(),
+            auto_flush: true,
             tombstones: AHashSet::new(),
             live_count: n as usize,
             delta_log,
@@ -1991,6 +2051,9 @@ impl DiskVamanaIndex {
     fn apply_delete(&mut self, id: u64) -> bool {
         let was_live = self.is_live(id);
         self.delta.remove(&id);
+        // Drop from the flush staging too, so a deleted id in an in-flight flush
+        // is not flat-scanned as live (the run copy is tombstone-masked).
+        self.flushing.remove(&id);
         self.tombstones.insert(id);
         if was_live {
             self.live_count -= 1;
@@ -2129,6 +2192,7 @@ impl DiskVamanaIndex {
     fn is_live(&self, id: u64) -> bool {
         !self.tombstones.contains(&id)
             && (self.delta.contains_key(&id)
+                || self.flushing.contains_key(&id)
                 || self.base.id_to_main_row.contains_key(&id)
                 || self.runs.iter().any(|r| r.id_to_main_row.contains_key(&id)))
     }
@@ -2153,6 +2217,7 @@ impl DiskVamanaIndex {
             .copied()
             .chain(self.runs.iter().flat_map(|r| r.ids.iter().copied()))
             .chain(self.delta.keys().copied())
+            .chain(self.flushing.keys().copied())
             .filter(|id| !self.tombstones.contains(id))
             .collect();
         // A delta overwrite of a main id appears in both sources; dedup.
@@ -2282,12 +2347,22 @@ impl DiskVamanaIndex {
         }
         self.delta_log.write_all(&rec)?;
         self.apply_insert(id, vector.to_vec());
-        // Keep the brute-forced L0 small: once it fills, fold it into a
-        // navigable run so search stays sub-linear between consolidations.
-        if self.delta.len() >= Self::FLUSH {
+        // Keep the brute-forced L0 small: once it fills, fold it into a navigable
+        // run so search stays sub-linear. INLINE (synchronous) - fine for direct
+        // use (benches, bulk load). A server sets `auto_flush(false)` and drives
+        // the flush OFF-THREAD from its maintenance loop, so ingest never blocks
+        // the request thread on a run build.
+        if self.auto_flush && self.delta.len() >= Self::FLUSH {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// Turn the inline auto-flush on (default) or off. With it off, the delta
+    /// grows unbounded until the caller drives [`flush_begin`](Self::flush_begin)
+    /// / [`flush_finish`](Self::flush_finish) off-thread. Meant for the server.
+    pub fn set_auto_flush(&mut self, on: bool) {
+        self.auto_flush = on;
     }
 
     /// Tombstone `id`. Returns `true` if it was live.
@@ -2314,6 +2389,10 @@ impl DiskVamanaIndex {
             return Ok(None);
         }
         if let Some(v) = self.delta.get(&id) {
+            return Ok(Some(v.clone()));
+        }
+        // Staged for an in-flight flush (delta > flushing).
+        if let Some(v) = self.flushing.get(&id) {
             return Ok(Some(v.clone()));
         }
         if let Some(&row) = self.base.id_to_main_row.get(&id) {
@@ -2665,6 +2744,7 @@ impl DiskVamanaIndex {
                     let id = seg.ids[row as usize];
                     !self.tombstones.contains(&id)
                         && !self.delta.contains_key(&id)
+                        && !self.flushing.contains_key(&id)
                         && matches.is_none_or(|m| m(id))
                 };
                 cand.extend(walk(&seed_rows, Some(&admit), None).iter());
@@ -2718,7 +2798,10 @@ impl DiskVamanaIndex {
             }
             let seg = segs[seg_idx];
             let id = seg.ids[row as usize];
-            if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
+            if self.tombstones.contains(&id)
+                || self.delta.contains_key(&id)
+                || self.flushing.contains_key(&id)
+            {
                 continue;
             }
             if let Some(m) = matches
@@ -2767,6 +2850,13 @@ impl DiskVamanaIndex {
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
         for (&id, v) in &self.delta {
             if matches.is_none_or(|m| m(id)) {
+                scored.push((OrderedFloat(cosine_f32(query, v)), id));
+            }
+        }
+        // Flat scan the in-flight flush staging too, skipping ids the delta
+        // already covers (delta wins). Empty except during an off-thread flush.
+        for (&id, v) in &self.flushing {
+            if !self.delta.contains_key(&id) && matches.is_none_or(|m| m(id)) {
                 scored.push((OrderedFloat(cosine_f32(query, v)), id));
             }
         }
@@ -3026,10 +3116,12 @@ impl DiskVamanaIndex {
         // RAM; base/run survivors are recorded as (seg, row) locations and read
         // off-thread in `build`. All the heavy work moves to the background.
         let mut seen: AHashSet<u64> = AHashSet::new();
-        let mut delta_ids: Vec<u64> = Vec::with_capacity(self.delta.len());
-        let mut delta_vectors: Vec<f32> = Vec::with_capacity(self.delta.len() * self.dim);
-        for (&id, v) in &self.delta {
-            // (a tombstoned id is already removed from the delta by apply_delete)
+        let cap = self.delta.len() + self.flushing.len();
+        let mut delta_ids: Vec<u64> = Vec::with_capacity(cap);
+        let mut delta_vectors: Vec<f32> = Vec::with_capacity(cap * self.dim);
+        // delta first (newest), then any in-flight flush staging (delta shadows
+        // it via `seen`). Tombstoned ids are already removed from both.
+        for (&id, v) in self.delta.iter().chain(self.flushing.iter()) {
             if seen.insert(id) {
                 delta_ids.push(id);
                 delta_vectors.extend_from_slice(v);
@@ -3123,7 +3215,7 @@ impl DiskVamanaIndex {
         self.tombstones.clear();
         self.live_count = self.base.main_n as usize;
         self.delta_log = delta_log;
-        self.tq1 = Box::default();
+        *self.tq1 = Default::default();
         self.ivf = None;
         self.replay_wal(&suffix);
         Ok(())
@@ -3224,6 +3316,54 @@ impl DiskVamanaIndex {
                 std::fs::remove_dir_all(&d)?;
             }
         }
+        Ok(())
+    }
+
+    /// Begin an OFF-THREAD flush of the delta into a run (short, exclusive).
+    /// Moves the delta into the `flushing` staging buffer (kept searchable) and
+    /// hands its vectors to the returned job; the run build + open happens off
+    /// the caller in [`FlushJob::build`]. `None` if the delta is empty or a flush
+    /// is already in flight. No WAL touch: the delta's inserts stay in the WAL,
+    /// so a crash before `flush_finish` replays them into the delta on reopen.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; returns `io::Result` for symmetry with the other
+    /// begin/finish pairs.
+    pub fn flush_begin(&mut self) -> io::Result<Option<FlushJob>> {
+        if self.delta.is_empty() || !self.flushing.is_empty() {
+            return Ok(None);
+        }
+        self.flushing = std::mem::take(&mut self.delta);
+        let mut vectors: Vec<f32> = Vec::with_capacity(self.flushing.len() * self.dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(self.flushing.len());
+        for (&id, v) in &self.flushing {
+            vectors.extend_from_slice(v);
+            ids.push(id);
+        }
+        let seq = self.run_seq;
+        self.run_seq += 1;
+        Ok(Some(FlushJob {
+            vectors,
+            ids,
+            dim: self.dim,
+            tier: self.tier,
+            seq,
+        }))
+    }
+
+    /// Splice the flushed run in (short, exclusive) and clear the staging. The
+    /// run is the newest, so it goes at the end (newest-wins in search). Ids
+    /// re-inserted during the build are in the fresh delta and shadow the run
+    /// copy; deleted ones are tombstone-masked.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; `io::Result` for symmetry.
+    pub fn flush_finish(&mut self, built: FlushBuilt) -> io::Result<()> {
+        self.runs.push(built.run);
+        self.run_dirs.push(built.seq);
+        self.flushing.clear();
         Ok(())
     }
 
@@ -4447,5 +4587,150 @@ mod tests {
         assert!(re.get(0).unwrap().is_none());
         let survivor = 2u64;
         assert!(re.get(survivor).unwrap().is_some(), "a survivor is still present");
+    }
+
+    // ── Off-thread flush (feat/off-thread-flush) ────────────────────────────
+
+    // The staged delta stays searchable during the off-thread build, then lands
+    // in a run; the live set is unchanged and everything remains retrievable.
+    #[test]
+    fn off_thread_flush_stages_and_splices() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(500, dim, 7);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let more = random_vectors(300, dim, 8);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(500 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+        assert_eq!(idx.delta_len(), 300);
+
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        assert_eq!(idx.delta_len(), 0, "delta moved to staging");
+        // A staged entry is still found DURING the flush (search + get).
+        let x = 600u64;
+        let qv = &more[(x - 500) as usize * dim..(x - 500 + 1) as usize * dim];
+        assert_eq!(idx.search(qv, 1).unwrap()[0].0, x, "staged searchable mid-flush");
+        assert!(idx.get(x).unwrap().is_some(), "staged get() mid-flush");
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 1, "flushed into one run");
+        assert_eq!(idx.len(), live, "live set unchanged");
+        assert_eq!(idx.search(qv, 1).unwrap()[0].0, x, "searchable after finish");
+    }
+
+    // Inserts, deletes, and re-inserts that race the off-thread flush all resolve
+    // correctly (delta > flushing > run precedence), and a reopen from disk gives
+    // the same live set (the WAL was never truncated by the flush).
+    #[test]
+    fn writes_during_off_thread_flush_survive() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(500, dim, 9);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let more = random_vectors(300, dim, 10);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(500 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+
+        let job = idx.flush_begin().unwrap().unwrap();
+        idx.insert(9000, &vec![0.5f32; dim]).unwrap(); // new
+        assert!(idx.delete(500).unwrap(), "delete a staged id"); // 500 is staged
+        idx.insert(501, &vec![0.7f32; dim]).unwrap(); // overwrite a staged id
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+
+        assert!(idx.get(9000).unwrap().is_some(), "post-begin insert kept");
+        assert!(idx.get(500).unwrap().is_none(), "deleted staged id gone");
+        assert_eq!(idx.get(501).unwrap().unwrap(), vec![0.7f32; dim], "re-insert wins over run");
+        assert_eq!(idx.len(), live + 1 - 1, "one new, one deleted");
+
+        drop(idx);
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live, "same live set from disk");
+        assert!(re.get(9000).unwrap().is_some());
+        assert!(re.get(500).unwrap().is_none());
+        assert_eq!(re.get(501).unwrap().unwrap(), vec![0.7f32; dim]);
+    }
+
+    // A crash between flush_begin and flush_finish loses nothing: the staged
+    // batch's inserts are still in the WAL, so a reopen replays them.
+    #[test]
+    fn off_thread_flush_crash_before_finish_recovers() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(400, dim, 11);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let more = random_vectors(300, dim, 12);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(400 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+        let job = idx.flush_begin().unwrap().unwrap();
+        let _built = job.build(tmp.path()).unwrap(); // built but NEVER finished
+        drop(idx); // crash
+
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live, "live set recovered from the WAL");
+        assert!(re.get(500).unwrap().is_some(), "a staged id recovered");
+    }
+
+    // set_auto_flush(false) stops the inline flush; the default keeps it.
+    #[test]
+    fn set_auto_flush_off_disables_inline_flush() {
+        let dim = 16;
+        let n = DiskVamanaIndex::FLUSH + 500;
+        let vecs = random_vectors(n, dim, 13);
+        let tmp0 = tempfile::TempDir::new().unwrap();
+        let mut off = DiskVamanaIndex::create_empty(tmp0.path(), dim, 64).unwrap();
+        off.set_auto_flush(false);
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            off.insert(i as u64, v).unwrap();
+        }
+        assert_eq!(off.run_count(), 0, "auto_flush off => no inline flush");
+        assert!(off.delta_len() >= DiskVamanaIndex::FLUSH, "delta grew past FLUSH");
+
+        let tmp1 = tempfile::TempDir::new().unwrap();
+        let mut on = DiskVamanaIndex::create_empty(tmp1.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            on.insert(i as u64, v).unwrap();
+        }
+        assert!(on.run_count() >= 1, "default auto_flush flushes inline");
     }
 }
