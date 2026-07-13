@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use skeg_vector::{ConsolidateBuilt, DiskVamanaIndex, QuantKind};
+use skeg_vector::{ConsolidateBuilt, DiskVamanaIndex, QuantKind, RunMergeBuilt};
 
 fn xs(s: &mut u64) -> u64 {
     *s ^= *s << 13;
@@ -42,7 +42,10 @@ fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
         .unwrap_or(d)
 }
 
-fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) {
+fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind, mode: &str) {
+    if mode == "l2" {
+        return run_l2(n, turns, dim, max_runs, tier);
+    }
     let dir = std::env::temp_dir().join(format!("skeg_scale_{n}"));
     let _ = std::fs::remove_dir_all(&dir);
     let mut idx = DiskVamanaIndex::create_empty_with_tier(&dir, dim, 300, tier).unwrap();
@@ -117,6 +120,126 @@ fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two-tier: frequent off-thread runs-merge (O(runs)) keeps the run count
+/// bounded; a full base rebuild runs inline once per turnover to reclaim base
+/// tombstones. The claim: retract/s decouples from the O(live-set) base cost.
+fn run_l2(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) {
+    let dir = std::env::temp_dir().join(format!("skeg_scale_l2_{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut idx = DiskVamanaIndex::create_empty_with_tier(&dir, dim, 300, tier).unwrap();
+    let mut s = 0xC0FF_EE00_1234u64 ^ (n as u64);
+    let mut ids: Vec<u64> = Vec::with_capacity(n);
+    for i in 0..n as u64 {
+        idx.insert(i, &uvec(dim, &mut s)).unwrap();
+        ids.push(i);
+    }
+    idx.consolidate().unwrap();
+
+    let ops = turns * n;
+    let mut next = n as u64;
+    // One background slot, holding EITHER a runs-merge or a base rebuild; the two
+    // never overlap (base consolidate discards the runs a merge would touch).
+    let mut merge_job: Option<std::thread::JoinHandle<std::io::Result<RunMergeBuilt>>> = None;
+    let mut base_job: Option<std::thread::JoinHandle<std::io::Result<ConsolidateBuilt>>> = None;
+    let mut job_start = Instant::now();
+    let mut max_runs_seen = 0usize;
+    let mut merges = 0usize;
+    let mut merge_busy = std::time::Duration::ZERO;
+    let mut merge_total = std::time::Duration::ZERO;
+    let mut base_folds = 0usize;
+    let mut base_busy = std::time::Duration::ZERO;
+    let mut base_total = std::time::Duration::ZERO;
+    let mut next_base = n; // op index at which the next base rebuild is due
+
+    let start = Instant::now();
+    for op in 0..ops {
+        idx.insert(next, &uvec(dim, &mut s)).unwrap();
+        let succ = next;
+        next += 1;
+        let j = (xs(&mut s) as usize) % ids.len();
+        idx.delete(ids[j]).unwrap();
+        ids[j] = succ;
+
+        let rc = idx.run_count();
+        max_runs_seen = max_runs_seen.max(rc);
+
+        // Reap a finished background job.
+        if base_job
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            let built = base_job.take().unwrap().join().unwrap().unwrap();
+            idx.consolidate_finish(built).unwrap();
+            let dt = job_start.elapsed();
+            base_busy += dt;
+            base_total += dt;
+            base_folds += 1;
+        } else if merge_job
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            let built = merge_job.take().unwrap().join().unwrap().unwrap();
+            idx.merge_runs_finish(built).unwrap();
+            let dt = job_start.elapsed();
+            merge_busy += dt;
+            merge_total += dt;
+            merges += 1;
+        }
+
+        if base_job.is_none() && merge_job.is_none() {
+            if op >= next_base {
+                // Rare: base rebuild off-thread, reclaims base tombstones.
+                if let Some(jb) = idx.consolidate_begin().unwrap() {
+                    let d = dir.clone();
+                    job_start = Instant::now();
+                    base_job = Some(std::thread::spawn(move || jb.build(&d)));
+                    next_base += n;
+                }
+            } else if rc >= max_runs {
+                // Frequent: fold the runs off-thread, O(runs) not O(live).
+                if let Some(jb) = idx.merge_runs_begin().unwrap() {
+                    let d = dir.clone();
+                    job_start = Instant::now();
+                    merge_job = Some(std::thread::spawn(move || jb.build(&d)));
+                }
+            }
+        }
+    }
+    if let Some(h) = base_job.take() {
+        idx.consolidate_finish(h.join().unwrap().unwrap()).unwrap();
+        let dt = job_start.elapsed();
+        base_busy += dt;
+        base_total += dt;
+        base_folds += 1;
+    }
+    if let Some(h) = merge_job.take() {
+        idx.merge_runs_finish(h.join().unwrap().unwrap()).unwrap();
+        let dt = job_start.elapsed();
+        merge_busy += dt;
+        merge_total += dt;
+        merges += 1;
+    }
+    let elapsed = start.elapsed();
+
+    let rps = ops as f64 / elapsed.as_secs_f64();
+    let busy_frac = (merge_busy + base_busy).as_secs_f64() / elapsed.as_secs_f64();
+    let avg_merge = if merges > 0 {
+        merge_total.as_secs_f64() / merges as f64
+    } else {
+        0.0
+    };
+    let avg_base = if base_folds > 0 {
+        base_total.as_secs_f64() / base_folds as f64
+    } else {
+        0.0
+    };
+    println!(
+        "| {n:>7} | {turns} | {rps:>7.0} | {max_runs_seen:>4} | {:>4} | {merges:>3}/{base_folds} | {avg_merge:>5.2}/{avg_base:>4.1} | {busy_frac:>5.2} |",
+        idx.run_count(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let sizes: Vec<usize> = std::env::var("SKEG_SIZES")
         .ok()
@@ -127,14 +250,18 @@ fn main() {
     let max_runs: usize = env("SKEG_MAXRUNS", 4);
     let bits: u8 = env("SKEG_BITS", 2);
     let tier = QuantKind::TurboQuant { bits };
-    println!("# scale_churn: turns={turns} dim={dim} max_runs={max_runs} tq{bits}");
-    println!("# retract/s = sustained; max_runs = peak run count (bounded => fold keeps pace);");
+    let mode = std::env::var("SKEG_MODE").unwrap_or_else(|_| "full".into());
+    println!("# scale_churn: mode={mode} turns={turns} dim={dim} max_runs={max_runs} tq{bits}");
+    println!("# retract/s = sustained; maxR = peak run count (bounded => fold keeps pace);");
+    if mode == "l2" {
+        println!("# folds = runsMerges/baseFolds; build_s = avgMerge/avgBase (s)");
+    }
     println!(
-        "# fold_busy = fraction of wall time a fold was in flight (~1.0 => fold is the bottleneck)"
+        "# busy = fraction of wall time a (runs-)fold was in flight (~1.0 => fold is the bottleneck)"
     );
     println!("| live    | T | retr/s | maxR | endR | folds | build_s | busy |");
     println!("|---------|---|-------:|-----:|-----:|------:|--------:|-----:|");
     for &n in &sizes {
-        run(n, turns, dim, max_runs, tier);
+        run(n, turns, dim, max_runs, tier, &mode);
     }
 }

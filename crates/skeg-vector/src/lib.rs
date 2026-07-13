@@ -38,7 +38,7 @@ pub use source::{InMemoryVectorSource, MmapVectorSource, VectorSource};
 pub use tq1_control::{SHADOW_EVERY, Tq1ProxyController};
 pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
 pub use vamana::{
-    ConsolidateBuilt, ConsolidateJob, DiskVamanaIndex, VamanaConfig, VamanaIndex,
-    build_phase_times_ns, reset_build_phase_times, set_speed_enabled,
+    ConsolidateBuilt, ConsolidateJob, DiskVamanaIndex, RunMergeBuilt, RunMergeJob, VamanaConfig,
+    VamanaIndex, build_phase_times_ns, reset_build_phase_times, set_speed_enabled,
 };
 pub use visited::VisitedBitset;

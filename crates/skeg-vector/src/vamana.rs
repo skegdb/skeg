@@ -1312,6 +1312,69 @@ fn consolidate_thread_cap() -> Option<usize> {
     (n >= 1 && n < avail).then_some(n)
 }
 
+/// Snapshot for a background runs-only merge. Holds the live vectors folded out
+/// of the front `n_merged` runs; an off-thread [`RunMergeJob::build`] turns them
+/// into one replacement run. Unlike [`ConsolidateJob`] it never touches the base
+/// or the WAL: runs are immutable, so the merge is a read-only fold whose result
+/// the search precedence (delta > newer runs > this merged run > base) slots in
+/// correctly. Cheap (O(runs), not O(live-set)), so it can run often enough to
+/// keep the run count bounded under fast churn.
+pub struct RunMergeJob {
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    dim: usize,
+    tier: QuantKind,
+    merged_seq: u64,
+    n_merged: usize,
+    old_dirs: Vec<u64>,
+}
+
+/// Output of [`RunMergeJob::build`]: the merged run on disk, ready for
+/// [`DiskVamanaIndex::merge_runs_finish`] to slot in.
+pub struct RunMergeBuilt {
+    merged_dir: PathBuf,
+    merged_seq: u64,
+    n_merged: usize,
+    old_dirs: Vec<u64>,
+}
+
+impl RunMergeJob {
+    /// Build the merged run graph. CPU-bounded but O(runs), far cheaper than a
+    /// full consolidate; run it on a background thread. Writes `run-<seq>` under
+    /// the index dir, never touching the files the live index serves from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the run fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<RunMergeBuilt> {
+        let RunMergeJob {
+            vectors,
+            ids,
+            dim,
+            tier,
+            merged_seq,
+            n_merged,
+            old_dirs,
+        } = self;
+        let dir = index_dir.join(format!("run-{merged_seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = disk_build_config();
+        let rebuilt = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
+        rebuilt.save(&dir)?;
+        Ok(RunMergeBuilt {
+            merged_dir: dir,
+            merged_seq,
+            n_merged,
+            old_dirs,
+        })
+    }
+}
+
 pub struct DiskVamanaIndex {
     dim: usize,
     l_search: usize,
@@ -1320,6 +1383,10 @@ pub struct DiskVamanaIndex {
     /// Additional immutable LSM runs, searched alongside `base`. Streaming
     /// writes flush from the delta into runs; `consolidate` folds them back.
     runs: Vec<Segment>,
+    /// The dir seq (`run-<seq>`) backing each entry of `runs`, kept parallel so
+    /// a runs-only merge can delete exactly the dirs it folded. Flush appends,
+    /// the merge rewrites the front, discard/consolidate clears.
+    run_dirs: Vec<u64>,
     /// Tier-1 quantiser, kept so a `flush` builds runs with the same tier as
     /// the base (and so `consolidate` reopens with it).
     tier: QuantKind,
@@ -1611,6 +1678,7 @@ impl DiskVamanaIndex {
                 vectors_file,
             },
             runs: Vec::new(),
+            run_dirs: Vec::new(),
             tier,
             run_seq: 0,
             dir: dir.to_path_buf(),
@@ -2570,7 +2638,8 @@ impl DiskVamanaIndex {
             vectors.extend_from_slice(v);
             ids.push(id);
         }
-        let run_dir = self.dir.join(format!("run-{}", self.run_seq));
+        let seq = self.run_seq;
+        let run_dir = self.dir.join(format!("run-{seq}"));
         self.run_seq += 1;
         let rebuilt = build_disk_graph(self.tier, vectors, ids, self.dim, &disk_build_config());
         rebuilt.save(&run_dir)?;
@@ -2578,6 +2647,7 @@ impl DiskVamanaIndex {
         // rest of the opened index (an empty delta/WAL over the run dir) is dropped.
         let run = DiskVamanaIndex::open_with_tier(&run_dir, self.tier)?;
         self.runs.push(run.base);
+        self.run_dirs.push(seq);
         self.delta.clear();
         Ok(())
     }
@@ -2596,6 +2666,7 @@ impl DiskVamanaIndex {
             }
         }
         self.runs.clear();
+        self.run_dirs.clear();
         Ok(())
     }
 
@@ -2789,6 +2860,99 @@ impl DiskVamanaIndex {
         self.discard_runs()?;
         std::fs::write(&wal_path, &suffix)?;
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
+        Ok(())
+    }
+
+    /// Begin a background runs-only merge (Level 2 of the write-heavy path):
+    /// snapshot the live vectors from the front runs (tombstone-masked,
+    /// newer-run-wins) so an off-thread [`RunMergeJob::build`] can fold them into
+    /// one replacement run, leaving the base untouched. O(runs), not O(live-set),
+    /// so it can run often enough to keep the run count - and thus per-query walk
+    /// cost - bounded under fast churn, deferring the expensive base rebuild to a
+    /// rare event. Needs no WAL manipulation: runs are immutable, so racing
+    /// inserts/deletes/flushes are handled by search precedence alone.
+    ///
+    /// Returns `None` with fewer than two runs (nothing to compact).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a run vector read fails.
+    pub fn merge_runs_begin(&mut self) -> io::Result<Option<RunMergeJob>> {
+        let n_merged = self.runs.len();
+        if n_merged < 2 {
+            return Ok(None);
+        }
+        // Newer runs win on a re-inserted id: fold the front runs newest-first.
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        let mut survivors: Vec<(usize, u32)> = Vec::new();
+        for ri in (0..n_merged).rev() {
+            let run = &self.runs[ri];
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                survivors.push((ri, row));
+            }
+        }
+        if survivors.is_empty() {
+            // Every folded run entry is tombstoned or shadowed: just drop them.
+            let old_dirs = self.run_dirs[..n_merged].to_vec();
+            let keep_runs = self.runs.split_off(n_merged);
+            let keep_dirs = self.run_dirs.split_off(n_merged);
+            self.runs = keep_runs;
+            self.run_dirs = keep_dirs;
+            for seq in old_dirs {
+                let d = self.dir.join(format!("run-{seq}"));
+                if d.exists() {
+                    std::fs::remove_dir_all(&d)?;
+                }
+            }
+            return Ok(None);
+        }
+        // id order for re-rank cache locality, same rule as consolidate.
+        survivors.sort_unstable_by_key(|&(ri, row)| self.runs[ri].ids[row as usize]);
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * self.dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
+        for (ri, row) in survivors {
+            vectors.extend(self.read_vector(&self.runs[ri], row)?);
+            ids.push(self.runs[ri].ids[row as usize]);
+        }
+        let old_dirs = self.run_dirs[..n_merged].to_vec();
+        let merged_seq = self.run_seq;
+        self.run_seq += 1;
+        Ok(Some(RunMergeJob {
+            vectors,
+            ids,
+            dim: self.dim,
+            tier: self.tier,
+            merged_seq,
+            n_merged,
+            old_dirs,
+        }))
+    }
+
+    /// Finish a background runs-only merge: slot the built run in place of the
+    /// front `n_merged` runs it folded, keep any runs flushed after begin (they
+    /// are newer, so they stay ahead of the merged run in search order), and
+    /// delete the folded run dirs. The base, delta, tombstones, and WAL are
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if opening the merged run or deleting a dir fails.
+    pub fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> io::Result<()> {
+        let merged = DiskVamanaIndex::open_with_tier(&built.merged_dir, self.tier)?.base;
+        let keep_runs = self.runs.split_off(built.n_merged);
+        let keep_dirs = self.run_dirs.split_off(built.n_merged);
+        self.runs = std::iter::once(merged).chain(keep_runs).collect();
+        self.run_dirs = std::iter::once(built.merged_seq).chain(keep_dirs).collect();
+        for seq in built.old_dirs {
+            let d = self.dir.join(format!("run-{seq}"));
+            if d.exists() {
+                std::fs::remove_dir_all(&d)?;
+            }
+        }
         Ok(())
     }
 
@@ -3759,5 +3923,79 @@ mod tests {
             idx.get(1000).unwrap().is_some(),
             "post-begin run content kept"
         );
+    }
+
+    /// A runs-only merge folds the runs into one, preserves the live set and the
+    /// search result, and leaves the base untouched.
+    #[test]
+    fn runs_merge_folds_and_preserves_search() {
+        let dim = 16;
+        let n = 3 * DiskVamanaIndex::FLUSH; // several runs
+        let vecs = random_vectors(n, dim, 21);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        // Scattered deletes across the runs.
+        for id in (0..n as u64).step_by(7) {
+            idx.delete(id).unwrap();
+        }
+        let live_before = idx.len();
+        let runs_before = idx.run_count();
+        assert!(runs_before >= 2, "need multiple runs to merge, got {runs_before}");
+
+        let job = idx.merge_runs_begin().unwrap().expect("runs to merge");
+        let built = job.build(tmp.path()).unwrap();
+        idx.merge_runs_finish(built).unwrap();
+
+        assert_eq!(idx.run_count(), 1, "runs folded into one");
+        assert_eq!(idx.len(), live_before, "live set unchanged by the merge");
+        // Deleted ids stay gone; a surviving id self-matches.
+        assert!(idx.get(0).unwrap().is_none(), "deleted id 0 stays gone");
+        let survivor = 1u64; // 1 % 7 != 0
+        assert!(idx.get(survivor).unwrap().is_some());
+        let q = &vecs[survivor as usize * dim..(survivor as usize + 1) * dim];
+        let hit = idx.search(q, 1).unwrap();
+        assert_eq!(hit[0].0, survivor, "query returns its own vector as top-1");
+    }
+
+    /// Inserts, deletes, and flushes that race a background runs-merge all
+    /// survive: the base/delta/WAL are untouched, so search precedence resolves
+    /// everything.
+    #[test]
+    fn writes_during_runs_merge_survive() {
+        let dim = 16;
+        let n = 3 * DiskVamanaIndex::FLUSH;
+        let vecs = random_vectors(n, dim, 22);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let live_before = idx.len();
+        let job = idx.merge_runs_begin().unwrap().expect("runs to merge");
+
+        // Race the build.
+        idx.insert(90_000, &vec![0.11f32; dim]).unwrap();
+        assert!(idx.delete(1).unwrap(), "delete a folded-in id"); // 1 % 7 != 0, was live
+        idx.insert(90_001, &vec![0.22f32; dim]).unwrap();
+        assert!(idx.delete(90_001).unwrap(), "insert+delete in the window");
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.merge_runs_finish(built).unwrap();
+
+        assert_eq!(idx.len(), live_before + 1 - 1, "one new live (90000), one folded id deleted");
+        assert!(idx.get(90_000).unwrap().is_some(), "post-begin insert kept");
+        assert!(idx.get(1).unwrap().is_none(), "post-begin delete of a folded id holds");
+        assert!(idx.get(90_001).unwrap().is_none(), "insert+delete in window stays dead");
+
+        // Reopen: the merge is transient (no WAL touch); the WAL replays the full
+        // history, so the live set is identical from disk alone.
+        drop(idx);
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live_before);
+        assert!(re.get(90_000).unwrap().is_some());
+        assert!(re.get(1).unwrap().is_none());
     }
 }
