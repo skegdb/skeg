@@ -3306,7 +3306,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 1).unwrap();
         shards.vindex_create("c", 64, 4, 1).await.unwrap(); // tq2 disk
-        let seed = 6000u64;
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+        };
+        let seed = env_usize("SKEG_STRESS_N", 6000) as u64;
         for id in 0..seed {
             shards.vset("c", id, tvec(id + 1), 0, None, None).await.unwrap();
         }
@@ -3314,7 +3317,7 @@ mod tests {
         let mut next = seed;
         let mut rng = 0x1234_5678u64;
         let mut lat: Vec<f64> = Vec::new();
-        let ops = 20_000usize;
+        let ops = env_usize("SKEG_STRESS_OPS", 20_000);
         let start = std::time::Instant::now();
         for step in 0..ops {
             shards.vset("c", next, tvec(next + 1), 0, None, None).await.unwrap();
@@ -3347,6 +3350,76 @@ mod tests {
         let live = ids[0];
         let hits = shards.vsearch("c", tvec(live + 1), 5, 0, 0, false, None).await.unwrap();
         assert!(hits.iter().any(|h| h.0 == live), "live id retrievable after churn");
+    }
+
+    // STRESS (concurrent): one task churns (vset+vdel) while ANOTHER hammers
+    // queries and times them. The shard is single-threaded, so an inline
+    // ingest-path fold (synchronous) blocks queued queries - this is the test
+    // that actually catches a stall (the sequential stress cannot). Run:
+    // SKEG_IDLE_MAINT_MS=50 SKEG_STRESS_N=50000 cargo test --release -p
+    // skeg-server -- --ignored stress_concurrent_query --nocapture
+    #[tokio::test]
+    #[ignore = "stress; run in release with SKEG_STRESS_N set"]
+    async fn stress_concurrent_query_during_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new().unwrap();
+        let shards = std::sync::Arc::new(ShardSet::open(dir.path(), 1).unwrap());
+        shards.vindex_create("c", 64, 4, 1).await.unwrap(); // tq2 disk
+        let env_usize =
+            |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let seed = env_usize("SKEG_STRESS_N", 50_000) as u64;
+        let ops = env_usize("SKEG_STRESS_OPS", 120_000);
+        for id in 0..seed {
+            shards.vset("c", id, tvec(id + 1), 0, None, None).await.unwrap();
+        }
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+
+        // Query task: continuous, times each search (a fixed query vector).
+        let q_shards = shards.clone();
+        let q_done = done.clone();
+        let query = async move {
+            let mut lat: Vec<f64> = Vec::new();
+            while !q_done.load(Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let _ = q_shards.vsearch("c", tvec(7), 10, 0, 0, false, None).await.unwrap();
+                lat.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            lat
+        };
+
+        // Churn task: sustained retract.
+        let c_shards = shards.clone();
+        let c_done = done.clone();
+        let churn = async move {
+            let mut ids: Vec<u64> = (0..seed).collect();
+            let mut next = seed;
+            let mut rng = 0x1234_5678u64;
+            let start = std::time::Instant::now();
+            for _ in 0..ops {
+                c_shards.vset("c", next, tvec(next + 1), 0, None, None).await.unwrap();
+                let succ = next;
+                next += 1;
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let j = (rng as usize) % ids.len();
+                c_shards.vdel("c", ids[j], 0).await.unwrap();
+                ids[j] = succ;
+            }
+            let e = start.elapsed().as_secs_f64();
+            c_done.store(true, Ordering::Relaxed);
+            (ops as f64 / e, e)
+        };
+
+        let ((rps, secs), lat) = tokio::join!(churn, query);
+        let p50 = lat[lat.len() / 2];
+        let p99 = lat[lat.len() * 99 / 100];
+        let max = *lat.last().unwrap();
+        println!(
+            "CONCURRENT | churn {rps:.0} retr/s over {secs:.1}s | {} queries: p50 {p50:.1}ms p99 {p99:.1}ms MAX {max:.1}ms",
+            lat.len()
+        );
     }
 
     // Find a hit's payload by id in a WITHPAYLOAD result.
