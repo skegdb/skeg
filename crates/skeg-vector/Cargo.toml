@@ -221,3 +221,7 @@ harness = false
 [[bench]]
 name = "trunc_hunt"
 harness = false
+
+[[bench]]
+name = "scale_churn"
+harness = false
