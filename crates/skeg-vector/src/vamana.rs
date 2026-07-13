@@ -2007,6 +2007,16 @@ impl DiskVamanaIndex {
         self.runs.len()
     }
 
+    /// Live tombstones (deleted ids not yet reclaimed). A cheap gate for the
+    /// delete-patch trigger: `tombstone_count() / main_len()` approximates the
+    /// dead fraction of the base without the O(base) scan `delete_patch_begin`
+    /// does. Over-counts slightly (it also covers tombstoned run/delta ids), so
+    /// it is a trigger heuristic, not an exact base-dead count.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
+    }
+
     /// Graph entry point (the approximate medoid). Used by an external walk
     /// that drives the graph with its own proxy distance (the PQ-tier gate).
     #[must_use]

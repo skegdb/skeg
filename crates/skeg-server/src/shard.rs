@@ -37,11 +37,29 @@ const IDLE_CONSOLIDATE_INTERVAL: Duration = Duration::from_secs(10);
 /// scan is cheap and a rebuild would churn the graph for little gain.
 const IDLE_CONSOLIDATE_MIN: usize = 4096;
 
+/// Fold the LSM runs into one (cheap, O(runs), base untouched) once the run
+/// count reaches this. Keeps per-query walk cost bounded under churn without
+/// waiting for a full consolidate. Fires regardless of idle - it is cheap and
+/// takes only two short locks around an off-thread build.
+const RUNS_MERGE_TRIGGER: usize = 4;
+
+/// Reclaim dead base rows in place (delete-patch, O(deleted)) once tombstones
+/// reach base/this (~6%): frequent enough to stay in delete-patch's cheap
+/// regime, so the base stays clean without a full O(live) rebuild.
+const DELETE_PATCH_DEAD_DIVISOR: usize = 16;
+
+/// Below this base size a full consolidate is already cheap; don't bother with
+/// an in-place delete-patch.
+const DELETE_PATCH_MIN_BASE: usize = 4096;
+
 use bytes::Bytes;
 use skeg_core::{Durability, VLog};
 
 use crate::payload::{Filter, PayloadIndex, parse_fields};
-use skeg_vector::{DiskVamanaIndex, FlatIndex, QuantKind};
+use skeg_vector::{
+    ConsolidateBuilt, ConsolidateJob, DeletePatchBuilt, DeletePatchJob, DiskVamanaIndex, FlatIndex,
+    QuantKind, RunMergeBuilt, RunMergeJob,
+};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tracing::error;
@@ -242,6 +260,83 @@ impl VectorBackend {
         match self {
             VectorBackend::Flat(_) => Ok(()),
             VectorBackend::Disk(i) => i.consolidate(),
+        }
+    }
+
+    /// Consolidated base-graph size (flat: its full length). Sizes the
+    /// delete-patch trigger against the tombstone count.
+    fn main_len(&self) -> usize {
+        match self {
+            VectorBackend::Flat(i) => i.len(),
+            VectorBackend::Disk(i) => i.main_len(),
+        }
+    }
+
+    /// LSM run count (0 for flat). Drives the runs-merge trigger.
+    fn run_count(&self) -> usize {
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.run_count(),
+        }
+    }
+
+    /// Live tombstones (0 for flat). Cheap gate for the delete-patch trigger.
+    fn tombstone_count(&self) -> usize {
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.tombstone_count(),
+        }
+    }
+
+    // ── Off-thread maintenance: begin (short lock) → build (off-lock, on the
+    // blocking pool) → finish (short lock). Flat has no maintenance, so `begin`
+    // returns `None` and the caller skips straight past. ──────────────────────
+
+    /// L1: snapshot for a full background consolidate (fold delta + runs into a
+    /// fresh base). `None` if nothing to fold or flat.
+    fn consolidate_begin(&mut self) -> std::io::Result<Option<ConsolidateJob>> {
+        match self {
+            VectorBackend::Flat(_) => Ok(None),
+            VectorBackend::Disk(i) => i.consolidate_begin(),
+        }
+    }
+
+    fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.consolidate_finish(built),
+        }
+    }
+
+    /// L2: snapshot for a runs-only merge (fold the LSM runs into one, base
+    /// untouched). `None` if fewer than two runs or flat.
+    fn merge_runs_begin(&mut self) -> std::io::Result<Option<RunMergeJob>> {
+        match self {
+            VectorBackend::Flat(_) => Ok(None),
+            VectorBackend::Disk(i) => i.merge_runs_begin(),
+        }
+    }
+
+    fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.merge_runs_finish(built),
+        }
+    }
+
+    /// L3: snapshot for a delete-patch (reclaim dead base rows in place, runs
+    /// untouched). `None` if there is nothing to reclaim or flat.
+    fn delete_patch_begin(&mut self) -> std::io::Result<Option<DeletePatchJob>> {
+        match self {
+            VectorBackend::Flat(_) => Ok(None),
+            VectorBackend::Disk(i) => i.delete_patch_begin(),
+        }
+    }
+
+    fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.delete_patch_finish(built),
         }
     }
 
@@ -646,6 +741,58 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
 /// mode). `mmap_tier` swaps the TurboQuant codes for a memory-mapped view
 /// (`--tier-mmap`); `mmap_graph` swaps the graph Node array for a mmap'd
 /// view of `graph.vmn` (`--graph-mmap`). Other tiers are unaffected.
+/// Run one off-thread maintenance op on a vindex: `begin` under a short write
+/// lock, `build` on the blocking pool with NO lock held (so queries to this
+/// vindex do not stall for the whole rebuild), `finish` under a short write
+/// lock. `begin` returning `None` means nothing to do. Best-effort: errors are
+/// logged, not propagated. Returns true if an op actually ran.
+///
+/// No lock is held across the `.await` (the guards are confined to the sync
+/// blocks), so the shard thread is free during the build.
+async fn off_thread_maintenance<T, B>(
+    arc: &VectorEntry,
+    label: &str,
+    shard_id: usize,
+    begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
+    build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
+    finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
+) -> bool
+where
+    T: Send + 'static,
+    B: Send + 'static,
+{
+    let job = {
+        let mut g = arc.write();
+        match begin(&mut g.backend) {
+            Ok(Some(j)) => j,
+            Ok(None) => return false,
+            Err(e) => {
+                error!("shard {shard_id}: {label} begin failed: {e}");
+                return false;
+            }
+        }
+    };
+    let built = match tokio::task::spawn_blocking(move || build(job)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            error!("shard {shard_id}: {label} build failed: {e}");
+            return false;
+        }
+        Err(e) => {
+            error!("shard {shard_id}: {label} build task panicked: {e}");
+            return false;
+        }
+    };
+    {
+        let mut g = arc.write();
+        if let Err(e) = finish(&mut g.backend, built) {
+            error!("shard {shard_id}: {label} finish failed: {e}");
+            return false;
+        }
+    }
+    true
+}
+
 fn recover_vindexes(
     shard_id: usize,
     dir: &Path,
@@ -894,6 +1041,7 @@ fn run_shard(
                     // fires only when idle, so collisions are rare. Upgrade path:
                     // background build + atomic swap (no lock during the build).
                     let kvindexes = vindexes.clone();
+                    let kdir = dir.clone();
                     tokio::task::spawn_local(async move {
                         // Phase-shift shards so their idle folds (each a graph
                         // rebuild) do not all run at once and stack their build
@@ -909,27 +1057,74 @@ fn run_shard(
                                 g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
                             };
                             for (name, arc) in snap {
-                                let delta = arc.read().backend.delta_len();
-                                // Idle == unchanged since the previous tick.
+                                let (delta, runs, tombs, base) = {
+                                    let g = arc.read();
+                                    (
+                                        g.backend.delta_len(),
+                                        g.backend.run_count(),
+                                        g.backend.tombstone_count(),
+                                        g.backend.main_len(),
+                                    )
+                                };
+                                // Idle == delta unchanged since the previous tick.
                                 let idle = prev.insert(name.clone(), delta) == Some(delta);
-                                if idle && delta >= IDLE_CONSOLIDATE_MIN {
-                                    let a = arc.clone();
-                                    let nm = name.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let mut g = a.write();
-                                        if let Err(e) = g.backend.consolidate() {
-                                            error!(
-                                                "shard {shard_id}: idle consolidate '{nm}': {e}"
-                                            );
-                                        } else if g.backend.wants_ivf() {
-                                            // Build the routed-filtered-search index
-                                            // off the request path, now that we are idle.
-                                            if let Err(e) = g.backend.build_ivf() {
+                                let vdir = kdir.join(format!("vindex-{name}"));
+
+                                // Priority, cheapest first. runs-merge (L2) and
+                                // delete-patch (L3) fire on their own triggers -
+                                // bounded, off-thread, two short locks - even while
+                                // writes continue. The heavy full consolidate (L1)
+                                // stays idle-gated. One op per vindex per tick.
+                                if runs >= RUNS_MERGE_TRIGGER {
+                                    let d = vdir.clone();
+                                    off_thread_maintenance(
+                                        &arc,
+                                        "runs-merge",
+                                        shard_id,
+                                        |b| b.merge_runs_begin(),
+                                        move |job| job.build(&d),
+                                        |b, built| b.merge_runs_finish(built),
+                                    )
+                                    .await;
+                                } else if base >= DELETE_PATCH_MIN_BASE
+                                    && tombs >= base / DELETE_PATCH_DEAD_DIVISOR
+                                {
+                                    let d = vdir.clone();
+                                    off_thread_maintenance(
+                                        &arc,
+                                        "delete-patch",
+                                        shard_id,
+                                        |b| b.delete_patch_begin(),
+                                        move |job| job.build(&d),
+                                        |b, built| b.delete_patch_finish(built),
+                                    )
+                                    .await;
+                                } else if idle && delta >= IDLE_CONSOLIDATE_MIN {
+                                    let d = vdir.clone();
+                                    let ran = off_thread_maintenance(
+                                        &arc,
+                                        "consolidate",
+                                        shard_id,
+                                        |b| b.consolidate_begin(),
+                                        move |job| job.build(&d),
+                                        |b, built| b.consolidate_finish(built),
+                                    )
+                                    .await;
+                                    if ran {
+                                        // Base changed and we are idle: (re)build the
+                                        // IVF router off the request path.
+                                        let a = arc.clone();
+                                        let nm = name.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            let mut g = a.write();
+                                            if g.backend.wants_ivf()
+                                                && let Err(e) = g.backend.build_ivf()
+                                            {
                                                 error!("shard {shard_id}: idle ivf '{nm}': {e}");
                                             }
-                                        }
-                                    })
-                                    .await;
+                                        })
+                                        .await;
+                                    }
                                     prev.insert(name, 0); // folded
                                 }
                             }
@@ -3025,6 +3220,72 @@ mod tests {
         shards.vindex_consolidate("idx").await.unwrap();
         shards.vindex_create("flat", 64, 0, 0).await.unwrap();
         shards.vindex_consolidate("flat").await.unwrap();
+    }
+
+    // The off-thread maintenance helper drives a runs-merge and a delete-patch
+    // through VectorBackend end to end: runs fold to one, dead base rows are
+    // reclaimed, and liveness is correct throughout. Exercises the exact server
+    // wiring (delegation + begin/build/finish orchestration), not just the
+    // engine primitives.
+    #[tokio::test]
+    async fn off_thread_maintenance_runs_merge_and_delete_patch() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-t");
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(&vdir, 64, 64, QuantKind::TurboQuant { bits: 2 })
+                .unwrap();
+        // A base of 5000 (one flush + consolidate), then 9000 more -> two runs.
+        for id in 0u64..5000 {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let base_before = idx.main_len();
+        for id in 5000u64..14000 {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        assert!(idx.run_count() >= 2, "need >=2 runs, got {}", idx.run_count());
+
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(idx))));
+
+        // L2: runs fold into one.
+        let d = vdir.clone();
+        let ran = off_thread_maintenance(
+            &arc,
+            "runs-merge",
+            0,
+            |b| b.merge_runs_begin(),
+            move |job| job.build(&d),
+            |b, built| b.merge_runs_finish(built),
+        )
+        .await;
+        assert!(ran, "runs-merge ran");
+        assert_eq!(arc.read().backend.run_count(), 1, "runs folded to one");
+        assert!(arc.read().backend.get(42).unwrap().is_some(), "base id live");
+
+        // Delete a fifth of the base, then L3: dead base rows reclaimed in place.
+        for id in 0u64..1000 {
+            assert!(arc.write().backend.delete(id).unwrap(), "deleting a live base id");
+        }
+        assert_eq!(arc.read().backend.tombstone_count(), 1000);
+        let d = vdir.clone();
+        let ran = off_thread_maintenance(
+            &arc,
+            "delete-patch",
+            0,
+            |b| b.delete_patch_begin(),
+            move |job| job.build(&d),
+            |b, built| b.delete_patch_finish(built),
+        )
+        .await;
+        assert!(ran, "delete-patch ran");
+        assert_eq!(
+            arc.read().backend.main_len(),
+            base_before - 1000,
+            "base shrank by the deletes"
+        );
+        assert!(arc.read().backend.get(0).unwrap().is_none(), "deleted id stays gone");
+        assert!(arc.read().backend.get(4999).unwrap().is_some(), "surviving base id live");
+        assert!(arc.read().backend.get(9000).unwrap().is_some(), "a run id still live");
     }
 
     // Find a hit's payload by id in a WITHPAYLOAD result.
