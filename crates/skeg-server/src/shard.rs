@@ -30,8 +30,15 @@ const COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 /// How often each shard writes an index snapshot for fast recovery.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
-/// How often a shard checks its disk vindexes for an idle delta to fold.
-const IDLE_CONSOLIDATE_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a shard checks its disk vindexes for maintenance (runs-merge /
+/// delete-patch / idle consolidate). Default 10 s; `SKEG_IDLE_MAINT_MS`
+/// overrides (tuning knob, and lets a stress test crank it low).
+fn idle_maint_interval() -> Duration {
+    std::env::var("SKEG_IDLE_MAINT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(Duration::from_secs(10), Duration::from_millis)
+}
 
 /// Only fold an idle delta once it is at least this large; below this the flat
 /// scan is cheap and a rebuild would churn the graph for little gain.
@@ -1051,7 +1058,7 @@ fn run_shard(
                         tokio::time::sleep(Duration::from_secs(shard_id as u64 * 2)).await;
                         let mut prev: HashMap<String, usize> = HashMap::new();
                         loop {
-                            tokio::time::sleep(IDLE_CONSOLIDATE_INTERVAL).await;
+                            tokio::time::sleep(idle_maint_interval()).await;
                             let snap: Vec<(String, VectorEntry)> = {
                                 let g = kvindexes.read();
                                 g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
@@ -3286,6 +3293,60 @@ mod tests {
         assert!(arc.read().backend.get(0).unwrap().is_none(), "deleted id stays gone");
         assert!(arc.read().backend.get(4999).unwrap().is_some(), "surviving base id live");
         assert!(arc.read().backend.get(9000).unwrap().is_some(), "a run id still live");
+    }
+
+    // STRESS: sustained retract churn (insert successor + delete predecessor)
+    // through the real ShardSet, with the background maintenance loop cranked
+    // fast (SKEG_IDLE_MAINT_MS). Measures query latency throughout and checks
+    // the index stays correct. Run: SKEG_IDLE_MAINT_MS=50 cargo test --release
+    // -p skeg-server -- --ignored stress_churn_maintenance --nocapture
+    #[tokio::test]
+    #[ignore = "stress; run with SKEG_IDLE_MAINT_MS=50 in release"]
+    async fn stress_churn_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        shards.vindex_create("c", 64, 4, 1).await.unwrap(); // tq2 disk
+        let seed = 6000u64;
+        for id in 0..seed {
+            shards.vset("c", id, tvec(id + 1), 0, None, None).await.unwrap();
+        }
+        let mut ids: Vec<u64> = (0..seed).collect();
+        let mut next = seed;
+        let mut rng = 0x1234_5678u64;
+        let mut lat: Vec<f64> = Vec::new();
+        let ops = 20_000usize;
+        let start = std::time::Instant::now();
+        for step in 0..ops {
+            shards.vset("c", next, tvec(next + 1), 0, None, None).await.unwrap();
+            let succ = next;
+            next += 1;
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let j = (rng as usize) % ids.len();
+            shards.vdel("c", ids[j], 0).await.unwrap();
+            ids[j] = succ;
+            if step % 100 == 0 {
+                let live = ids[(rng as usize) % ids.len()];
+                let t = std::time::Instant::now();
+                let _ = shards.vsearch("c", tvec(live + 1), 10, 0, 0, false, None).await.unwrap();
+                lat.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = lat[lat.len() / 2];
+        let p99 = lat[lat.len() * 99 / 100];
+        let max = *lat.last().unwrap();
+        println!(
+            "churn {ops} retr/{elapsed:.1}s = {:.0}/s | query p50 {p50:.1}ms p99 {p99:.1}ms max {max:.1}ms ({} samples)",
+            ops as f64 / elapsed,
+            lat.len()
+        );
+        // Correctness after churn: a live id is retrievable as its own neighbour.
+        let live = ids[0];
+        let hits = shards.vsearch("c", tvec(live + 1), 5, 0, 0, false, None).await.unwrap();
+        assert!(hits.iter().any(|h| h.0 == live), "live id retrievable after churn");
     }
 
     // Find a hit's payload by id in a WITHPAYLOAD result.
