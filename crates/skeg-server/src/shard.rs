@@ -70,7 +70,7 @@ use skeg_core::{Durability, VLog};
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{
     ConsolidateBuilt, ConsolidateJob, DeletePatchBuilt, DeletePatchJob, DiskVamanaIndex, FlatIndex,
-    FlushBuilt, FlushJob, QuantKind, RunMergeBuilt, RunMergeJob,
+    FlushBuilt, FlushJob, IvfBuilt, IvfJob, QuantKind, RunMergeBuilt, RunMergeJob,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -308,6 +308,21 @@ impl VectorBackend {
         }
     }
 
+    /// IVF rebuild, off-thread: dup the base fd. `None` if flat / empty.
+    fn ivf_begin(&self) -> std::io::Result<Option<IvfJob>> {
+        match self {
+            VectorBackend::Flat(_) => Ok(None),
+            VectorBackend::Disk(i) => i.ivf_begin(0, 8),
+        }
+    }
+
+    fn ivf_finish(&mut self, built: IvfBuilt) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.ivf_finish(built),
+        }
+    }
+
     /// Live tombstones (0 for flat). Cheap gate for the delete-patch trigger.
     fn tombstone_count(&self) -> usize {
         match self {
@@ -377,13 +392,6 @@ impl VectorBackend {
         }
     }
 
-    /// Build the IVF router (background only - never on the inline ingest path).
-    fn build_ivf(&mut self) -> std::io::Result<()> {
-        match self {
-            VectorBackend::Flat(_) => Ok(()),
-            VectorBackend::Disk(i) => i.build_ivf(0, 8),
-        }
-    }
 
     /// Un-consolidated streaming inserts (the in-RAM delta that a bulk load
     /// leaves behind). 0 for flat. Drives the idle-consolidate trigger.
@@ -1136,19 +1144,19 @@ fn run_shard(
                                         |b, built| b.consolidate_finish(built),
                                     )
                                     .await;
-                                    if ran {
-                                        // Base changed: (re)build the IVF router off
-                                        // the request path.
-                                        let a = arc.clone();
-                                        let nm = name.clone();
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            let mut g = a.write();
-                                            if g.backend.wants_ivf()
-                                                && let Err(e) = g.backend.build_ivf()
-                                            {
-                                                error!("shard {shard_id}: idle ivf '{nm}': {e}");
-                                            }
-                                        })
+                                    if ran && arc.read().backend.wants_ivf() {
+                                        // Base changed: rebuild the IVF router off
+                                        // the request path AND off the write lock -
+                                        // begin dups the fd, build runs k-means
+                                        // off-thread, finish swaps under a short lock.
+                                        off_thread_maintenance(
+                                            &arc,
+                                            "ivf",
+                                            shard_id,
+                                            |b| b.ivf_begin(),
+                                            |job| job.build(),
+                                            |b, built| b.ivf_finish(built),
+                                        )
                                         .await;
                                     }
                                     prev.insert(name, 0); // folded

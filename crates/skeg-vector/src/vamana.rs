@@ -1469,6 +1469,57 @@ pub struct FlushBuilt {
     seq: u64,
 }
 
+/// Snapshot for an OFF-THREAD IVF-router rebuild. `ivf_begin` dups the base
+/// vectors fd (O(1)); `build` reads them and runs k-means off the caller;
+/// `ivf_finish` swaps the router in under a short lock. The k-means (O(live))
+/// no longer runs on the shard thread.
+pub struct IvfJob {
+    seg_file: File,
+    n: u32,
+    dim: usize,
+    n_cells: usize,
+    iters: usize,
+}
+
+/// Output of [`IvfJob::build`]: the built router, ready for
+/// [`DiskVamanaIndex::ivf_finish`] to install.
+pub struct IvfBuilt {
+    router: IvfRouter,
+}
+
+impl IvfJob {
+    /// Read the base vectors and run k-means - off the caller.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if a base-vector read fails.
+    pub fn build(self) -> io::Result<IvfBuilt> {
+        let IvfJob {
+            seg_file,
+            n,
+            dim,
+            n_cells,
+            iters,
+        } = self;
+        let mut all = vec![0f32; n as usize * dim];
+        let mut buf = vec![0u8; dim * 4];
+        for r in 0..n as usize {
+            let off = HEADER_LEN as u64 + r as u64 * dim as u64 * 4;
+            seg_file.read_exact_at(&mut buf, off)?;
+            for (slot, c) in all[r * dim..r * dim + dim].iter_mut().zip(buf.chunks_exact(4)) {
+                *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let n_cells = if n_cells == 0 {
+            IvfRouter::cells_for(n as usize)
+        } else {
+            n_cells
+        };
+        let router = IvfRouter::build(&all, n, dim, n_cells, iters);
+        Ok(IvfBuilt { router })
+    }
+}
+
 impl FlushJob {
     /// Build the run graph and open it - off the caller's thread.
     ///
@@ -3408,23 +3459,27 @@ impl DiskVamanaIndex {
     ///
     /// I/O error if the flush or a base-vector read fails.
     pub fn delete_patch_begin(&mut self) -> io::Result<Option<DeletePatchJob>> {
-        self.flush()?;
+        // NO flush (that would build a run graph on the caller). A base row is
+        // dead if tombstoned OR shadowed by a newer copy anywhere - run, delta,
+        // or flush staging; the newer copy wins in search, so dropping the stale
+        // base row is safe without moving the delta into a run first.
         let n = self.base.main_n as usize;
         if n == 0 {
             return Ok(None);
         }
-        // Ids that live in a surviving run shadow the base copy of the same id.
-        let mut in_run: AHashSet<u64> = AHashSet::new();
+        let mut shadowed: AHashSet<u64> = AHashSet::new();
         for run in &self.runs {
             for &id in &run.ids {
-                in_run.insert(id);
+                shadowed.insert(id);
             }
         }
+        shadowed.extend(self.delta.keys().copied());
+        shadowed.extend(self.flushing.keys().copied());
         let mut dead = vec![false; n];
         let mut dead_count = 0usize;
         for row in 0..n {
             let id = self.base.ids[row];
-            if self.tombstones.contains(&id) || in_run.contains(&id) {
+            if self.tombstones.contains(&id) || shadowed.contains(&id) {
                 dead[row] = true;
                 dead_count += 1;
             }
@@ -3520,6 +3575,37 @@ impl DiskVamanaIndex {
         let router = IvfRouter::build(&all, n, dim, n_cells, iters);
         let _ = std::fs::write(self.dir.join(IVF_FILE), router.to_bytes());
         self.ivf = Some(Box::new(router));
+        Ok(())
+    }
+
+    /// Begin an OFF-THREAD IVF rebuild: dup the base vectors fd (O(1)). `None`
+    /// if the base is empty. The read + k-means happen in [`IvfJob::build`].
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the fd cannot be duped.
+    pub fn ivf_begin(&self, n_cells: usize, iters: usize) -> io::Result<Option<IvfJob>> {
+        let n = self.base.main_n;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(IvfJob {
+            seg_file: self.base.vectors_file.try_clone()?,
+            n,
+            dim: self.dim,
+            n_cells,
+            iters,
+        }))
+    }
+
+    /// Install the router built off-thread (short, exclusive) and persist it.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; `io::Result` for symmetry.
+    pub fn ivf_finish(&mut self, built: IvfBuilt) -> io::Result<()> {
+        let _ = std::fs::write(self.dir.join(IVF_FILE), built.router.to_bytes());
+        self.ivf = Some(Box::new(built.router));
         Ok(())
     }
 
