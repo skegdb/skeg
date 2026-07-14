@@ -122,13 +122,7 @@ impl Server {
         // Recover shards before binding so the port only opens once queries can
         // be served (see bind_serve_full_mmap for the phantom-stall rationale).
         let shards = ShardSet::open_mode_full_mmap(
-            data_dir,
-            n_shards,
-            false,
-            tier,
-            workers,
-            mmap_tier,
-            mmap_graph,
+            data_dir, n_shards, false, tier, workers, mmap_tier, mmap_graph,
         )?;
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {

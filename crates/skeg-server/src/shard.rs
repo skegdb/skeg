@@ -392,7 +392,6 @@ impl VectorBackend {
         }
     }
 
-
     /// Un-consolidated streaming inserts (the in-RAM delta that a bulk load
     /// leaves behind). 0 for flat. Drives the idle-consolidate trigger.
     fn delta_len(&self) -> usize {
@@ -474,6 +473,13 @@ enum ShardReq {
     /// `(key, value, durability, tenant, disk_limit)`.
     Set(Bytes, Bytes, Durability, u128, Option<u64>),
     Del(Bytes, Durability),
+    /// Erase everything owned by `tenant` on this shard: its vindexes (with
+    /// their payload blobs and vector quota) and every KV key carrying its
+    /// 16-byte prefix. Refused for tenant `0`, whose keys are unscoped.
+    EraseTenant {
+        tenant: u128,
+        durability: Durability,
+    },
     /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
     MgetBatch(Vec<(usize, Bytes)>, u128),
     /// Bytes of hot-key cache charged to a tenant on this shard.
@@ -548,6 +554,11 @@ enum ShardResp {
     Value(Option<Bytes>),
     Done,
     Existed(bool),
+    /// What an `EraseTenant` removed on the answering shard.
+    Erased {
+        vindexes: u64,
+        keys: u64,
+    },
     /// Bytes of hot-key cache charged to a tenant on the answering shard.
     CacheBytes(usize),
     MgetBatch(Vec<(usize, Option<Bytes>)>),
@@ -1241,6 +1252,7 @@ fn is_mutation(req: &ShardReq) -> bool {
         req,
         ShardReq::Set(..)
             | ShardReq::Del(..)
+            | ShardReq::EraseTenant { .. }
             | ShardReq::VindexCreate { .. }
             | ShardReq::VindexDrop { .. }
             | ShardReq::VindexConsolidate { .. }
@@ -1264,7 +1276,11 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         ShardReq::Vset { .. } => Some(Op::VSet),
         ShardReq::Vsearch { .. } => Some(Op::VSearch),
         ShardReq::Vdel { .. } => Some(Op::VDel),
-        ShardReq::Vget { .. }
+        // An erase is one request but N deletes; counting it as a single Del
+        // would understate it and counting it as N would hide its latency, so
+        // it stays out of the op counters until it has its own classifier.
+        ShardReq::EraseTenant { .. }
+        | ShardReq::Vget { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
@@ -1274,6 +1290,56 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::TenantCacheBytes(_)
         | ShardReq::Stats => None,
     }
+}
+
+/// Drop one vindex by its scoped map key, reclaiming its vector quota and its
+/// payload blobs. `Ok(false)` means it was not there to begin with; the caller
+/// decides whether that is an error (an explicit DROP) or a no-op (an erasure
+/// sweep racing a concurrent drop).
+///
+/// Pops the entry from the outer map first; this prevents new ops from
+/// observing it. In-flight ops on this vindex keep their cloned `Arc` alive and
+/// finish their inner lock window before dropping it. `remove_dir_all` on POSIX
+/// deletes the path immediately even if open file handles persist on the still-
+/// alive Arc clones; the handles close when the last clone drops.
+async fn drop_vindex(
+    vlog: &VLog,
+    vindexes: &RwLock<VindexSet>,
+    dir: &Path,
+    quota: &Arc<crate::quota::TenantVectorQuota>,
+    name: &str,
+    tenant: u128,
+) -> Result<bool, String> {
+    let Some(arc) = vindexes.write().remove(name) else {
+        return Ok(false);
+    };
+    // Read everything off the index in a tight block so the guard is gone
+    // before the payload-del `await` below. `live_ids` is enumerated now,
+    // while the index still exists, so we can reclaim its payload blobs.
+    let (was_disk, fragment, payload_ids) = {
+        let guard = arc.read();
+        (
+            matches!(guard.backend, VectorBackend::Disk(_)),
+            guard.backend.len() as u64,
+            guard.backend.live_ids(),
+        )
+    };
+    drop(arc);
+    quota.sub(tenant, fragment);
+    if was_disk {
+        let _ = std::fs::remove_dir_all(dir.join(format!("vindex-{name}")));
+        persist_registry(dir, vindexes);
+    }
+    // Drop the index's payload blobs. Without this a recreated index reusing
+    // the same name and id would resurface a stale blob under the same
+    // reserved key.
+    for id in payload_ids {
+        let key = payload_key(tenant, name, id);
+        if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
+            return Err(format!("vindex drop payload failed: {e}"));
+        }
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1452,45 +1518,65 @@ async fn process(
             ShardResp::IndexStats(rows)
         }
         ShardReq::VindexDrop { name, tenant } => {
-            // Pop the entry from the outer map first; this prevents new ops
-            // from observing it. In-flight ops on this vindex keep their
-            // cloned `Arc` alive and finish their inner lock window before
-            // dropping it. `remove_dir_all` on POSIX deletes the path
-            // immediately even if open file handles persist on the still-
-            // alive Arc clones; the handles close when the last clone drops.
-            let removed = vindexes.write().remove(&name);
-            match removed {
-                Some(arc) => {
-                    // Read everything off the index in a tight block so the
-                    // guard is gone before the payload-del `await` below.
-                    // `live_ids` is enumerated now, while the index still
-                    // exists, so we can reclaim its payload blobs.
-                    let (was_disk, fragment, payload_ids) = {
-                        let guard = arc.read();
-                        (
-                            matches!(guard.backend, VectorBackend::Disk(_)),
-                            guard.backend.len() as u64,
-                            guard.backend.live_ids(),
-                        )
-                    };
-                    drop(arc);
-                    quota.sub(tenant, fragment);
-                    if was_disk {
-                        let _ = std::fs::remove_dir_all(dir.join(format!("vindex-{name}")));
-                        persist_registry(dir, vindexes);
-                    }
-                    // Drop the index's payload blobs. Without this a recreated
-                    // index reusing the same name and id would resurface a stale
-                    // blob under the same reserved key.
-                    for id in payload_ids {
-                        let key = payload_key(tenant, &name, id);
-                        if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
-                            return ShardResp::Err(format!("vindex drop payload failed: {e}"));
-                        }
-                    }
-                    ShardResp::Done
+            match drop_vindex(vlog, vindexes, dir, quota, &name, tenant).await {
+                Ok(true) => ShardResp::Done,
+                Ok(false) => ShardResp::Err(format!("vindex '{name}' not found")),
+                Err(e) => ShardResp::Err(e),
+            }
+        }
+        ShardReq::EraseTenant { tenant, durability } => {
+            // Erasing tenant 0 is refused: its keys are stored unscoped (no
+            // 16-byte prefix), so there is no way to tell them from another
+            // tenant's, and the sweep below would be a whole-store wipe.
+            if tenant == 0 {
+                return ShardResp::Err("cannot erase the anonymous tenant (0)".to_owned());
+            }
+            // Vindexes first. A vector's payload blob is itself a KV key under
+            // this tenant's prefix, so the KV sweep below would delete the blob
+            // and leave the index pointing at a hole. Dropping the index first
+            // reclaims its blobs and its vector quota through the same path a
+            // VINDEX.DROP takes, and leaves nothing dangling.
+            let mine: Vec<String> = vindexes
+                .read()
+                .keys()
+                .filter(|k| unscope_key(k).0 == tenant)
+                .cloned()
+                .collect();
+            let mut dropped = 0u64;
+            for name in mine {
+                match drop_vindex(vlog, vindexes, dir, quota, &name, tenant).await {
+                    Ok(true) => dropped += 1,
+                    // Lost a race with a concurrent drop: already gone, fine.
+                    Ok(false) => {}
+                    Err(e) => return ShardResp::Err(e),
                 }
-                None => ShardResp::Err(format!("vindex '{name}' not found")),
+            }
+
+            // Now the KV sweep. Collect under the index borrow, filtering on
+            // the tenant prefix so only this tenant's keys are materialised,
+            // then release the borrow before deleting: the callback is sync and
+            // `del` is async, and `del` would take the index mutably anyway.
+            let prefix = tenant.to_le_bytes();
+            let victims: Vec<Vec<u8>> = {
+                let mut v = Vec::new();
+                vlog.for_each_key(|k| {
+                    if k.len() >= 16 && k[..16] == prefix {
+                        v.push(k.to_vec());
+                    }
+                });
+                v
+            };
+            let mut erased = 0u64;
+            for key in &victims {
+                match vlog.del(key, durability).await {
+                    Ok(true) => erased += 1,
+                    Ok(false) => {}
+                    Err(e) => return ShardResp::Err(format!("erase failed: {e}")),
+                }
+            }
+            ShardResp::Erased {
+                vindexes: dropped,
+                keys: erased,
             }
         }
         ShardReq::Vset {
@@ -1923,7 +2009,9 @@ impl ShardSet {
             for h in handles {
                 let _ = h.join();
             }
-            return Err(std::io::Error::other(format!("shard startup failed: {msg}")));
+            return Err(std::io::Error::other(format!(
+                "shard startup failed: {msg}"
+            )));
         }
         Ok(Self {
             inner: Arc::new(ShardSetInner {
@@ -2281,6 +2369,47 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if every shard is unavailable.
+    /// Erase every trace of `tenant`: its vindexes (payload blobs and vector
+    /// quota included) and every KV key under its prefix. Returns
+    /// `(vindexes_dropped, keys_deleted)` summed over the shards.
+    ///
+    /// A tenant's keys hash across every shard, so this fans out to all of
+    /// them. It is not atomic: shards are swept in turn, and a concurrent write
+    /// from the tenant being erased can land behind the sweep and survive it.
+    /// Bar the tenant's traffic first if the erasure has to be final.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for tenant `0` (its keys are unscoped, so a sweep would
+    /// wipe the store), or if a shard is unavailable or a delete fails.
+    pub async fn erase_tenant(
+        &self,
+        tenant: u128,
+        durability: Durability,
+    ) -> Result<(u64, u64), ShardError> {
+        if tenant == 0 {
+            return Err(ShardError::Storage(
+                "cannot erase the anonymous tenant (0)".to_owned(),
+            ));
+        }
+        let (mut vindexes, mut keys) = (0u64, 0u64);
+        for shard in 0..self.inner.n {
+            let req = ShardReq::EraseTenant { tenant, durability };
+            match self.call(shard, req).await? {
+                ShardResp::Erased {
+                    vindexes: v,
+                    keys: k,
+                } => {
+                    vindexes += v;
+                    keys += k;
+                }
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok((vindexes, keys))
+    }
+
     pub async fn vindex_list(&self) -> Result<Vec<(String, u32, u8, u8, u64)>, ShardError> {
         use std::collections::BTreeMap;
         let mut agg: BTreeMap<String, (u32, u8, u8, u64)> = BTreeMap::new();
@@ -2713,6 +2842,162 @@ mod tests {
                 "shard {s} got {c}, expected ~{expected} (±10%)"
             );
         }
+    }
+
+    /// A tenant-scoped key, exactly as `resp3_handler::scope_key` builds it:
+    /// the tenant's 16 bytes in little-endian order, then the raw key.
+    fn scoped(tenant: u128, key: &str) -> Vec<u8> {
+        let mut k = tenant.to_le_bytes().to_vec();
+        k.extend_from_slice(key.as_bytes());
+        k
+    }
+
+    #[tokio::test]
+    async fn erase_tenant_removes_only_that_tenants_keys() {
+        const VICTIM: u128 = 1;
+        const NEIGHBOUR: u128 = 2;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+
+        // Both tenants' keys hash across all four shards, and they collide on
+        // the unscoped part: erasing one must not touch the other.
+        for i in 0u32..30 {
+            let k = format!("k{i}");
+            for t in [VICTIM, NEIGHBOUR] {
+                shards
+                    .set_scoped(&scoped(t, &k), b"v", Durability::Kernel, t, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let (vindexes, keys) = shards
+            .erase_tenant(VICTIM, Durability::Kernel)
+            .await
+            .unwrap();
+        assert_eq!(keys, 30, "every key of the victim tenant deleted");
+        assert_eq!(vindexes, 0, "no vindexes existed to drop");
+
+        for i in 0u32..30 {
+            let k = format!("k{i}");
+            assert_eq!(
+                shards.get(&scoped(VICTIM, &k)).await.unwrap(),
+                None,
+                "victim key {k} survived the erasure"
+            );
+            assert_eq!(
+                shards.get(&scoped(NEIGHBOUR, &k)).await.unwrap().as_deref(),
+                Some(b"v".as_slice()),
+                "neighbour key {k} was collateral damage"
+            );
+        }
+
+        // Erasure is idempotent: nothing left to find the second time.
+        let (_, keys) = shards
+            .erase_tenant(VICTIM, Durability::Kernel)
+            .await
+            .unwrap();
+        assert_eq!(keys, 0, "second erase is a no-op");
+    }
+
+    #[tokio::test]
+    async fn erase_tenant_drops_its_vindexes_and_leaves_no_disk_charged() {
+        const VICTIM: u128 = 7;
+        const NEIGHBOUR: u128 = 8;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+
+        // A vector's payload blob is a KV key under the tenant's prefix. If the
+        // sweep ran before the vindex drop it would delete the blob and leave
+        // the index pointing at a hole, so the order is what this pins down.
+        for t in [VICTIM, NEIGHBOUR] {
+            let name = scope_key(t, "idx");
+            shards.vindex_create(&name, 4, 0, 0).await.unwrap();
+            for id in 0u64..8 {
+                shards
+                    .vset(
+                        &name,
+                        id,
+                        vec![0.1, 0.2, 0.3, 0.4],
+                        t,
+                        None,
+                        Some(Bytes::from_static(b"payload")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // A plain KV key alongside the vector data.
+            shards
+                .set_scoped(&scoped(t, "doc"), b"v", Durability::Kernel, t, None)
+                .await
+                .unwrap();
+        }
+
+        let (vindexes, _) = shards
+            .erase_tenant(VICTIM, Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(vindexes >= 1, "the victim's vindex was dropped");
+
+        // Nothing of the victim's is left: no vindex, no key, no disk charged.
+        let names: Vec<String> = shards
+            .vindex_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(n, ..)| n)
+            .collect();
+        assert!(
+            !names.contains(&scope_key(VICTIM, "idx")),
+            "victim vindex still listed: {names:?}"
+        );
+        assert_eq!(
+            shards.get(&scoped(VICTIM, "doc")).await.unwrap(),
+            None,
+            "victim KV key survived"
+        );
+        assert_eq!(
+            shards.tenant_disk_bytes(VICTIM),
+            0,
+            "victim still charged for disk after erasure"
+        );
+
+        // The neighbour is untouched: index still listed, key still readable.
+        assert!(
+            names.contains(&scope_key(NEIGHBOUR, "idx")),
+            "neighbour vindex was collateral damage: {names:?}"
+        );
+        assert_eq!(
+            shards
+                .get(&scoped(NEIGHBOUR, "doc"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"v".as_slice()),
+            "neighbour KV key was collateral damage"
+        );
+    }
+
+    #[tokio::test]
+    async fn erase_tenant_refuses_the_anonymous_tenant() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards
+            .set(b"plain", b"v", Durability::Kernel)
+            .await
+            .unwrap();
+
+        // Tenant 0's keys are unscoped, so a prefix sweep cannot tell them from
+        // anyone else's: erasing it would be a whole-store wipe. It must refuse.
+        assert!(
+            shards.erase_tenant(0, Durability::Kernel).await.is_err(),
+            "erasing tenant 0 must be refused"
+        );
+        assert_eq!(
+            shards.get(b"plain").await.unwrap().as_deref(),
+            Some(b"v".as_slice()),
+            "the refused erase must not have deleted anything"
+        );
     }
 
     #[tokio::test]
@@ -3332,9 +3617,13 @@ mod tests {
     async fn off_thread_maintenance_runs_merge_and_delete_patch() {
         let dir = TempDir::new().unwrap();
         let vdir = dir.path().join("vindex-t");
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(&vdir, 64, 64, QuantKind::TurboQuant { bits: 2 })
-                .unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
         // A base of 5000 (one flush + consolidate), then 9000 more -> two runs.
         for id in 0u64..5000 {
             idx.insert(id, &tvec(id + 1)).unwrap();
@@ -3344,7 +3633,11 @@ mod tests {
         for id in 5000u64..14000 {
             idx.insert(id, &tvec(id + 1)).unwrap();
         }
-        assert!(idx.run_count() >= 2, "need >=2 runs, got {}", idx.run_count());
+        assert!(
+            idx.run_count() >= 2,
+            "need >=2 runs, got {}",
+            idx.run_count()
+        );
 
         let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(idx))));
 
@@ -3361,11 +3654,17 @@ mod tests {
         .await;
         assert!(ran, "runs-merge ran");
         assert_eq!(arc.read().backend.run_count(), 1, "runs folded to one");
-        assert!(arc.read().backend.get(42).unwrap().is_some(), "base id live");
+        assert!(
+            arc.read().backend.get(42).unwrap().is_some(),
+            "base id live"
+        );
 
         // Delete a fifth of the base, then L3: dead base rows reclaimed in place.
         for id in 0u64..1000 {
-            assert!(arc.write().backend.delete(id).unwrap(), "deleting a live base id");
+            assert!(
+                arc.write().backend.delete(id).unwrap(),
+                "deleting a live base id"
+            );
         }
         assert_eq!(arc.read().backend.tombstone_count(), 1000);
         let d = vdir.clone();
@@ -3384,9 +3683,18 @@ mod tests {
             base_before - 1000,
             "base shrank by the deletes"
         );
-        assert!(arc.read().backend.get(0).unwrap().is_none(), "deleted id stays gone");
-        assert!(arc.read().backend.get(4999).unwrap().is_some(), "surviving base id live");
-        assert!(arc.read().backend.get(9000).unwrap().is_some(), "a run id still live");
+        assert!(
+            arc.read().backend.get(0).unwrap().is_none(),
+            "deleted id stays gone"
+        );
+        assert!(
+            arc.read().backend.get(4999).unwrap().is_some(),
+            "surviving base id live"
+        );
+        assert!(
+            arc.read().backend.get(9000).unwrap().is_some(),
+            "a run id still live"
+        );
     }
 
     // STRESS: sustained retract churn (insert successor + delete predecessor)
@@ -3401,11 +3709,17 @@ mod tests {
         let shards = ShardSet::open(dir.path(), 1).unwrap();
         shards.vindex_create("c", 64, 4, 1).await.unwrap(); // tq2 disk
         let env_usize = |k: &str, d: usize| {
-            std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
         };
         let seed = env_usize("SKEG_STRESS_N", 6000) as u64;
         for id in 0..seed {
-            shards.vset("c", id, tvec(id + 1), 0, None, None).await.unwrap();
+            shards
+                .vset("c", id, tvec(id + 1), 0, None, None)
+                .await
+                .unwrap();
         }
         let mut ids: Vec<u64> = (0..seed).collect();
         let mut next = seed;
@@ -3414,7 +3728,10 @@ mod tests {
         let ops = env_usize("SKEG_STRESS_OPS", 20_000);
         let start = std::time::Instant::now();
         for step in 0..ops {
-            shards.vset("c", next, tvec(next + 1), 0, None, None).await.unwrap();
+            shards
+                .vset("c", next, tvec(next + 1), 0, None, None)
+                .await
+                .unwrap();
             let succ = next;
             next += 1;
             rng ^= rng << 13;
@@ -3426,7 +3743,10 @@ mod tests {
             if step % 100 == 0 {
                 let live = ids[(rng as usize) % ids.len()];
                 let t = std::time::Instant::now();
-                let _ = shards.vsearch("c", tvec(live + 1), 10, 0, 0, false, None).await.unwrap();
+                let _ = shards
+                    .vsearch("c", tvec(live + 1), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
                 lat.push(t.elapsed().as_secs_f64() * 1e3);
             }
         }
@@ -3442,8 +3762,14 @@ mod tests {
         );
         // Correctness after churn: a live id is retrievable as its own neighbour.
         let live = ids[0];
-        let hits = shards.vsearch("c", tvec(live + 1), 5, 0, 0, false, None).await.unwrap();
-        assert!(hits.iter().any(|h| h.0 == live), "live id retrievable after churn");
+        let hits = shards
+            .vsearch("c", tvec(live + 1), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.0 == live),
+            "live id retrievable after churn"
+        );
     }
 
     // STRESS (concurrent): one task churns (vset+vdel) while ANOTHER hammers
@@ -3459,12 +3785,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shards = std::sync::Arc::new(ShardSet::open(dir.path(), 1).unwrap());
         shards.vindex_create("c", 64, 4, 1).await.unwrap(); // tq2 disk
-        let env_usize =
-            |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
         let seed = env_usize("SKEG_STRESS_N", 50_000) as u64;
         let ops = env_usize("SKEG_STRESS_OPS", 120_000);
         for id in 0..seed {
-            shards.vset("c", id, tvec(id + 1), 0, None, None).await.unwrap();
+            shards
+                .vset("c", id, tvec(id + 1), 0, None, None)
+                .await
+                .unwrap();
         }
         let done = std::sync::Arc::new(AtomicBool::new(false));
 
@@ -3475,7 +3808,10 @@ mod tests {
             let mut lat: Vec<f64> = Vec::new();
             while !q_done.load(Ordering::Relaxed) {
                 let t = std::time::Instant::now();
-                let _ = q_shards.vsearch("c", tvec(7), 10, 0, 0, false, None).await.unwrap();
+                let _ = q_shards
+                    .vsearch("c", tvec(7), 10, 0, 0, false, None)
+                    .await
+                    .unwrap();
                 lat.push(t.elapsed().as_secs_f64() * 1e3);
             }
             lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -3491,7 +3827,10 @@ mod tests {
             let mut rng = 0x1234_5678u64;
             let start = std::time::Instant::now();
             for _ in 0..ops {
-                c_shards.vset("c", next, tvec(next + 1), 0, None, None).await.unwrap();
+                c_shards
+                    .vset("c", next, tvec(next + 1), 0, None, None)
+                    .await
+                    .unwrap();
                 let succ = next;
                 next += 1;
                 rng ^= rng << 13;
@@ -3880,9 +4219,16 @@ mod tests {
             let s = &shards;
             async move {
                 let g = grp(id);
-                s.vset("idx", id, tvec(id + 1), 0, None, Some(Bytes::from(format!("g={g}"))))
-                    .await
-                    .unwrap();
+                s.vset(
+                    "idx",
+                    id,
+                    tvec(id + 1),
+                    0,
+                    None,
+                    Some(Bytes::from(format!("g={g}"))),
+                )
+                .await
+                .unwrap();
             }
         };
         let seed = 2000u64;
@@ -3910,8 +4256,11 @@ mod tests {
             if step % 500 == 499 {
                 // Fold delta + runs into base (exercises the refactored path).
                 shards.vindex_consolidate("idx").await.unwrap();
-                let want: BTreeSet<u64> =
-                    live.iter().filter(|&(_, &g)| g == 3).map(|(&id, _)| id).collect();
+                let want: BTreeSet<u64> = live
+                    .iter()
+                    .filter(|&(_, &g)| g == 3)
+                    .map(|(&id, _)| id)
+                    .collect();
                 // k covers every match, so the exact-scan filter returns all of them.
                 let got = shards
                     .vsearch("idx", tvec(3), want.len() + 50, 0, 0, false, flt("g = 3"))
