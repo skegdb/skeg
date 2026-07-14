@@ -1,6 +1,6 @@
 [package]
 name = "skeg-server"
-version = "0.6.0"
+version = "0.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,7 +28,7 @@ path = "src/bin/skeg-server-resp3.rs"
 skeg-proto = { path = "../skeg-proto", version = "0.1.3" }
 skeg-core = { path = "../skeg-core", version = "0.3.2" }
 skeg-platform = { path = "../skeg-platform", version = "0.1" }
-skeg-vector = { path = "../skeg-vector", version = "0.1.6" }
+skeg-vector = { path = "../skeg-vector", version = "0.1.7" }
 skeg-resp3 = { path = "../skeg-resp3", version = "0.2.2" }
 skeg-telemetry = { path = "../skeg-telemetry", version = "0.2" }
 socket2 = "0.5"

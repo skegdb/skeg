@@ -7,6 +7,49 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.7.0] - 2026-07-14
+
+### Added
+
+- **Off-thread maintenance.** Every graph rebuild (consolidate, runs-merge,
+  delete-patch, and the new delta flush) now runs as begin then build then
+  finish: a short write-lock snapshot, an off-thread build on a capped pool, and
+  a short write-lock swap of the prebuilt segment. On a single-threaded shard a
+  synchronous build used to stall every concurrent query; under sustained churn
+  the query tail drops from ~200 ms to ~17 ms. A per-shard maintenance loop
+  drives flush, consolidate, runs-merge, and delete-patch by priority and
+  threshold, so ingest never blocks the shard.
+
+- **Off-thread delta flush.** A delta flush moves to a staging buffer built on a
+  blocking thread and is still searched at full precedence while it runs, so the
+  shard keeps serving during a flush.
+
+- **Runs-merge and delete-patch scaling levels.** Runs-merge folds immutable run
+  segments into one merged run for a bounded per-query traversal (best p99 under
+  churn, largest win at high dimension). Delete-patch reclaims deleted rows in
+  place in O(deleted) instead of an O(live) rebuild, about 4.5 to 10x cheaper
+  while dead rows stay under a few percent; it is gated at a low tombstone
+  threshold, with full consolidate as the fallback above the crossover.
+
+- **Parallel quant-tier build.** The TurboQuant tier build on the streaming path
+  encodes rows across all cores (the rotation dominates and is independent per
+  row), byte-identical to the sequential output. Serve-open recovery of a 500k
+  tq2 index drops from ~9.6 s to ~2.1 s.
+
+- **Serve readiness barrier.** In serve mode the listen port opens only after the
+  shard has recovered and built its tier, so a connecting client can query at
+  once. First-query latency at 500k drops from ~8 s (the client used to race
+  recovery and wait in the backlog) to ~15 ms.
+
+### Changed
+
+- **Default read-write tier is now tq2** (TurboQuant 2-bit), was int8, and
+  `--tier` applies to both `rw` and `serve` modes. On real embeddings tq2 roughly
+  halves index RAM versus int8 at equal recall@10, with recall@100 within about
+  0.5 points at 384 to 1536 dimensions. Low-dimension corpora (for example GloVe
+  104d) keep more recall on tq4 or int8. Pass `--tier int8` to restore the old
+  default.
+
 ## [0.6.1] - 2026-07-11
 
 ### Fixed
