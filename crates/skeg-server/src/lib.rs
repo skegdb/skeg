@@ -204,7 +204,7 @@ impl Server {
         // Open (and eagerly recover) the shard BEFORE binding, so the listen
         // port only comes up once the index is queryable. Otherwise the kernel
         // accepts connections into the backlog during the multi-second recover
-        // and the first query blocks until `run()` starts — a phantom ~8s stall
+        // and the first query blocks until `run()` starts, a phantom ~8s stall
         // at 500k. Bind-after-open makes `wait_tcp` mean "ready".
         let shards =
             ShardSet::open_mode_full_mmap(data_dir, 1, true, tier, workers, mmap_tier, mmap_graph)?;

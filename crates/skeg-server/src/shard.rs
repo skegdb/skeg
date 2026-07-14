@@ -876,7 +876,7 @@ fn recover_vindexes(
 /// it needs the data. The tiering policy is responsible for not thrashing
 /// (hysteresis); this is just the mechanism.
 ///
-/// ponytail: no in-flight dedup. Two requests racing on the same just-evicted
+/// No in-flight dedup. Two requests racing on the same just-evicted
 /// index both open it; the write-lock double-check below keeps the first
 /// published and drops the loser. Wasteful (a second open) but correct. Upgrade
 /// path if a reopen storm spikes RAM: an in-flight set + `Notify`.
@@ -1082,7 +1082,7 @@ fn run_shard(
                     // so the served index is lean BY DEFAULT, not only after an
                     // explicit VINDEX.CONSOLIDATE. The fold runs on a blocking
                     // thread so the build does not stall the shard runtime.
-                    // ponytail: the swap still holds the per-vindex write lock for
+                    // The swap still holds the per-vindex write lock for
                     // the rebuild, so a query to THAT vindex mid-fold waits; it
                     // fires only when idle, so collisions are rare. Upgrade path:
                     // background build + atomic swap (no lock during the build).
@@ -1091,7 +1091,7 @@ fn run_shard(
                     tokio::task::spawn_local(async move {
                         // Phase-shift shards so their idle folds (each a graph
                         // rebuild) do not all run at once and stack their build
-                        // buffers into one RSS spike. ponytail: a process-wide
+                        // buffers into one RSS spike. A process-wide
                         // permit would serialise them exactly; the stagger is the
                         // cheap version with no cross-shard plumbing.
                         tokio::time::sleep(Duration::from_secs(shard_id as u64 * 2)).await;
@@ -1647,7 +1647,7 @@ async fn process(
                     match search_result {
                         Err(e) => ShardResp::Err(e),
                         Ok(hits) => {
-                            // ponytail: fetch a payload per local hit; some get
+                            // Fetch a payload per local hit; some get
                             // trimmed by the global top-k merge, but k is small.
                             // Route the final-k by id if it ever bites.
                             match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
@@ -1863,7 +1863,7 @@ impl ShardSet {
         let mut handles = Vec::with_capacity(n_shards);
         // Readiness barrier: each shard signals once recovery is done. We block
         // below until all have, so `open` (and the caller's bind-after-open)
-        // means "queryable" — no phantom stall on the first query.
+        // means "queryable": no phantom stall on the first query.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         // One vector quota shared across all shards: a tenant's vectors are
         // spread over shards by id, so the counter must aggregate cross-shard.
@@ -1901,10 +1901,10 @@ impl ShardSet {
         for _ in 0..n_shards {
             // Each shard signals exactly once (success or degraded VLog path),
             // then keeps its sender alive in the request loop. recover_vindexes
-            // never panics — bad indexes are logged and skipped — so this always
-            // gets its n signals.
-            // ponytail: a hard panic before signalling (e.g. OOM) would hang here,
-            // but that aborts the process anyway. Add recv_timeout if that changes.
+            // never panics (bad indexes are logged and skipped), so this always
+            // gets its n signals. A hard panic before signalling (e.g. OOM) would
+            // hang here, but that aborts the process anyway; add recv_timeout if
+            // that changes.
             let _ = ready_rx.recv();
         }
         Ok(Self {

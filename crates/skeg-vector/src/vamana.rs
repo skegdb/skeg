@@ -1763,7 +1763,7 @@ pub struct DiskVamanaIndex {
     /// Online tq1 proxy controller, `None` unless enabled via
     /// [`enable_tq1_controller`](Self::enable_tq1_controller). Behind a mutex
     /// because `search` is `&self`; only touched on shadow queries.
-    // ponytail: Box the whole tq1 runtime (mutex + counter) so this cold state
+    // Box the whole tq1 runtime (mutex + counter) so this cold state
     // stays off DiskVamanaIndex as one pointer - else the pthread mutex inline
     // bloats skeg-server's VectorBackend enum past large_enum_variant.
     tq1: Box<Tq1Runtime>,
@@ -2892,7 +2892,7 @@ impl DiskVamanaIndex {
             if !reranked_ids.insert(id) {
                 continue;
             }
-            // ponytail: no-rerank mode = rank by the proxy estimate alone, zero
+            // No-rerank mode = rank by the proxy estimate alone, zero
             // disk reads. For apples-to-apples vs the TurboQuant blog (pure
             // quantized recall, no f32 rerank). pscore = -(proxy i32).
             if no_rerank() {
@@ -3151,7 +3151,7 @@ impl DiskVamanaIndex {
         // idle-consolidate rebuilds it off the request path; until then filtered
         // search falls back to the exact scan (correct, just O(|s|)).
         let _ = std::fs::remove_file(dir.join(IVF_FILE));
-        // ponytail: env-gated phase timing to find the real consolidate cost
+        // Env-gated phase timing to find the real consolidate cost
         // before optimizing it. Off unless SKEG_CONSOLIDATE_TIMING is set.
         let timing = std::env::var("SKEG_CONSOLIDATE_TIMING").is_ok();
         let t = std::time::Instant::now();
