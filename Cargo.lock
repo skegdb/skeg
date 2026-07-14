@@ -1733,6 +1733,7 @@ name = "skeg-server"
 version = "0.7.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

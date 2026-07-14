@@ -65,6 +65,7 @@ const DELETE_PATCH_DEAD_DIVISOR: usize = 16;
 const DELETE_PATCH_MIN_BASE: usize = 4096;
 
 use bytes::Bytes;
+use futures_util::stream::{self, StreamExt};
 use skeg_core::{Durability, VLog};
 
 use crate::payload::{Filter, PayloadIndex, parse_fields};
@@ -447,6 +448,13 @@ const SHARD_INBOX_CAPACITY: usize = 4096;
 /// `send` blocks and backpressure reaches the client.
 const MAX_INFLIGHT_PER_SHARD: usize = 1024;
 
+/// Deletes kept in flight during a tenant erasure. High enough that the group
+/// committer batches them into shared flushes instead of one flush per key; no
+/// higher than the concurrency the write path already handles from ordinary
+/// clients (`MAX_INFLIGHT_PER_SHARD`), so segment rotation stays inside a
+/// regime it is already exercised at.
+const ERASE_CONCURRENCY: usize = 256;
+
 /// Route a key to a shard index.
 #[must_use]
 pub fn shard_for(key: &[u8], n_shards: usize) -> usize {
@@ -480,6 +488,8 @@ enum ShardReq {
         tenant: u128,
         durability: Durability,
     },
+    /// Count this shard's live KV keys carrying `tenant`'s 16-byte prefix.
+    CountTenantKeys(u128),
     /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
     MgetBatch(Vec<(usize, Bytes)>, u128),
     /// Bytes of hot-key cache charged to a tenant on this shard.
@@ -559,6 +569,8 @@ enum ShardResp {
         vindexes: u64,
         keys: u64,
     },
+    /// Live key count for a tenant on the answering shard.
+    Count(u64),
     /// Bytes of hot-key cache charged to a tenant on the answering shard.
     CacheBytes(usize),
     MgetBatch(Vec<(usize, Option<Bytes>)>),
@@ -1280,6 +1292,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         // would understate it and counting it as N would hide its latency, so
         // it stays out of the op counters until it has its own classifier.
         ShardReq::EraseTenant { .. }
+        | ShardReq::CountTenantKeys(_)
         | ShardReq::Vget { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
@@ -1524,6 +1537,18 @@ async fn process(
                 Err(e) => ShardResp::Err(e),
             }
         }
+        ShardReq::CountTenantKeys(tenant) => {
+            // Read-only, so the streaming form pays off exactly as intended:
+            // the count never materialises a key.
+            let prefix = tenant.to_le_bytes();
+            let mut n = 0u64;
+            vlog.for_each_key(|k| {
+                if k.len() >= 16 && k[..16] == prefix {
+                    n += 1;
+                }
+            });
+            ShardResp::Count(n)
+        }
         ShardReq::EraseTenant { tenant, durability } => {
             // Erasing tenant 0 is refused: its keys are stored unscoped (no
             // 16-byte prefix), so there is no way to tell them from another
@@ -1566,9 +1591,24 @@ async fn process(
                 });
                 v
             };
+            // Delete concurrently, not one at a time. The group committer
+            // batches whatever it finds queued together, so awaiting each `del`
+            // before issuing the next puts exactly one record in every batch and
+            // pays a flush per key: measured at 1.4ms each, ~14s per 10k keys.
+            // Keeping many in flight lets them share flushes. The bound keeps
+            // segment rotation inside the concurrency the write path already
+            // sees, instead of a regime it has never been run at.
+            //
+            // Safe on the shard's single thread: `del` holds no borrow of the
+            // index across its await, so overlapping calls never collide.
+            let results: Vec<_> = stream::iter(victims.iter())
+                .map(|key| vlog.del(key, durability))
+                .buffer_unordered(ERASE_CONCURRENCY)
+                .collect()
+                .await;
             let mut erased = 0u64;
-            for key in &victims {
-                match vlog.del(key, durability).await {
+            for r in results {
+                match r {
                     Ok(true) => erased += 1,
                     Ok(false) => {}
                     Err(e) => return ShardResp::Err(format!("erase failed: {e}")),
@@ -2369,6 +2409,28 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if every shard is unavailable.
+    /// Count the tenant's live KV keys across the shards. Streams the index
+    /// with `for_each_key`, so nothing is materialised. Vector payload blobs
+    /// are KV keys under the tenant's prefix, so they are counted too.
+    ///
+    /// O(whole keyspace): every shard walks its entire index. Use it for audits
+    /// and post-erasure leak checks, not on a hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable.
+    pub async fn count_tenant_keys(&self, tenant: u128) -> Result<u64, ShardError> {
+        let mut total = 0u64;
+        for shard in 0..self.inner.n {
+            match self.call(shard, ShardReq::CountTenantKeys(tenant)).await? {
+                ShardResp::Count(n) => total += n,
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(total)
+    }
+
     /// Erase every trace of `tenant`: its vindexes (payload blobs and vector
     /// quota included) and every KV key under its prefix. Returns
     /// `(vindexes_dropped, keys_deleted)` summed over the shards.
