@@ -524,6 +524,19 @@ impl VLog {
         self.inner.index.borrow().is_empty()
     }
 
+    /// Monotonic write sequence for this store: it advances by one on every
+    /// durable SET and DEL (an N-pair MSET advances it by N) and never moves on
+    /// a read. Restored across restart from the snapshot, so it does not reset.
+    /// O(1), no lock.
+    ///
+    /// A cheap store version stamp: read it once, and an unchanged value means
+    /// nothing was written since. Useful for change-detected STATS refresh,
+    /// snapshot/backup consistency checks, and invalidating derived state.
+    #[must_use]
+    pub fn write_seq(&self) -> u64 {
+        self.inner.clock.get()
+    }
+
     /// Number of segment files currently open.
     #[must_use]
     pub fn segment_count(&self) -> usize {
@@ -1197,6 +1210,61 @@ mod tests {
         assert_eq!(v.len(), 2);
         v.del(b"k1", Durability::Kernel).await.unwrap();
         assert_eq!(v.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_seq_advances_on_writes_only_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let after_del;
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            let s0 = v.write_seq();
+            v.set(b"k1", b"v1", Durability::Kernel).await.unwrap();
+            let s1 = v.write_seq();
+            assert!(s1 > s0, "SET must advance write_seq");
+            // A read leaves it untouched.
+            v.get(b"k1").await.unwrap();
+            assert_eq!(v.write_seq(), s1, "a read must not advance write_seq");
+            v.del(b"k1", Durability::Kernel).await.unwrap();
+            after_del = v.write_seq();
+            assert!(after_del > s1, "DEL must advance write_seq");
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+        }
+        // Reopen: the sequence resumes past the last write, never resets to 0.
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert!(
+            v.write_seq() >= after_del,
+            "write_seq must not reset across reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_seq_counts_effective_writes_exactly() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let base = v.write_seq();
+        // N distinct SETs advance by exactly N.
+        for i in 0u32..5 {
+            v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        assert_eq!(v.write_seq(), base + 5, "5 SETs advance by exactly 5");
+        // Overwriting an existing key is still a write.
+        v.set(b"k0", b"v2", Durability::Kernel).await.unwrap();
+        assert_eq!(v.write_seq(), base + 6, "overwrite advances");
+        // DEL of a missing key is a no-op: it must not advance.
+        let before = v.write_seq();
+        assert!(!v.del(b"absent", Durability::Kernel).await.unwrap());
+        assert_eq!(
+            v.write_seq(),
+            before,
+            "DEL of a missing key must not advance"
+        );
+        // DEL of a present key advances by exactly one.
+        assert!(v.del(b"k0", Durability::Kernel).await.unwrap());
+        assert_eq!(v.write_seq(), before + 1, "DEL of a present key advances by one");
     }
 
     #[tokio::test]
