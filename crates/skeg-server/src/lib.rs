@@ -37,6 +37,11 @@ pub use tenant::{
     TenantBackend, TenantId,
 };
 
+/// Default quantiser tier for the read-write path and the CLI. TurboQuant 2-bit:
+/// the product's tier of record (data-oblivious, 4x smaller than int8), cheap to
+/// rebuild since the tier build parallelises across cores. Requires `dim % 4 == 0`.
+pub const DEFAULT_RW_TIER: QuantKind = QuantKind::TurboQuant { bits: 2 };
+
 pub struct Server {
     listener: TcpListener,
     shards: ShardSet,
@@ -59,7 +64,7 @@ impl Server {
         data_dir: &Path,
     ) -> std::io::Result<Self> {
         let n_shards = skeg_platform::num_performance_cores();
-        Self::bind_full(addr, data_dir, n_shards, 0, false).await
+        Self::bind_full(addr, data_dir, n_shards, 0, false, DEFAULT_RW_TIER).await
     }
 
     /// Bind the server with an explicit shard count and worker-pool size.
@@ -78,7 +83,7 @@ impl Server {
         n_shards: usize,
         workers: usize,
     ) -> std::io::Result<Self> {
-        Self::bind_full(addr, data_dir, n_shards, workers, false).await
+        Self::bind_full(addr, data_dir, n_shards, workers, false, DEFAULT_RW_TIER).await
     }
 
     /// Full-knob constructor for the read-write path: shard count, worker
@@ -94,8 +99,9 @@ impl Server {
         n_shards: usize,
         workers: usize,
         mmap_tier: bool,
+        tier: QuantKind,
     ) -> std::io::Result<Self> {
-        Self::bind_full_mmap(addr, data_dir, n_shards, workers, mmap_tier, false).await
+        Self::bind_full_mmap(addr, data_dir, n_shards, workers, mmap_tier, false, tier).await
     }
 
     /// All-knobs constructor for the read-write path. Adds `mmap_graph`
@@ -111,6 +117,7 @@ impl Server {
         workers: usize,
         mmap_tier: bool,
         mmap_graph: bool,
+        tier: QuantKind,
     ) -> std::io::Result<Self> {
         // Recover shards before binding so the port only opens once queries can
         // be served (see bind_serve_full_mmap for the phantom-stall rationale).
@@ -118,7 +125,7 @@ impl Server {
             data_dir,
             n_shards,
             false,
-            QuantKind::Int8,
+            tier,
             workers,
             mmap_tier,
             mmap_graph,
