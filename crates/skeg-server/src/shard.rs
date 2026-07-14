@@ -987,10 +987,12 @@ fn run_shard(
     mmap_graph: bool,
     quota: Arc<crate::quota::TenantVectorQuota>,
     disk_counter: skeg_core::SharedTenantDisk,
-    // Fired once recovery is done and the request loop is about to run, so
-    // `ShardSet::open` can block until the shard is queryable. Dropping it
-    // (a panic before signalling) unblocks the waiter with an error.
-    ready: std::sync::mpsc::Sender<()>,
+    // Reports the shard's startup outcome to `ShardSet::open`: `Ok` once recovery
+    // is done and the request loop is about to run, `Err` if the store cannot be
+    // opened (e.g. already locked by another process). `open` blocks on this and
+    // aborts startup if any shard reports `Err`. Dropping the sender without
+    // signalling (a panic) unblocks the waiter with a recv error.
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
@@ -1009,13 +1011,9 @@ fn run_shard(
         let vlog = match VLog::open_with_shared_disk(&dir, disk_counter).await {
             Ok(v) => v,
             Err(e) => {
-                error!("shard {shard_id}: VLog::open failed: {e}");
-                let _ = ready.send(()); // come up (degraded) so the server binds
-                while let Some(msg) = rx.recv().await {
-                    let _ = msg
-                        .reply
-                        .send(ShardResp::Err("shard storage unavailable".to_owned()));
-                }
+                // Report the failure so `ShardSet::open` aborts startup instead
+                // of binding a server whose storage never came up.
+                let _ = ready.send(Err(format!("shard {shard_id}: VLog::open: {e}")));
                 return;
             }
         };
@@ -1038,7 +1036,7 @@ fn run_shard(
         )));
         // Recovery (incl. the multi-second quant-tier build at 500k+) is done;
         // signal ready so `open` returns and the listener can bind.
-        let _ = ready.send(());
+        let _ = ready.send(Ok(()));
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1861,10 +1859,12 @@ impl ShardSet {
         assert!(n_shards >= 1, "n_shards must be >= 1");
         let mut senders = Vec::with_capacity(n_shards);
         let mut handles = Vec::with_capacity(n_shards);
-        // Readiness barrier: each shard signals once recovery is done. We block
-        // below until all have, so `open` (and the caller's bind-after-open)
-        // means "queryable": no phantom stall on the first query.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        // Readiness barrier: each shard reports its startup outcome once recovery
+        // is done. We block below until all have, so `open` (and the caller's
+        // bind-after-open) means "queryable": no phantom stall on the first
+        // query. A shard that fails to open its store reports `Err` and aborts
+        // the whole open.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         // One vector quota shared across all shards: a tenant's vectors are
         // spread over shards by id, so the counter must aggregate cross-shard.
         let quota = Arc::new(crate::quota::TenantVectorQuota::new());
@@ -1898,14 +1898,32 @@ impl ShardSet {
             handles.push(handle);
         }
         drop(ready_tx); // only shard threads hold senders now
+        let mut fatal: Option<String> = None;
         for _ in 0..n_shards {
-            // Each shard signals exactly once (success or degraded VLog path),
-            // then keeps its sender alive in the request loop. recover_vindexes
-            // never panics (bad indexes are logged and skipped), so this always
-            // gets its n signals. A hard panic before signalling (e.g. OOM) would
-            // hang here, but that aborts the process anyway; add recv_timeout if
-            // that changes.
-            let _ = ready_rx.recv();
+            // Each shard signals exactly once: `Ok` when queryable, `Err` when
+            // its store could not be opened. recover_vindexes never panics (bad
+            // indexes are logged and skipped), so this always gets its n signals.
+            // A hard panic before signalling (e.g. OOM) drops the sender and
+            // yields a recv error, which we treat as a failed shard.
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    fatal.get_or_insert(msg);
+                }
+                Err(_) => {
+                    fatal.get_or_insert_with(|| "a shard died before signalling".to_owned());
+                }
+            }
+        }
+        if let Some(msg) = fatal {
+            // Abort startup. Dropping the senders closes each shard's inbox, so
+            // the shard threads exit and release their store locks; joining makes
+            // that deterministic before we return (and free the lock for a retry).
+            drop(senders);
+            for h in handles {
+                let _ = h.join();
+            }
+            return Err(std::io::Error::other(format!("shard startup failed: {msg}")));
         }
         Ok(Self {
             inner: Arc::new(ShardSetInner {
