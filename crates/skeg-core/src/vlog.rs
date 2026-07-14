@@ -77,6 +77,12 @@ struct VLogInner {
     tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     active: RefCell<ActiveState>,
     clock: Cell<u64>,
+    /// Exclusive advisory lock on the store directory, held for the lifetime of
+    /// the open store so a second process cannot open it concurrently and race
+    /// appends into the same segments. Released when the last `VLog` clone drops
+    /// (or the process exits). Declared last so it is dropped after the rest of
+    /// the store state.
+    _lock: skeg_platform::DirLock,
 }
 
 /// A per-tenant live-disk-byte counter shared across a shard set, so the disk
@@ -172,6 +178,9 @@ impl VLog {
         tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        // Take the store lock before touching any segment: recovery can truncate
+        // a torn tail, so even opening must be single-process.
+        let store_lock = skeg_platform::DirLock::acquire_exclusive(dir)?;
         let seg_ids = list_segments(dir)?;
         let last_id = seg_ids.last().copied();
 
@@ -301,6 +310,7 @@ impl VLog {
                     committer,
                 }),
                 clock: Cell::new(max_ts + 1),
+                _lock: store_lock,
             }),
         })
     }
