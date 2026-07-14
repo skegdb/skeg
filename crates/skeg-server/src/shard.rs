@@ -1345,10 +1345,19 @@ async fn drop_vindex(
     }
     // Drop the index's payload blobs. Without this a recreated index reusing
     // the same name and id would resurface a stale blob under the same
-    // reserved key.
-    for id in payload_ids {
-        let key = payload_key(tenant, name, id);
-        if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
+    // reserved key. Concurrently, for the same reason the KV erase sweep is:
+    // one blob per flush would make a full-index drop take seconds (a 20k-
+    // vector index cost ~28s serial). Bounded like the erase sweep.
+    let results: Vec<_> = stream::iter(payload_ids)
+        .map(|id| {
+            let key = payload_key(tenant, name, id);
+            async move { vlog.del(&key, PAYLOAD_DURABILITY).await }
+        })
+        .buffer_unordered(ERASE_CONCURRENCY)
+        .collect()
+        .await;
+    for r in results {
+        if let Err(e) = r {
             return Err(format!("vindex drop payload failed: {e}"));
         }
     }
