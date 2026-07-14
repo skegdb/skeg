@@ -537,6 +537,37 @@ impl VLog {
         self.inner.clock.get()
     }
 
+    /// Every live key, in unspecified order. One pass over the in-memory index;
+    /// dead (deleted/tombstoned) keys are already absent from it, so they never
+    /// appear. The returned `Vec` owns its bytes and outlives the internal
+    /// borrow.
+    ///
+    /// For GC / compaction / backup / export / key-space audits that must visit
+    /// every key once. Not a resumable cursor: the order is not stable across
+    /// mutations (the index is a hash map). Materialises the whole key set; at
+    /// large key counts prefer [`for_each_key`](Self::for_each_key), which
+    /// streams without allocating.
+    #[must_use]
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.inner.index.borrow().len());
+        self.for_each_key(|k| out.push(k.to_vec()));
+        out
+    }
+
+    /// Visit every live key once, in unspecified order, without allocating: `f`
+    /// is called with a borrow of each key. The zero-copy form of
+    /// [`keys`](Self::keys) for GC / erasure / backup sweeps that do not need to
+    /// keep the keys around.
+    ///
+    /// The index is borrowed for the whole walk, so `f` must not call back into
+    /// this store in a way that mutates it (`set` / `del` would panic on the
+    /// borrow). Collect what you need and act after the walk returns.
+    pub fn for_each_key(&self, mut f: impl FnMut(&[u8])) {
+        for (k, _) in self.inner.index.borrow().iter() {
+            f(k);
+        }
+    }
+
     /// Number of segment files currently open.
     #[must_use]
     pub fn segment_count(&self) -> usize {
@@ -1264,7 +1295,76 @@ mod tests {
         );
         // DEL of a present key advances by exactly one.
         assert!(v.del(b"k0", Durability::Kernel).await.unwrap());
-        assert_eq!(v.write_seq(), before + 1, "DEL of a present key advances by one");
+        assert_eq!(
+            v.write_seq(),
+            before + 1,
+            "DEL of a present key advances by one"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_lists_every_live_key_and_no_dead_ones() {
+        use std::collections::BTreeSet;
+        let dir = TempDir::new().unwrap();
+        let after_reopen;
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            assert!(v.keys().is_empty(), "empty store has no keys");
+            v.set(b"a", b"1", Durability::Kernel).await.unwrap();
+            v.set(b"b", b"2", Durability::Kernel).await.unwrap();
+            v.set(b"c", b"3", Durability::Kernel).await.unwrap();
+            // Overwrite must not duplicate the key.
+            v.set(b"a", b"1b", Durability::Kernel).await.unwrap();
+            // Delete must drop the key from the listing.
+            v.del(b"b", Durability::Kernel).await.unwrap();
+
+            let got: BTreeSet<Vec<u8>> = v.keys().into_iter().collect();
+            let want: BTreeSet<Vec<u8>> = [b"a".to_vec(), b"c".to_vec()].into_iter().collect();
+            assert_eq!(got, want, "keys = live set, order-agnostic");
+            assert_eq!(v.keys().len(), v.len(), "keys count matches len()");
+            assert_eq!(v.keys().len(), 2);
+
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+            after_reopen = got;
+        }
+        // Keys survive a reopen (recovered from the index).
+        let v = VLog::open(dir.path()).await.unwrap();
+        let got: std::collections::BTreeSet<Vec<u8>> = v.keys().into_iter().collect();
+        assert_eq!(got, after_reopen, "keys recovered on reopen");
+    }
+
+    #[tokio::test]
+    async fn for_each_key_streams_the_same_live_set_as_keys() {
+        use std::collections::BTreeSet;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        // Empty store: f is never called.
+        let mut calls = 0usize;
+        v.for_each_key(|_| calls += 1);
+        assert_eq!(calls, 0, "no keys, no calls");
+
+        for i in 0u32..20 {
+            v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        v.del(b"k0", Durability::Kernel).await.unwrap();
+
+        // for_each_key visits exactly the live set, once each.
+        let mut streamed: Vec<Vec<u8>> = Vec::new();
+        v.for_each_key(|k| streamed.push(k.to_vec()));
+        assert_eq!(streamed.len(), v.len(), "one call per live key");
+        let streamed: BTreeSet<Vec<u8>> = streamed.into_iter().collect();
+        let via_keys: BTreeSet<Vec<u8>> = v.keys().into_iter().collect();
+        assert_eq!(
+            streamed, via_keys,
+            "for_each_key sees the same set as keys()"
+        );
+        assert!(
+            !streamed.contains(b"k0".as_slice()),
+            "deleted key not streamed"
+        );
     }
 
     #[tokio::test]

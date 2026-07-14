@@ -53,5 +53,10 @@ harness = false
 name = "cache_eviction_scaling"
 harness = false
 
+# How does VLog::keys() materialisation scale with the live key count?
+[[bench]]
+name = "keys_scaling"
+harness = false
+
 [lints]
 workspace = true
