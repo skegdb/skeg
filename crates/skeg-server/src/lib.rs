@@ -112,7 +112,8 @@ impl Server {
         mmap_tier: bool,
         mmap_graph: bool,
     ) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
+        // Recover shards before binding so the port only opens once queries can
+        // be served (see bind_serve_full_mmap for the phantom-stall rationale).
         let shards = ShardSet::open_mode_full_mmap(
             data_dir,
             n_shards,
@@ -122,6 +123,7 @@ impl Server {
             mmap_tier,
             mmap_graph,
         )?;
+        let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
             shards,
@@ -192,9 +194,14 @@ impl Server {
         mmap_tier: bool,
         mmap_graph: bool,
     ) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
+        // Open (and eagerly recover) the shard BEFORE binding, so the listen
+        // port only comes up once the index is queryable. Otherwise the kernel
+        // accepts connections into the backlog during the multi-second recover
+        // and the first query blocks until `run()` starts — a phantom ~8s stall
+        // at 500k. Bind-after-open makes `wait_tcp` mean "ready".
         let shards =
             ShardSet::open_mode_full_mmap(data_dir, 1, true, tier, workers, mmap_tier, mmap_graph)?;
+        let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
             shards,

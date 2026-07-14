@@ -987,6 +987,10 @@ fn run_shard(
     mmap_graph: bool,
     quota: Arc<crate::quota::TenantVectorQuota>,
     disk_counter: skeg_core::SharedTenantDisk,
+    // Fired once recovery is done and the request loop is about to run, so
+    // `ShardSet::open` can block until the shard is queryable. Dropping it
+    // (a panic before signalling) unblocks the waiter with an error.
+    ready: std::sync::mpsc::Sender<()>,
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
@@ -1006,6 +1010,7 @@ fn run_shard(
             Ok(v) => v,
             Err(e) => {
                 error!("shard {shard_id}: VLog::open failed: {e}");
+                let _ = ready.send(()); // come up (degraded) so the server binds
                 while let Some(msg) = rx.recv().await {
                     let _ = msg
                         .reply
@@ -1031,6 +1036,9 @@ fn run_shard(
         let vindexes: Arc<RwLock<VindexSet>> = Arc::new(RwLock::new(recover_vindexes(
             shard_id, &dir, tier, mmap_tier, mmap_graph,
         )));
+        // Recovery (incl. the multi-second quant-tier build at 500k+) is done;
+        // signal ready so `open` returns and the listener can bind.
+        let _ = ready.send(());
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1853,6 +1861,10 @@ impl ShardSet {
         assert!(n_shards >= 1, "n_shards must be >= 1");
         let mut senders = Vec::with_capacity(n_shards);
         let mut handles = Vec::with_capacity(n_shards);
+        // Readiness barrier: each shard signals once recovery is done. We block
+        // below until all have, so `open` (and the caller's bind-after-open)
+        // means "queryable" — no phantom stall on the first query.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         // One vector quota shared across all shards: a tenant's vectors are
         // spread over shards by id, so the counter must aggregate cross-shard.
         let quota = Arc::new(crate::quota::TenantVectorQuota::new());
@@ -1864,6 +1876,7 @@ impl ShardSet {
             let (tx, rx) = tokio::sync::mpsc::channel::<ShardMsg>(SHARD_INBOX_CAPACITY);
             let quota = quota.clone();
             let disk_counter = disk_counter.clone();
+            let ready_tx = ready_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("skeg-shard-{id}"))
                 .spawn(move || {
@@ -1878,10 +1891,21 @@ impl ShardSet {
                         mmap_graph,
                         quota,
                         disk_counter,
+                        ready_tx,
                     )
                 })?;
             senders.push(tx);
             handles.push(handle);
+        }
+        drop(ready_tx); // only shard threads hold senders now
+        for _ in 0..n_shards {
+            // Each shard signals exactly once (success or degraded VLog path),
+            // then keeps its sender alive in the request loop. recover_vindexes
+            // never panics — bad indexes are logged and skipped — so this always
+            // gets its n signals.
+            // ponytail: a hard panic before signalling (e.g. OOM) would hang here,
+            // but that aborts the process anyway. Add recv_timeout if that changes.
+            let _ = ready_rx.recv();
         }
         Ok(Self {
             inner: Arc::new(ShardSetInner {
