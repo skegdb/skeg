@@ -483,6 +483,9 @@ enum ShardReq {
     /// Atomic multi-key write for the keys of one MSET that route to this shard.
     /// Keys are already tenant-scoped; the batch is all-or-nothing on this shard.
     SetMany(Vec<(Bytes, Bytes)>, Durability),
+    /// `(key, value, durability, tenant, disk_limit)`: append to a scoped key,
+    /// reply with the new value length.
+    Append(Bytes, Bytes, Durability, u128, Option<u64>),
     Del(Bytes, Durability),
     /// Erase everything owned by `tenant` on this shard: its vindexes (with
     /// their payload blobs and vector quota) and every KV key carrying its
@@ -584,6 +587,8 @@ enum ShardResp {
     },
     /// Live key count for a tenant on the answering shard.
     Count(u64),
+    /// New value length after an APPEND.
+    Len(u64),
     /// Dead bytes physically reclaimed on the answering shard.
     Reclaimed(u64),
     /// Bytes of hot-key cache charged to a tenant on the answering shard.
@@ -1279,6 +1284,7 @@ fn is_mutation(req: &ShardReq) -> bool {
         req,
         ShardReq::Set(..)
             | ShardReq::SetMany(..)
+            | ShardReq::Append(..)
             | ShardReq::Del(..)
             | ShardReq::EraseTenant { .. }
             | ShardReq::ErasePrefix { .. }
@@ -1301,7 +1307,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
     use skeg_telemetry::Op;
     match req {
         ShardReq::Get(..) | ShardReq::MgetBatch(..) => Some(Op::Get),
-        ShardReq::Set(..) | ShardReq::SetMany(..) => Some(Op::Set),
+        ShardReq::Set(..) | ShardReq::SetMany(..) | ShardReq::Append(..) => Some(Op::Set),
         ShardReq::Del(..) => Some(Op::Del),
         ShardReq::Vset { .. } => Some(Op::VSet),
         ShardReq::Vsearch { .. } => Some(Op::VSearch),
@@ -1871,6 +1877,17 @@ async fn process(
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
+        ShardReq::Append(key, val, dur, tenant, disk_limit) => {
+            match vlog
+                .tenant(tenant)
+                .with_disk_limit(disk_limit)
+                .append(&key, &val, dur)
+                .await
+            {
+                Ok(len) => ShardResp::Len(len),
+                Err(e) => ShardResp::Err(e.to_string()),
+            }
+        }
         ShardReq::Del(key, dur) => match vlog.del(&key, dur).await {
             Ok(b) => ShardResp::Existed(b),
             Err(e) => ShardResp::Err(e.to_string()),
@@ -2259,6 +2276,29 @@ impl ShardSet {
         let req = ShardReq::Del(Bytes::copy_from_slice(key), durability);
         match self.call(shard, req).await? {
             ShardResp::Existed(b) => Ok(b),
+            ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            _ => Err(ShardError::Unavailable),
+        }
+    }
+
+    async fn append_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<u64, ShardError> {
+        let shard = shard_for(key, self.inner.n);
+        let req = ShardReq::Append(
+            Bytes::copy_from_slice(key),
+            Bytes::copy_from_slice(value),
+            durability,
+            tenant,
+            disk_limit,
+        );
+        match self.call(shard, req).await? {
+            ShardResp::Len(n) => Ok(n),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
@@ -3034,6 +3074,24 @@ impl ShardTenantView<'_> {
     ) -> Result<(), ShardError> {
         self.shards
             .set_scoped(key, value, durability, self.tenant, self.disk_limit)
+            .await
+    }
+
+    /// APPEND to a key, charged and quota-checked against this tenant. Returns
+    /// the new value length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard is unavailable, storage fails, or the disk
+    /// quota would be exceeded.
+    pub async fn append(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+    ) -> Result<u64, ShardError> {
+        self.shards
+            .append_scoped(key, value, durability, self.tenant, self.disk_limit)
             .await
     }
 

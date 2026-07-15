@@ -31,6 +31,12 @@ pub enum Command {
         key: Bytes,
         value: Bytes,
     },
+    /// `APPEND key value` => integer reply with the new value length. Creates
+    /// the key (as `SET`) if absent.
+    Append {
+        key: Bytes,
+        value: Bytes,
+    },
     /// `DEL key [key ...]` => integer reply with the count of keys
     /// that existed and were removed.
     Del {
@@ -267,6 +273,7 @@ pub fn parse_command(frame: Frame) -> Result<Command, CommandError> {
         "ECHO" => Ok(Command::Echo(parse_echo(args)?)),
         "GET" => parse_kv_get(args),
         "SET" => parse_kv_set(args),
+        "APPEND" => parse_kv_append(args),
         "DEL" => parse_kv_del(args),
         "EXISTS" => parse_kv_exists(args),
         "MGET" => parse_kv_mget(args),
@@ -477,6 +484,15 @@ fn parse_kv_set(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
     let value = args.swap_remove(1);
     let key = args.swap_remove(0);
     Ok(Command::Set { key, value })
+}
+
+fn parse_kv_append(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 2 {
+        return Err(CommandError::WrongArity { command: "APPEND" });
+    }
+    let value = args.swap_remove(1);
+    let key = args.swap_remove(0);
+    Ok(Command::Append { key, value })
 }
 
 fn parse_kv_del(args: Vec<Bytes>) -> Result<Command, CommandError> {
@@ -891,6 +907,26 @@ mod tests {
                 key: Bytes::from_static(b"k"),
                 value: Bytes::from_static(b"v"),
             }
+        );
+    }
+
+    #[test]
+    fn append_two_args() {
+        let cmd = parse_command(arr(&[b"APPEND", b"k", b"v"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Append {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+            }
+        );
+        assert!(
+            parse_command(arr(&[b"APPEND", b"k"])).is_err(),
+            "arity 1 rejected"
+        );
+        assert!(
+            parse_command(arr(&[b"APPEND", b"k", b"v", b"x"])).is_err(),
+            "arity 3 rejected"
         );
     }
 

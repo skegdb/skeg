@@ -140,6 +140,12 @@ struct VLogInner {
     /// full segment), so the fast path skips the lock entirely and only a
     /// rotation pays for it; the body re-checks the fill under the lock.
     rotate_lock: tokio::sync::Mutex<()>,
+    /// Serialises `append`'s read-modify-write. Requests run concurrently on the
+    /// shard, so two appends to the same key would otherwise both read the old
+    /// value and both write old+delta, silently dropping one delta. Held across
+    /// the whole read+write, so appends on this store are serial; ordinary
+    /// set/get/del are untouched.
+    append_lock: tokio::sync::Mutex<()>,
     clock: Cell<u64>,
     /// Exclusive advisory lock on the store directory, held for the lifetime of
     /// the open store so a second process cannot open it concurrently and race
@@ -378,6 +384,7 @@ impl VLog {
                     committer,
                 }),
                 rotate_lock: tokio::sync::Mutex::new(()),
+                append_lock: tokio::sync::Mutex::new(()),
                 clock: Cell::new(max_ts + 1),
                 _lock: store_lock,
             }),
@@ -498,6 +505,51 @@ impl VLog {
             *e = e.saturating_sub(old_disk) + u64::from(padded);
         }
         Ok(())
+    }
+
+    /// Append `value` to `key`'s current value (creating the key if absent) and
+    /// return the new value's length, mirroring Redis `APPEND`.
+    ///
+    /// Read-modify-write: it reads the whole current value, concatenates, and
+    /// writes the whole result as one new record — so a single append is
+    /// O(current value length). A key whose value grows over many appends costs
+    /// O(n^2) in total; that is the naive log-store cost, fine for bounded
+    /// values (e.g. a capped adjacency list) but not for an unbounded one.
+    ///
+    /// Atomic against concurrent appends: the read and the write are serialised
+    /// by the store's `append_lock`, so two appends to the same key never both
+    /// read the old value and drop a delta. Appends on one store are therefore
+    /// serial; `set`/`get`/`del` are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure or if the disk quota would be exceeded.
+    pub async fn append(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<u64> {
+        self.append_scoped(key, value, durability, 0, None).await
+    }
+
+    async fn append_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<u64> {
+        let _serialise = self.inner.append_lock.lock().await;
+        let combined = match self.get_scoped(key, tenant).await? {
+            Some(current) => {
+                let mut buf = Vec::with_capacity(current.len() + value.len());
+                buf.extend_from_slice(&current);
+                buf.extend_from_slice(value);
+                buf
+            }
+            None => value.to_vec(),
+        };
+        let new_len = combined.len() as u64;
+        self.set_scoped(key, &combined, durability, tenant, disk_limit)
+            .await?;
+        Ok(new_len)
     }
 
     /// Atomically write every `(key, value)` pair, or none. The pairs are
@@ -1229,6 +1281,18 @@ impl TenantView<'_> {
             .await
     }
 
+    /// APPEND to a key, charged and quota-checked against this view's tenant.
+    /// Returns the new value length. See [`VLog::append`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure or if the disk quota would be exceeded.
+    pub async fn append(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<u64> {
+        self.vlog
+            .append_scoped(key, value, durability, self.tenant, self.disk_limit)
+            .await
+    }
+
     /// DEL a key. Returns `true` if it existed. Cache release is self-attributed
     /// from the evicted entry, so this needs no tenant argument.
     ///
@@ -1699,6 +1763,61 @@ mod tests {
             }
         }
         all
+    }
+
+    #[tokio::test]
+    async fn append_creates_accumulates_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            // Absent key: append creates it, returns its length.
+            assert_eq!(v.append(b"k", b"ab", Durability::Kernel).await.unwrap(), 2);
+            assert_eq!(
+                v.get(b"k").await.unwrap().as_deref(),
+                Some(b"ab".as_slice())
+            );
+            // Subsequent appends accumulate; the return is the new length.
+            assert_eq!(v.append(b"k", b"cd", Durability::Kernel).await.unwrap(), 4);
+            assert_eq!(v.append(b"k", b"e", Durability::Kernel).await.unwrap(), 5);
+            assert_eq!(
+                v.get(b"k").await.unwrap().as_deref(),
+                Some(b"abcde".as_slice())
+            );
+            v.flush().await.unwrap();
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get(b"k").await.unwrap().as_deref(),
+            Some(b"abcde".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_appends_lose_nothing() {
+        // Without the append_lock, interleaved read-modify-write would drop
+        // deltas. Fire many single-byte appends at one key concurrently and
+        // assert every byte lands (order-agnostic).
+        let dir = TempDir::new().unwrap();
+        let v = std::rc::Rc::new(VLog::open(dir.path()).await.unwrap());
+        let n = 200u32;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut handles = Vec::new();
+                for _ in 0..n {
+                    let v = v.clone();
+                    handles.push(tokio::task::spawn_local(async move {
+                        v.append(b"log", b"x", Durability::Relaxed).await.unwrap();
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            })
+            .await;
+        let got = v.get(b"log").await.unwrap().unwrap();
+        assert_eq!(got.len(), n as usize, "every concurrent append survived");
+        assert!(got.iter().all(|&b| b == b'x'));
     }
 
     #[tokio::test]

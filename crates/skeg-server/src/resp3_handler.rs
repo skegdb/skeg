@@ -345,6 +345,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
     match cmd {
         Command::Get { .. } | Command::Mget { .. } | Command::Exists { .. } => CommandKind::KvRead,
         Command::Set { .. }
+        | Command::Append { .. }
         | Command::Mset { .. }
         | Command::Del { .. }
         | Command::Incr { .. }
@@ -495,6 +496,9 @@ async fn dispatch_command(
             kv_get(std::slice::from_ref(&key), shards, *tenant, tenant_backend).await
         }
         Command::Set { key, value } => kv_set(&[key, value], shards, *tenant, tenant_backend).await,
+        Command::Append { key, value } => {
+            kv_append(&[key, value], shards, *tenant, tenant_backend).await
+        }
         Command::Del { keys } => kv_del(&keys, shards, *tenant, tenant_backend).await,
         Command::Exists { keys } => kv_exists(&keys, shards, *tenant, tenant_backend).await,
         Command::Mget { keys } => kv_mget(&keys, shards, *tenant, tenant_backend).await,
@@ -1410,6 +1414,33 @@ async fn kv_set(
     }
 }
 
+/// `APPEND key value` => integer reply with the new value length. Creates the
+/// key (like SET) when absent.
+async fn kv_append(
+    args: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    if args.len() != 2 {
+        return Frame::Error("ERR wrong number of arguments for 'APPEND'".into());
+    }
+    if anon_key_collides_with_tenant(tenant, &args[0], ctx) {
+        return anon_forgery_error();
+    }
+    let k = scope_key(tenant, &args[0]);
+    let disk_limit = ctx.and_then(|b| b.limits(tenant).max_disk_bytes);
+    match shards
+        .tenant(k.accounting_tenant())
+        .with_disk_limit(disk_limit)
+        .append(k.as_bytes(), &args[1], DEFAULT_DURABILITY)
+        .await
+    {
+        Ok(len) => Frame::Integer(len as i64),
+        Err(e) => shard_error(&e),
+    }
+}
+
 async fn kv_del(
     args: &[Bytes],
     shards: &ShardSet,
@@ -2188,6 +2219,22 @@ mod tests {
         )
         .await;
         assert!(matches!(bad, Frame::Error(ref e) if e.contains("bad FILTER")));
+    }
+
+    #[tokio::test]
+    async fn append_creates_then_accumulates_and_returns_length() {
+        let (_dir, shards) = fresh_shards().await;
+        // Absent key: APPEND creates it, returns its length.
+        let r = kv_append(&args(&["doc"]), &shards, TenantId::ZERO, None).await;
+        assert!(matches!(r, Frame::Error(_)), "APPEND needs a value arg");
+
+        let r = kv_append(&args(&["doc", "ab"]), &shards, TenantId::ZERO, None).await;
+        assert!(matches!(r, Frame::Integer(2)), "new length after create");
+        let r = kv_append(&args(&["doc", "cde"]), &shards, TenantId::ZERO, None).await;
+        assert!(matches!(r, Frame::Integer(5)), "new length after append");
+
+        let g = kv_get(&args(&["doc"]), &shards, TenantId::ZERO, None).await;
+        assert!(matches!(g, Frame::Bulk(ref b) if &b[..] == b"abcde"));
     }
 
     #[tokio::test]
