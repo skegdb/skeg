@@ -56,6 +56,14 @@ harness = false
 
 # How does VLog::keys() materialisation scale with the live key count?
 [[bench]]
+name = "set_many_throughput"
+harness = false
+
+[[bench]]
+name = "recovery_scaling"
+harness = false
+
+[[bench]]
 name = "keys_scaling"
 harness = false
 

@@ -73,10 +73,11 @@ struct BatchGate {
 }
 
 impl BatchGate {
-    /// Feed one scanned record; returns the records ready to apply now. A record
-    /// outside a batch passes straight through; a batch's members are released
-    /// together, and only once the batch is complete.
-    fn feed(&mut self, offset: u64, rec: Record) -> Vec<(u64, Record)> {
+    /// Feed one scanned record, invoking `apply` on each record that is ready.
+    /// A record outside a batch is applied straight through (zero allocation —
+    /// the hot path for every normal recovery); a batch's members are held in
+    /// `pending` and applied together once the batch completes.
+    fn feed(&mut self, offset: u64, rec: Record, mut apply: impl FnMut(u64, Record)) {
         if rec.kind == RecordKind::BatchBegin {
             let n = rec
                 .value
@@ -85,19 +86,19 @@ impl BatchGate {
                 .map_or(0, u32::from_le_bytes) as usize;
             self.pending.clear();
             self.expect = (n > 0).then_some(n);
-            return Vec::new();
+            return;
         }
         match self.expect {
             Some(n) => {
                 self.pending.push((offset, rec));
                 if self.pending.len() == n {
                     self.expect = None;
-                    std::mem::take(&mut self.pending)
-                } else {
-                    Vec::new()
+                    for (o, r) in self.pending.drain(..) {
+                        apply(o, r);
+                    }
                 }
             }
-            None => vec![(offset, rec)],
+            None => apply(offset, rec),
         }
     }
 }
@@ -285,7 +286,7 @@ impl VLog {
                 let mut gate = BatchGate::default();
                 let last_valid = scan_file(&seg.file, |offset, rec| {
                     max_ts = max_ts.max(rec.ts);
-                    for (off, r) in gate.feed(offset, rec) {
+                    gate.feed(offset, rec, |off, r| {
                         if r.kind == RecordKind::Tombstone {
                             index.remove(&r.key);
                         } else {
@@ -298,7 +299,7 @@ impl VLog {
                             };
                             index.set(r.key, entry);
                         }
-                    }
+                    });
                 })?;
                 if Some(id) == last_id {
                     seg.file.truncate_sync(last_valid)?;
@@ -314,7 +315,7 @@ impl VLog {
                     if rec.ts > max_ts {
                         max_ts = rec.ts;
                     }
-                    for (off, r) in gate.feed(offset, rec) {
+                    gate.feed(offset, rec, |off, r| {
                         let newer = winners.get(&r.key).is_none_or(|&(wts, _, _)| r.ts > wts);
                         if newer {
                             let entry = IndexEntry {
@@ -326,7 +327,7 @@ impl VLog {
                             };
                             winners.insert(r.key, (r.ts, r.kind, entry));
                         }
-                    }
+                    });
                 })?;
                 if Some(id) == last_id {
                     seg.file.truncate_sync(last_valid)?;
