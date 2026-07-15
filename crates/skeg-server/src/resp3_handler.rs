@@ -1502,17 +1502,18 @@ async fn kv_mset(
             return anon_forgery_error();
         }
     }
-    for chunk in args.chunks(2) {
-        let k = scope_key(tenant, &chunk[0]);
-        match shards
-            .set(k.as_bytes(), &chunk[1], DEFAULT_DURABILITY)
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => return shard_error(&e),
-        }
+    // Scope every key up front (the owned keys back the borrows below), then
+    // hand the whole set to `mset`, which writes one atomic batch per shard.
+    let scoped: Vec<_> = args.chunks(2).map(|c| scope_key(tenant, &c[0])).collect();
+    let pairs: Vec<(&[u8], &[u8])> = scoped
+        .iter()
+        .zip(args.chunks(2))
+        .map(|(k, c)| (k.as_bytes().as_ref(), c[1].as_ref()))
+        .collect();
+    match shards.mset(&pairs, DEFAULT_DURABILITY).await {
+        Ok(()) => Frame::ok(),
+        Err(e) => shard_error(&e),
     }
-    Frame::ok()
 }
 
 async fn kv_incr_by(

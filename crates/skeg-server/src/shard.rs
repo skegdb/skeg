@@ -480,6 +480,9 @@ enum ShardReq {
     Get(Bytes, u128),
     /// `(key, value, durability, tenant, disk_limit)`.
     Set(Bytes, Bytes, Durability, u128, Option<u64>),
+    /// Atomic multi-key write for the keys of one MSET that route to this shard.
+    /// Keys are already tenant-scoped; the batch is all-or-nothing on this shard.
+    SetMany(Vec<(Bytes, Bytes)>, Durability),
     Del(Bytes, Durability),
     /// Erase everything owned by `tenant` on this shard: its vindexes (with
     /// their payload blobs and vector quota) and every KV key carrying its
@@ -1275,6 +1278,7 @@ fn is_mutation(req: &ShardReq) -> bool {
     matches!(
         req,
         ShardReq::Set(..)
+            | ShardReq::SetMany(..)
             | ShardReq::Del(..)
             | ShardReq::EraseTenant { .. }
             | ShardReq::ErasePrefix { .. }
@@ -1297,7 +1301,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
     use skeg_telemetry::Op;
     match req {
         ShardReq::Get(..) | ShardReq::MgetBatch(..) => Some(Op::Get),
-        ShardReq::Set(..) => Some(Op::Set),
+        ShardReq::Set(..) | ShardReq::SetMany(..) => Some(Op::Set),
         ShardReq::Del(..) => Some(Op::Del),
         ShardReq::Vset { .. } => Some(Op::VSet),
         ShardReq::Vsearch { .. } => Some(Op::VSearch),
@@ -1857,6 +1861,16 @@ async fn process(
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
+        ShardReq::SetMany(pairs, dur) => {
+            let refs: Vec<(&[u8], &[u8])> = pairs
+                .iter()
+                .map(|(k, v)| (k.as_ref(), v.as_ref()))
+                .collect();
+            match vlog.set_many(&refs, dur).await {
+                Ok(()) => ShardResp::Done,
+                Err(e) => ShardResp::Err(e.to_string()),
+            }
+        }
         ShardReq::Del(key, dur) => match vlog.del(&key, dur).await {
             Ok(b) => ShardResp::Existed(b),
             Err(e) => ShardResp::Err(e.to_string()),
@@ -2194,6 +2208,45 @@ impl ShardSet {
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
+    }
+
+    /// Multi-key set. Keys are grouped by shard and each shard's group is
+    /// written as one atomic [`VLog::set_many`] batch, so a shard's portion is
+    /// all-or-nothing across a crash.
+    ///
+    /// It is NOT globally atomic: keys route to shards by hash, so a batch that
+    /// spans shards is several independent per-shard commits with no cross-shard
+    /// coordination. A single-shard deployment (or an MSET whose keys all hash
+    /// to one shard) is fully atomic. Callers wanting a global transaction must
+    /// keep the keys on one shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable or a write fails.
+    pub async fn mset(
+        &self,
+        pairs: &[(&[u8], &[u8])],
+        durability: Durability,
+    ) -> Result<(), ShardError> {
+        let mut by_shard: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); self.inner.n];
+        for (key, value) in pairs {
+            let s = shard_for(key, self.inner.n);
+            by_shard[s].push((Bytes::copy_from_slice(key), Bytes::copy_from_slice(value)));
+        }
+        for (shard, batch) in by_shard.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            match self
+                .call(shard, ShardReq::SetMany(batch, durability))
+                .await?
+            {
+                ShardResp::Done => {}
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(())
     }
 
     /// DEL a key at the given durability. Returns `true` if it existed.
@@ -3294,6 +3347,35 @@ mod tests {
             Some(b"v".as_slice()),
             "the refused erase must not have deleted anything"
         );
+    }
+
+    #[tokio::test]
+    async fn mset_writes_all_keys_across_shards_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let owned: Vec<(Vec<u8>, Vec<u8>)> = (0u32..40)
+            .map(|i| (format!("mk{i}").into_bytes(), format!("v{i}").into_bytes()))
+            .collect();
+        {
+            let shards = ShardSet::open(dir.path(), 4).unwrap();
+            let pairs: Vec<(&[u8], &[u8])> = owned
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            shards.mset(&pairs, Durability::Kernel).await.unwrap();
+            for (k, v) in &owned {
+                assert_eq!(shards.get(k).await.unwrap().as_deref(), Some(v.as_slice()));
+            }
+            // Dropping ShardSet joins the worker threads (files closed).
+        }
+        // Each shard's batch is durable: every key survives a reopen.
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        for (k, v) in &owned {
+            assert_eq!(
+                shards.get(k).await.unwrap().as_deref(),
+                Some(v.as_slice()),
+                "key survived reopen"
+            );
+        }
     }
 
     #[tokio::test]

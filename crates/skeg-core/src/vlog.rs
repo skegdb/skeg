@@ -59,6 +59,49 @@ const RELOCATE_CONCURRENCY: usize = 256;
 /// record the index no longer points at).
 type RelocOutcome = Result<Option<(u16, u32, bool)>>;
 
+/// Recovery-time gate for atomic batches ([`VLog::set_many`]). A `BatchBegin(N)`
+/// header opens a run of `N` records; the gate withholds them until all `N`
+/// have been scanned, then releases them for application. A run torn by a crash
+/// — fewer than `N` durable before the scan hits the corrupt tail — is never
+/// released, which is what makes `set_many` all-or-nothing on reopen. A batch
+/// never spans segments (its blob is written to one segment), so a fresh gate
+/// per segment is enough; anything still pending when a segment ends is dropped.
+#[derive(Default)]
+struct BatchGate {
+    expect: Option<usize>,
+    pending: Vec<(u64, Record)>,
+}
+
+impl BatchGate {
+    /// Feed one scanned record; returns the records ready to apply now. A record
+    /// outside a batch passes straight through; a batch's members are released
+    /// together, and only once the batch is complete.
+    fn feed(&mut self, offset: u64, rec: Record) -> Vec<(u64, Record)> {
+        if rec.kind == RecordKind::BatchBegin {
+            let n = rec
+                .value
+                .get(..4)
+                .and_then(|b| b.try_into().ok())
+                .map_or(0, u32::from_le_bytes) as usize;
+            self.pending.clear();
+            self.expect = (n > 0).then_some(n);
+            return Vec::new();
+        }
+        match self.expect {
+            Some(n) => {
+                self.pending.push((offset, rec));
+                if self.pending.len() == n {
+                    self.expect = None;
+                    std::mem::take(&mut self.pending)
+                } else {
+                    Vec::new()
+                }
+            }
+            None => vec![(offset, rec)],
+        }
+    }
+}
+
 /// A read handle on a segment file, plus its tracked live-bytes counter.
 struct ReadSegment {
     id: u16,
@@ -239,19 +282,22 @@ impl VLog {
                     continue;
                 }
                 let id = seg.id;
+                let mut gate = BatchGate::default();
                 let last_valid = scan_file(&seg.file, |offset, rec| {
                     max_ts = max_ts.max(rec.ts);
-                    if rec.kind == RecordKind::Tombstone {
-                        index.remove(&rec.key);
-                    } else {
-                        let entry = IndexEntry {
-                            fingerprint: fingerprint(&rec.key),
-                            segment_id: id,
-                            _pad: 0,
-                            offset: offset as u32,
-                            size: padded_record_size(rec.key.len(), rec.value.len()) as u32,
-                        };
-                        index.set(rec.key, entry);
+                    for (off, r) in gate.feed(offset, rec) {
+                        if r.kind == RecordKind::Tombstone {
+                            index.remove(&r.key);
+                        } else {
+                            let entry = IndexEntry {
+                                fingerprint: fingerprint(&r.key),
+                                segment_id: id,
+                                _pad: 0,
+                                offset: off as u32,
+                                size: padded_record_size(r.key.len(), r.value.len()) as u32,
+                            };
+                            index.set(r.key, entry);
+                        }
                     }
                 })?;
                 if Some(id) == last_id {
@@ -263,22 +309,23 @@ impl VLog {
             let mut winners: AHashMap<Vec<u8>, (u64, RecordKind, IndexEntry)> = AHashMap::new();
             for seg in &read_segments {
                 let id = seg.id;
+                let mut gate = BatchGate::default();
                 let last_valid = scan_file(&seg.file, |offset, rec| {
                     if rec.ts > max_ts {
                         max_ts = rec.ts;
                     }
-                    let newer = winners
-                        .get(&rec.key)
-                        .is_none_or(|&(wts, _, _)| rec.ts > wts);
-                    if newer {
-                        let entry = IndexEntry {
-                            fingerprint: fingerprint(&rec.key),
-                            segment_id: id,
-                            _pad: 0,
-                            offset: offset as u32,
-                            size: padded_record_size(rec.key.len(), rec.value.len()) as u32,
-                        };
-                        winners.insert(rec.key, (rec.ts, rec.kind, entry));
+                    for (off, r) in gate.feed(offset, rec) {
+                        let newer = winners.get(&r.key).is_none_or(|&(wts, _, _)| r.ts > wts);
+                        if newer {
+                            let entry = IndexEntry {
+                                fingerprint: fingerprint(&r.key),
+                                segment_id: id,
+                                _pad: 0,
+                                offset: off as u32,
+                                size: padded_record_size(r.key.len(), r.value.len()) as u32,
+                            };
+                            winners.insert(r.key, (r.ts, r.kind, entry));
+                        }
                     }
                 })?;
                 if Some(id) == last_id {
@@ -448,6 +495,108 @@ impl VLog {
             let mut disk = self.inner.tenant_disk.lock();
             let e = disk.entry(dtenant).or_insert(0);
             *e = e.saturating_sub(old_disk) + u64::from(padded);
+        }
+        Ok(())
+    }
+
+    /// Atomically write every `(key, value)` pair, or none. The pairs are
+    /// encoded behind a single `BatchBegin(N)` header and submitted as one
+    /// group-commit append — one contiguous write, one flush. If a crash tears
+    /// the write, recovery finds fewer than `N` members after the header and
+    /// drops the whole batch, so a reopened store never shows a partial MSET.
+    ///
+    /// All-or-nothing holds for THIS store only. A caller that shards keys
+    /// across several `VLog`s gets per-store atomicity, not a global
+    /// transaction — there is no cross-store coordination here.
+    ///
+    /// Later pairs win over earlier ones for a duplicate key (each carries a
+    /// higher timestamp), matching last-write-wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, or if the encoded batch exceeds one
+    /// segment (`max_seg_size`) — split into smaller batches.
+    pub async fn set_many(&self, pairs: &[(&[u8], &[u8])], durability: Durability) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Build the contiguous blob: BatchBegin(N) then one Scalar per pair,
+        // each with its own increasing timestamp so a repeated key resolves
+        // last-wins on recovery. Record the padded offset of each member
+        // relative to the blob start so we can index them after the append.
+        let n = u32::try_from(pairs.len()).map_err(|_| Error::InvalidRecord {
+            msg: "batch too large",
+        })?;
+        let header = encode_record(
+            b"",
+            &n.to_le_bytes(),
+            RecordKind::BatchBegin,
+            self.next_ts(),
+        );
+        let mut blob = header;
+        let mut member_rel: Vec<(u32, u32)> = Vec::with_capacity(pairs.len()); // (rel_offset, padded)
+        for (key, value) in pairs {
+            let rel = u32::try_from(blob.len()).map_err(|_| Error::InvalidRecord {
+                msg: "batch too large",
+            })?;
+            let rec = encode_record(key, value, RecordKind::Scalar, self.next_ts());
+            let padded = u32::try_from(rec.len()).expect("padded record fits u32");
+            member_rel.push((rel, padded));
+            blob.extend_from_slice(&rec);
+        }
+
+        let blob_len = blob.len() as u64;
+        if blob_len > self.inner.max_seg_size {
+            return Err(Error::InvalidRecord {
+                msg: "batch exceeds one segment",
+            });
+        }
+
+        // One rotation decision for the whole blob, then one append: the members
+        // cannot be split across segments or interleaved with another writer's
+        // records, which is what makes the header/member run contiguous for
+        // recovery.
+        self.maybe_rotate(blob_len).await?;
+        let (committer, seg_id) = {
+            let a = self.inner.active.borrow();
+            (a.committer.clone(), a.id)
+        };
+        let (start, padded_total) = committer.append(blob, durability).await?;
+        self.bump_active_size(seg_id, start + u64::from(padded_total));
+
+        // Now durable: apply each member to the index + accounting. Same steps
+        // as `set_scoped`, minus the per-key durability wait (already paid once).
+        let mut index = self.inner.index.borrow_mut();
+        let mut cache = self.inner.cache.borrow_mut();
+        let mut disk = self.inner.tenant_disk.lock();
+        for ((key, value), (rel, padded)) in pairs.iter().zip(&member_rel) {
+            let offset = start + u64::from(*rel);
+            if let Some(prev) = index.get(*key).copied() {
+                self.dec_live(prev.segment_id, prev.size);
+                let dtenant = tenant_from_key(key);
+                if let Some(e) = disk.get_mut(&dtenant) {
+                    *e = e.saturating_sub(u64::from(prev.size));
+                }
+            }
+            self.inc_live(seg_id, *padded);
+            index.set(
+                key.to_vec(),
+                IndexEntry {
+                    fingerprint: fingerprint(key),
+                    segment_id: seg_id,
+                    _pad: 0,
+                    offset: u32::try_from(offset).expect("offset fits u32"),
+                    size: *padded,
+                },
+            );
+            cache.insert_for(
+                key,
+                Bytes::copy_from_slice(value),
+                value.len(),
+                tenant_from_key(key),
+            );
+            *disk.entry(tenant_from_key(key)).or_insert(0) += u64::from(*padded);
         }
         Ok(())
     }
@@ -1549,6 +1698,92 @@ mod tests {
             }
         }
         all
+    }
+
+    #[tokio::test]
+    async fn set_many_writes_all_pairs_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"pre", b"0", Durability::Kernel).await.unwrap();
+            v.set_many(
+                &[
+                    (b"a".as_slice(), b"1".as_slice()),
+                    (b"b", b"2"),
+                    (b"c", b"3"),
+                    // Duplicate key in the batch: last write wins.
+                    (b"a", b"1b"),
+                ],
+                Durability::Kernel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(v.len(), 4, "pre + a,b,c (a deduped)");
+            assert_eq!(
+                v.get(b"a").await.unwrap().as_deref(),
+                Some(b"1b".as_slice())
+            );
+            assert_eq!(v.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
+            v.flush().await.unwrap();
+        }
+        // A complete batch is fully present after a reopen (recovery applies it).
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(v.len(), 4);
+        assert_eq!(
+            v.get(b"pre").await.unwrap().as_deref(),
+            Some(b"0".as_slice())
+        );
+        assert_eq!(
+            v.get(b"a").await.unwrap().as_deref(),
+            Some(b"1b".as_slice())
+        );
+        assert_eq!(v.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(v.get(b"c").await.unwrap().as_deref(), Some(b"3".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn torn_batch_is_dropped_whole_on_recovery() {
+        use crate::record::encode_record;
+        use crate::segment::segment_path;
+
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"survivor", b"ok", Durability::Kernel).await.unwrap();
+            v.flush().await.unwrap();
+        }
+        // Simulate a crash mid-`set_many`: a `BatchBegin(3)` header but only two
+        // members reach disk before the tear. Append them raw to the segment.
+        {
+            let mut blob = encode_record(b"", &3u32.to_le_bytes(), RecordKind::BatchBegin, 100);
+            blob.extend_from_slice(&encode_record(b"x", b"1", RecordKind::Scalar, 101));
+            blob.extend_from_slice(&encode_record(b"y", b"2", RecordKind::Scalar, 102));
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(segment_path(dir.path(), 0))
+                .unwrap();
+            f.write_all(&blob).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Recovery must drop the incomplete batch WHOLE: neither member appears,
+        // and the pre-batch survivor is untouched.
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get(b"survivor").await.unwrap().as_deref(),
+            Some(b"ok".as_slice())
+        );
+        assert_eq!(
+            v.get(b"x").await.unwrap(),
+            None,
+            "torn batch member x must not survive"
+        );
+        assert_eq!(
+            v.get(b"y").await.unwrap(),
+            None,
+            "torn batch member y must not survive"
+        );
+        assert_eq!(v.len(), 1, "only the survivor");
     }
 
     #[tokio::test]
