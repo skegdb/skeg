@@ -23,7 +23,7 @@ fn main() {
 
     println!("VLog recovery (full-scan reopen), min of {rounds} rounds");
     println!("  {:>9}  {:>12}  {:>14}", "keys", "reopen ms", "us/key");
-    for &n in &[100_000u32, 500_000, 1_000_000] {
+    for &n in &[100_000u32, 500_000] {
         let mut best = f64::MAX;
         for _ in 0..rounds {
             let dir = TempDir::new().unwrap();
