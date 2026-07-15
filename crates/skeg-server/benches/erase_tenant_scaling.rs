@@ -60,6 +60,38 @@ async fn erase_once(dir: &TempDir, total_keys: u32, victim_keys: u32) -> (f64, u
     (ms, deleted)
 }
 
+/// Populate `total_keys` for the victim under two subject prefixes (`keep/` and
+/// `drop/`, half each), erase the `drop/` subject, then reclaim. Returns
+/// `(erase_ms, keys_erased, reclaim_ms, bytes_freed)`. Exercises the selective
+/// erase (`erase_prefix`) and the physical reclaim together.
+async fn erase_prefix_then_reclaim(dir: &TempDir, total_keys: u32) -> (f64, u64, f64, u64) {
+    let shards = ShardSet::open(dir.path(), SHARDS).unwrap();
+    let key = |subject: &str, i: u32| {
+        let mut k = VICTIM.to_le_bytes().to_vec();
+        k.extend_from_slice(format!("{subject}/{i}").as_bytes());
+        k
+    };
+    for i in 0..total_keys {
+        let subject = if i % 2 == 0 { "keep" } else { "drop" };
+        shards
+            .set(&key(subject, i), b"v", Durability::Relaxed)
+            .await
+            .unwrap();
+    }
+
+    let t0 = Instant::now();
+    let erased = shards
+        .erase_prefix(VICTIM, b"drop/", Durability::Relaxed)
+        .await
+        .unwrap();
+    let erase_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    let t1 = Instant::now();
+    let freed = shards.reclaim().await.unwrap();
+    let reclaim_ms = t1.elapsed().as_secs_f64() * 1e3;
+    (erase_ms, erased, reclaim_ms, freed)
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -94,5 +126,17 @@ fn main() {
         let us_each = ms * 1e3 / f64::from(victim);
         println!("   {total:>10}  {victim:>10}  {ms:>9.1}  {us_each:>12.2}");
         std::hint::black_box(n);
+    }
+
+    println!("\nC. selective erase (drop/ subject = half) + physical reclaim");
+    println!(
+        "   {:>10}  {:>9}  {:>9}  {:>11}  {:>10}",
+        "keyspace", "erased", "erase ms", "reclaim ms", "MiB freed"
+    );
+    for &total in &[50_000u32, 100_000, 250_000, 500_000] {
+        let dir = TempDir::new().unwrap();
+        let (ems, erased, rms, freed) = rt.block_on(erase_prefix_then_reclaim(&dir, total));
+        let mib = freed as f64 / (1024.0 * 1024.0);
+        println!("   {total:>10}  {erased:>9}  {ems:>9.1}  {rms:>11.1}  {mib:>10.1}");
     }
 }

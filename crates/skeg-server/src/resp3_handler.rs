@@ -327,6 +327,11 @@ fn command_cost(cmd: &Command) -> u32 {
             };
             num(1).saturating_add(num(2)).max(1)
         }
+        // Each walks every key on every shard (and reclaim rewrites segments);
+        // charge a flat premium so the admission gate throttles them, not the
+        // per-key work which is not known from the args.
+        Command::SkegSubjectErase { .. } | Command::SkegTenantErase { .. } => 100,
+        Command::SkegReclaim => 1000,
         _ => 1,
     }
 }
@@ -352,7 +357,12 @@ fn command_kind(cmd: &Command) -> CommandKind {
         Command::SkegVindexDrop { .. } => CommandKind::VindexDrop,
         Command::SkegVindexConsolidate { .. } => CommandKind::VindexConsolidate,
         Command::SkegVindexList => CommandKind::VindexList,
-        Command::SkegQuotaSet { .. }
+        // A tenant erasing its own subject's keys is a KV write; the two
+        // cross-tenant / store-wide ops are admin.
+        Command::SkegSubjectErase { .. } => CommandKind::KvWrite,
+        Command::SkegTenantErase { .. }
+        | Command::SkegReclaim
+        | Command::SkegQuotaSet { .. }
         | Command::SkegQuotaGet { .. }
         | Command::SkegQosSet { .. }
         | Command::SkegQosGet { .. } => CommandKind::Admin,
@@ -535,6 +545,11 @@ async fn dispatch_command(
         Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVmset { args } => skeg_vmset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
+        Command::SkegSubjectErase { args } => skeg_subject_erase(&args, shards, *tenant).await,
+        Command::SkegTenantErase { args } => {
+            skeg_tenant_erase(&args, shards, *tenant, tenant_backend).await
+        }
+        Command::SkegReclaim => skeg_reclaim(shards, *tenant, tenant_backend).await,
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
         Command::SkegQuotaGet { args } => skeg_quota_get(&args, *tenant, tenant_backend),
         Command::SkegQosSet { args } => skeg_qos_set(&args, *tenant, tenant_backend),
@@ -703,6 +718,75 @@ async fn skeg_vindex_consolidate(args: &[Bytes], shards: &ShardSet, tenant: Tena
     };
     match shards.vindex_consolidate(&scoped).await {
         Ok(()) => Frame::ok(),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.SUBJECT.ERASE prefix`. Erase every KV key of the calling tenant whose
+/// app-key bytes start with `prefix` (a data subject within the tenant). Logical
+/// delete; the value bytes leave the disk only on a later `SKEG.RECLAIM`.
+/// Returns the number of keys erased.
+async fn skeg_subject_erase(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    if args.len() != 1 {
+        return Frame::Error("ERR wrong number of arguments for 'SKEG.SUBJECT.ERASE'".into());
+    }
+    // The anonymous tenant's keys are unscoped, so a subject prefix cannot be
+    // told apart from any other key: refuse rather than risk a store-wide wipe.
+    if tenant.is_zero() {
+        return Frame::Error("ERR SKEG.SUBJECT.ERASE requires an authenticated tenant".into());
+    }
+    if args[0].is_empty() {
+        return Frame::Error("ERR subject prefix must not be empty".into());
+    }
+    match shards
+        .erase_prefix(tenant_u128(tenant), &args[0], DEFAULT_DURABILITY)
+        .await
+    {
+        Ok(n) => Frame::Integer(n as i64),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.TENANT.ERASE tenant`. Admin only. Erase a whole named tenant: its
+/// vindexes and every KV key. Returns `[vindexes_dropped, keys_erased]`.
+async fn skeg_tenant_erase(
+    args: &[Bytes],
+    shards: &ShardSet,
+    caller: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    let (_backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match shards
+        .erase_tenant(tenant_u128(target), DEFAULT_DURABILITY)
+        .await
+    {
+        Ok((vindexes, keys)) => Frame::Array(vec![
+            Frame::Integer(vindexes as i64),
+            Frame::Integer(keys as i64),
+        ]),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.RECLAIM`. Admin only. Physically reclaim every dead byte across the
+/// store — the durable half of an erase. Store-wide (a segment interleaves all
+/// tenants), so it is admin-gated, not tenant-facing. Returns bytes reclaimed.
+async fn skeg_reclaim(
+    shards: &ShardSet,
+    caller: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    let Some(backend) = ctx else {
+        return Frame::Error("ERR multi-tenant backend not configured".into());
+    };
+    if !backend.is_admin(caller) {
+        return Frame::Error("ERR admin privileges required".into());
+    }
+    match shards.reclaim().await {
+        Ok(freed) => Frame::Integer(freed as i64),
         Err(e) => shard_error(&e),
     }
 }

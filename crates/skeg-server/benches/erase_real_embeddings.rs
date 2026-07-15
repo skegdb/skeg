@@ -186,9 +186,9 @@ fn main() {
          {nq} queries).\nTenant 1 is erased; tenant 2 is measured before and after. Drifts must be zero.\n"
     );
     println!(
-        "| embedding | dim | erase ms | keys erased | vindexes | recall@10 before | after | drift | p99 ms before | after | victim keys left | victim disk left |"
+        "| embedding | dim | erase ms | reclaim ms | MiB freed | keys erased | vindexes | recall@10 before | after | drift | p99 ms before | after | victim keys left | victim disk left |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
     for &(label, stem, native) in ROSTER {
         if let Some(only) = &only
@@ -269,6 +269,12 @@ fn main() {
                 .unwrap();
             let erase_ms = t0.elapsed().as_secs_f64() * 1e3;
 
+            // Physical reclaim: erase only tombstoned; this compacts the dead
+            // bytes off disk. Timed and measured (bytes freed) on real data.
+            let t1 = Instant::now();
+            let freed = shards.reclaim().await.unwrap();
+            let reclaim_ms = t1.elapsed().as_secs_f64() * 1e3;
+
             let (r_after, _p50_a, p99_after) =
                 probe(&shards, survivor, &queries, nq, dim, l_search, &truth).await;
 
@@ -280,6 +286,8 @@ fn main() {
 
             (
                 erase_ms,
+                reclaim_ms,
+                freed,
                 keys,
                 vindexes,
                 r_before,
@@ -291,9 +299,10 @@ fn main() {
             )
         });
 
-        let (ms, keys, vidx, rb, ra, p99b, p99a, left, disk) = row;
+        let (ms, rec_ms, freed, keys, vidx, rb, ra, p99b, p99a, left, disk) = row;
+        let freed_mib = freed as f64 / (1024.0 * 1024.0);
         println!(
-            "| {label} | {native} | {ms:.1} | {keys} | {vidx} | {rb:.3} | {ra:.3} | {:+.3} | {p99b:.2} | {p99a:.2} | {left} | {disk} |",
+            "| {label} | {native} | {ms:.1} | {rec_ms:.1} | {freed_mib:.1} | {keys} | {vidx} | {rb:.3} | {ra:.3} | {:+.3} | {p99b:.2} | {p99a:.2} | {left} | {disk} |",
             ra - rb
         );
     }
