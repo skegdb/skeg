@@ -33,6 +33,8 @@ use crate::cache::S3Fifo;
 use crate::group_commit::{Durability, GroupCommitter};
 use crate::index::{Index, IndexEntry, fingerprint};
 use crate::record::{Record, RecordKind, decode_record, encode_record, padded_record_size};
+use futures_util::stream::{self, StreamExt};
+
 use crate::segment::{MAX_SEGMENT_SIZE, list_segments, scan_file, segment_path};
 use crate::snapshot;
 use crate::{Error, Result};
@@ -45,6 +47,17 @@ const CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// A segment whose live-bytes ratio falls below this gets compacted.
 const COMPACTION_LIVE_RATIO: f64 = 0.5;
+
+/// Survivor relocations kept in flight while compacting one segment, so they
+/// share group-commit flushes instead of paying one each. Matches the shard's
+/// erase-sweep bound; segment rotation stays inside the concurrency ordinary
+/// writes already drive.
+const RELOCATE_CONCURRENCY: usize = 256;
+
+/// One relocation's contribution: `(dest_segment, padded_bytes, is_data)`.
+/// `None` when the record was skipped (a re-SET tombstone or a stale data
+/// record the index no longer points at).
+type RelocOutcome = Result<Option<(u16, u32, bool)>>;
 
 /// A read handle on a segment file, plus its tracked live-bytes counter.
 struct ReadSegment {
@@ -76,6 +89,13 @@ struct VLogInner {
     /// standalone `VLog` gets its own counter (single shard = already global).
     tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     active: RefCell<ActiveState>,
+    /// Serialises segment rotation. Appends run concurrently (the shard spawns a
+    /// task per request, plus the compaction/reclaim drivers), so two of them
+    /// can both observe the active segment full and both try to create the same
+    /// `old_id + 1` file, colliding with `EEXIST`. Rotation is rare (once per
+    /// full segment), so the fast path skips the lock entirely and only a
+    /// rotation pays for it; the body re-checks the fill under the lock.
+    rotate_lock: tokio::sync::Mutex<()>,
     clock: Cell<u64>,
     /// Exclusive advisory lock on the store directory, held for the lifetime of
     /// the open store so a second process cannot open it concurrently and race
@@ -309,6 +329,7 @@ impl VLog {
                     size: active_size,
                     committer,
                 }),
+                rotate_lock: tokio::sync::Mutex::new(()),
                 clock: Cell::new(max_ts + 1),
                 _lock: store_lock,
             }),
@@ -784,54 +805,72 @@ impl VLog {
             }
         };
 
-        for (offset, rec) in records {
-            if rec.kind == RecordKind::Tombstone {
-                // Carry the tombstone forward only while the key stays deleted.
-                // A concurrent re-SET (higher timestamp) wins on recovery, so a
-                // stale carried tombstone can never resurrect a key.
-                let still_deleted = self.inner.index.borrow().get(&rec.key).is_none();
-                if still_deleted {
-                    let (nseg, _, _) = self
-                        .append_raw(
-                            &rec.key,
-                            b"",
-                            RecordKind::Tombstone,
-                            rec.ts,
-                            Durability::Relaxed,
-                        )
-                        .await?;
-                    note_dest(nseg, &mut dest_segments);
+        // Relocate concurrently. Each record awaits its own `append_raw`; doing
+        // them one at a time puts a single record in every group-commit batch
+        // and pays a flush per record (~3.6 ms each, ~90 s to relocate 25k
+        // survivors). `buffer_unordered` keeps many in flight so they share
+        // flushes. Safe: `append_raw` never holds a RefCell borrow across its
+        // await (the shard already runs concurrent set/del on this same path),
+        // and each record touches only its own key's index entry, so distinct
+        // records never collide. Bound so a single compaction cannot swamp the
+        // committer past what ordinary write traffic drives.
+        let outcomes: Vec<RelocOutcome> = stream::iter(records)
+            .map(|(offset, rec)| async move {
+                if rec.kind == RecordKind::Tombstone {
+                    // Carry the tombstone forward only while the key stays
+                    // deleted. A concurrent re-SET (higher timestamp) wins on
+                    // recovery, so a stale carried tombstone cannot resurrect.
+                    if self.inner.index.borrow().get(&rec.key).is_none() {
+                        let (nseg, _, _) = self
+                            .append_raw(
+                                &rec.key,
+                                b"",
+                                RecordKind::Tombstone,
+                                rec.ts,
+                                Durability::Relaxed,
+                            )
+                            .await?;
+                        return Ok(Some((nseg, 0u32, false)));
+                    }
+                    return Ok(None);
                 }
-                continue;
-            }
+                // A data record is live iff the index still points at this
+                // exact location.
+                if !self.index_points_at(&rec.key, seg_id, offset) {
+                    return Ok(None);
+                }
+                let (nseg, noff, npad) = self
+                    .append_raw(&rec.key, &rec.value, rec.kind, rec.ts, Durability::Relaxed)
+                    .await?;
+                // Recheck-CAS: a concurrent SET may have moved the key during
+                // the await above. Only adopt the relocated copy if nothing
+                // changed; otherwise it is dead bytes in the active segment,
+                // reclaimed when that segment is itself compacted.
+                if self.index_points_at(&rec.key, seg_id, offset) {
+                    let entry = IndexEntry {
+                        fingerprint: fingerprint(&rec.key),
+                        segment_id: nseg,
+                        _pad: 0,
+                        offset: noff,
+                        size: npad,
+                    };
+                    self.inner.index.borrow_mut().set(rec.key.clone(), entry);
+                    self.inc_live(nseg, npad);
+                }
+                Ok(Some((nseg, npad, true)))
+            })
+            .buffer_unordered(RELOCATE_CONCURRENCY)
+            .collect()
+            .await;
 
-            // A data record is live iff the index still points at this exact
-            // location.
-            if !self.index_points_at(&rec.key, seg_id, offset) {
-                continue;
+        for outcome in outcomes {
+            if let Some((nseg, npad, is_data)) = outcome? {
+                note_dest(nseg, &mut dest_segments);
+                moved_bytes += u64::from(npad);
+                if is_data {
+                    moved += 1;
+                }
             }
-            let (nseg, noff, npad) = self
-                .append_raw(&rec.key, &rec.value, rec.kind, rec.ts, Durability::Relaxed)
-                .await?;
-            moved += 1;
-            moved_bytes += u64::from(npad);
-            note_dest(nseg, &mut dest_segments);
-
-            // Recheck-CAS: a concurrent SET may have moved the key during the
-            // await above. Only adopt the relocated copy if nothing changed.
-            if self.index_points_at(&rec.key, seg_id, offset) {
-                let entry = IndexEntry {
-                    fingerprint: fingerprint(&rec.key),
-                    segment_id: nseg,
-                    _pad: 0,
-                    offset: noff,
-                    size: npad,
-                };
-                self.inner.index.borrow_mut().set(rec.key.clone(), entry);
-                self.inc_live(nseg, npad);
-            }
-            // else: the relocated copy is dead bytes in the active segment; it
-            // will be reclaimed when that segment is itself compacted.
         }
 
         // Each relocation's `append_raw` resolved only after its `write_at`, so
@@ -855,7 +894,18 @@ impl VLog {
             .read_segments
             .borrow_mut()
             .retain(|s| s.id != seg_id);
-        std::fs::remove_file(segment_path(&self.inner.dir, seg_id))?;
+        // Tolerate an already-removed file: `compact_segment` now has two
+        // callers on the same store (the background maintenance loop and
+        // `reclaim_all_dead`). They interleave at the `await`s above, so both
+        // can pass the `find` guard on the same seg_id with a cloned file
+        // handle, relocate its records (harmless — the recheck-CAS dedups), and
+        // then both reach here. The second unlink would be `ENOENT`; that is the
+        // work already done, not an error.
+        match std::fs::remove_file(segment_path(&self.inner.dir, seg_id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         // Any existing snapshot may reference the now-removed segment.
         let _ = snapshot::remove(&self.inner.dir);
         Ok(moved)
@@ -937,6 +987,20 @@ impl VLog {
     /// `SharedCommitter` attach round-trips through its bg task); the
     /// `PerFile` path resolves synchronously.
     async fn maybe_rotate(&self, incoming: u64) -> Result<()> {
+        let needs = {
+            let a = self.inner.active.borrow();
+            a.size + incoming > self.inner.max_seg_size
+        };
+        if !needs {
+            return Ok(());
+        }
+
+        // Serialise the rotation itself. Without this, two concurrent appends
+        // both see the segment full and both create `old_id + 1` (EEXIST on the
+        // loser). Re-check the fill under the lock: if a peer rotated while we
+        // waited, the active is fresh and our record now fits, so there is
+        // nothing to do.
+        let _rotating = self.inner.rotate_lock.lock().await;
         let needs = {
             let a = self.inner.active.borrow();
             a.size + incoming > self.inner.max_seg_size
@@ -1485,6 +1549,105 @@ mod tests {
             }
         }
         all
+    }
+
+    #[tokio::test]
+    async fn reclaim_all_dead_spans_many_segments() {
+        let dir = TempDir::new().unwrap();
+        // Small segments so a few hundred keys spread over many sealed segments;
+        // deleting half leaves dead bytes in most of them, so reclaim must
+        // compact many segments in one pass (the multi-segment path).
+        let v = VLog::open_with_max_segment(dir.path(), 512).await.unwrap();
+        for i in 0u32..400 {
+            v.set(
+                format!("k{i:04}").as_bytes(),
+                b"some-value-bytes",
+                Durability::Kernel,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(v.segment_count() > 5, "expected many segments");
+        // Delete every even key: dead bytes scattered across most segments.
+        for i in (0u32..400).step_by(2) {
+            v.del(format!("k{i:04}").as_bytes(), Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        v.flush().await.unwrap();
+
+        let freed = v.reclaim_all_dead().await.unwrap();
+        assert!(freed > 0, "reclaimed bytes across segments");
+        v.flush().await.unwrap();
+
+        // Survivors (odd keys) intact, deleted (even) gone.
+        for i in 0u32..400 {
+            let got = v.get(format!("k{i:04}").as_bytes()).await.unwrap();
+            if i % 2 == 0 {
+                assert_eq!(got, None, "even key {i} should be gone");
+            } else {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(b"some-value-bytes".as_slice()),
+                    "odd key {i}"
+                );
+            }
+        }
+        // Reopen: the compacted layout is consistent on disk.
+        drop(v);
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get(b"k0001").await.unwrap().as_deref(),
+            Some(b"some-value-bytes".as_slice())
+        );
+        assert_eq!(v.get(b"k0000").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn reclaim_races_the_background_compactor_without_erroring() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open_with_max_segment(dir.path(), 512).await.unwrap();
+        for i in 0u32..400 {
+            v.set(
+                format!("k{i:04}").as_bytes(),
+                b"some-value-bytes",
+                Durability::Kernel,
+            )
+            .await
+            .unwrap();
+        }
+        // Delete 3 of every 4 so segments are well past the 50% dead the
+        // background `maybe_compact` needs, and it targets the same segments
+        // `reclaim_all_dead` does.
+        for i in 0u32..400 {
+            if i % 4 != 0 {
+                v.del(format!("k{i:04}").as_bytes(), Durability::Kernel)
+                    .await
+                    .unwrap();
+            }
+        }
+        v.flush().await.unwrap();
+
+        // join! polls both on this one task, interleaving them at every await —
+        // the exact contention the shard's background loop creates against a
+        // reclaim. Neither must error on a segment the other already unlinked.
+        let (reclaimed, compacted) = tokio::join!(v.reclaim_all_dead(), v.maybe_compact());
+        reclaimed.expect("reclaim tolerates a concurrent compaction");
+        compacted.expect("compaction tolerates a concurrent reclaim");
+        v.flush().await.unwrap();
+
+        for i in 0u32..400 {
+            let got = v.get(format!("k{i:04}").as_bytes()).await.unwrap();
+            if i % 4 == 0 {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(b"some-value-bytes".as_slice()),
+                    "survivor {i}"
+                );
+            } else {
+                assert_eq!(got, None, "deleted {i}");
+            }
+        }
     }
 
     #[tokio::test]
