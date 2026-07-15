@@ -1681,11 +1681,43 @@ mod tests {
                 Command::SkegQosSet { args: args(&["t"]) },
                 CommandKind::Admin,
             ),
+            // A subject erase is the caller acting on its own data: a KV write,
+            // not admin. The two store-wide / cross-tenant ops ARE admin — a
+            // misclassification here would let a tenant erase or reclaim across
+            // the whole store.
+            (
+                Command::SkegSubjectErase {
+                    args: args(&["subj/"]),
+                },
+                CommandKind::KvWrite,
+            ),
+            (
+                Command::SkegTenantErase { args: args(&["t"]) },
+                CommandKind::Admin,
+            ),
+            (Command::SkegReclaim, CommandKind::Admin),
             (Command::Ping(None), CommandKind::Meta),
         ];
         for (cmd, want) in cases {
             assert_eq!(command_kind(&cmd), want, "misclassified {cmd:?}");
         }
+    }
+
+    #[test]
+    fn command_cost_erasure_charges_a_premium() {
+        // These walk the whole keyspace / rewrite segments, so the admission
+        // gate must see a cost far above the flat-1 default.
+        assert_eq!(
+            command_cost(&Command::SkegSubjectErase {
+                args: args(&["s/"]),
+            }),
+            100
+        );
+        assert_eq!(
+            command_cost(&Command::SkegTenantErase { args: args(&["t"]) }),
+            100
+        );
+        assert_eq!(command_cost(&Command::SkegReclaim), 1000);
     }
 
     /// A backend that records every `Admission.op` it sees and refuses
@@ -1760,6 +1792,64 @@ mod tests {
             seen,
             vec![CommandKind::VindexDrop, CommandKind::KvRead],
             "admit must see each command's classified op"
+        );
+    }
+
+    #[tokio::test]
+    async fn erasure_verbs_enforce_their_privilege_boundary() {
+        let (_dir, shards) = fresh_shards().await;
+        // A backend whose is_admin default is false: every caller is a plain
+        // tenant, none an admin.
+        let backend: std::sync::Arc<dyn TenantBackend> = std::sync::Arc::new(RbacBackend {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = ConnectionState::new(0);
+
+        // RECLAIM from a non-admin tenant: refused.
+        let mut tenant = tid_from_name("t");
+        let f = dispatch_command(
+            Command::SkegReclaim,
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("admin privileges required")),
+            "RECLAIM must require admin, got {f:?}"
+        );
+
+        // TENANT.ERASE from a non-admin tenant: refused.
+        let f = dispatch_command(
+            Command::SkegTenantErase { args: args(&["t"]) },
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("admin privileges required")),
+            "TENANT.ERASE must require admin, got {f:?}"
+        );
+
+        // SUBJECT.ERASE from the anonymous tenant (id 0): refused, because its
+        // keys are unscoped and a prefix sweep cannot be confined to it.
+        let mut anon = TenantId::ZERO;
+        let f = dispatch_command(
+            Command::SkegSubjectErase {
+                args: args(&["subj/"]),
+            },
+            &mut state,
+            &mut anon,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("authenticated tenant")),
+            "SUBJECT.ERASE must refuse the anonymous tenant, got {f:?}"
         );
     }
 
