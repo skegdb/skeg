@@ -686,6 +686,57 @@ impl VLog {
         }
     }
 
+    /// Physically reclaim every dead byte in the store: seal the active
+    /// segment, then compact every sealed segment that holds any dead record.
+    /// Returns the number of dead bytes reclaimed.
+    ///
+    /// `del`/overwrite only tombstone: the old value stays in its segment until
+    /// compaction rewrites the segment without it. The background loop only
+    /// compacts a segment once it is past `COMPACTION_LIVE_RATIO` dead, so a
+    /// freshly deleted value can linger indefinitely. This forces the issue for
+    /// erasure-with-guarantee (GDPR): after it returns, no tombstoned value
+    /// remains on disk.
+    ///
+    /// Store-wide, not scoped: a segment interleaves every tenant's records in
+    /// write order, so "reclaim only tenant T" is not expressible at this
+    /// layer. Reclaiming other tenants' already-dead bytes too is harmless.
+    /// O(bytes in segments that have any dead record) — heavy; call it after a
+    /// batch of deletes, not per key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn reclaim_all_dead(&self) -> Result<u64> {
+        // Seal the active segment so its own dead bytes become compactable
+        // (the active segment is never a compaction candidate). A huge
+        // `incoming` forces the rotation unless the active is empty, in which
+        // case it holds nothing to reclaim anyway.
+        self.maybe_rotate(self.inner.max_seg_size).await?;
+
+        // Snapshot the targets up front — sealed segments with any dead byte —
+        // so freshly written relocation segments are never re-picked and the
+        // loop cannot diverge.
+        let targets: Vec<(u16, u64)> = {
+            let active_id = self.inner.active.borrow().id;
+            let segs = self.inner.read_segments.borrow();
+            segs.iter()
+                .filter(|s| s.id != active_id)
+                .filter_map(|s| {
+                    let total = s.file.size().unwrap_or(0);
+                    let dead = total.saturating_sub(s.live.get());
+                    (total > 0 && dead > 0).then_some((s.id, dead))
+                })
+                .collect()
+        };
+
+        let mut freed = 0u64;
+        for (id, dead) in targets {
+            self.compact_segment(id).await?;
+            freed += dead;
+        }
+        Ok(freed)
+    }
+
     /// Compact `seg_id`: relocate its still-live records into the active
     /// segment, then delete the source file. The active segment is never
     /// compacted.
@@ -1421,6 +1472,78 @@ mod tests {
             Some(b"data".as_slice())
         );
         assert_eq!(v.len(), 1);
+    }
+
+    /// Concatenate every segment `.seg` file's raw bytes — what a verbatim
+    /// backup of the data dir would capture.
+    fn raw_disk_bytes(dir: &std::path::Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "seg") {
+                all.extend(std::fs::read(&path).unwrap());
+            }
+        }
+        all
+    }
+
+    #[tokio::test]
+    async fn reclaim_all_dead_physically_removes_deleted_values() {
+        let needle = b"SECRET-PII-Rossi-Mario";
+        let dir = TempDir::new().unwrap();
+        // Small segments so the deleted value lands in a sealed segment that
+        // later rotations leave behind, i.e. the realistic case.
+        let v = VLog::open_with_max_segment(dir.path(), 256).await.unwrap();
+        v.set(b"subject", needle, Durability::Kernel).await.unwrap();
+        // Write past a rotation so the secret's segment is sealed, not active.
+        for i in 0u64..20 {
+            v.set(format!("filler{i}").as_bytes(), b"x", Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        v.del(b"subject", Durability::Kernel).await.unwrap();
+        v.flush().await.unwrap();
+
+        // Gone logically at once...
+        assert_eq!(v.get(b"subject").await.unwrap(), None);
+        // ...but the raw value bytes are still on disk (tombstone only).
+        let before = raw_disk_bytes(dir.path());
+        assert!(
+            before.windows(needle.len()).any(|w| w == needle),
+            "precondition: deleted value should still be on disk before reclaim"
+        );
+
+        let freed = v.reclaim_all_dead().await.unwrap();
+        v.flush().await.unwrap();
+        assert!(freed > 0, "reclaim reported bytes freed");
+
+        // Now the bytes are physically gone, and survivors are intact.
+        let after = raw_disk_bytes(dir.path());
+        assert!(
+            !after.windows(needle.len()).any(|w| w == needle),
+            "deleted value must not survive reclaim on disk"
+        );
+        assert_eq!(v.get(b"subject").await.unwrap(), None, "still deleted");
+        for i in 0u64..20 {
+            assert_eq!(
+                v.get(format!("filler{i}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"x".as_slice()),
+                "reclaim kept live survivors"
+            );
+        }
+        // Survives a reopen: reclaim rewrote the segments, it did not just hide.
+        drop(v);
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert!(
+            !raw_disk_bytes(dir.path())
+                .windows(needle.len())
+                .any(|w| w == needle),
+            "value stays gone after reopen"
+        );
+        assert_eq!(v.get(b"subject").await.unwrap(), None);
     }
 
     #[tokio::test]

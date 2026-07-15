@@ -488,6 +488,16 @@ enum ShardReq {
         tenant: u128,
         durability: Durability,
     },
+    /// Erase a subject within a tenant: every KV key under `tenant`'s prefix
+    /// followed by `subject`. No vindex drop. Refused for tenant `0`.
+    ErasePrefix {
+        tenant: u128,
+        subject: Vec<u8>,
+        durability: Durability,
+    },
+    /// Physically reclaim every dead byte on this shard's store (compact all
+    /// sealed segments with dead records). The durable other half of an erase.
+    Reclaim,
     /// Count this shard's live KV keys carrying `tenant`'s 16-byte prefix.
     CountTenantKeys(u128),
     /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
@@ -571,6 +581,8 @@ enum ShardResp {
     },
     /// Live key count for a tenant on the answering shard.
     Count(u64),
+    /// Dead bytes physically reclaimed on the answering shard.
+    Reclaimed(u64),
     /// Bytes of hot-key cache charged to a tenant on the answering shard.
     CacheBytes(usize),
     MgetBatch(Vec<(usize, Option<Bytes>)>),
@@ -1265,6 +1277,8 @@ fn is_mutation(req: &ShardReq) -> bool {
         ShardReq::Set(..)
             | ShardReq::Del(..)
             | ShardReq::EraseTenant { .. }
+            | ShardReq::ErasePrefix { .. }
+            | ShardReq::Reclaim
             | ShardReq::VindexCreate { .. }
             | ShardReq::VindexDrop { .. }
             | ShardReq::VindexConsolidate { .. }
@@ -1292,6 +1306,8 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         // would understate it and counting it as N would hide its latency, so
         // it stays out of the op counters until it has its own classifier.
         ShardReq::EraseTenant { .. }
+        | ShardReq::ErasePrefix { .. }
+        | ShardReq::Reclaim
         | ShardReq::CountTenantKeys(_)
         | ShardReq::Vget { .. }
         | ShardReq::VindexCreate { .. }
@@ -1362,6 +1378,45 @@ async fn drop_vindex(
         }
     }
     Ok(true)
+}
+
+/// Delete every live KV key that starts with `prefix`, concurrently. Returns
+/// the count deleted.
+///
+/// Collect under the index borrow, filtering on the prefix so only the matching
+/// keys are materialised, then release the borrow before deleting: the
+/// `for_each_key` callback is sync and `del` is async (and takes the index
+/// mutably anyway). Deletes run `buffer_unordered` so they share the group
+/// committer's flushes — awaiting each in turn put one record per batch and
+/// paid a flush per key (~1.4 ms each, ~14 s per 10k). The bound stays inside
+/// the concurrency ordinary client writes already drive the shard at.
+///
+/// Logical only: `del` tombstones, it does not reclaim the value bytes. Follow
+/// with a `Reclaim` when the bytes must physically leave the disk.
+async fn sweep_prefix(vlog: &VLog, prefix: &[u8], durability: Durability) -> Result<u64, String> {
+    let victims: Vec<Vec<u8>> = {
+        let mut v = Vec::new();
+        vlog.for_each_key(|k| {
+            if k.starts_with(prefix) {
+                v.push(k.to_vec());
+            }
+        });
+        v
+    };
+    let results: Vec<_> = stream::iter(victims.iter())
+        .map(|key| vlog.del(key, durability))
+        .buffer_unordered(ERASE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut erased = 0u64;
+    for r in results {
+        match r {
+            Ok(true) => erased += 1,
+            Ok(false) => {}
+            Err(e) => return Err(format!("erase failed: {e}")),
+        }
+    }
+    Ok(erased)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1586,48 +1641,42 @@ async fn process(
                 }
             }
 
-            // Now the KV sweep. Collect under the index borrow, filtering on
-            // the tenant prefix so only this tenant's keys are materialised,
-            // then release the borrow before deleting: the callback is sync and
-            // `del` is async, and `del` would take the index mutably anyway.
-            let prefix = tenant.to_le_bytes();
-            let victims: Vec<Vec<u8>> = {
-                let mut v = Vec::new();
-                vlog.for_each_key(|k| {
-                    if k.len() >= 16 && k[..16] == prefix {
-                        v.push(k.to_vec());
-                    }
-                });
-                v
-            };
-            // Delete concurrently, not one at a time. The group committer
-            // batches whatever it finds queued together, so awaiting each `del`
-            // before issuing the next puts exactly one record in every batch and
-            // pays a flush per key: measured at 1.4ms each, ~14s per 10k keys.
-            // Keeping many in flight lets them share flushes. The bound keeps
-            // segment rotation inside the concurrency the write path already
-            // sees, instead of a regime it has never been run at.
-            //
-            // Safe on the shard's single thread: `del` holds no borrow of the
-            // index across its await, so overlapping calls never collide.
-            let results: Vec<_> = stream::iter(victims.iter())
-                .map(|key| vlog.del(key, durability))
-                .buffer_unordered(ERASE_CONCURRENCY)
-                .collect()
-                .await;
-            let mut erased = 0u64;
-            for r in results {
-                match r {
-                    Ok(true) => erased += 1,
-                    Ok(false) => {}
-                    Err(e) => return ShardResp::Err(format!("erase failed: {e}")),
-                }
-            }
-            ShardResp::Erased {
-                vindexes: dropped,
-                keys: erased,
+            // Now the KV sweep over the whole tenant prefix.
+            match sweep_prefix(vlog, &tenant.to_le_bytes(), durability).await {
+                Ok(erased) => ShardResp::Erased {
+                    vindexes: dropped,
+                    keys: erased,
+                },
+                Err(e) => ShardResp::Err(e),
             }
         }
+        ShardReq::ErasePrefix {
+            tenant,
+            subject,
+            durability,
+        } => {
+            if tenant == 0 {
+                return ShardResp::Err("cannot erase under the anonymous tenant (0)".to_owned());
+            }
+            // Subject-scoped erase: the tenant's 16 bytes followed by the
+            // caller's subject bytes. No vindex drop — a subject is a slice of a
+            // tenant, not the tenant; the caller reclaims a subject's vectors
+            // with vdel + vindex_consolidate. This sweeps only the app's own KV
+            // keys namespaced under the subject.
+            let mut prefix = tenant.to_le_bytes().to_vec();
+            prefix.extend_from_slice(&subject);
+            match sweep_prefix(vlog, &prefix, durability).await {
+                Ok(erased) => ShardResp::Erased {
+                    vindexes: 0,
+                    keys: erased,
+                },
+                Err(e) => ShardResp::Err(e),
+            }
+        }
+        ShardReq::Reclaim => match vlog.reclaim_all_dead().await {
+            Ok(freed) => ShardResp::Reclaimed(freed),
+            Err(e) => ShardResp::Err(format!("reclaim failed: {e}")),
+        },
         ShardReq::Vset {
             name,
             id,
@@ -2481,6 +2530,77 @@ impl ShardSet {
         Ok((vindexes, keys))
     }
 
+    /// Erase a subject within a tenant: every KV key whose bytes are
+    /// `tenant` (16B LE) followed by `subject`. Returns the count deleted,
+    /// summed over the shards. Logical only — follow with [`reclaim`] when the
+    /// value bytes must physically leave the disk (GDPR).
+    ///
+    /// KV keys only. A subject's *vectors* live in the tenant's shared vindex;
+    /// erase them with `vdel` by id, then `vindex_consolidate` to reclaim the
+    /// f32 bytes. This call does not touch vindexes.
+    ///
+    /// [`reclaim`]: Self::reclaim
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for tenant `0`, or if a shard is unavailable or a
+    /// delete fails.
+    pub async fn erase_prefix(
+        &self,
+        tenant: u128,
+        subject: &[u8],
+        durability: Durability,
+    ) -> Result<u64, ShardError> {
+        if tenant == 0 {
+            return Err(ShardError::Storage(
+                "cannot erase under the anonymous tenant (0)".to_owned(),
+            ));
+        }
+        let mut keys = 0u64;
+        for shard in 0..self.inner.n {
+            let req = ShardReq::ErasePrefix {
+                tenant,
+                subject: subject.to_vec(),
+                durability,
+            };
+            match self.call(shard, req).await? {
+                ShardResp::Erased { keys: k, .. } => keys += k,
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Physically reclaim dead bytes across every shard: compact all sealed
+    /// segments holding deleted/overwritten records so the old values leave the
+    /// disk. Returns the total bytes reclaimed.
+    ///
+    /// The durable half of erasure. `erase_*`/`del` only tombstone; the value
+    /// bytes sit in their segments until compaction rewrites them, and the
+    /// background loop only compacts a segment once it is mostly dead. For a
+    /// GDPR guarantee, call this after the deletes. Store-wide and heavy
+    /// (O(bytes in segments with any dead record)) — batch your deletes, then
+    /// reclaim once.
+    ///
+    /// Does not touch backups already taken, or vector f32 bytes (use
+    /// `vindex_consolidate` for those).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable or a compaction fails.
+    pub async fn reclaim(&self) -> Result<u64, ShardError> {
+        let mut freed = 0u64;
+        for shard in 0..self.inner.n {
+            match self.call(shard, ShardReq::Reclaim).await? {
+                ShardResp::Reclaimed(n) => freed += n,
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(freed)
+    }
+
     pub async fn vindex_list(&self) -> Result<Vec<(String, u32, u8, u8, u64)>, ShardError> {
         use std::collections::BTreeMap;
         let mut agg: BTreeMap<String, (u32, u8, u8, u64)> = BTreeMap::new();
@@ -3047,6 +3167,111 @@ mod tests {
             Some(b"v".as_slice()),
             "neighbour KV key was collateral damage"
         );
+    }
+
+    #[tokio::test]
+    async fn erase_prefix_removes_one_subject_and_spares_the_others() {
+        const TENANT: u128 = 5;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+
+        // Two subjects under the same tenant, keys namespaced `subject/i`.
+        let key = |subject: &str, i: u32| {
+            let mut k = TENANT.to_le_bytes().to_vec();
+            k.extend_from_slice(format!("{subject}/{i}").as_bytes());
+            k
+        };
+        for i in 0u32..25 {
+            for subj in ["alice", "bob"] {
+                shards
+                    .set_scoped(&key(subj, i), b"v", Durability::Kernel, TENANT, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let erased = shards
+            .erase_prefix(TENANT, b"alice/", Durability::Kernel)
+            .await
+            .unwrap();
+        assert_eq!(erased, 25, "every key of the named subject deleted");
+
+        for i in 0u32..25 {
+            assert_eq!(
+                shards.get(&key("alice", i)).await.unwrap(),
+                None,
+                "alice key {i} survived"
+            );
+            assert_eq!(
+                shards.get(&key("bob", i)).await.unwrap().as_deref(),
+                Some(b"v".as_slice()),
+                "bob key {i} was collateral damage"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_makes_erased_values_unrecoverable_on_disk() {
+        const TENANT: u128 = 9;
+        let needle = b"pii-value-to-erase";
+        let base = TempDir::new().unwrap().path().to_owned();
+        std::fs::create_dir_all(&base).unwrap();
+
+        {
+            let shards = ShardSet::open(&base, 2).unwrap();
+            let mut k = TENANT.to_le_bytes().to_vec();
+            k.extend_from_slice(b"subject/doc");
+            shards
+                .set_scoped(&k, needle, Durability::Kernel, TENANT, None)
+                .await
+                .unwrap();
+            // Filler so the secret's segment seals behind a rotation.
+            for i in 0u32..50 {
+                let mut fk = TENANT.to_le_bytes().to_vec();
+                fk.extend_from_slice(format!("filler/{i}").as_bytes());
+                shards
+                    .set_scoped(&fk, b"x", Durability::Kernel, TENANT, None)
+                    .await
+                    .unwrap();
+            }
+            shards
+                .erase_prefix(TENANT, b"subject/", Durability::Kernel)
+                .await
+                .unwrap();
+            let freed = shards.reclaim().await.unwrap();
+            assert!(freed > 0, "reclaim freed bytes");
+            // Dropping ShardSet joins the worker threads and closes the files.
+        }
+
+        // Scan every segment file: the erased value must be gone from disk.
+        let mut raw = Vec::new();
+        for e in walk_seg_files(&base) {
+            raw.extend(std::fs::read(&e).unwrap());
+        }
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "erased value must not survive reclaim on disk"
+        );
+    }
+
+    /// Every `.seg` file under `root`, recursively (shards live in subdirs).
+    fn walk_seg_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_owned()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|e| e == "seg") {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     #[tokio::test]
