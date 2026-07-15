@@ -330,7 +330,9 @@ fn command_cost(cmd: &Command) -> u32 {
         // Each walks every key on every shard (and reclaim rewrites segments);
         // charge a flat premium so the admission gate throttles them, not the
         // per-key work which is not known from the args.
-        Command::SkegSubjectErase { .. } | Command::SkegTenantErase { .. } => 100,
+        Command::SkegSubjectErase { .. }
+        | Command::SkegTenantErase { .. }
+        | Command::SkegTenantDelete { .. } => 100,
         Command::SkegReclaim => 1000,
         _ => 1,
     }
@@ -361,6 +363,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
         // cross-tenant / store-wide ops are admin.
         Command::SkegSubjectErase { .. } => CommandKind::KvWrite,
         Command::SkegTenantErase { .. }
+        | Command::SkegTenantDelete { .. }
         | Command::SkegReclaim
         | Command::SkegQuotaSet { .. }
         | Command::SkegQuotaGet { .. }
@@ -548,6 +551,9 @@ async fn dispatch_command(
         Command::SkegSubjectErase { args } => skeg_subject_erase(&args, shards, *tenant).await,
         Command::SkegTenantErase { args } => {
             skeg_tenant_erase(&args, shards, *tenant, tenant_backend).await
+        }
+        Command::SkegTenantDelete { args } => {
+            skeg_tenant_delete(&args, shards, *tenant, tenant_backend).await
         }
         Command::SkegReclaim => skeg_reclaim(shards, *tenant, tenant_backend).await,
         Command::SkegQuotaSet { args } => skeg_quota_set(&args, *tenant, tenant_backend),
@@ -769,6 +775,47 @@ async fn skeg_tenant_erase(
         ]),
         Err(e) => shard_error(&e),
     }
+}
+
+/// `SKEG.TENANT.DELETE tenant`. Admin only. The full offboarding lifecycle:
+/// erase the tenant's data, then remove its identity (logins + limits) so the
+/// tenant ceases to exist. Returns `[vindexes, keys, logins_removed]`.
+///
+/// Data is erased *before* the identity is removed: if the identity went first
+/// and the erase failed, the data would be orphaned under a tenant that can no
+/// longer log in — the exact leak this command closes. This way a failure
+/// leaves a still-valid tenant with erased data, which a retry finishes.
+/// Erasure is logical (tombstones); run `SKEG.RECLAIM` to reclaim the bytes.
+async fn skeg_tenant_delete(
+    args: &[Bytes],
+    shards: &ShardSet,
+    caller: TenantId,
+    ctx: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
+    let (backend, target) = match admin_target(&args[0], caller, ctx) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let (vindexes, keys) = match shards
+        .erase_tenant(tenant_u128(target), DEFAULT_DURABILITY)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(e) => return shard_error(&e),
+    };
+    let logins = match backend.remove_tenant(target) {
+        Ok(n) => n,
+        Err(e) => {
+            return Frame::Error(format!(
+                "ERR data erased but identity removal failed: {e:?}"
+            ));
+        }
+    };
+    Frame::Array(vec![
+        Frame::Integer(vindexes as i64),
+        Frame::Integer(keys as i64),
+        Frame::Integer(logins as i64),
+    ])
 }
 
 /// `SKEG.RECLAIM`. Admin only. Physically reclaim every dead byte across the
@@ -1695,6 +1742,10 @@ mod tests {
                 Command::SkegTenantErase { args: args(&["t"]) },
                 CommandKind::Admin,
             ),
+            (
+                Command::SkegTenantDelete { args: args(&["t"]) },
+                CommandKind::Admin,
+            ),
             (Command::SkegReclaim, CommandKind::Admin),
             (Command::Ping(None), CommandKind::Meta),
         ];
@@ -1832,6 +1883,20 @@ mod tests {
         assert!(
             matches!(&f, Frame::Error(e) if e.contains("admin privileges required")),
             "TENANT.ERASE must require admin, got {f:?}"
+        );
+
+        // TENANT.DELETE from a non-admin tenant: refused (before any erase).
+        let f = dispatch_command(
+            Command::SkegTenantDelete { args: args(&["t"]) },
+            &mut state,
+            &mut tenant,
+            &shards,
+            Some(&backend),
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("admin privileges required")),
+            "TENANT.DELETE must require admin, got {f:?}"
         );
 
         // SUBJECT.ERASE from the anonymous tenant (id 0): refused, because its

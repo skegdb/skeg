@@ -167,6 +167,15 @@ impl AuthStore {
         self.by_user.remove(user)
     }
 
+    /// Drop every user bound to `tenant` (a tenant may own several logins).
+    /// Returns how many were removed. Linear in the user count, like
+    /// [`has_tenant`](Self::has_tenant); the store is small.
+    pub fn remove_tenant(&mut self, tenant: TenantId) -> usize {
+        let before = self.by_user.len();
+        self.by_user.retain(|_, r| r.tenant != tenant);
+        before - self.by_user.len()
+    }
+
     #[must_use]
     pub fn get(&self, user: &str) -> Option<&AuthRecord> {
         self.by_user.get(user)

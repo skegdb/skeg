@@ -143,6 +143,13 @@ pub enum Command {
     SkegTenantErase {
         args: Vec<Bytes>,
     },
+    /// `SKEG.TENANT.DELETE tenant`. Arity 1. Admin only; the full offboarding
+    /// lifecycle — erase the tenant's data (as ERASE) AND remove its logins and
+    /// limits from the identity store, so the tenant ceases to exist. Inner
+    /// parsing in the dispatcher.
+    SkegTenantDelete {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.RECLAIM`. Arity 0. Admin only; physically reclaim every dead byte
     /// across the store (the durable half of an erase). Store-wide and heavy.
     SkegReclaim,
@@ -335,6 +342,14 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegTenantErase { args })
+        }
+        "TENANT.DELETE" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.TENANT.DELETE",
+                });
+            }
+            Ok(Command::SkegTenantDelete { args })
         }
         "RECLAIM" => {
             if !args.is_empty() {
@@ -1237,6 +1252,21 @@ mod tests {
         );
         assert!(
             parse_command(arr(&[b"SKEG.TENANT.ERASE"])).is_err(),
+            "arity 0 rejected"
+        );
+    }
+
+    #[test]
+    fn skeg_tenant_delete_takes_one_name() {
+        let cmd = parse_command(arr(&[b"SKEG.TENANT.DELETE", b"acme"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SkegTenantDelete {
+                args: vec![Bytes::from_static(b"acme")]
+            }
+        );
+        assert!(
+            parse_command(arr(&[b"SKEG.TENANT.DELETE"])).is_err(),
             "arity 0 rejected"
         );
     }

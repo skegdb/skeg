@@ -116,6 +116,22 @@ impl TenantBackend for AuthStoreBackend {
             )
             .map_err(|_| QuotaAdminError::Unsupported)
     }
+
+    fn remove_tenant(&self, id: TenantId) -> Result<u64, QuotaAdminError> {
+        let engine_tid = tid_from_engine(id);
+        // Auth first, persisted: once its logins are gone the tenant can no
+        // longer authenticate, which must hold even if the limits write below
+        // fails.
+        let removed = {
+            let mut auth = self.auth.write();
+            let n = auth.remove_tenant(engine_tid);
+            auth.save().map_err(|_| QuotaAdminError::Unsupported)?;
+            n
+        };
+        // Best-effort: a leftover limits row maps to no login, so it is inert.
+        let _ = self.limits.write().remove(*engine_tid.as_bytes());
+        Ok(removed as u64)
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +187,56 @@ mod tests {
         drop(be);
         let be2 = AuthStoreBackend::open(&path, false, Some("admin")).unwrap();
         assert_eq!(be2.limits(acme_id).max_vectors, Some(1000));
+    }
+
+    #[test]
+    fn remove_tenant_drops_all_its_logins_and_limits_and_spares_others() {
+        let dir = TempDir::new().unwrap();
+        // acme owns two logins; globex one. Removing acme must take both of its
+        // logins and leave globex untouched.
+        let path = write_auth(
+            dir.path(),
+            &[
+                ("admin", "admin"),
+                ("acme-a", "acme"),
+                ("acme-b", "acme"),
+                ("gx", "globex"),
+            ],
+        );
+        let be = AuthStoreBackend::open(&path, false, Some("admin")).unwrap();
+        let acme_id = tid_to_engine(TenantTenantId::from_name("acme"));
+        let globex_id = tid_to_engine(TenantTenantId::from_name("globex"));
+        be.set_limits(
+            acme_id,
+            TenantLimits {
+                max_vectors: Some(500),
+                max_disk_bytes: None,
+            },
+        )
+        .unwrap();
+
+        assert!(be.has_tenant(acme_id));
+        let removed = be.remove_tenant(acme_id).unwrap();
+        assert_eq!(removed, 2, "both acme logins removed");
+
+        assert!(!be.has_tenant(acme_id), "acme gone");
+        assert!(be.has_tenant(globex_id), "globex spared");
+        assert_eq!(be.resolve_tenant("acme"), None);
+        assert_eq!(
+            be.limits(acme_id),
+            TenantLimits::default(),
+            "acme limits dropped"
+        );
+
+        // Removing an absent tenant is a no-op, not an error.
+        assert_eq!(be.remove_tenant(acme_id).unwrap(), 0);
+
+        // Persisted: a fresh backend over the same files still has acme gone,
+        // globex present.
+        drop(be);
+        let be2 = AuthStoreBackend::open(&path, false, Some("admin")).unwrap();
+        assert!(!be2.has_tenant(acme_id), "acme stays gone after reopen");
+        assert!(be2.has_tenant(globex_id), "globex stays after reopen");
     }
 
     #[test]
