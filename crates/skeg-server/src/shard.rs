@@ -143,9 +143,12 @@ const VAMANA_L_SEARCH: usize = 100;
 /// A VINDEX is backed either by an in-RAM `FlatIndex` or by an on-disk
 /// Vamana graph (`DiskVamanaIndex`) - f32 vectors on disk, graph + int8
 /// tier in RAM. The choice is made at `VINDEX CREATE`.
+// Both variants boxed: DiskVamanaIndex and FlatIndex are each hundreds of bytes,
+// so an unboxed variant would size every VectorBackend to the larger one (clippy
+// large_enum_variant). One heap indirection per vindex, off the hot path.
 enum VectorBackend {
-    Flat(FlatIndex),
-    Disk(DiskVamanaIndex),
+    Flat(Box<FlatIndex>),
+    Disk(Box<DiskVamanaIndex>),
 }
 
 impl VectorBackend {
@@ -887,7 +890,7 @@ fn recover_vindexes(
                 idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
                 set.insert(
                     name,
-                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx)))),
+                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(Box::new(idx))))),
                 );
             }
             Err(e) => error!("shard {shard_id}: recovering vindex '{name}' failed: {e}"),
@@ -968,7 +971,7 @@ async fn get_or_reopen(
         return Some(entry);
     }
     idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
-    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(idx))));
+    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(Box::new(idx)))));
     entry.read().touch();
     w.insert(name.to_owned(), entry.clone());
     Some(entry)
@@ -1523,7 +1526,7 @@ async fn process(
                             Ok(mut idx) => {
                                 idx.set_auto_flush(false); // flushed off-thread by the loop
                                 e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(
-                                    idx,
+                                    Box::new(idx),
                                 )))));
                                 Ok(true)
                             }
@@ -1531,7 +1534,7 @@ async fn process(
                         }
                     } else {
                         e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Flat(
-                            FlatIndex::new(dim, kind),
+                            Box::new(FlatIndex::new(dim, kind)),
                         )))));
                         Ok(false)
                     }
@@ -4075,7 +4078,7 @@ mod tests {
             idx.run_count()
         );
 
-        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(idx))));
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(Box::new(idx)))));
 
         // L2: runs fold into one.
         let d = vdir.clone();
