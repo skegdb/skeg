@@ -1069,6 +1069,9 @@ const VECTORS_FILE: &str = "vectors.bin";
 const DELTA_LOG_FILE: &str = "delta.log";
 /// Persisted IVF router sidecar (centroids + cell assignment).
 const IVF_FILE: &str = "ivf.bin";
+/// Optional per-base-row u64 attribute column (little-endian), for range-filtered
+/// search. Absent unless [`DiskVamanaIndex::set_attr`] was called.
+const ATTR_FILE: &str = "attr.bin";
 /// Persists which tier-1 quantiser a read-write disk index rebuilds at `open`
 /// and `consolidate`. Absent => `Int8` (the historical default). Only the KIND
 /// is stored, not codes: every tier here is deterministic from `vectors.bin`
@@ -1771,6 +1774,11 @@ pub struct DiskVamanaIndex {
     /// medium filters). `None` until built via [`build_ivf`](Self::build_ivf).
     /// Boxed to keep DiskVamanaIndex small (VectorBackend large_enum_variant).
     ivf: Option<Box<IvfRouter>>,
+    /// Optional u64 attribute per BASE row (index = base row), for range-filtered
+    /// search ([`search_range`](Self::search_range)). `None` unless
+    /// [`set_attr`](Self::set_attr) was called. Covers base rows only; streaming
+    /// (delta/run) inserts are not range-filterable until the next consolidate.
+    attr: Option<Vec<u64>>,
 }
 
 /// Cold per-index tq1 online-controller state, kept behind a single `Box` on
@@ -2049,13 +2057,15 @@ impl DiskVamanaIndex {
             delta_log,
             tq1: Box::default(),
             ivf: None,
+            attr: None,
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
         // already put their vectors back in L0, so the stale dirs are redundant
         // (and would collide with `run-0` of this session). See the flush ADR.
         index.clean_stale_runs();
-        index.load_ivf();
+        index.load_attr();
+        index.load_ivf(); // rebuilds the zone-map if attr is present
         Ok(index)
     }
 
@@ -3575,6 +3585,7 @@ impl DiskVamanaIndex {
         let router = IvfRouter::build(&all, n, dim, n_cells, iters);
         let _ = std::fs::write(self.dir.join(IVF_FILE), router.to_bytes());
         self.ivf = Some(Box::new(router));
+        self.refresh_zonemap();
         Ok(())
     }
 
@@ -3606,6 +3617,7 @@ impl DiskVamanaIndex {
     pub fn ivf_finish(&mut self, built: IvfBuilt) -> io::Result<()> {
         let _ = std::fs::write(self.dir.join(IVF_FILE), built.router.to_bytes());
         self.ivf = Some(Box::new(built.router));
+        self.refresh_zonemap();
         Ok(())
     }
 
@@ -3619,7 +3631,58 @@ impl DiskVamanaIndex {
             && r.len() == self.base.main_n as usize
         {
             self.ivf = Some(Box::new(r));
+            self.refresh_zonemap();
         }
+    }
+
+    /// Load the persisted attribute column, if present + sized to the base.
+    /// Best-effort: a missing / stale sidecar just leaves `attr` unset.
+    fn load_attr(&mut self) {
+        let Ok(bytes) = std::fs::read(self.dir.join(ATTR_FILE)) else {
+            return;
+        };
+        let n = self.base.main_n as usize;
+        if bytes.len() != n * 8 {
+            return; // stale (base resized) — ignore
+        }
+        let attr: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        self.attr = Some(attr);
+    }
+
+    /// (Re)build the router's zone-map from the attribute column. Called after
+    /// any router install and by [`set_attr`]; the zone-map is RAM-only (not in
+    /// the IVF sidecar), so it must be rebuilt whenever either side changes.
+    fn refresh_zonemap(&mut self) {
+        if let (Some(r), Some(a)) = (self.ivf.as_mut(), self.attr.as_ref())
+            && a.len() == r.len()
+        {
+            r.set_zonemap(a);
+        }
+    }
+
+    /// Attach a u64 attribute column (one value per BASE row, in row order) for
+    /// range-filtered search. Persists a sidecar and builds the router zone-map
+    /// if the IVF router is present. The column is opaque — a time axis, an
+    /// importance score, any monotone-comparable key.
+    ///
+    /// # Errors
+    /// I/O error if the sidecar write fails.
+    ///
+    /// # Panics
+    /// Panics if `attr.len()` does not equal the base row count.
+    pub fn set_attr(&mut self, attr: &[u64]) -> io::Result<()> {
+        assert_eq!(attr.len(), self.base.main_n as usize, "attr/base-rows mismatch");
+        let mut bytes = Vec::with_capacity(attr.len() * 8);
+        for &a in attr {
+            bytes.extend_from_slice(&a.to_le_bytes());
+        }
+        std::fs::write(self.dir.join(ATTR_FILE), &bytes)?;
+        self.attr = Some(attr.to_vec());
+        self.refresh_zonemap();
+        Ok(())
     }
 
     /// Hybrid filtered search over the base. `s` = the filter's SORTED matching
@@ -3676,6 +3739,84 @@ impl DiskVamanaIndex {
             }
             _ => self.score_ids_quantized(query, s, k, rerank),
         }
+    }
+
+    /// Range-filtered search: top-k nearest to `query` among base rows whose
+    /// attribute (set via [`set_attr`](Self::set_attr)) is in `[lo, hi]`.
+    ///
+    /// Self-routing on the estimated match count (O(cells), from the zone-map,
+    /// no attribute scan): a WIDE range takes the zone-map path
+    /// ([`probe_range`](IvfRouter::probe_range)) that never materialises the id
+    /// set; a NARROW range materialises the matching ids and reuses
+    /// [`search_filtered_hybrid`](Self::search_filtered_hybrid), whose own small-
+    /// set path is already cheap. Both rerank through `score_ids_quantized`, so
+    /// recall matches the filtered path. Requires a zone-map (attr + IVF router);
+    /// without one it falls back to a full attribute scan + the filtered path.
+    ///
+    /// # Errors
+    /// I/O error if a re-rank read fails.
+    pub fn search_range(
+        &self,
+        query: &[f32],
+        lo: u64,
+        hi: u64,
+        k: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        /// Match-count crossover: above it, avoiding the id-set materialisation
+        /// wins; below it, the filtered path's small-set scan is cheaper
+        /// (measured ~= SHORTLIST, the router's candidate budget).
+        const RANGE_MIN: usize = 4_096;
+        const SHORTLIST: usize = 4_096;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let (Some(router), Some(attr)) = (&self.ivf, &self.attr) else {
+            // No zone-map: fall back to a full scan into the filtered path.
+            let s = self.ids_in_range(lo, hi);
+            return self.search_filtered_hybrid(query, &s, k, rerank);
+        };
+        if router.estimate_range_count(lo, hi) >= RANGE_MIN {
+            // Wide: zone-map path, no id set built.
+            let q = normalized(query);
+            let short_rows = router.probe_range(&q, lo, hi, attr, SHORTLIST.max(rerank));
+            let ids: Vec<u64> = short_rows.iter().map(|&r| self.base.ids[r as usize]).collect();
+            self.score_ids_quantized(query, &ids, k, rerank)
+        } else {
+            // Narrow: materialise the matching ids, reuse the filtered path.
+            let s = self.ids_in_range(lo, hi);
+            self.search_filtered_hybrid(query, &s, k, rerank)
+        }
+    }
+
+    /// TEST/BENCH: the range planner's estimate and whether `search_range` would
+    /// take the zone-map (wide) path. Not part of the stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_range_plan(&self, lo: u64, hi: u64) -> (usize, bool) {
+        match &self.ivf {
+            Some(r) => {
+                let est = r.estimate_range_count(lo, hi);
+                (est, est >= 4_096)
+            }
+            None => (0, false),
+        }
+    }
+
+    /// Sorted external ids of base rows whose attribute is in `[lo, hi]`. O(base).
+    /// Empty if no attribute column is set.
+    fn ids_in_range(&self, lo: u64, hi: u64) -> Vec<u64> {
+        let Some(attr) = &self.attr else {
+            return Vec::new();
+        };
+        let mut s: Vec<u64> = attr
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| (lo..=hi).contains(&a))
+            .map(|(row, _)| self.base.ids[row])
+            .collect();
+        s.sort_unstable();
+        s
     }
 }
 
@@ -3893,6 +4034,54 @@ mod tests {
             recall >= 0.95,
             "on-disk Vamana recall@10 = {recall:.4} (target >= 0.95)"
         );
+    }
+
+    // Range-filtered search over the disk index: every result honours [lo,hi],
+    // recall matches a brute filtered top-k, and the attr column + zone-map
+    // survive a save/reopen. ids == row so the range predicate is exact.
+    #[test]
+    fn disk_search_range() {
+        let dim = 48;
+        let n = 4000; // > RANGE_MIN so the zone-map path engages for a wide range
+        let vectors = random_vectors(n, dim, 42);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let index = VamanaIndex::build(vectors.clone(), ids, dim, &VamanaConfig::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        index.save(tmp.path()).unwrap();
+
+        let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+        let attr: Vec<u64> = (0..n as u64).collect(); // attr[row] = row = id
+        disk.set_attr(&attr).unwrap();
+        disk.build_ivf(0, 6).unwrap();
+
+        let check = |d: &DiskVamanaIndex, lo: u64, hi: u64| {
+            let mut rng = StdRng::seed_from_u64(9);
+            let (mut hits, mut total) = (0usize, 0usize);
+            for _ in 0..30 {
+                let q: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+                let got: Vec<u64> = d.search_range(&q, lo, hi, 10, 80).unwrap().into_iter().map(|(id, _)| id).collect();
+                assert!(got.iter().all(|&id| (lo..=hi).contains(&id)), "result out of [{lo},{hi}]");
+                // brute filtered truth
+                let mut truth: Vec<(f32, u64)> = (lo..=hi)
+                    .map(|id| (cosine_f32(&q, &vectors[id as usize * dim..id as usize * dim + dim]), id))
+                    .collect();
+                truth.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+                let want: std::collections::HashSet<u64> = truth.iter().take(10).map(|&(_, id)| id).collect();
+                hits += got.iter().filter(|id| want.contains(id)).count();
+                total += want.len().min(10);
+            }
+            hits as f64 / total as f64
+        };
+
+        // Wide range (zone-map path) and narrow range (materialise path).
+        assert!(check(&disk, 1000, 3500) >= 0.9, "wide-range recall");
+        assert!(check(&disk, 100, 260) >= 0.9, "narrow-range recall");
+
+        // Persistence: reopen must reload attr + rebuild the zone-map.
+        drop(disk);
+        let disk2 = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert!(disk2.attr.is_some(), "attr column must survive reopen");
+        assert!(check(&disk2, 1000, 3500) >= 0.9, "wide-range recall after reopen");
     }
 
     // RW disk index with a TurboQuant tier: the live write path (create -> insert

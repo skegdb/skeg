@@ -24,6 +24,19 @@ pub struct IvfRouter {
     n_cells: usize,
     /// Cell id for each vector row (index = vector row).
     cell_of: Vec<u32>,
+    /// Optional zone-map over a u64 attribute (see [`set_zonemap`]). RAM-only,
+    /// not serialised: rebuilt from the attribute column on load.
+    zone: Option<ZoneMap>,
+}
+
+/// Per-cell min/max of a u64 attribute plus a cell->rows inverted index. Lets a
+/// range query skip whole cells whose `[min,max]` misses the query range, without
+/// materialising a match id-set. Opaque numeric column: the router never
+/// interprets it (time, importance score, ... are all just u64 to it).
+struct ZoneMap {
+    min: Vec<u64>,          // per cell; u64::MAX for an empty cell
+    max: Vec<u64>,          // per cell; u64::MIN for an empty cell
+    members: Vec<Vec<u64>>, // per cell, the rows it holds
 }
 
 impl IvfRouter {
@@ -106,6 +119,7 @@ impl IvfRouter {
             dim,
             n_cells,
             cell_of,
+            zone: None,
         }
     }
 
@@ -138,6 +152,94 @@ impl IvfRouter {
         let mut out: Vec<u64> = Vec::with_capacity(budget + s.len() / self.n_cells.max(1));
         for (_, c) in cells {
             out.extend_from_slice(&by_cell[&c]);
+            if out.len() >= budget {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Attach a zone-map over a u64 attribute: per-cell `[min,max]` plus a
+    /// cell->rows inverted index, so [`probe_range`](Self::probe_range) can skip
+    /// whole cells unread. `attr[row]` is the attribute of base row `row`; its
+    /// length must equal [`len`](Self::len). O(n) one pass. The column is opaque
+    /// (time, importance, ...) — the router only compares it.
+    ///
+    /// # Panics
+    /// Panics if `attr.len() != self.len()`.
+    pub fn set_zonemap(&mut self, attr: &[u64]) {
+        assert_eq!(attr.len(), self.cell_of.len(), "attr/rows length mismatch");
+        let mut min = vec![u64::MAX; self.n_cells];
+        let mut max = vec![u64::MIN; self.n_cells];
+        let mut members: Vec<Vec<u64>> = vec![Vec::new(); self.n_cells];
+        for (row, &a) in attr.iter().enumerate() {
+            let c = self.cell_of[row] as usize;
+            min[c] = min[c].min(a);
+            max[c] = max[c].max(a);
+            members[c].push(row as u64);
+        }
+        self.zone = Some(ZoneMap { min, max, members });
+    }
+
+    /// Estimate how many rows fall in `[lo, hi]` WITHOUT scanning the attribute
+    /// column: O(n_cells) over the zone-map. A fully-covered cell contributes all
+    /// its members; a straddling cell contributes a proportional share (uniform
+    /// assumption within the cell); a missed cell contributes zero. The router's
+    /// planner uses this to choose the range path vs materialising the id-set,
+    /// the same |match-set|-based decision `search_filtered_hybrid` makes. Zero
+    /// (not a panic) if no zone-map is attached.
+    #[must_use]
+    pub fn estimate_range_count(&self, lo: u64, hi: u64) -> usize {
+        let Some(z) = &self.zone else { return 0 };
+        let mut est = 0usize;
+        for c in 0..self.n_cells {
+            let (cmin, cmax) = (z.min[c], z.max[c]);
+            if z.members[c].is_empty() || cmax < lo || cmin > hi {
+                continue;
+            }
+            if cmin >= lo && cmax <= hi {
+                est += z.members[c].len();
+            } else {
+                // Straddle: assume uniform spread over [cmin,cmax].
+                let span = (cmax - cmin).saturating_add(1);
+                let ov = hi.min(cmax).saturating_sub(lo.max(cmin)).saturating_add(1);
+                est += (z.members[c].len() as u128 * ov as u128 / span as u128) as usize;
+            }
+        }
+        est
+    }
+
+    /// Zone-map probe: rows whose attribute is in `[lo, hi]`, drawn from the
+    /// query-nearest cells that OVERLAP the range and gathered up to `budget`.
+    /// Cells whose `[min,max]` misses `[lo,hi]` are skipped unread — no match
+    /// id-set is ever materialised, unlike [`probe`](Self::probe). Members of a
+    /// fully-covered cell are taken wholesale; a straddling cell is filtered by
+    /// `attr`. Returns base rows. Empty (not a panic) if no zone-map is attached.
+    #[must_use]
+    pub fn probe_range(&self, query: &[f32], lo: u64, hi: u64, attr: &[u64], budget: usize) -> Vec<u64> {
+        let Some(z) = &self.zone else { return Vec::new() };
+        // Rank the overlapping cells by query-centroid cosine (nearest first).
+        let mut cells: Vec<(f32, usize, bool)> = Vec::new(); // (score, cell, fully_covered)
+        for c in 0..self.n_cells {
+            if z.members[c].is_empty() || z.max[c] < lo || z.min[c] > hi {
+                continue; // empty or zone-map miss
+            }
+            let covered = z.min[c] >= lo && z.max[c] <= hi;
+            let ce = &self.centroids[c * self.dim..c * self.dim + self.dim];
+            cells.push((cosine_f32(query, ce), c, covered));
+        }
+        cells.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let mut out: Vec<u64> = Vec::with_capacity(budget + 64);
+        for (_, c, covered) in cells {
+            if covered {
+                out.extend_from_slice(&z.members[c]);
+            } else {
+                for &row in &z.members[c] {
+                    if (lo..=hi).contains(&attr[row as usize]) {
+                        out.push(row);
+                    }
+                }
+            }
             if out.len() >= budget {
                 break;
             }
@@ -226,6 +328,7 @@ impl IvfRouter {
             dim,
             n_cells,
             cell_of,
+            zone: None,
         })
     }
 }
@@ -292,5 +395,35 @@ mod tests {
         let ivf = IvfRouter::build(&data, 500, 8, 64, 4);
         let s: Vec<u64> = (0..50).collect();
         assert_eq!(ivf.probe(&spread(1, 8), &s, 1000).len(), 50);
+    }
+
+    #[test]
+    fn zonemap_range_is_exact_and_estimate_is_close() {
+        // attr[row] = row, so [lo,hi] selects exactly rows lo..=hi.
+        let n = 2000u32;
+        let dim = 8;
+        let mut ivf = IvfRouter::build(
+            &(0..n).flat_map(|r| spread(r, dim)).collect::<Vec<f32>>(),
+            n,
+            dim,
+            IvfRouter::cells_for(n as usize),
+            4,
+        );
+        let attr: Vec<u64> = (0..n as u64).collect();
+        ivf.set_zonemap(&attr);
+        let (lo, hi) = (400u64, 899u64); // exactly 500 rows
+        let query = spread(42, dim);
+
+        // probe_range returns ONLY in-range rows (no false positives).
+        let got = ivf.probe_range(&query, lo, hi, &attr, 10_000);
+        assert!(got.iter().all(|&r| (lo..=hi).contains(&attr[r as usize])), "no out-of-range rows");
+        // Budget above the match count -> every in-range row surfaces.
+        assert_eq!(got.len(), 500, "all 500 matches within budget");
+
+        // Estimate is within 10% of truth without scanning the column.
+        let est = ivf.estimate_range_count(lo, hi);
+        assert!((est as i64 - 500).abs() <= 50, "estimate {est} ~ 500");
+        // Empty on a range outside the domain.
+        assert_eq!(ivf.probe_range(&query, 5000, 6000, &attr, 100).len(), 0);
     }
 }

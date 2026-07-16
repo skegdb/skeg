@@ -225,3 +225,11 @@ harness = false
 [[bench]]
 name = "scale_churn"
 harness = false
+
+[[bench]]
+name = "attr_zonemap"
+harness = false
+
+[[bench]]
+name = "range_e2e"
+harness = false
