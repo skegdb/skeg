@@ -52,6 +52,9 @@ manual_is_multiple_of = "allow"   # 1.93 asks for `.is_multiple_of()` which is u
 [workspace.dependencies]
 # Async
 tokio = { version = "1", features = ["full"] }
+# Already in the tree transitively; used directly for bounded concurrency over
+# !Send futures (buffer_unordered), which tokio's JoinSet cannot express.
+futures-util = { version = "0.3", default-features = false }
 
 # Framing & bytes
 bytes = "1"

@@ -31,6 +31,12 @@ pub enum Command {
         key: Bytes,
         value: Bytes,
     },
+    /// `APPEND key value` => integer reply with the new value length. Creates
+    /// the key (as `SET`) if absent.
+    Append {
+        key: Bytes,
+        value: Bytes,
+    },
     /// `DEL key [key ...]` => integer reply with the count of keys
     /// that existed and were removed.
     Del {
@@ -130,6 +136,29 @@ pub enum Command {
     SkegVsearch {
         args: Vec<Bytes>,
     },
+
+    /// `SKEG.SUBJECT.ERASE prefix`. Arity 1. Erase every KV key of the calling
+    /// tenant whose app-key bytes start with `prefix` (a data subject within
+    /// the tenant, GDPR Art. 17). Logical delete; pair with `SKEG.RECLAIM` for
+    /// physical removal. Inner parsing in the dispatcher.
+    SkegSubjectErase {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.TENANT.ERASE tenant`. Arity 1. Admin only; erase a whole named
+    /// tenant (its vindexes and every KV key). Inner parsing in the dispatcher.
+    SkegTenantErase {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.TENANT.DELETE tenant`. Arity 1. Admin only; the full offboarding
+    /// lifecycle - erase the tenant's data (as ERASE) AND remove its logins and
+    /// limits from the identity store, so the tenant ceases to exist. Inner
+    /// parsing in the dispatcher.
+    SkegTenantDelete {
+        args: Vec<Bytes>,
+    },
+    /// `SKEG.RECLAIM`. Arity 0. Admin only; physically reclaim every dead byte
+    /// across the store (the durable half of an erase). Store-wide and heavy.
+    SkegReclaim,
 
     /// `SKEG.QUOTA.SET tenant max_vectors max_disk_bytes`. Arity 3. Admin
     /// only; sets a tenant's hard quotas. Each limit is a u64, or `*` for
@@ -244,6 +273,7 @@ pub fn parse_command(frame: Frame) -> Result<Command, CommandError> {
         "ECHO" => Ok(Command::Echo(parse_echo(args)?)),
         "GET" => parse_kv_get(args),
         "SET" => parse_kv_set(args),
+        "APPEND" => parse_kv_append(args),
         "DEL" => parse_kv_del(args),
         "EXISTS" => parse_kv_exists(args),
         "MGET" => parse_kv_mget(args),
@@ -303,6 +333,38 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVindexCreate { args })
+        }
+        "SUBJECT.ERASE" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.SUBJECT.ERASE",
+                });
+            }
+            Ok(Command::SkegSubjectErase { args })
+        }
+        "TENANT.ERASE" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.TENANT.ERASE",
+                });
+            }
+            Ok(Command::SkegTenantErase { args })
+        }
+        "TENANT.DELETE" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.TENANT.DELETE",
+                });
+            }
+            Ok(Command::SkegTenantDelete { args })
+        }
+        "RECLAIM" => {
+            if !args.is_empty() {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.RECLAIM",
+                });
+            }
+            Ok(Command::SkegReclaim)
         }
         "VINDEX.DROP" => {
             if args.len() != 1 {
@@ -422,6 +484,15 @@ fn parse_kv_set(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
     let value = args.swap_remove(1);
     let key = args.swap_remove(0);
     Ok(Command::Set { key, value })
+}
+
+fn parse_kv_append(mut args: Vec<Bytes>) -> Result<Command, CommandError> {
+    if args.len() != 2 {
+        return Err(CommandError::WrongArity { command: "APPEND" });
+    }
+    let value = args.swap_remove(1);
+    let key = args.swap_remove(0);
+    Ok(Command::Append { key, value })
 }
 
 fn parse_kv_del(args: Vec<Bytes>) -> Result<Command, CommandError> {
@@ -840,6 +911,26 @@ mod tests {
     }
 
     #[test]
+    fn append_two_args() {
+        let cmd = parse_command(arr(&[b"APPEND", b"k", b"v"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Append {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+            }
+        );
+        assert!(
+            parse_command(arr(&[b"APPEND", b"k"])).is_err(),
+            "arity 1 rejected"
+        );
+        assert!(
+            parse_command(arr(&[b"APPEND", b"k", b"v", b"x"])).is_err(),
+            "arity 3 rejected"
+        );
+    }
+
+    #[test]
     fn set_wrong_arity() {
         let err = parse_command(arr(&[b"SET", b"k"])).unwrap_err();
         assert_eq!(err.to_string(), "wrong number of arguments for 'SET'");
@@ -1165,6 +1256,67 @@ mod tests {
     fn skeg_vindex_list_no_args() {
         let cmd = parse_command(arr(&[b"SKEG.VINDEX.LIST"])).unwrap();
         assert_eq!(cmd, Command::SkegVindexList);
+    }
+
+    #[test]
+    fn skeg_subject_erase_takes_one_prefix() {
+        let cmd = parse_command(arr(&[b"SKEG.SUBJECT.ERASE", b"user:42/"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SkegSubjectErase {
+                args: vec![Bytes::from_static(b"user:42/")]
+            }
+        );
+        assert!(
+            parse_command(arr(&[b"SKEG.SUBJECT.ERASE"])).is_err(),
+            "arity 0 rejected"
+        );
+        assert!(
+            parse_command(arr(&[b"SKEG.SUBJECT.ERASE", b"a", b"b"])).is_err(),
+            "arity 2 rejected"
+        );
+    }
+
+    #[test]
+    fn skeg_tenant_erase_takes_one_name() {
+        let cmd = parse_command(arr(&[b"SKEG.TENANT.ERASE", b"acme"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SkegTenantErase {
+                args: vec![Bytes::from_static(b"acme")]
+            }
+        );
+        assert!(
+            parse_command(arr(&[b"SKEG.TENANT.ERASE"])).is_err(),
+            "arity 0 rejected"
+        );
+    }
+
+    #[test]
+    fn skeg_tenant_delete_takes_one_name() {
+        let cmd = parse_command(arr(&[b"SKEG.TENANT.DELETE", b"acme"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SkegTenantDelete {
+                args: vec![Bytes::from_static(b"acme")]
+            }
+        );
+        assert!(
+            parse_command(arr(&[b"SKEG.TENANT.DELETE"])).is_err(),
+            "arity 0 rejected"
+        );
+    }
+
+    #[test]
+    fn skeg_reclaim_no_args() {
+        assert_eq!(
+            parse_command(arr(&[b"SKEG.RECLAIM"])).unwrap(),
+            Command::SkegReclaim
+        );
+        assert!(
+            parse_command(arr(&[b"SKEG.RECLAIM", b"x"])).is_err(),
+            "arity 1 rejected"
+        );
     }
 
     #[test]

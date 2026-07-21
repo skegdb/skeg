@@ -1261,8 +1261,46 @@ impl QuantizedVectors {
             }
             calib.unwrap_or_default()
         } else {
+            // No cross-row dependency (tq2/tq4, or tq1 on an expanded dim): each
+            // row's rotate+quantise is independent, and the rotation (FHT) is the
+            // dominant cost. Buffer rows into a chunk and encode the chunk across
+            // all cores; output stays in row order. Bounded extra RAM = one chunk
+            // of f32 rows. This is the serve-open hot path at 500k+.
+            const TQ_PAR_CHUNK_ROWS: usize = 8192;
             let identity = Tq1Aniso::default();
-            for_each_row(&mut |row| enc(row, &identity, &mut codes_buf, &mut scales))?;
+            let mut buf: Vec<f32> = Vec::with_capacity(TQ_PAR_CHUNK_ROWS * dim);
+            let flush = |buf: &[f32], codes_buf: &mut Vec<u8>, scales: &mut Vec<f32>| {
+                let rows = buf.len() / dim;
+                let out: Vec<(Vec<u8>, f32)> = (0..rows)
+                    .into_par_iter()
+                    .map(|j| {
+                        turboquant_encode_vec(
+                            &buf[j * dim..(j + 1) * dim],
+                            dim,
+                            bits,
+                            code_bytes,
+                            &rotation,
+                            &centroids,
+                            &boundaries,
+                            &identity,
+                        )
+                    })
+                    .collect();
+                for (c, s) in out {
+                    codes_buf.extend_from_slice(&c);
+                    scales.push(s);
+                }
+            };
+            for_each_row(&mut |row| {
+                buf.extend_from_slice(row);
+                if buf.len() >= TQ_PAR_CHUNK_ROWS * dim {
+                    flush(&buf, &mut codes_buf, &mut scales);
+                    buf.clear();
+                }
+            })?;
+            if !buf.is_empty() {
+                flush(&buf, &mut codes_buf, &mut scales);
+            }
             identity
         };
         debug_assert_eq!(scales.len(), n, "streamed row count disagrees with n");

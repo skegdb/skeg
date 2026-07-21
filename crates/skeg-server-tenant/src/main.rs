@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.workers,
             cfg.tier_mmap,
             cfg.graph_mmap,
+            cfg.tier,
         )
         .await?
     };
@@ -99,7 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_tier(arg: Option<&String>) -> QuantKind {
     match arg.map(String::as_str) {
-        None | Some("int8") => QuantKind::Int8,
+        None => skeg_server::DEFAULT_RW_TIER,
+        Some("int8") => QuantKind::Int8,
         Some("pq") => QuantKind::Pq { m: 128, k: 256 },
         Some(s) if s.starts_with("pq:") => {
             let mut parts = s[3..].split(':');

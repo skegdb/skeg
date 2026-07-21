@@ -107,7 +107,7 @@ fn main() {
     );
     println!("recall (real): {n} x {pad}, {} queries", queries.len());
     println!(
-        "{:<5} {:<8}  {:>10}  {:>11}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>9}",
+        "{:<5} {:<8}  {:>10}  {:>11}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
         "tier",
         "walk",
         "recall@10",
@@ -117,7 +117,8 @@ fn main() {
         "ramIdle",
         "rssIdle",
         "rssHot",
-        "qps"
+        "qps",
+        "build_s"
     );
 
     // SKEG_BITS=1 (or 2/4) restricts to one tier - skips the wasted tq2 build on

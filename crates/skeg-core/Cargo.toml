@@ -1,6 +1,6 @@
 [package]
 name = "skeg-core"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,6 +25,7 @@ ahash = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -51,6 +52,23 @@ harness = false
 # Does fair eviction's over-share scan bottleneck as resident tenants grow?
 [[bench]]
 name = "cache_eviction_scaling"
+harness = false
+
+# How does VLog::keys() materialisation scale with the live key count?
+[[bench]]
+name = "set_many_throughput"
+harness = false
+
+[[bench]]
+name = "append_cost"
+harness = false
+
+[[bench]]
+name = "recovery_scaling"
+harness = false
+
+[[bench]]
+name = "keys_scaling"
 harness = false
 
 [lints]

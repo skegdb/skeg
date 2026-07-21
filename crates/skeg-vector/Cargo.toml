@@ -1,6 +1,6 @@
 [package]
 name = "skeg-vector"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -208,4 +208,28 @@ harness = false
 
 [[bench]]
 name = "tier_mmap"
+harness = false
+
+[[bench]]
+name = "churn_gate"
+harness = false
+
+[[bench]]
+name = "churn_recall"
+harness = false
+
+[[bench]]
+name = "trunc_hunt"
+harness = false
+
+[[bench]]
+name = "scale_churn"
+harness = false
+
+[[bench]]
+name = "attr_zonemap"
+harness = false
+
+[[bench]]
+name = "range_e2e"
 harness = false

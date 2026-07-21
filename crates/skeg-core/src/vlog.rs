@@ -33,6 +33,8 @@ use crate::cache::S3Fifo;
 use crate::group_commit::{Durability, GroupCommitter};
 use crate::index::{Index, IndexEntry, fingerprint};
 use crate::record::{Record, RecordKind, decode_record, encode_record, padded_record_size};
+use futures_util::stream::{self, StreamExt};
+
 use crate::segment::{MAX_SEGMENT_SIZE, list_segments, scan_file, segment_path};
 use crate::snapshot;
 use crate::{Error, Result};
@@ -45,6 +47,61 @@ const CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// A segment whose live-bytes ratio falls below this gets compacted.
 const COMPACTION_LIVE_RATIO: f64 = 0.5;
+
+/// Survivor relocations kept in flight while compacting one segment, so they
+/// share group-commit flushes instead of paying one each. Matches the shard's
+/// erase-sweep bound; segment rotation stays inside the concurrency ordinary
+/// writes already drive.
+const RELOCATE_CONCURRENCY: usize = 256;
+
+/// One relocation's contribution: `(dest_segment, padded_bytes, is_data)`.
+/// `None` when the record was skipped (a re-SET tombstone or a stale data
+/// record the index no longer points at).
+type RelocOutcome = Result<Option<(u16, u32, bool)>>;
+
+/// Recovery-time gate for atomic batches ([`VLog::set_many`]). A `BatchBegin(N)`
+/// header opens a run of `N` records; the gate withholds them until all `N`
+/// have been scanned, then releases them for application. A run torn by a crash
+/// (fewer than `N` durable before the scan hits the corrupt tail) is never
+/// released, which is what makes `set_many` all-or-nothing on reopen. A batch
+/// never spans segments (its blob is written to one segment), so a fresh gate
+/// per segment is enough; anything still pending when a segment ends is dropped.
+#[derive(Default)]
+struct BatchGate {
+    expect: Option<usize>,
+    pending: Vec<(u64, Record)>,
+}
+
+impl BatchGate {
+    /// Feed one scanned record, invoking `apply` on each record that is ready.
+    /// A record outside a batch is applied straight through (zero allocation -
+    /// the hot path for every normal recovery); a batch's members are held in
+    /// `pending` and applied together once the batch completes.
+    fn feed(&mut self, offset: u64, rec: Record, mut apply: impl FnMut(u64, Record)) {
+        if rec.kind == RecordKind::BatchBegin {
+            let n = rec
+                .value
+                .get(..4)
+                .and_then(|b| b.try_into().ok())
+                .map_or(0, u32::from_le_bytes) as usize;
+            self.pending.clear();
+            self.expect = (n > 0).then_some(n);
+            return;
+        }
+        match self.expect {
+            Some(n) => {
+                self.pending.push((offset, rec));
+                if self.pending.len() == n {
+                    self.expect = None;
+                    for (o, r) in self.pending.drain(..) {
+                        apply(o, r);
+                    }
+                }
+            }
+            None => apply(offset, rec),
+        }
+    }
+}
 
 /// A read handle on a segment file, plus its tracked live-bytes counter.
 struct ReadSegment {
@@ -76,7 +133,26 @@ struct VLogInner {
     /// standalone `VLog` gets its own counter (single shard = already global).
     tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     active: RefCell<ActiveState>,
+    /// Serialises segment rotation. Appends run concurrently (the shard spawns a
+    /// task per request, plus the compaction/reclaim drivers), so two of them
+    /// can both observe the active segment full and both try to create the same
+    /// `old_id + 1` file, colliding with `EEXIST`. Rotation is rare (once per
+    /// full segment), so the fast path skips the lock entirely and only a
+    /// rotation pays for it; the body re-checks the fill under the lock.
+    rotate_lock: tokio::sync::Mutex<()>,
+    /// Serialises `append`'s read-modify-write. Requests run concurrently on the
+    /// shard, so two appends to the same key would otherwise both read the old
+    /// value and both write old+delta, silently dropping one delta. Held across
+    /// the whole read+write, so appends on this store are serial; ordinary
+    /// set/get/del are untouched.
+    append_lock: tokio::sync::Mutex<()>,
     clock: Cell<u64>,
+    /// Exclusive advisory lock on the store directory, held for the lifetime of
+    /// the open store so a second process cannot open it concurrently and race
+    /// appends into the same segments. Released when the last `VLog` clone drops
+    /// (or the process exits). Declared last so it is dropped after the rest of
+    /// the store state.
+    _lock: skeg_platform::DirLock,
 }
 
 /// A per-tenant live-disk-byte counter shared across a shard set, so the disk
@@ -172,6 +248,9 @@ impl VLog {
         tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        // Take the store lock before touching any segment: recovery can truncate
+        // a torn tail, so even opening must be single-process.
+        let store_lock = skeg_platform::DirLock::acquire_exclusive(dir)?;
         let seg_ids = list_segments(dir)?;
         let last_id = seg_ids.last().copied();
 
@@ -210,20 +289,23 @@ impl VLog {
                     continue;
                 }
                 let id = seg.id;
+                let mut gate = BatchGate::default();
                 let last_valid = scan_file(&seg.file, |offset, rec| {
                     max_ts = max_ts.max(rec.ts);
-                    if rec.kind == RecordKind::Tombstone {
-                        index.remove(&rec.key);
-                    } else {
-                        let entry = IndexEntry {
-                            fingerprint: fingerprint(&rec.key),
-                            segment_id: id,
-                            _pad: 0,
-                            offset: offset as u32,
-                            size: padded_record_size(rec.key.len(), rec.value.len()) as u32,
-                        };
-                        index.set(rec.key, entry);
-                    }
+                    gate.feed(offset, rec, |off, r| {
+                        if r.kind == RecordKind::Tombstone {
+                            index.remove(&r.key);
+                        } else {
+                            let entry = IndexEntry {
+                                fingerprint: fingerprint(&r.key),
+                                segment_id: id,
+                                _pad: 0,
+                                offset: off as u32,
+                                size: padded_record_size(r.key.len(), r.value.len()) as u32,
+                            };
+                            index.set(r.key, entry);
+                        }
+                    });
                 })?;
                 if Some(id) == last_id {
                     seg.file.truncate_sync(last_valid)?;
@@ -234,23 +316,24 @@ impl VLog {
             let mut winners: AHashMap<Vec<u8>, (u64, RecordKind, IndexEntry)> = AHashMap::new();
             for seg in &read_segments {
                 let id = seg.id;
+                let mut gate = BatchGate::default();
                 let last_valid = scan_file(&seg.file, |offset, rec| {
                     if rec.ts > max_ts {
                         max_ts = rec.ts;
                     }
-                    let newer = winners
-                        .get(&rec.key)
-                        .is_none_or(|&(wts, _, _)| rec.ts > wts);
-                    if newer {
-                        let entry = IndexEntry {
-                            fingerprint: fingerprint(&rec.key),
-                            segment_id: id,
-                            _pad: 0,
-                            offset: offset as u32,
-                            size: padded_record_size(rec.key.len(), rec.value.len()) as u32,
-                        };
-                        winners.insert(rec.key, (rec.ts, rec.kind, entry));
-                    }
+                    gate.feed(offset, rec, |off, r| {
+                        let newer = winners.get(&r.key).is_none_or(|&(wts, _, _)| r.ts > wts);
+                        if newer {
+                            let entry = IndexEntry {
+                                fingerprint: fingerprint(&r.key),
+                                segment_id: id,
+                                _pad: 0,
+                                offset: off as u32,
+                                size: padded_record_size(r.key.len(), r.value.len()) as u32,
+                            };
+                            winners.insert(r.key, (r.ts, r.kind, entry));
+                        }
+                    });
                 })?;
                 if Some(id) == last_id {
                     seg.file.truncate_sync(last_valid)?;
@@ -300,7 +383,10 @@ impl VLog {
                     size: active_size,
                     committer,
                 }),
+                rotate_lock: tokio::sync::Mutex::new(()),
+                append_lock: tokio::sync::Mutex::new(()),
                 clock: Cell::new(max_ts + 1),
+                _lock: store_lock,
             }),
         })
     }
@@ -421,6 +507,153 @@ impl VLog {
         Ok(())
     }
 
+    /// Append `value` to `key`'s current value (creating the key if absent) and
+    /// return the new value's length, mirroring Redis `APPEND`.
+    ///
+    /// Read-modify-write: it reads the whole current value, concatenates, and
+    /// writes the whole result as one new record - so a single append is
+    /// O(current value length). A key whose value grows over many appends costs
+    /// O(n^2) in total; that is the naive log-store cost, fine for bounded
+    /// values (e.g. a capped adjacency list) but not for an unbounded one.
+    ///
+    /// Atomic against concurrent appends: the read and the write are serialised
+    /// by the store's `append_lock`, so two appends to the same key never both
+    /// read the old value and drop a delta. Appends on one store are therefore
+    /// serial; `set`/`get`/`del` are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure or if the disk quota would be exceeded.
+    pub async fn append(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<u64> {
+        self.append_scoped(key, value, durability, 0, None).await
+    }
+
+    async fn append_scoped(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<u64> {
+        let _serialise = self.inner.append_lock.lock().await;
+        let combined = match self.get_scoped(key, tenant).await? {
+            Some(current) => {
+                let mut buf = Vec::with_capacity(current.len() + value.len());
+                buf.extend_from_slice(&current);
+                buf.extend_from_slice(value);
+                buf
+            }
+            None => value.to_vec(),
+        };
+        let new_len = combined.len() as u64;
+        self.set_scoped(key, &combined, durability, tenant, disk_limit)
+            .await?;
+        Ok(new_len)
+    }
+
+    /// Atomically write every `(key, value)` pair, or none. The pairs are
+    /// encoded behind a single `BatchBegin(N)` header and submitted as one
+    /// group-commit append - one contiguous write, one flush. If a crash tears
+    /// the write, recovery finds fewer than `N` members after the header and
+    /// drops the whole batch, so a reopened store never shows a partial MSET.
+    ///
+    /// All-or-nothing holds for THIS store only. A caller that shards keys
+    /// across several `VLog`s gets per-store atomicity, not a global
+    /// transaction - there is no cross-store coordination here.
+    ///
+    /// Later pairs win over earlier ones for a duplicate key (each carries a
+    /// higher timestamp), matching last-write-wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, or if the encoded batch exceeds one
+    /// segment (`max_seg_size`) - split into smaller batches.
+    pub async fn set_many(&self, pairs: &[(&[u8], &[u8])], durability: Durability) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Build the contiguous blob: BatchBegin(N) then one Scalar per pair,
+        // each with its own increasing timestamp so a repeated key resolves
+        // last-wins on recovery. Record the padded offset of each member
+        // relative to the blob start so we can index them after the append.
+        let n = u32::try_from(pairs.len()).map_err(|_| Error::InvalidRecord {
+            msg: "batch too large",
+        })?;
+        let header = encode_record(
+            b"",
+            &n.to_le_bytes(),
+            RecordKind::BatchBegin,
+            self.next_ts(),
+        );
+        let mut blob = header;
+        let mut member_rel: Vec<(u32, u32)> = Vec::with_capacity(pairs.len()); // (rel_offset, padded)
+        for (key, value) in pairs {
+            let rel = u32::try_from(blob.len()).map_err(|_| Error::InvalidRecord {
+                msg: "batch too large",
+            })?;
+            let rec = encode_record(key, value, RecordKind::Scalar, self.next_ts());
+            let padded = u32::try_from(rec.len()).expect("padded record fits u32");
+            member_rel.push((rel, padded));
+            blob.extend_from_slice(&rec);
+        }
+
+        let blob_len = blob.len() as u64;
+        if blob_len > self.inner.max_seg_size {
+            return Err(Error::InvalidRecord {
+                msg: "batch exceeds one segment",
+            });
+        }
+
+        // One rotation decision for the whole blob, then one append: the members
+        // cannot be split across segments or interleaved with another writer's
+        // records, which is what makes the header/member run contiguous for
+        // recovery.
+        self.maybe_rotate(blob_len).await?;
+        let (committer, seg_id) = {
+            let a = self.inner.active.borrow();
+            (a.committer.clone(), a.id)
+        };
+        let (start, padded_total) = committer.append(blob, durability).await?;
+        self.bump_active_size(seg_id, start + u64::from(padded_total));
+
+        // Now durable: apply each member to the index + accounting. Same steps
+        // as `set_scoped`, minus the per-key durability wait (already paid once).
+        let mut index = self.inner.index.borrow_mut();
+        let mut cache = self.inner.cache.borrow_mut();
+        let mut disk = self.inner.tenant_disk.lock();
+        for ((key, value), (rel, padded)) in pairs.iter().zip(&member_rel) {
+            let offset = start + u64::from(*rel);
+            if let Some(prev) = index.get(key).copied() {
+                self.dec_live(prev.segment_id, prev.size);
+                let dtenant = tenant_from_key(key);
+                if let Some(e) = disk.get_mut(&dtenant) {
+                    *e = e.saturating_sub(u64::from(prev.size));
+                }
+            }
+            self.inc_live(seg_id, *padded);
+            index.set(
+                key.to_vec(),
+                IndexEntry {
+                    fingerprint: fingerprint(key),
+                    segment_id: seg_id,
+                    _pad: 0,
+                    offset: u32::try_from(offset).expect("offset fits u32"),
+                    size: *padded,
+                },
+            );
+            cache.insert_for(
+                key,
+                Bytes::copy_from_slice(value),
+                value.len(),
+                tenant_from_key(key),
+            );
+            *disk.entry(tenant_from_key(key)).or_insert(0) += u64::from(*padded);
+        }
+        Ok(())
+    }
+
     /// DEL a key at the given durability. Returns `true` if the key existed.
     ///
     /// # Errors
@@ -512,6 +745,50 @@ impl VLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.index.borrow().is_empty()
+    }
+
+    /// Monotonic write sequence for this store: it advances by one on every
+    /// durable SET and DEL (an N-pair MSET advances it by N) and never moves on
+    /// a read. Restored across restart from the snapshot, so it does not reset.
+    /// O(1), no lock.
+    ///
+    /// A cheap store version stamp: read it once, and an unchanged value means
+    /// nothing was written since. Useful for change-detected STATS refresh,
+    /// snapshot/backup consistency checks, and invalidating derived state.
+    #[must_use]
+    pub fn write_seq(&self) -> u64 {
+        self.inner.clock.get()
+    }
+
+    /// Every live key, in unspecified order. One pass over the in-memory index;
+    /// dead (deleted/tombstoned) keys are already absent from it, so they never
+    /// appear. The returned `Vec` owns its bytes and outlives the internal
+    /// borrow.
+    ///
+    /// For GC / compaction / backup / export / key-space audits that must visit
+    /// every key once. Not a resumable cursor: the order is not stable across
+    /// mutations (the index is a hash map). Materialises the whole key set; at
+    /// large key counts prefer [`for_each_key`](Self::for_each_key), which
+    /// streams without allocating.
+    #[must_use]
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.inner.index.borrow().len());
+        self.for_each_key(|k| out.push(k.to_vec()));
+        out
+    }
+
+    /// Visit every live key once, in unspecified order, without allocating: `f`
+    /// is called with a borrow of each key. The zero-copy form of
+    /// [`keys`](Self::keys) for GC / erasure / backup sweeps that do not need to
+    /// keep the keys around.
+    ///
+    /// The index is borrowed for the whole walk, so `f` must not call back into
+    /// this store in a way that mutates it (`set` / `del` would panic on the
+    /// borrow). Collect what you need and act after the walk returns.
+    pub fn for_each_key(&self, mut f: impl FnMut(&[u8])) {
+        for (k, _) in self.inner.index.borrow().iter() {
+            f(k);
+        }
     }
 
     /// Number of segment files currently open.
@@ -632,6 +909,57 @@ impl VLog {
         }
     }
 
+    /// Physically reclaim every dead byte in the store: seal the active
+    /// segment, then compact every sealed segment that holds any dead record.
+    /// Returns the number of dead bytes reclaimed.
+    ///
+    /// `del`/overwrite only tombstone: the old value stays in its segment until
+    /// compaction rewrites the segment without it. The background loop only
+    /// compacts a segment once it is past `COMPACTION_LIVE_RATIO` dead, so a
+    /// freshly deleted value can linger indefinitely. This forces the issue for
+    /// erasure-with-guarantee (GDPR): after it returns, no tombstoned value
+    /// remains on disk.
+    ///
+    /// Store-wide, not scoped: a segment interleaves every tenant's records in
+    /// write order, so "reclaim only tenant T" is not expressible at this
+    /// layer. Reclaiming other tenants' already-dead bytes too is harmless.
+    /// O(bytes in segments that have any dead record) - heavy; call it after a
+    /// batch of deletes, not per key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure.
+    pub async fn reclaim_all_dead(&self) -> Result<u64> {
+        // Seal the active segment so its own dead bytes become compactable
+        // (the active segment is never a compaction candidate). A huge
+        // `incoming` forces the rotation unless the active is empty, in which
+        // case it holds nothing to reclaim anyway.
+        self.maybe_rotate(self.inner.max_seg_size).await?;
+
+        // Snapshot the targets up front - sealed segments with any dead byte -
+        // so freshly written relocation segments are never re-picked and the
+        // loop cannot diverge.
+        let targets: Vec<(u16, u64)> = {
+            let active_id = self.inner.active.borrow().id;
+            let segs = self.inner.read_segments.borrow();
+            segs.iter()
+                .filter(|s| s.id != active_id)
+                .filter_map(|s| {
+                    let total = s.file.size().unwrap_or(0);
+                    let dead = total.saturating_sub(s.live.get());
+                    (total > 0 && dead > 0).then_some((s.id, dead))
+                })
+                .collect()
+        };
+
+        let mut freed = 0u64;
+        for (id, dead) in targets {
+            self.compact_segment(id).await?;
+            freed += dead;
+        }
+        Ok(freed)
+    }
+
     /// Compact `seg_id`: relocate its still-live records into the active
     /// segment, then delete the source file. The active segment is never
     /// compacted.
@@ -679,54 +1007,72 @@ impl VLog {
             }
         };
 
-        for (offset, rec) in records {
-            if rec.kind == RecordKind::Tombstone {
-                // Carry the tombstone forward only while the key stays deleted.
-                // A concurrent re-SET (higher timestamp) wins on recovery, so a
-                // stale carried tombstone can never resurrect a key.
-                let still_deleted = self.inner.index.borrow().get(&rec.key).is_none();
-                if still_deleted {
-                    let (nseg, _, _) = self
-                        .append_raw(
-                            &rec.key,
-                            b"",
-                            RecordKind::Tombstone,
-                            rec.ts,
-                            Durability::Relaxed,
-                        )
-                        .await?;
-                    note_dest(nseg, &mut dest_segments);
+        // Relocate concurrently. Each record awaits its own `append_raw`; doing
+        // them one at a time puts a single record in every group-commit batch
+        // and pays a flush per record (~3.6 ms each, ~90 s to relocate 25k
+        // survivors). `buffer_unordered` keeps many in flight so they share
+        // flushes. Safe: `append_raw` never holds a RefCell borrow across its
+        // await (the shard already runs concurrent set/del on this same path),
+        // and each record touches only its own key's index entry, so distinct
+        // records never collide. Bound so a single compaction cannot swamp the
+        // committer past what ordinary write traffic drives.
+        let outcomes: Vec<RelocOutcome> = stream::iter(records)
+            .map(|(offset, rec)| async move {
+                if rec.kind == RecordKind::Tombstone {
+                    // Carry the tombstone forward only while the key stays
+                    // deleted. A concurrent re-SET (higher timestamp) wins on
+                    // recovery, so a stale carried tombstone cannot resurrect.
+                    if self.inner.index.borrow().get(&rec.key).is_none() {
+                        let (nseg, _, _) = self
+                            .append_raw(
+                                &rec.key,
+                                b"",
+                                RecordKind::Tombstone,
+                                rec.ts,
+                                Durability::Relaxed,
+                            )
+                            .await?;
+                        return Ok(Some((nseg, 0u32, false)));
+                    }
+                    return Ok(None);
                 }
-                continue;
-            }
+                // A data record is live iff the index still points at this
+                // exact location.
+                if !self.index_points_at(&rec.key, seg_id, offset) {
+                    return Ok(None);
+                }
+                let (nseg, noff, npad) = self
+                    .append_raw(&rec.key, &rec.value, rec.kind, rec.ts, Durability::Relaxed)
+                    .await?;
+                // Recheck-CAS: a concurrent SET may have moved the key during
+                // the await above. Only adopt the relocated copy if nothing
+                // changed; otherwise it is dead bytes in the active segment,
+                // reclaimed when that segment is itself compacted.
+                if self.index_points_at(&rec.key, seg_id, offset) {
+                    let entry = IndexEntry {
+                        fingerprint: fingerprint(&rec.key),
+                        segment_id: nseg,
+                        _pad: 0,
+                        offset: noff,
+                        size: npad,
+                    };
+                    self.inner.index.borrow_mut().set(rec.key.clone(), entry);
+                    self.inc_live(nseg, npad);
+                }
+                Ok(Some((nseg, npad, true)))
+            })
+            .buffer_unordered(RELOCATE_CONCURRENCY)
+            .collect()
+            .await;
 
-            // A data record is live iff the index still points at this exact
-            // location.
-            if !self.index_points_at(&rec.key, seg_id, offset) {
-                continue;
+        for outcome in outcomes {
+            if let Some((nseg, npad, is_data)) = outcome? {
+                note_dest(nseg, &mut dest_segments);
+                moved_bytes += u64::from(npad);
+                if is_data {
+                    moved += 1;
+                }
             }
-            let (nseg, noff, npad) = self
-                .append_raw(&rec.key, &rec.value, rec.kind, rec.ts, Durability::Relaxed)
-                .await?;
-            moved += 1;
-            moved_bytes += u64::from(npad);
-            note_dest(nseg, &mut dest_segments);
-
-            // Recheck-CAS: a concurrent SET may have moved the key during the
-            // await above. Only adopt the relocated copy if nothing changed.
-            if self.index_points_at(&rec.key, seg_id, offset) {
-                let entry = IndexEntry {
-                    fingerprint: fingerprint(&rec.key),
-                    segment_id: nseg,
-                    _pad: 0,
-                    offset: noff,
-                    size: npad,
-                };
-                self.inner.index.borrow_mut().set(rec.key.clone(), entry);
-                self.inc_live(nseg, npad);
-            }
-            // else: the relocated copy is dead bytes in the active segment; it
-            // will be reclaimed when that segment is itself compacted.
         }
 
         // Each relocation's `append_raw` resolved only after its `write_at`, so
@@ -750,7 +1096,18 @@ impl VLog {
             .read_segments
             .borrow_mut()
             .retain(|s| s.id != seg_id);
-        std::fs::remove_file(segment_path(&self.inner.dir, seg_id))?;
+        // Tolerate an already-removed file: `compact_segment` now has two
+        // callers on the same store (the background maintenance loop and
+        // `reclaim_all_dead`). They interleave at the `await`s above, so both
+        // can pass the `find` guard on the same seg_id with a cloned file
+        // handle, relocate its records (harmless - the recheck-CAS dedups), and
+        // then both reach here. The second unlink would be `ENOENT`; that is the
+        // work already done, not an error.
+        match std::fs::remove_file(segment_path(&self.inner.dir, seg_id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         // Any existing snapshot may reference the now-removed segment.
         let _ = snapshot::remove(&self.inner.dir);
         Ok(moved)
@@ -840,6 +1197,20 @@ impl VLog {
             return Ok(());
         }
 
+        // Serialise the rotation itself. Without this, two concurrent appends
+        // both see the segment full and both create `old_id + 1` (EEXIST on the
+        // loser). Re-check the fill under the lock: if a peer rotated while we
+        // waited, the active is fresh and our record now fits, so there is
+        // nothing to do.
+        let _rotating = self.inner.rotate_lock.lock().await;
+        let needs = {
+            let a = self.inner.active.borrow();
+            a.size + incoming > self.inner.max_seg_size
+        };
+        if !needs {
+            return Ok(());
+        }
+
         let old_id = self.inner.active.borrow().id;
         let new_id = old_id.checked_add(1).ok_or(Error::InvalidRecord {
             msg: "segment id overflow",
@@ -907,6 +1278,18 @@ impl TenantView<'_> {
     pub async fn set(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
         self.vlog
             .set_scoped(key, value, durability, self.tenant, self.disk_limit)
+            .await
+    }
+
+    /// APPEND to a key, charged and quota-checked against this view's tenant.
+    /// Returns the new value length. See [`VLog::append`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure or if the disk quota would be exceeded.
+    pub async fn append(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<u64> {
+        self.vlog
+            .append_scoped(key, value, durability, self.tenant, self.disk_limit)
             .await
     }
 
@@ -1190,6 +1573,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_seq_advances_on_writes_only_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let after_del;
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            let s0 = v.write_seq();
+            v.set(b"k1", b"v1", Durability::Kernel).await.unwrap();
+            let s1 = v.write_seq();
+            assert!(s1 > s0, "SET must advance write_seq");
+            // A read leaves it untouched.
+            v.get(b"k1").await.unwrap();
+            assert_eq!(v.write_seq(), s1, "a read must not advance write_seq");
+            v.del(b"k1", Durability::Kernel).await.unwrap();
+            after_del = v.write_seq();
+            assert!(after_del > s1, "DEL must advance write_seq");
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+        }
+        // Reopen: the sequence resumes past the last write, never resets to 0.
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert!(
+            v.write_seq() >= after_del,
+            "write_seq must not reset across reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_seq_counts_effective_writes_exactly() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let base = v.write_seq();
+        // N distinct SETs advance by exactly N.
+        for i in 0u32..5 {
+            v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        assert_eq!(v.write_seq(), base + 5, "5 SETs advance by exactly 5");
+        // Overwriting an existing key is still a write.
+        v.set(b"k0", b"v2", Durability::Kernel).await.unwrap();
+        assert_eq!(v.write_seq(), base + 6, "overwrite advances");
+        // DEL of a missing key is a no-op: it must not advance.
+        let before = v.write_seq();
+        assert!(!v.del(b"absent", Durability::Kernel).await.unwrap());
+        assert_eq!(
+            v.write_seq(),
+            before,
+            "DEL of a missing key must not advance"
+        );
+        // DEL of a present key advances by exactly one.
+        assert!(v.del(b"k0", Durability::Kernel).await.unwrap());
+        assert_eq!(
+            v.write_seq(),
+            before + 1,
+            "DEL of a present key advances by one"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_lists_every_live_key_and_no_dead_ones() {
+        use std::collections::BTreeSet;
+        let dir = TempDir::new().unwrap();
+        let after_reopen;
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            assert!(v.keys().is_empty(), "empty store has no keys");
+            v.set(b"a", b"1", Durability::Kernel).await.unwrap();
+            v.set(b"b", b"2", Durability::Kernel).await.unwrap();
+            v.set(b"c", b"3", Durability::Kernel).await.unwrap();
+            // Overwrite must not duplicate the key.
+            v.set(b"a", b"1b", Durability::Kernel).await.unwrap();
+            // Delete must drop the key from the listing.
+            v.del(b"b", Durability::Kernel).await.unwrap();
+
+            let got: BTreeSet<Vec<u8>> = v.keys().into_iter().collect();
+            let want: BTreeSet<Vec<u8>> = [b"a".to_vec(), b"c".to_vec()].into_iter().collect();
+            assert_eq!(got, want, "keys = live set, order-agnostic");
+            assert_eq!(v.keys().len(), v.len(), "keys count matches len()");
+            assert_eq!(v.keys().len(), 2);
+
+            v.write_snapshot().await.unwrap();
+            v.flush().await.unwrap();
+            after_reopen = got;
+        }
+        // Keys survive a reopen (recovered from the index).
+        let v = VLog::open(dir.path()).await.unwrap();
+        let got: std::collections::BTreeSet<Vec<u8>> = v.keys().into_iter().collect();
+        assert_eq!(got, after_reopen, "keys recovered on reopen");
+    }
+
+    #[tokio::test]
+    async fn for_each_key_streams_the_same_live_set_as_keys() {
+        use std::collections::BTreeSet;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        // Empty store: f is never called.
+        let mut calls = 0usize;
+        v.for_each_key(|_| calls += 1);
+        assert_eq!(calls, 0, "no keys, no calls");
+
+        for i in 0u32..20 {
+            v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        v.del(b"k0", Durability::Kernel).await.unwrap();
+
+        // for_each_key visits exactly the live set, once each.
+        let mut streamed: Vec<Vec<u8>> = Vec::new();
+        v.for_each_key(|k| streamed.push(k.to_vec()));
+        assert_eq!(streamed.len(), v.len(), "one call per live key");
+        let streamed: BTreeSet<Vec<u8>> = streamed.into_iter().collect();
+        let via_keys: BTreeSet<Vec<u8>> = v.keys().into_iter().collect();
+        assert_eq!(
+            streamed, via_keys,
+            "for_each_key sees the same set as keys()"
+        );
+        assert!(
+            !streamed.contains(b"k0".as_slice()),
+            "deleted key not streamed"
+        );
+    }
+
+    #[tokio::test]
     async fn test_crash_recovery_full_scan() {
         let dir = TempDir::new().unwrap();
         {
@@ -1243,6 +1750,318 @@ mod tests {
             Some(b"data".as_slice())
         );
         assert_eq!(v.len(), 1);
+    }
+
+    /// Concatenate every segment `.seg` file's raw bytes - what a verbatim
+    /// backup of the data dir would capture.
+    fn raw_disk_bytes(dir: &std::path::Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "seg") {
+                all.extend(std::fs::read(&path).unwrap());
+            }
+        }
+        all
+    }
+
+    #[tokio::test]
+    async fn append_creates_accumulates_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            // Absent key: append creates it, returns its length.
+            assert_eq!(v.append(b"k", b"ab", Durability::Kernel).await.unwrap(), 2);
+            assert_eq!(
+                v.get(b"k").await.unwrap().as_deref(),
+                Some(b"ab".as_slice())
+            );
+            // Subsequent appends accumulate; the return is the new length.
+            assert_eq!(v.append(b"k", b"cd", Durability::Kernel).await.unwrap(), 4);
+            assert_eq!(v.append(b"k", b"e", Durability::Kernel).await.unwrap(), 5);
+            assert_eq!(
+                v.get(b"k").await.unwrap().as_deref(),
+                Some(b"abcde".as_slice())
+            );
+            v.flush().await.unwrap();
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get(b"k").await.unwrap().as_deref(),
+            Some(b"abcde".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_appends_lose_nothing() {
+        // Without the append_lock, interleaved read-modify-write would drop
+        // deltas. Fire many single-byte appends at one key concurrently and
+        // assert every byte lands (order-agnostic).
+        let dir = TempDir::new().unwrap();
+        let v = std::rc::Rc::new(VLog::open(dir.path()).await.unwrap());
+        let n = 200u32;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut handles = Vec::new();
+                for _ in 0..n {
+                    let v = v.clone();
+                    handles.push(tokio::task::spawn_local(async move {
+                        v.append(b"log", b"x", Durability::Relaxed).await.unwrap();
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            })
+            .await;
+        let got = v.get(b"log").await.unwrap().unwrap();
+        assert_eq!(got.len(), n as usize, "every concurrent append survived");
+        assert!(got.iter().all(|&b| b == b'x'));
+    }
+
+    #[tokio::test]
+    async fn set_many_writes_all_pairs_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"pre", b"0", Durability::Kernel).await.unwrap();
+            v.set_many(
+                &[
+                    (b"a".as_slice(), b"1".as_slice()),
+                    (b"b", b"2"),
+                    (b"c", b"3"),
+                    // Duplicate key in the batch: last write wins.
+                    (b"a", b"1b"),
+                ],
+                Durability::Kernel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(v.len(), 4, "pre + a,b,c (a deduped)");
+            assert_eq!(
+                v.get(b"a").await.unwrap().as_deref(),
+                Some(b"1b".as_slice())
+            );
+            assert_eq!(v.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
+            v.flush().await.unwrap();
+        }
+        // A complete batch is fully present after a reopen (recovery applies it).
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(v.len(), 4);
+        assert_eq!(
+            v.get(b"pre").await.unwrap().as_deref(),
+            Some(b"0".as_slice())
+        );
+        assert_eq!(
+            v.get(b"a").await.unwrap().as_deref(),
+            Some(b"1b".as_slice())
+        );
+        assert_eq!(v.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(v.get(b"c").await.unwrap().as_deref(), Some(b"3".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn torn_batch_is_dropped_whole_on_recovery() {
+        use crate::record::encode_record;
+        use crate::segment::segment_path;
+
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"survivor", b"ok", Durability::Kernel).await.unwrap();
+            v.flush().await.unwrap();
+        }
+        // Simulate a crash mid-`set_many`: a `BatchBegin(3)` header but only two
+        // members reach disk before the tear. Append them raw to the segment.
+        {
+            let mut blob = encode_record(b"", &3u32.to_le_bytes(), RecordKind::BatchBegin, 100);
+            blob.extend_from_slice(&encode_record(b"x", b"1", RecordKind::Scalar, 101));
+            blob.extend_from_slice(&encode_record(b"y", b"2", RecordKind::Scalar, 102));
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(segment_path(dir.path(), 0))
+                .unwrap();
+            f.write_all(&blob).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Recovery must drop the incomplete batch WHOLE: neither member appears,
+        // and the pre-batch survivor is untouched.
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get(b"survivor").await.unwrap().as_deref(),
+            Some(b"ok".as_slice())
+        );
+        assert_eq!(
+            v.get(b"x").await.unwrap(),
+            None,
+            "torn batch member x must not survive"
+        );
+        assert_eq!(
+            v.get(b"y").await.unwrap(),
+            None,
+            "torn batch member y must not survive"
+        );
+        assert_eq!(v.len(), 1, "only the survivor");
+    }
+
+    #[tokio::test]
+    async fn reclaim_all_dead_spans_many_segments() {
+        let dir = TempDir::new().unwrap();
+        // Small segments so a few hundred keys spread over many sealed segments;
+        // deleting half leaves dead bytes in most of them, so reclaim must
+        // compact many segments in one pass (the multi-segment path).
+        let v = VLog::open_with_max_segment(dir.path(), 512).await.unwrap();
+        for i in 0u32..400 {
+            v.set(
+                format!("k{i:04}").as_bytes(),
+                b"some-value-bytes",
+                Durability::Kernel,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(v.segment_count() > 5, "expected many segments");
+        // Delete every even key: dead bytes scattered across most segments.
+        for i in (0u32..400).step_by(2) {
+            v.del(format!("k{i:04}").as_bytes(), Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        v.flush().await.unwrap();
+
+        let freed = v.reclaim_all_dead().await.unwrap();
+        assert!(freed > 0, "reclaimed bytes across segments");
+        v.flush().await.unwrap();
+
+        // Survivors (odd keys) intact, deleted (even) gone.
+        for i in 0u32..400 {
+            let got = v.get(format!("k{i:04}").as_bytes()).await.unwrap();
+            if i % 2 == 0 {
+                assert_eq!(got, None, "even key {i} should be gone");
+            } else {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(b"some-value-bytes".as_slice()),
+                    "odd key {i}"
+                );
+            }
+        }
+        // Reopen: the compacted layout is consistent on disk.
+        drop(v);
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get(b"k0001").await.unwrap().as_deref(),
+            Some(b"some-value-bytes".as_slice())
+        );
+        assert_eq!(v.get(b"k0000").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn reclaim_races_the_background_compactor_without_erroring() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open_with_max_segment(dir.path(), 512).await.unwrap();
+        for i in 0u32..400 {
+            v.set(
+                format!("k{i:04}").as_bytes(),
+                b"some-value-bytes",
+                Durability::Kernel,
+            )
+            .await
+            .unwrap();
+        }
+        // Delete 3 of every 4 so segments are well past the 50% dead the
+        // background `maybe_compact` needs, and it targets the same segments
+        // `reclaim_all_dead` does.
+        for i in 0u32..400 {
+            if i % 4 != 0 {
+                v.del(format!("k{i:04}").as_bytes(), Durability::Kernel)
+                    .await
+                    .unwrap();
+            }
+        }
+        v.flush().await.unwrap();
+
+        // join! polls both on this one task, interleaving them at every await -
+        // the exact contention the shard's background loop creates against a
+        // reclaim. Neither must error on a segment the other already unlinked.
+        let (reclaimed, compacted) = tokio::join!(v.reclaim_all_dead(), v.maybe_compact());
+        reclaimed.expect("reclaim tolerates a concurrent compaction");
+        compacted.expect("compaction tolerates a concurrent reclaim");
+        v.flush().await.unwrap();
+
+        for i in 0u32..400 {
+            let got = v.get(format!("k{i:04}").as_bytes()).await.unwrap();
+            if i % 4 == 0 {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(b"some-value-bytes".as_slice()),
+                    "survivor {i}"
+                );
+            } else {
+                assert_eq!(got, None, "deleted {i}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_all_dead_physically_removes_deleted_values() {
+        let needle = b"SECRET-PII-Rossi-Mario";
+        let dir = TempDir::new().unwrap();
+        // Small segments so the deleted value lands in a sealed segment that
+        // later rotations leave behind, i.e. the realistic case.
+        let v = VLog::open_with_max_segment(dir.path(), 256).await.unwrap();
+        v.set(b"subject", needle, Durability::Kernel).await.unwrap();
+        // Write past a rotation so the secret's segment is sealed, not active.
+        for i in 0u64..20 {
+            v.set(format!("filler{i}").as_bytes(), b"x", Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        v.del(b"subject", Durability::Kernel).await.unwrap();
+        v.flush().await.unwrap();
+
+        // Gone logically at once...
+        assert_eq!(v.get(b"subject").await.unwrap(), None);
+        // ...but the raw value bytes are still on disk (tombstone only).
+        let before = raw_disk_bytes(dir.path());
+        assert!(
+            before.windows(needle.len()).any(|w| w == needle),
+            "precondition: deleted value should still be on disk before reclaim"
+        );
+
+        let freed = v.reclaim_all_dead().await.unwrap();
+        v.flush().await.unwrap();
+        assert!(freed > 0, "reclaim reported bytes freed");
+
+        // Now the bytes are physically gone, and survivors are intact.
+        let after = raw_disk_bytes(dir.path());
+        assert!(
+            !after.windows(needle.len()).any(|w| w == needle),
+            "deleted value must not survive reclaim on disk"
+        );
+        assert_eq!(v.get(b"subject").await.unwrap(), None, "still deleted");
+        for i in 0u64..20 {
+            assert_eq!(
+                v.get(format!("filler{i}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"x".as_slice()),
+                "reclaim kept live survivors"
+            );
+        }
+        // Survives a reopen: reclaim rewrote the segments, it did not just hide.
+        drop(v);
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert!(
+            !raw_disk_bytes(dir.path())
+                .windows(needle.len())
+                .any(|w| w == needle),
+            "value stays gone after reopen"
+        );
+        assert_eq!(v.get(b"subject").await.unwrap(), None);
     }
 
     #[tokio::test]

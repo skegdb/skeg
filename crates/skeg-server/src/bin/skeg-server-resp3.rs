@@ -148,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.workers,
             cfg.tier_mmap,
             cfg.graph_mmap,
+            cfg.tier,
         )
         .await?
     };

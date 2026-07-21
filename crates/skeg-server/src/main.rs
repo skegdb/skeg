@@ -49,8 +49,8 @@ OPTIONS:
     --addr <HOST:PORT>     Listen address. Default 127.0.0.1:7379. Env: SKEG_ADDR.
     --data-dir <PATH>      Data directory. Default ./data. Env: SKEG_DATA_DIR.
     --mode <MODE>          'rw' (default) or 'serve' (read-only, mmap tier).
-    --tier <KIND>          Quantizer for the serve tier:
-                             int8 (default) | pq | pq:M:K |
+    --tier <KIND>          Quantizer tier (read-write and serve):
+                             tq2 (default) | int8 | pq | pq:M:K |
                              turboquant-1 | turboquant-2 | turboquant-4
                              (aliases: tq1, tq2, tq4)
     --speed                Opt-in early-termination in greedy walk
@@ -199,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.workers,
             cfg.tier_mmap,
             cfg.graph_mmap,
+            cfg.tier,
         )
         .await?
     };
@@ -210,8 +211,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Parse a `--tier` argument:
-/// - `int8` (default): 8-bit symmetric, max recall
+/// Parse a `--tier` argument (applies to both read-write and serve modes):
+/// - default (unset): `tq2`, the product tier of record
+/// - `int8`: 8-bit symmetric, max recall
 /// - `pq` / `pq:M:K`: Product Quantization (default M=128 K=256)
 /// - `turboquant-N` where N in {1, 2, 4}: TurboQuant data-oblivious tier
 ///   (`turboquant-1` matches the PQ-128 footprint without k-means training)
@@ -219,7 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// An unknown value falls back to int8 with a warning.
 fn parse_tier(arg: Option<&String>) -> QuantKind {
     match arg.map(String::as_str) {
-        None | Some("int8") => QuantKind::Int8,
+        None => skeg_server::DEFAULT_RW_TIER,
+        Some("int8") => QuantKind::Int8,
         Some("pq") => QuantKind::Pq { m: 128, k: 256 },
         Some(s) if s.starts_with("pq:") => {
             let mut parts = s[3..].split(':');
@@ -242,7 +245,7 @@ struct Config {
     addr: String,
     data_dir: String,
     serve: bool,
-    /// Tier-1 quantisation for serve mode (ignored in read-write mode).
+    /// Tier-1 quantisation, applied in both read-write and serve modes.
     tier: QuantKind,
     /// Opt-in early-termination on the Vamana graph walk: trades
     /// 0.3-0.7% recall@10 for +40-60% QPS. Maps to `SKEG_SPEED=1` so

@@ -57,6 +57,22 @@ impl LimitsStore {
     /// Returns an IO error if the file cannot be written.
     pub fn set(&mut self, tenant: [u8; 16], limits: Limits) -> io::Result<()> {
         self.by_tenant.insert(tenant, limits);
+        self.persist()
+    }
+
+    /// Drop `tenant`'s limits and persist. A no-op (still persists) if the
+    /// tenant had no entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the file cannot be written.
+    pub fn remove(&mut self, tenant: [u8; 16]) -> io::Result<()> {
+        self.by_tenant.remove(&tenant);
+        self.persist()
+    }
+
+    /// Write the whole table out atomically (tmp + rename).
+    fn persist(&self) -> io::Result<()> {
         let body: String = self
             .by_tenant
             .iter()

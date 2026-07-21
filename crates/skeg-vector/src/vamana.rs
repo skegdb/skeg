@@ -1069,6 +1069,9 @@ const VECTORS_FILE: &str = "vectors.bin";
 const DELTA_LOG_FILE: &str = "delta.log";
 /// Persisted IVF router sidecar (centroids + cell assignment).
 const IVF_FILE: &str = "ivf.bin";
+/// Optional per-base-row u64 attribute column (little-endian), for range-filtered
+/// search. Absent unless [`DiskVamanaIndex::set_attr`] was called.
+const ATTR_FILE: &str = "attr.bin";
 /// Persists which tier-1 quantiser a read-write disk index rebuilds at `open`
 /// and `consolidate`. Absent => `Int8` (the historical default). Only the KIND
 /// is stored, not codes: every tier here is deterministic from `vectors.bin`
@@ -1222,6 +1225,514 @@ struct Segment {
     vectors_file: File,
 }
 
+/// The snapshot a background consolidate builds from. Produced by
+/// [`DiskVamanaIndex::consolidate_begin`] (short, exclusive), consumed by
+/// [`ConsolidateJob::build`] on any thread (long, no lock on the index),
+/// finished by [`DiskVamanaIndex::consolidate_finish`] (short, exclusive).
+/// Owns everything it needs: the surviving vectors, ids, and the WAL offset
+/// separating pre-snapshot records (folded) from post-snapshot ones (replayed).
+pub struct ConsolidateJob {
+    /// Newest layer: the delta captured directly at `begin` (no flush, no graph
+    /// build on the caller). Row-major, paired with `delta_ids`.
+    delta_vectors: Vec<f32>,
+    delta_ids: Vec<u64>,
+    /// Base/run survivors, read OFF-THREAD in `build` from `seg_files`.
+    /// `(id, seg_index, row)`; seg_index 0 = base, 1.. = runs.
+    survivors: Vec<(u64, usize, u32)>,
+    /// Duplicated `vectors.bin` handles [base, run0, run1, ...]. `try_clone`
+    /// dups the fd (O(1)); the reads happen off the caller in `build`. A
+    /// concurrent consolidate/flush may rename these files, but an open fd keeps
+    /// the inode, so the snapshot stays readable.
+    seg_files: Vec<File>,
+    dim: usize,
+    tier: QuantKind,
+    run_seq_high: u64,
+    wal_offset: u64,
+}
+
+/// The output of [`ConsolidateJob::build`]: a freshly built base segment,
+/// already OPENED off-thread (graph parsed + quant tier built), plus its sidecar
+/// dir for the file rename. [`DiskVamanaIndex::consolidate_finish`] swaps the
+/// segment in without a reopen, so the O(live) tier rebuild never lands on the
+/// shard thread.
+pub struct ConsolidateBuilt {
+    base: Segment,
+    tmp: PathBuf,
+    run_seq_high: u64,
+    wal_offset: u64,
+}
+
+impl ConsolidateJob {
+    /// Build the consolidated graph. CPU-heavy; run it on a background thread.
+    /// Writes into `<index dir>/consolidating/`, never touching the files the
+    /// live index serves from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the sidecar files fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<ConsolidateBuilt> {
+        let tmp = index_dir.join("consolidating");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let ConsolidateJob {
+            delta_vectors,
+            delta_ids,
+            survivors,
+            seg_files,
+            dim,
+            tier,
+            run_seq_high,
+            wal_offset,
+        } = self;
+        // Assemble the survivor set in id order (near-neighbours land at nearby
+        // rows so the re-rank stays cache-local). Reads happen HERE, off-thread:
+        // delta from RAM, base/run survivors from the duped `vectors.bin` fds.
+        enum Src {
+            Delta(usize),
+            Seg(usize, u32),
+        }
+        let total = delta_ids.len() + survivors.len();
+        let mut items: Vec<(u64, Src)> = Vec::with_capacity(total);
+        for (i, &id) in delta_ids.iter().enumerate() {
+            items.push((id, Src::Delta(i)));
+        }
+        for (id, seg, row) in survivors {
+            items.push((id, Src::Seg(seg, row)));
+        }
+        items.sort_unstable_by_key(|&(id, _)| id);
+        let mut vectors: Vec<f32> = Vec::with_capacity(total * dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(total);
+        let mut buf = vec![0u8; dim * 4];
+        for (id, src) in items {
+            match src {
+                Src::Delta(i) => vectors.extend_from_slice(&delta_vectors[i * dim..(i + 1) * dim]),
+                Src::Seg(seg, row) => {
+                    let off = HEADER_LEN as u64 + u64::from(row) * dim as u64 * 4;
+                    seg_files[seg].read_exact_at(&mut buf, off)?;
+                    vectors.extend(
+                        buf.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                    );
+                }
+            }
+            ids.push(id);
+        }
+        let cfg = disk_build_config();
+        // Cap the build's rayon parallelism. The consolidate runs off the request
+        // path on a background thread, but `build_disk_graph` fans out over the
+        // GLOBAL rayon pool (all cores), so while it runs it starves the
+        // foreground - streaming inserts and queries - of every core, collapsing
+        // sustained ingest throughput (measured: churn drops ~10x during a fold).
+        // Confine it to a bounded pool so the foreground keeps making progress.
+        let rebuilt = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
+        rebuilt.save(&tmp)?;
+        // Open the freshly-saved base HERE (still off-thread): this is where the
+        // O(live) quant-tier build happens now - not on the shard thread in
+        // finish. The vectors.bin fd survives the finish rename (inode), so the
+        // returned segment stays valid after the file moves into place.
+        let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
+        Ok(ConsolidateBuilt {
+            base,
+            tmp,
+            run_seq_high,
+            wal_offset,
+        })
+    }
+}
+
+/// Rayon thread cap for a background consolidate build, or `None` to use every
+/// core. Default: a fixed FRACTION of the machine's cores (three quarters),
+/// reserving the rest for the foreground (streaming writes and queries) so a
+/// background rebuild does not collapse ingest throughput while it runs. Being
+/// proportional means it scales with any core count (4 cores -> 3 build / 1
+/// foreground; 64 -> 48 / 16) rather than a fixed reserve that starves either
+/// side at the extremes. Override the fraction's numerator with
+/// `SKEG_CONSOLIDATE_THREADS` (an absolute thread count; 0 or >= parallelism
+/// means "all cores"). Machines with 1-2 cores are left uncapped.
+fn consolidate_thread_cap() -> Option<usize> {
+    /// Cores the build takes, out of every 4 available; the other 1/4 stays free
+    /// for the foreground.
+    const BUILD_NUM: usize = 3;
+    const BUILD_DEN: usize = 4;
+    let avail = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let n = std::env::var("SKEG_CONSOLIDATE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| (avail * BUILD_NUM / BUILD_DEN).max(1));
+    (n >= 1 && n < avail).then_some(n)
+}
+
+/// Snapshot for a background runs-only merge. Holds the live vectors folded out
+/// of the front `n_merged` runs; an off-thread [`RunMergeJob::build`] turns them
+/// into one replacement run. Unlike [`ConsolidateJob`] it never touches the base
+/// or the WAL: runs are immutable, so the merge is a read-only fold whose result
+/// the search precedence (delta > newer runs > this merged run > base) slots in
+/// correctly. Cheap (O(runs), not O(live-set)), so it can run often enough to
+/// keep the run count bounded under fast churn.
+pub struct RunMergeJob {
+    /// (seg_index, row) survivor locations, id-sorted; read OFF-THREAD in build
+    /// from the duped fds. seg_index parallels `seg_files`.
+    survivors: Vec<(usize, u32)>,
+    ids: Vec<u64>,
+    /// Duped vectors.bin fds for the folded runs (O(1) each at begin).
+    seg_files: Vec<File>,
+    dim: usize,
+    tier: QuantKind,
+    merged_seq: u64,
+    n_merged: usize,
+    old_dirs: Vec<u64>,
+}
+
+/// Output of [`RunMergeJob::build`]: the merged run already OPENED off-thread
+/// (graph + quant tier built), ready for [`DiskVamanaIndex::merge_runs_finish`]
+/// to splice in without a reopen on the shard thread.
+pub struct RunMergeBuilt {
+    merged: Segment,
+    merged_seq: u64,
+    n_merged: usize,
+    old_dirs: Vec<u64>,
+}
+
+impl RunMergeJob {
+    /// Build the merged run graph. CPU-bounded but O(runs), far cheaper than a
+    /// full consolidate; run it on a background thread. Writes `run-<seq>` under
+    /// the index dir, never touching the files the live index serves from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the run fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<RunMergeBuilt> {
+        let RunMergeJob {
+            survivors,
+            ids,
+            seg_files,
+            dim,
+            tier,
+            merged_seq,
+            n_merged,
+            old_dirs,
+        } = self;
+        let dir = index_dir.join(format!("run-{merged_seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Read survivor vectors OFF-THREAD from the duped run fds.
+        let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
+        let mut buf = vec![0u8; dim * 4];
+        for (seg, row) in survivors {
+            let off = HEADER_LEN as u64 + u64::from(row) * dim as u64 * 4;
+            seg_files[seg].read_exact_at(&mut buf, off)?;
+            vectors.extend(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
+        let cfg = disk_build_config();
+        let rebuilt = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
+        rebuilt.save(&dir)?;
+        // Open the merged run HERE (off-thread): the quant-tier build for the
+        // merged run happens now, not on the shard thread in finish.
+        let merged = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
+        Ok(RunMergeBuilt {
+            merged,
+            merged_seq,
+            n_merged,
+            old_dirs,
+        })
+    }
+}
+
+/// Snapshot for an OFF-THREAD flush of the delta into a run. `flush_begin` moves
+/// the delta aside (into the index's `flushing` staging buffer, still searched)
+/// and hands the vectors here; `build` builds the run graph + opens it, all off
+/// the caller; `flush_finish` splices the run and clears the staging. The delta
+/// batch never blocks the caller on a graph build.
+pub struct FlushJob {
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    dim: usize,
+    tier: QuantKind,
+    seq: u64,
+}
+
+/// Output of [`FlushJob::build`]: the run already opened off-thread, ready for
+/// [`DiskVamanaIndex::flush_finish`] to splice in.
+pub struct FlushBuilt {
+    run: Segment,
+    seq: u64,
+}
+
+/// Snapshot for an OFF-THREAD IVF-router rebuild. `ivf_begin` dups the base
+/// vectors fd (O(1)); `build` reads them and runs k-means off the caller;
+/// `ivf_finish` swaps the router in under a short lock. The k-means (O(live))
+/// no longer runs on the shard thread.
+pub struct IvfJob {
+    seg_file: File,
+    n: u32,
+    dim: usize,
+    n_cells: usize,
+    iters: usize,
+}
+
+/// Output of [`IvfJob::build`]: the built router, ready for
+/// [`DiskVamanaIndex::ivf_finish`] to install.
+pub struct IvfBuilt {
+    router: IvfRouter,
+}
+
+impl IvfJob {
+    /// Read the base vectors and run k-means - off the caller.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if a base-vector read fails.
+    pub fn build(self) -> io::Result<IvfBuilt> {
+        let IvfJob {
+            seg_file,
+            n,
+            dim,
+            n_cells,
+            iters,
+        } = self;
+        let mut all = vec![0f32; n as usize * dim];
+        let mut buf = vec![0u8; dim * 4];
+        for r in 0..n as usize {
+            let off = HEADER_LEN as u64 + r as u64 * dim as u64 * 4;
+            seg_file.read_exact_at(&mut buf, off)?;
+            for (slot, c) in all[r * dim..r * dim + dim]
+                .iter_mut()
+                .zip(buf.chunks_exact(4))
+            {
+                *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let n_cells = if n_cells == 0 {
+            IvfRouter::cells_for(n as usize)
+        } else {
+            n_cells
+        };
+        let router = IvfRouter::build(&all, n, dim, n_cells, iters);
+        Ok(IvfBuilt { router })
+    }
+}
+
+impl FlushJob {
+    /// Build the run graph and open it - off the caller's thread.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if writing or opening the run fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<FlushBuilt> {
+        let FlushJob {
+            vectors,
+            ids,
+            dim,
+            tier,
+            seq,
+        } = self;
+        let dir = index_dir.join(format!("run-{seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = disk_build_config();
+        let rebuilt = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
+        rebuilt.save(&dir)?;
+        let run = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
+        Ok(FlushBuilt { run, seq })
+    }
+}
+
+/// Snapshot for a background delete-patch of the base graph. Removes the base
+/// rows that are dead at `begin` (tombstoned, or shadowed by a newer copy in a
+/// run) by re-pruning only the nodes that pointed at a removed node - the
+/// FreshDiskANN lazy-deletion rule - instead of rebuilding the whole graph
+/// from scratch. Cost is O(#nodes touching a deleted node), not O(live-set), so
+/// it reclaims dead base rows far cheaper than a full consolidate. Runs are left
+/// intact: the insert side is handled by a run-merge / flush, not here.
+pub struct DeletePatchJob {
+    /// Duped base `vectors.bin` fd: the O(live) row reads happen OFF-THREAD in
+    /// `build`, not on the caller. `n_rows` rows, row-major.
+    seg_file: File,
+    n_rows: usize,
+    /// Base id by old row.
+    ids: Vec<u64>,
+    /// Base adjacency by old row (owned copy of the served graph).
+    adj: Vec<Node>,
+    /// old row -> removed at this patch.
+    dead: Vec<bool>,
+    /// Old-row medoid.
+    medoid: VecId,
+    dim: usize,
+    l_search: usize,
+    tier: QuantKind,
+}
+
+/// Output of [`DeletePatchJob::build`]: the patched base graph in a sidecar
+/// dir, ready for [`DiskVamanaIndex::delete_patch_finish`] to swap in.
+pub struct DeletePatchBuilt {
+    base: Segment,
+    tmp: PathBuf,
+}
+
+impl DeletePatchJob {
+    /// Apply the delete-patch. CPU-bounded but O(affected), far cheaper than a
+    /// full consolidate's greedy rebuild; run it on a background thread. Writes
+    /// into `<index dir>/patching/`, never touching the served files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the sidecar files fails.
+    pub fn build(self, index_dir: &Path) -> io::Result<DeletePatchBuilt> {
+        let tmp = index_dir.join("patching");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let DeletePatchJob {
+            seg_file,
+            n_rows,
+            ids,
+            adj,
+            dead,
+            medoid,
+            dim,
+            l_search,
+            tier,
+        } = self;
+        // O(live) vector read, OFF-THREAD (was on the shard thread in begin).
+        let mut vectors: Vec<f32> = Vec::with_capacity(n_rows * dim);
+        let mut buf = vec![0u8; dim * 4];
+        for row in 0..n_rows as u64 {
+            let off = HEADER_LEN as u64 + row * dim as u64 * 4;
+            seg_file.read_exact_at(&mut buf, off)?;
+            vectors.extend(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
+        let cfg = disk_build_config();
+        // Same rayon cap as the consolidate: keep a background patch from
+        // starving the foreground of every core while it runs.
+        let patched = match consolidate_thread_cap()
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+        {
+            Some(pool) => {
+                pool.install(|| patch_graph(vectors, ids, adj, &dead, medoid, dim, l_search, &cfg))
+            }
+            None => patch_graph(vectors, ids, adj, &dead, medoid, dim, l_search, &cfg),
+        };
+        patched.save(&tmp)?;
+        // Open the patched base HERE (off-thread): the O(live) tier rebuild
+        // happens off the shard thread, not in finish.
+        let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
+        Ok(DeletePatchBuilt { base, tmp })
+    }
+}
+
+/// FreshDiskANN lazy-delete patch: drop the `dead` rows and re-wire only the
+/// survivors that pointed at one. A node whose out-list held no dead neighbour
+/// keeps its edges verbatim (just row-remapped); a node that lost a neighbour
+/// gets a fresh candidate set - its live neighbours plus the live neighbours of
+/// its dead ones (bridging the gap) - and a single `robust_prune` back down to
+/// `R`. No greedy search, so the cost is the pruning of affected nodes only.
+fn patch_graph(
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    adj: Vec<Node>,
+    dead: &[bool],
+    old_medoid: VecId,
+    dim: usize,
+    l_search: usize,
+    cfg: &VamanaConfig,
+) -> VamanaIndex {
+    let n_old = ids.len();
+    // old row -> new row (u32::MAX = removed).
+    let mut remap = vec![u32::MAX; n_old];
+    let mut new_ids: Vec<u64> = Vec::new();
+    let mut new_vectors: Vec<f32> = Vec::new();
+    let mut survivors: Vec<u32> = Vec::new();
+    for row in 0..n_old {
+        if !dead[row] {
+            remap[row] = new_ids.len() as u32;
+            new_ids.push(ids[row]);
+            new_vectors.extend_from_slice(&vectors[row * dim..(row + 1) * dim]);
+            survivors.push(row as u32);
+        }
+    }
+    let n_new = new_ids.len();
+    assert!(n_new > 0, "delete-patch left no survivors");
+    // Distances during pruning are measured over the OLD row space (candidates
+    // are old rows), so prune against a source indexed by old row.
+    let old_src = InMemoryVectorSource::new(vectors, dim);
+    let new_nodes: Vec<Node> = survivors
+        .par_iter()
+        .map(|&p| {
+            let out = adj[p as usize].slice();
+            let touches_dead = out.iter().any(|&w| dead[w as usize]);
+            let mut node = Node::new();
+            if !touches_dead {
+                // Fast path: edges intact, just remap to new rows.
+                let kept: SmallVec<[VecId; MAX_R]> =
+                    out.iter().map(|&w| remap[w as usize]).collect();
+                node.set(&kept);
+                return node;
+            }
+            // Bridge over dead neighbours, then prune back to R.
+            let mut cand: AHashSet<VecId> = AHashSet::new();
+            for &w in out {
+                if !dead[w as usize] {
+                    cand.insert(w);
+                } else {
+                    for &x in adj[w as usize].slice() {
+                        if x != p && !dead[x as usize] {
+                            cand.insert(x);
+                        }
+                    }
+                }
+            }
+            let pv = old_src.row(p);
+            let mut scored: Vec<(f32, VecId)> = cand
+                .iter()
+                .map(|&c| (dist(pv, old_src.row(c)), c))
+                .collect();
+            let picked = robust_prune(p, &mut scored, cfg.alpha2, cfg.r, &old_src);
+            let remapped: SmallVec<[VecId; MAX_R]> =
+                picked.iter().map(|&w| remap[w as usize]).collect();
+            node.set(&remapped);
+            node
+        })
+        .collect();
+    drop(old_src);
+
+    let new_src = InMemoryVectorSource::new(new_vectors, dim);
+    let medoid = if old_medoid != u32::MAX && !dead[old_medoid as usize] {
+        remap[old_medoid as usize]
+    } else {
+        approximate_medoid(&new_src, n_new as u32, cfg.medoid_sample, cfg.seed)
+    };
+    VamanaIndex {
+        dim,
+        n: n_new as u32,
+        vectors: Box::new(new_src),
+        ids: new_ids,
+        nodes: new_nodes,
+        medoid,
+        r: cfg.r,
+        l_search,
+    }
+}
+
 pub struct DiskVamanaIndex {
     dim: usize,
     l_search: usize,
@@ -1230,6 +1741,10 @@ pub struct DiskVamanaIndex {
     /// Additional immutable LSM runs, searched alongside `base`. Streaming
     /// writes flush from the delta into runs; `consolidate` folds them back.
     runs: Vec<Segment>,
+    /// The dir seq (`run-<seq>`) backing each entry of `runs`, kept parallel so
+    /// a runs-only merge can delete exactly the dirs it folded. Flush appends,
+    /// the merge rewrites the front, discard/consolidate clears.
+    run_dirs: Vec<u64>,
     /// Tier-1 quantiser, kept so a `flush` builds runs with the same tier as
     /// the base (and so `consolidate` reopens with it).
     tier: QuantKind,
@@ -1238,6 +1753,15 @@ pub struct DiskVamanaIndex {
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
+    /// Staging buffer for an in-flight OFF-THREAD flush: the delta entries moved
+    /// aside by `flush_begin` while their run is built off-thread. Searched with
+    /// precedence `delta > flushing > runs > base`, so the batch stays visible
+    /// during the build; `flush_finish` clears it once the run is spliced in.
+    /// Empty except during an off-thread flush.
+    flushing: AHashMap<u64, Vec<f32>>,
+    /// When true (default), `insert` flushes the delta into a run inline once it
+    /// fills. A server turns this off and flushes off-thread instead.
+    auto_flush: bool,
     /// Tombstoned external ids (covers both main and delta).
     tombstones: AHashSet<u64>,
     live_count: usize,
@@ -1247,7 +1771,7 @@ pub struct DiskVamanaIndex {
     /// Online tq1 proxy controller, `None` unless enabled via
     /// [`enable_tq1_controller`](Self::enable_tq1_controller). Behind a mutex
     /// because `search` is `&self`; only touched on shadow queries.
-    // ponytail: Box the whole tq1 runtime (mutex + counter) so this cold state
+    // Box the whole tq1 runtime (mutex + counter) so this cold state
     // stays off DiskVamanaIndex as one pointer - else the pthread mutex inline
     // bloats skeg-server's VectorBackend enum past large_enum_variant.
     tq1: Box<Tq1Runtime>,
@@ -1255,6 +1779,11 @@ pub struct DiskVamanaIndex {
     /// medium filters). `None` until built via [`build_ivf`](Self::build_ivf).
     /// Boxed to keep DiskVamanaIndex small (VectorBackend large_enum_variant).
     ivf: Option<Box<IvfRouter>>,
+    /// Optional u64 attribute per BASE row (index = base row), for range-filtered
+    /// search ([`search_range`](Self::search_range)). `None` unless
+    /// [`set_attr`](Self::set_attr) was called. Covers base rows only; streaming
+    /// (delta/run) inserts are not range-filterable until the next consolidate.
+    attr: Option<Vec<u64>>,
 }
 
 /// Cold per-index tq1 online-controller state, kept behind a single `Box` on
@@ -1521,22 +2050,27 @@ impl DiskVamanaIndex {
                 vectors_file,
             },
             runs: Vec::new(),
+            run_dirs: Vec::new(),
             tier,
             run_seq: 0,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
+            flushing: AHashMap::new(),
+            auto_flush: true,
             tombstones: AHashSet::new(),
             live_count: n as usize,
             delta_log,
             tq1: Box::default(),
             ivf: None,
+            attr: None,
         };
         index.replay_wal(&wal);
         // Runs flushed before a restart are not reloaded; the WAL replay above
         // already put their vectors back in L0, so the stale dirs are redundant
         // (and would collide with `run-0` of this session). See the flush ADR.
         index.clean_stale_runs();
-        index.load_ivf();
+        index.load_attr();
+        index.load_ivf(); // rebuilds the zone-map if attr is present
         Ok(index)
     }
 
@@ -1603,6 +2137,9 @@ impl DiskVamanaIndex {
     fn apply_delete(&mut self, id: u64) -> bool {
         let was_live = self.is_live(id);
         self.delta.remove(&id);
+        // Drop from the flush staging too, so a deleted id in an in-flight flush
+        // is not flat-scanned as live (the run copy is tombstone-masked).
+        self.flushing.remove(&id);
         self.tombstones.insert(id);
         if was_live {
             self.live_count -= 1;
@@ -1685,6 +2222,33 @@ impl DiskVamanaIndex {
         self.base.main_n as usize
     }
 
+    /// Number of flushed LSM runs currently searched alongside the base.
+    /// Each run adds a (shallow) graph walk per query, so a growing count is
+    /// the signal that a consolidate is due.
+    #[must_use]
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Total rows across all flushed runs. With the off-thread flush the delta
+    /// stays small (flushed at `FLUSH`), so this - not `delta_len` - is what a
+    /// server watches to decide when a full consolidate (fold runs into base +
+    /// truncate the WAL) is due.
+    #[must_use]
+    pub fn run_rows(&self) -> usize {
+        self.runs.iter().map(|r| r.main_n as usize).sum()
+    }
+
+    /// Live tombstones (deleted ids not yet reclaimed). A cheap gate for the
+    /// delete-patch trigger: `tombstone_count() / main_len()` approximates the
+    /// dead fraction of the base without the O(base) scan `delete_patch_begin`
+    /// does. Over-counts slightly (it also covers tombstoned run/delta ids), so
+    /// it is a trigger heuristic, not an exact base-dead count.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
+    }
+
     /// Graph entry point (the approximate medoid). Used by an external walk
     /// that drives the graph with its own proxy distance (the PQ-tier gate).
     #[must_use]
@@ -1723,6 +2287,7 @@ impl DiskVamanaIndex {
     fn is_live(&self, id: u64) -> bool {
         !self.tombstones.contains(&id)
             && (self.delta.contains_key(&id)
+                || self.flushing.contains_key(&id)
                 || self.base.id_to_main_row.contains_key(&id)
                 || self.runs.iter().any(|r| r.id_to_main_row.contains_key(&id)))
     }
@@ -1747,6 +2312,7 @@ impl DiskVamanaIndex {
             .copied()
             .chain(self.runs.iter().flat_map(|r| r.ids.iter().copied()))
             .chain(self.delta.keys().copied())
+            .chain(self.flushing.keys().copied())
             .filter(|id| !self.tombstones.contains(id))
             .collect();
         // A delta overwrite of a main id appears in both sources; dedup.
@@ -1876,12 +2442,22 @@ impl DiskVamanaIndex {
         }
         self.delta_log.write_all(&rec)?;
         self.apply_insert(id, vector.to_vec());
-        // Keep the brute-forced L0 small: once it fills, fold it into a
-        // navigable run so search stays sub-linear between consolidations.
-        if self.delta.len() >= Self::FLUSH {
+        // Keep the brute-forced L0 small: once it fills, fold it into a navigable
+        // run so search stays sub-linear. INLINE (synchronous) - fine for direct
+        // use (benches, bulk load). A server sets `auto_flush(false)` and drives
+        // the flush OFF-THREAD from its maintenance loop, so ingest never blocks
+        // the request thread on a run build.
+        if self.auto_flush && self.delta.len() >= Self::FLUSH {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// Turn the inline auto-flush on (default) or off. With it off, the delta
+    /// grows unbounded until the caller drives [`flush_begin`](Self::flush_begin)
+    /// / [`flush_finish`](Self::flush_finish) off-thread. Meant for the server.
+    pub fn set_auto_flush(&mut self, on: bool) {
+        self.auto_flush = on;
     }
 
     /// Tombstone `id`. Returns `true` if it was live.
@@ -1908,6 +2484,10 @@ impl DiskVamanaIndex {
             return Ok(None);
         }
         if let Some(v) = self.delta.get(&id) {
+            return Ok(Some(v.clone()));
+        }
+        // Staged for an in-flight flush (delta > flushing).
+        if let Some(v) = self.flushing.get(&id) {
             return Ok(Some(v.clone()));
         }
         if let Some(&row) = self.base.id_to_main_row.get(&id) {
@@ -2259,6 +2839,7 @@ impl DiskVamanaIndex {
                     let id = seg.ids[row as usize];
                     !self.tombstones.contains(&id)
                         && !self.delta.contains_key(&id)
+                        && !self.flushing.contains_key(&id)
                         && matches.is_none_or(|m| m(id))
                 };
                 cand.extend(walk(&seed_rows, Some(&admit), None).iter());
@@ -2312,7 +2893,10 @@ impl DiskVamanaIndex {
             }
             let seg = segs[seg_idx];
             let id = seg.ids[row as usize];
-            if self.tombstones.contains(&id) || self.delta.contains_key(&id) {
+            if self.tombstones.contains(&id)
+                || self.delta.contains_key(&id)
+                || self.flushing.contains_key(&id)
+            {
                 continue;
             }
             if let Some(m) = matches
@@ -2323,7 +2907,7 @@ impl DiskVamanaIndex {
             if !reranked_ids.insert(id) {
                 continue;
             }
-            // ponytail: no-rerank mode = rank by the proxy estimate alone, zero
+            // No-rerank mode = rank by the proxy estimate alone, zero
             // disk reads. For apples-to-apples vs the TurboQuant blog (pure
             // quantized recall, no f32 rerank). pscore = -(proxy i32).
             if no_rerank() {
@@ -2361,6 +2945,13 @@ impl DiskVamanaIndex {
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
         for (&id, v) in &self.delta {
             if matches.is_none_or(|m| m(id)) {
+                scored.push((OrderedFloat(cosine_f32(query, v)), id));
+            }
+        }
+        // Flat scan the in-flight flush staging too, skipping ids the delta
+        // already covers (delta wins). Empty except during an off-thread flush.
+        for (&id, v) in &self.flushing {
+            if !self.delta.contains_key(&id) && matches.is_none_or(|m| m(id)) {
                 scored.push((OrderedFloat(cosine_f32(query, v)), id));
             }
         }
@@ -2472,7 +3063,8 @@ impl DiskVamanaIndex {
             vectors.extend_from_slice(v);
             ids.push(id);
         }
-        let run_dir = self.dir.join(format!("run-{}", self.run_seq));
+        let seq = self.run_seq;
+        let run_dir = self.dir.join(format!("run-{seq}"));
         self.run_seq += 1;
         let rebuilt = build_disk_graph(self.tier, vectors, ids, self.dim, &disk_build_config());
         rebuilt.save(&run_dir)?;
@@ -2480,6 +3072,7 @@ impl DiskVamanaIndex {
         // rest of the opened index (an empty delta/WAL over the run dir) is dropped.
         let run = DiskVamanaIndex::open_with_tier(&run_dir, self.tier)?;
         self.runs.push(run.base);
+        self.run_dirs.push(seq);
         self.delta.clear();
         Ok(())
     }
@@ -2498,6 +3091,7 @@ impl DiskVamanaIndex {
             }
         }
         self.runs.clear();
+        self.run_dirs.clear();
         Ok(())
     }
 
@@ -2572,7 +3166,7 @@ impl DiskVamanaIndex {
         // idle-consolidate rebuilds it off the request path; until then filtered
         // search falls back to the exact scan (correct, just O(|s|)).
         let _ = std::fs::remove_file(dir.join(IVF_FILE));
-        // ponytail: env-gated phase timing to find the real consolidate cost
+        // Env-gated phase timing to find the real consolidate cost
         // before optimizing it. Off unless SKEG_CONSOLIDATE_TIMING is set.
         let timing = std::env::var("SKEG_CONSOLIDATE_TIMING").is_ok();
         let t = std::time::Instant::now();
@@ -2593,6 +3187,370 @@ impl DiskVamanaIndex {
                 save_ms - build_ms,
             );
         }
+        Ok(())
+    }
+
+    /// Begin a background consolidate: the short, exclusive phase.
+    ///
+    /// Flushes the delta into a run (so the snapshot is over immutable segments
+    /// only), collects the surviving vectors (tombstone-masked, newest-wins, id
+    /// order), and records the WAL high-water offset. Everything appended to the
+    /// WAL after this point (inserts, deletes, and any runs they flush) is NOT
+    /// in the snapshot and survives [`consolidate_finish`](Self::consolidate_finish)
+    /// via WAL-suffix replay.
+    ///
+    /// Returns `None` when there is nothing to fold. At most one job should be
+    /// outstanding per index; the caller enforces that (the engine does not).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the flush or a vector read fails.
+    pub fn consolidate_begin(&mut self) -> io::Result<Option<ConsolidateJob>> {
+        // Cheap snapshot: NO flush (which would build a graph from the delta) and
+        // NO O(live) vector reads. The delta is the newest layer, captured in
+        // RAM; base/run survivors are recorded as (seg, row) locations and read
+        // off-thread in `build`. All the heavy work moves to the background.
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        let cap = self.delta.len() + self.flushing.len();
+        let mut delta_ids: Vec<u64> = Vec::with_capacity(cap);
+        let mut delta_vectors: Vec<f32> = Vec::with_capacity(cap * self.dim);
+        // delta first (newest), then any in-flight flush staging (delta shadows
+        // it via `seen`). Tombstoned ids are already removed from both.
+        for (&id, v) in self.delta.iter().chain(self.flushing.iter()) {
+            if seen.insert(id) {
+                delta_ids.push(id);
+                delta_vectors.extend_from_slice(v);
+            }
+        }
+        // Base/runs, newest run first; delta already shadows via `seen`.
+        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        for (ri, run) in self.runs.iter().enumerate().rev() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                survivors.push((id, ri + 1, row));
+            }
+        }
+        for row in 0..self.base.main_n {
+            let id = self.base.ids[row as usize];
+            if self.tombstones.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            survivors.push((id, 0, row));
+        }
+        if survivors.is_empty() && delta_ids.is_empty() {
+            return Ok(None);
+        }
+        // Dup the vectors.bin fds [base, run0, ...] for off-thread reads (O(1)).
+        let mut seg_files: Vec<File> = Vec::with_capacity(1 + self.runs.len());
+        seg_files.push(self.base.vectors_file.try_clone()?);
+        for run in &self.runs {
+            seg_files.push(run.vectors_file.try_clone()?);
+        }
+        let wal_offset = self.delta_log.metadata()?.len();
+        Ok(Some(ConsolidateJob {
+            delta_vectors,
+            delta_ids,
+            survivors,
+            seg_files,
+            dim: self.dim,
+            tier: self.tier,
+            run_seq_high: self.run_seq,
+            wal_offset,
+        }))
+    }
+
+    /// Finish a background consolidate: the short, exclusive swap phase.
+    ///
+    /// Replaces the base with the graph the job built, discards every run
+    /// (post-begin runs are rebuilt from the WAL suffix), rewrites the WAL to
+    /// hold only the records appended after `consolidate_begin`, and reopens.
+    /// Post-begin inserts land back in the delta (re-flushing if large) and
+    /// post-begin deletes land back in the tombstone set, so no write that
+    /// raced the background build is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a file move, the WAL rewrite, or the reopen fails.
+    pub fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> io::Result<()> {
+        let dir = self.dir.clone();
+        let tier = self.tier;
+        // The rebuild reorders base rows: drop the router sidecar first, exactly
+        // like the inline consolidate (crash below leaves no sidecar, not a
+        // stale one).
+        let _ = std::fs::remove_file(dir.join(IVF_FILE));
+        // WAL suffix = everything appended after begin. Copy it out before the
+        // reopen truncates.
+        let wal_path = dir.join(DELTA_LOG_FILE);
+        let wal = std::fs::read(&wal_path)?;
+        let suffix_start = usize::try_from(built.wal_offset).unwrap_or(wal.len());
+        let suffix = wal.get(suffix_start..).unwrap_or(&[]).to_vec();
+        // Swap in the built base, drop every run dir (pre-begin runs are folded
+        // into the new base; post-begin runs replay from the WAL suffix).
+        std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
+        std::fs::rename(built.tmp.join(VECTORS_FILE), dir.join(VECTORS_FILE))?;
+        let _ = std::fs::remove_dir_all(&built.tmp);
+        self.run_seq = built.run_seq_high.max(self.run_seq);
+        self.discard_runs()?;
+        std::fs::write(&wal_path, &suffix)?;
+        // Surgical swap: install the prebuilt base (tier already built off-thread)
+        // and reconstruct the in-RAM state the way `open` would, then replay the
+        // WAL suffix - WITHOUT a full reopen, so the O(live) tier rebuild does not
+        // run here on the shard thread. `tier` is unused now (the segment carries
+        // its own quant); keep the arg-free reopen out of the hot path.
+        let _ = tier;
+        let delta_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
+        self.base = built.base;
+        self.delta.clear();
+        self.tombstones.clear();
+        self.live_count = self.base.main_n as usize;
+        self.delta_log = delta_log;
+        *self.tq1 = Default::default();
+        self.ivf = None;
+        self.replay_wal(&suffix);
+        Ok(())
+    }
+
+    /// Begin a background runs-only merge (Level 2 of the write-heavy path):
+    /// snapshot the live vectors from the front runs (tombstone-masked,
+    /// newer-run-wins) so an off-thread [`RunMergeJob::build`] can fold them into
+    /// one replacement run, leaving the base untouched. O(runs), not O(live-set),
+    /// so it can run often enough to keep the run count - and thus per-query walk
+    /// cost - bounded under fast churn, deferring the expensive base rebuild to a
+    /// rare event. Needs no WAL manipulation: runs are immutable, so racing
+    /// inserts/deletes/flushes are handled by search precedence alone.
+    ///
+    /// Returns `None` with fewer than two runs (nothing to compact).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a run vector read fails.
+    pub fn merge_runs_begin(&mut self) -> io::Result<Option<RunMergeJob>> {
+        let n_merged = self.runs.len();
+        if n_merged < 2 {
+            return Ok(None);
+        }
+        // Newer runs win on a re-inserted id: fold the front runs newest-first.
+        let mut seen: AHashSet<u64> = AHashSet::new();
+        let mut survivors: Vec<(usize, u32)> = Vec::new();
+        for ri in (0..n_merged).rev() {
+            let run = &self.runs[ri];
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                survivors.push((ri, row));
+            }
+        }
+        if survivors.is_empty() {
+            // Every folded run entry is tombstoned or shadowed: just drop them.
+            let old_dirs = self.run_dirs[..n_merged].to_vec();
+            let keep_runs = self.runs.split_off(n_merged);
+            let keep_dirs = self.run_dirs.split_off(n_merged);
+            self.runs = keep_runs;
+            self.run_dirs = keep_dirs;
+            for seq in old_dirs {
+                let d = self.dir.join(format!("run-{seq}"));
+                if d.exists() {
+                    std::fs::remove_dir_all(&d)?;
+                }
+            }
+            return Ok(None);
+        }
+        // id order for re-rank cache locality, same rule as consolidate.
+        survivors.sort_unstable_by_key(|&(ri, row)| self.runs[ri].ids[row as usize]);
+        let ids: Vec<u64> = survivors
+            .iter()
+            .map(|&(ri, row)| self.runs[ri].ids[row as usize])
+            .collect();
+        // Dup the folded runs' vectors.bin fds (O(1)); the reads happen off-thread
+        // in build. seg_index in `survivors` is the run index 0..n_merged.
+        let mut seg_files: Vec<File> = Vec::with_capacity(n_merged);
+        for ri in 0..n_merged {
+            seg_files.push(self.runs[ri].vectors_file.try_clone()?);
+        }
+        let old_dirs = self.run_dirs[..n_merged].to_vec();
+        let merged_seq = self.run_seq;
+        self.run_seq += 1;
+        Ok(Some(RunMergeJob {
+            survivors,
+            ids,
+            seg_files,
+            dim: self.dim,
+            tier: self.tier,
+            merged_seq,
+            n_merged,
+            old_dirs,
+        }))
+    }
+
+    /// Finish a background runs-only merge: slot the built run in place of the
+    /// front `n_merged` runs it folded, keep any runs flushed after begin (they
+    /// are newer, so they stay ahead of the merged run in search order), and
+    /// delete the folded run dirs. The base, delta, tombstones, and WAL are
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if opening the merged run or deleting a dir fails.
+    pub fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> io::Result<()> {
+        // The merged run was already opened off-thread in build; splice it in.
+        let keep_runs = self.runs.split_off(built.n_merged);
+        let keep_dirs = self.run_dirs.split_off(built.n_merged);
+        self.runs = std::iter::once(built.merged).chain(keep_runs).collect();
+        self.run_dirs = std::iter::once(built.merged_seq).chain(keep_dirs).collect();
+        for seq in built.old_dirs {
+            let d = self.dir.join(format!("run-{seq}"));
+            if d.exists() {
+                std::fs::remove_dir_all(&d)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Begin an OFF-THREAD flush of the delta into a run (short, exclusive).
+    /// Moves the delta into the `flushing` staging buffer (kept searchable) and
+    /// hands its vectors to the returned job; the run build + open happens off
+    /// the caller in [`FlushJob::build`]. `None` if the delta is empty or a flush
+    /// is already in flight. No WAL touch: the delta's inserts stay in the WAL,
+    /// so a crash before `flush_finish` replays them into the delta on reopen.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; returns `io::Result` for symmetry with the other
+    /// begin/finish pairs.
+    pub fn flush_begin(&mut self) -> io::Result<Option<FlushJob>> {
+        if self.delta.is_empty() || !self.flushing.is_empty() {
+            return Ok(None);
+        }
+        self.flushing = std::mem::take(&mut self.delta);
+        let mut vectors: Vec<f32> = Vec::with_capacity(self.flushing.len() * self.dim);
+        let mut ids: Vec<u64> = Vec::with_capacity(self.flushing.len());
+        for (&id, v) in &self.flushing {
+            vectors.extend_from_slice(v);
+            ids.push(id);
+        }
+        let seq = self.run_seq;
+        self.run_seq += 1;
+        Ok(Some(FlushJob {
+            vectors,
+            ids,
+            dim: self.dim,
+            tier: self.tier,
+            seq,
+        }))
+    }
+
+    /// Splice the flushed run in (short, exclusive) and clear the staging. The
+    /// run is the newest, so it goes at the end (newest-wins in search). Ids
+    /// re-inserted during the build are in the fresh delta and shadow the run
+    /// copy; deleted ones are tombstone-masked.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; `io::Result` for symmetry.
+    pub fn flush_finish(&mut self, built: FlushBuilt) -> io::Result<()> {
+        self.runs.push(built.run);
+        self.run_dirs.push(built.seq);
+        self.flushing.clear();
+        Ok(())
+    }
+
+    /// Snapshot for a background delete-patch of the base graph (short,
+    /// exclusive). Flushes the delta, then marks every base row that is dead -
+    /// tombstoned, or shadowed by a newer copy in a run - and captures the base
+    /// adjacency + vectors so [`DeletePatchJob::build`] can re-prune only the
+    /// survivors that lost a neighbour (O(affected), no greedy rebuild).
+    /// Returns `None` when there is nothing to reclaim, or when the patch would
+    /// empty the base (a full `consolidate` is the right tool then).
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the flush or a base-vector read fails.
+    pub fn delete_patch_begin(&mut self) -> io::Result<Option<DeletePatchJob>> {
+        // NO flush (that would build a run graph on the caller). A base row is
+        // dead if tombstoned OR shadowed by a newer copy anywhere - run, delta,
+        // or flush staging; the newer copy wins in search, so dropping the stale
+        // base row is safe without moving the delta into a run first.
+        let n = self.base.main_n as usize;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut shadowed: AHashSet<u64> = AHashSet::new();
+        for run in &self.runs {
+            for &id in &run.ids {
+                shadowed.insert(id);
+            }
+        }
+        shadowed.extend(self.delta.keys().copied());
+        shadowed.extend(self.flushing.keys().copied());
+        let mut dead = vec![false; n];
+        let mut dead_count = 0usize;
+        for row in 0..n {
+            let id = self.base.ids[row];
+            if self.tombstones.contains(&id) || shadowed.contains(&id) {
+                dead[row] = true;
+                dead_count += 1;
+            }
+        }
+        if dead_count == 0 || n - dead_count == 0 {
+            return Ok(None);
+        }
+        // Copy the adjacency (fast memcpy of the Node array) but DEFER the
+        // O(live) vector reads to build via a duped fd.
+        let adj: Vec<Node> = (0..n).map(|r| self.base.nodes[r]).collect();
+        let seg_file = self.base.vectors_file.try_clone()?;
+        Ok(Some(DeletePatchJob {
+            seg_file,
+            n_rows: n,
+            ids: self.base.ids.clone(),
+            adj,
+            dead,
+            medoid: self.base.medoid,
+            dim: self.dim,
+            l_search: self.l_search,
+            tier: self.tier,
+        }))
+    }
+
+    /// Swap the patched base in (short, exclusive). The patch touched only the
+    /// base graph, so - unlike `consolidate_finish` - runs, delta, tombstones,
+    /// and the WAL are all left as they are. That is safe across a restart: every
+    /// row the patch removed was either tombstoned (the WAL still re-tombstones
+    /// it) or shadowed by a run (the WAL still holds the newer copy), so a plain
+    /// reopen reconstructs the same live set. The patched base's `vectors.bin`
+    /// fd, opened via the sidecar, keeps pointing at the renamed inode.
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the sidecar open or the file renames fail.
+    pub fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> io::Result<()> {
+        let dir = self.dir.clone();
+        // The patched base was already opened off-thread in build; swap it in.
+        let new_base = built.base;
+        // The patch reordered base rows: drop the stale router sidecar.
+        let _ = std::fs::remove_file(dir.join(IVF_FILE));
+        std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
+        std::fs::rename(built.tmp.join(VECTORS_FILE), dir.join(VECTORS_FILE))?;
+        let _ = std::fs::remove_dir_all(&built.tmp);
+        self.base = new_base;
+        self.ivf = None;
+        // Drop tombstones that no longer cover anything (their only copy was a
+        // base row we just removed); the WAL still carries them for a restart,
+        // and the next consolidate clears them for good. Keeps the live filter
+        // from growing without bound under sustained delete-patching.
+        let mut present: AHashSet<u64> = AHashSet::with_capacity(self.base.ids.len());
+        present.extend(self.base.ids.iter().copied());
+        for run in &self.runs {
+            present.extend(run.ids.iter().copied());
+        }
+        self.tombstones.retain(|id| present.contains(id));
         Ok(())
     }
 
@@ -2632,6 +3590,39 @@ impl DiskVamanaIndex {
         let router = IvfRouter::build(&all, n, dim, n_cells, iters);
         let _ = std::fs::write(self.dir.join(IVF_FILE), router.to_bytes());
         self.ivf = Some(Box::new(router));
+        self.refresh_zonemap();
+        Ok(())
+    }
+
+    /// Begin an OFF-THREAD IVF rebuild: dup the base vectors fd (O(1)). `None`
+    /// if the base is empty. The read + k-means happen in [`IvfJob::build`].
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the fd cannot be duped.
+    pub fn ivf_begin(&self, n_cells: usize, iters: usize) -> io::Result<Option<IvfJob>> {
+        let n = self.base.main_n;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(IvfJob {
+            seg_file: self.base.vectors_file.try_clone()?,
+            n,
+            dim: self.dim,
+            n_cells,
+            iters,
+        }))
+    }
+
+    /// Install the router built off-thread (short, exclusive) and persist it.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; `io::Result` for symmetry.
+    pub fn ivf_finish(&mut self, built: IvfBuilt) -> io::Result<()> {
+        let _ = std::fs::write(self.dir.join(IVF_FILE), built.router.to_bytes());
+        self.ivf = Some(Box::new(built.router));
+        self.refresh_zonemap();
         Ok(())
     }
 
@@ -2645,7 +3636,62 @@ impl DiskVamanaIndex {
             && r.len() == self.base.main_n as usize
         {
             self.ivf = Some(Box::new(r));
+            self.refresh_zonemap();
         }
+    }
+
+    /// Load the persisted attribute column, if present + sized to the base.
+    /// Best-effort: a missing / stale sidecar just leaves `attr` unset.
+    fn load_attr(&mut self) {
+        let Ok(bytes) = std::fs::read(self.dir.join(ATTR_FILE)) else {
+            return;
+        };
+        let n = self.base.main_n as usize;
+        if bytes.len() != n * 8 {
+            return; // stale (base resized) - ignore
+        }
+        let attr: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        self.attr = Some(attr);
+    }
+
+    /// (Re)build the router's zone-map from the attribute column. Called after
+    /// any router install and by [`set_attr`]; the zone-map is RAM-only (not in
+    /// the IVF sidecar), so it must be rebuilt whenever either side changes.
+    fn refresh_zonemap(&mut self) {
+        if let (Some(r), Some(a)) = (self.ivf.as_mut(), self.attr.as_ref())
+            && a.len() == r.len()
+        {
+            r.set_zonemap(a);
+        }
+    }
+
+    /// Attach a u64 attribute column (one value per BASE row, in row order) for
+    /// range-filtered search. Persists a sidecar and builds the router zone-map
+    /// if the IVF router is present. The column is opaque - a time axis, an
+    /// importance score, any monotone-comparable key.
+    ///
+    /// # Errors
+    /// I/O error if the sidecar write fails.
+    ///
+    /// # Panics
+    /// Panics if `attr.len()` does not equal the base row count.
+    pub fn set_attr(&mut self, attr: &[u64]) -> io::Result<()> {
+        assert_eq!(
+            attr.len(),
+            self.base.main_n as usize,
+            "attr/base-rows mismatch"
+        );
+        let mut bytes = Vec::with_capacity(attr.len() * 8);
+        for &a in attr {
+            bytes.extend_from_slice(&a.to_le_bytes());
+        }
+        std::fs::write(self.dir.join(ATTR_FILE), &bytes)?;
+        self.attr = Some(attr.to_vec());
+        self.refresh_zonemap();
+        Ok(())
     }
 
     /// Hybrid filtered search over the base. `s` = the filter's SORTED matching
@@ -2702,6 +3748,87 @@ impl DiskVamanaIndex {
             }
             _ => self.score_ids_quantized(query, s, k, rerank),
         }
+    }
+
+    /// Range-filtered search: top-k nearest to `query` among base rows whose
+    /// attribute (set via [`set_attr`](Self::set_attr)) is in `[lo, hi]`.
+    ///
+    /// Self-routing on the estimated match count (O(cells), from the zone-map,
+    /// no attribute scan): a WIDE range takes the zone-map path
+    /// ([`probe_range`](IvfRouter::probe_range)) that never materialises the id
+    /// set; a NARROW range materialises the matching ids and reuses
+    /// [`search_filtered_hybrid`](Self::search_filtered_hybrid), whose own small-
+    /// set path is already cheap. Both rerank through `score_ids_quantized`, so
+    /// recall matches the filtered path. Requires a zone-map (attr + IVF router);
+    /// without one it falls back to a full attribute scan + the filtered path.
+    ///
+    /// # Errors
+    /// I/O error if a re-rank read fails.
+    pub fn search_range(
+        &self,
+        query: &[f32],
+        lo: u64,
+        hi: u64,
+        k: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        /// Match-count crossover: above it, avoiding the id-set materialisation
+        /// wins; below it, the filtered path's small-set scan is cheaper
+        /// (measured ~= SHORTLIST, the router's candidate budget).
+        const RANGE_MIN: usize = 4_096;
+        const SHORTLIST: usize = 4_096;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let (Some(router), Some(attr)) = (&self.ivf, &self.attr) else {
+            // No zone-map: fall back to a full scan into the filtered path.
+            let s = self.ids_in_range(lo, hi);
+            return self.search_filtered_hybrid(query, &s, k, rerank);
+        };
+        if router.estimate_range_count(lo, hi) >= RANGE_MIN {
+            // Wide: zone-map path, no id set built.
+            let q = normalized(query);
+            let short_rows = router.probe_range(&q, lo, hi, attr, SHORTLIST.max(rerank));
+            let ids: Vec<u64> = short_rows
+                .iter()
+                .map(|&r| self.base.ids[r as usize])
+                .collect();
+            self.score_ids_quantized(query, &ids, k, rerank)
+        } else {
+            // Narrow: materialise the matching ids, reuse the filtered path.
+            let s = self.ids_in_range(lo, hi);
+            self.search_filtered_hybrid(query, &s, k, rerank)
+        }
+    }
+
+    /// TEST/BENCH: the range planner's estimate and whether `search_range` would
+    /// take the zone-map (wide) path. Not part of the stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_range_plan(&self, lo: u64, hi: u64) -> (usize, bool) {
+        match &self.ivf {
+            Some(r) => {
+                let est = r.estimate_range_count(lo, hi);
+                (est, est >= 4_096)
+            }
+            None => (0, false),
+        }
+    }
+
+    /// Sorted external ids of base rows whose attribute is in `[lo, hi]`. O(base).
+    /// Empty if no attribute column is set.
+    fn ids_in_range(&self, lo: u64, hi: u64) -> Vec<u64> {
+        let Some(attr) = &self.attr else {
+            return Vec::new();
+        };
+        let mut s: Vec<u64> = attr
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| (lo..=hi).contains(&a))
+            .map(|(row, _)| self.base.ids[row])
+            .collect();
+        s.sort_unstable();
+        s
     }
 }
 
@@ -2918,6 +4045,71 @@ mod tests {
         assert!(
             recall >= 0.95,
             "on-disk Vamana recall@10 = {recall:.4} (target >= 0.95)"
+        );
+    }
+
+    // Range-filtered search over the disk index: every result honours [lo,hi],
+    // recall matches a brute filtered top-k, and the attr column + zone-map
+    // survive a save/reopen. ids == row so the range predicate is exact.
+    #[test]
+    fn disk_search_range() {
+        let dim = 48;
+        let n = 4000; // > RANGE_MIN so the zone-map path engages for a wide range
+        let vectors = random_vectors(n, dim, 42);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let index = VamanaIndex::build(vectors.clone(), ids, dim, &VamanaConfig::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        index.save(tmp.path()).unwrap();
+
+        let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
+        let attr: Vec<u64> = (0..n as u64).collect(); // attr[row] = row = id
+        disk.set_attr(&attr).unwrap();
+        disk.build_ivf(0, 6).unwrap();
+
+        let check = |d: &DiskVamanaIndex, lo: u64, hi: u64| {
+            let mut rng = StdRng::seed_from_u64(9);
+            let (mut hits, mut total) = (0usize, 0usize);
+            for _ in 0..30 {
+                let q: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+                let got: Vec<u64> = d
+                    .search_range(&q, lo, hi, 10, 80)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert!(
+                    got.iter().all(|&id| (lo..=hi).contains(&id)),
+                    "result out of [{lo},{hi}]"
+                );
+                // brute filtered truth
+                let mut truth: Vec<(f32, u64)> = (lo..=hi)
+                    .map(|id| {
+                        (
+                            cosine_f32(&q, &vectors[id as usize * dim..id as usize * dim + dim]),
+                            id,
+                        )
+                    })
+                    .collect();
+                truth.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+                let want: std::collections::HashSet<u64> =
+                    truth.iter().take(10).map(|&(_, id)| id).collect();
+                hits += got.iter().filter(|id| want.contains(id)).count();
+                total += want.len().min(10);
+            }
+            hits as f64 / total as f64
+        };
+
+        // Wide range (zone-map path) and narrow range (materialise path).
+        assert!(check(&disk, 1000, 3500) >= 0.9, "wide-range recall");
+        assert!(check(&disk, 100, 260) >= 0.9, "narrow-range recall");
+
+        // Persistence: reopen must reload attr + rebuild the zone-map.
+        drop(disk);
+        let disk2 = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert!(disk2.attr.is_some(), "attr column must survive reopen");
+        assert!(
+            check(&disk2, 1000, 3500) >= 0.9,
+            "wide-range recall after reopen"
         );
     }
 
@@ -3446,5 +4638,482 @@ mod tests {
         let index = VamanaIndex::build(vectors, ids, dim, &VamanaConfig::default());
         let hits = index.search(&vec![0.2f32; dim], 100);
         assert!(hits.len() <= 10, "k > n returns at most n results");
+    }
+
+    /// The background split (begin/build/finish) must land on the same state as
+    /// the inline consolidate for the same operation history.
+    #[test]
+    fn background_consolidate_matches_inline() {
+        let dim = 16;
+        let n = 300;
+        let vecs = random_vectors(n, dim, 11);
+        let mk = |tmp: &std::path::Path| {
+            let mut idx = DiskVamanaIndex::create_empty(tmp, dim, 64).unwrap();
+            for (i, v) in vecs.chunks_exact(dim).enumerate() {
+                idx.insert(i as u64, v).unwrap();
+            }
+            for id in 0..40u64 {
+                idx.delete(id * 3).unwrap(); // scattered deletes
+            }
+            idx
+        };
+        let t_inline = tempfile::TempDir::new().unwrap();
+        let mut inline = mk(t_inline.path());
+        inline.consolidate().unwrap();
+
+        let t_bg = tempfile::TempDir::new().unwrap();
+        let mut bg = mk(t_bg.path());
+        let job = bg.consolidate_begin().unwrap().expect("non-empty");
+        let built = job.build(t_bg.path()).unwrap();
+        bg.consolidate_finish(built).unwrap();
+
+        assert_eq!(bg.len(), inline.len(), "same live count");
+        assert_eq!(bg.run_count(), 0, "runs folded");
+        assert_eq!(bg.delta_len(), 0, "no post-begin writes -> empty delta");
+        let q = &vecs[..dim];
+        let a = inline.search(q, 10).unwrap();
+        let b = bg.search(q, 10).unwrap();
+        assert_eq!(
+            a.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            b.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "same top-k"
+        );
+    }
+
+    /// Writes that race the background build (inserts, deletes of snapshot ids,
+    /// deletes of post-begin ids) must all survive the finish swap, in RAM and
+    /// across a restart.
+    #[test]
+    fn writes_during_background_build_survive() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        let vecs = random_vectors(200, dim, 7);
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let job = idx.consolidate_begin().unwrap().expect("non-empty");
+
+        // Race the build: new inserts, a delete of a folded id, and an
+        // insert-then-delete entirely inside the window.
+        idx.insert(1000, &vec![0.25f32; dim]).unwrap();
+        idx.insert(1001, &vec![0.35f32; dim]).unwrap();
+        assert!(idx.delete(5).unwrap(), "folded id was live");
+        idx.insert(1002, &vec![0.45f32; dim]).unwrap();
+        assert!(idx.delete(1002).unwrap(), "post-begin id was live");
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.consolidate_finish(built).unwrap();
+
+        assert_eq!(idx.len(), 200 + 2 - 1, "200 folded + 2 new - 1 deleted");
+        assert!(idx.get(1000).unwrap().is_some(), "post-begin insert kept");
+        assert!(idx.get(1001).unwrap().is_some(), "post-begin insert kept");
+        assert!(
+            idx.get(5).unwrap().is_none(),
+            "post-begin delete of folded id holds"
+        );
+        assert!(
+            idx.get(1002).unwrap().is_none(),
+            "insert+delete in window stays dead"
+        );
+
+        // The same must hold from disk alone (WAL suffix replay).
+        drop(idx);
+        let reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(reopened.len(), 201);
+        assert!(reopened.get(1000).unwrap().is_some());
+        assert!(reopened.get(5).unwrap().is_none());
+        assert!(reopened.get(1002).unwrap().is_none());
+    }
+
+    /// A flush that fires during the background window (delta reaching FLUSH)
+    /// creates post-begin runs; finish discards their dirs and the WAL suffix
+    /// replays them, so nothing is lost and no stale run dir survives.
+    #[test]
+    fn post_begin_flush_survives_finish() {
+        let dim = 8;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for i in 0..100u64 {
+            idx.insert(i, &vec![0.1f32 + i as f32 * 1e-3; dim]).unwrap();
+        }
+        let job = idx.consolidate_begin().unwrap().expect("non-empty");
+        // Enough post-begin inserts to cross FLUSH and mint a run mid-window.
+        for i in 1000..(1000 + DiskVamanaIndex::FLUSH as u64 + 10) {
+            idx.insert(i, &vec![0.2f32 + (i as f32) * 1e-6; dim])
+                .unwrap();
+        }
+        assert!(idx.run_count() > 0, "a post-begin run exists");
+        let built = job.build(tmp.path()).unwrap();
+        idx.consolidate_finish(built).unwrap();
+        assert_eq!(
+            idx.len(),
+            100 + DiskVamanaIndex::FLUSH + 10,
+            "folded + post-begin (replayed through the WAL suffix)"
+        );
+        assert!(
+            idx.get(1000).unwrap().is_some(),
+            "post-begin run content kept"
+        );
+    }
+
+    /// A runs-only merge folds the runs into one, preserves the live set and the
+    /// search result, and leaves the base untouched.
+    #[test]
+    fn runs_merge_folds_and_preserves_search() {
+        let dim = 16;
+        let n = 3 * DiskVamanaIndex::FLUSH; // several runs
+        let vecs = random_vectors(n, dim, 21);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        // Scattered deletes across the runs.
+        for id in (0..n as u64).step_by(7) {
+            idx.delete(id).unwrap();
+        }
+        let live_before = idx.len();
+        let runs_before = idx.run_count();
+        assert!(
+            runs_before >= 2,
+            "need multiple runs to merge, got {runs_before}"
+        );
+
+        let job = idx.merge_runs_begin().unwrap().expect("runs to merge");
+        let built = job.build(tmp.path()).unwrap();
+        idx.merge_runs_finish(built).unwrap();
+
+        assert_eq!(idx.run_count(), 1, "runs folded into one");
+        assert_eq!(idx.len(), live_before, "live set unchanged by the merge");
+        // Deleted ids stay gone; a surviving id self-matches.
+        assert!(idx.get(0).unwrap().is_none(), "deleted id 0 stays gone");
+        let survivor = 1u64; // 1 % 7 != 0
+        assert!(idx.get(survivor).unwrap().is_some());
+        let q = &vecs[survivor as usize * dim..(survivor as usize + 1) * dim];
+        let hit = idx.search(q, 1).unwrap();
+        assert_eq!(hit[0].0, survivor, "query returns its own vector as top-1");
+    }
+
+    /// Inserts, deletes, and flushes that race a background runs-merge all
+    /// survive: the base/delta/WAL are untouched, so search precedence resolves
+    /// everything.
+    #[test]
+    fn writes_during_runs_merge_survive() {
+        let dim = 16;
+        let n = 3 * DiskVamanaIndex::FLUSH;
+        let vecs = random_vectors(n, dim, 22);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let live_before = idx.len();
+        let job = idx.merge_runs_begin().unwrap().expect("runs to merge");
+
+        // Race the build.
+        idx.insert(90_000, &vec![0.11f32; dim]).unwrap();
+        assert!(idx.delete(1).unwrap(), "delete a folded-in id"); // 1 % 7 != 0, was live
+        idx.insert(90_001, &vec![0.22f32; dim]).unwrap();
+        assert!(idx.delete(90_001).unwrap(), "insert+delete in the window");
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.merge_runs_finish(built).unwrap();
+
+        assert_eq!(
+            idx.len(),
+            live_before + 1 - 1,
+            "one new live (90000), one folded id deleted"
+        );
+        assert!(idx.get(90_000).unwrap().is_some(), "post-begin insert kept");
+        assert!(
+            idx.get(1).unwrap().is_none(),
+            "post-begin delete of a folded id holds"
+        );
+        assert!(
+            idx.get(90_001).unwrap().is_none(),
+            "insert+delete in window stays dead"
+        );
+
+        // Reopen: the merge is transient (no WAL touch); the WAL replays the full
+        // history, so the live set is identical from disk alone.
+        drop(idx);
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live_before);
+        assert!(re.get(90_000).unwrap().is_some());
+        assert!(re.get(1).unwrap().is_none());
+    }
+
+    /// Delete-patch removes the tombstoned rows from the base graph in place
+    /// (O(deleted), no full rebuild) while keeping the survivors searchable.
+    #[test]
+    fn delete_patch_removes_deleted_and_preserves_search() {
+        let dim = 16;
+        let n = 400usize;
+        let vecs = random_vectors(n, dim, 31);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap(); // land every vector in the base
+        let base_before = idx.main_len();
+        assert_eq!(base_before, n, "all rows in base");
+
+        let deleted: Vec<u64> = (0..n as u64).step_by(5).collect();
+        for &id in &deleted {
+            idx.delete(id).unwrap();
+        }
+        let live_before = idx.len();
+
+        let job = idx
+            .delete_patch_begin()
+            .unwrap()
+            .expect("dead rows to reclaim");
+        let built = job.build(tmp.path()).unwrap();
+        idx.delete_patch_finish(built).unwrap();
+
+        assert_eq!(
+            idx.main_len(),
+            n - deleted.len(),
+            "base shrank by the deletes"
+        );
+        assert_eq!(idx.len(), live_before, "live set unchanged by the patch");
+        for &id in &deleted {
+            assert!(idx.get(id).unwrap().is_none(), "deleted id {id} stays gone");
+        }
+        // The rewired graph still reaches its survivors: top-1 self-match on a
+        // broad sample.
+        let mut self_hits = 0usize;
+        let survivors: Vec<u64> = (0..n as u64).filter(|id| id % 5 != 0).collect();
+        for &id in &survivors {
+            let q = &vecs[id as usize * dim..(id as usize + 1) * dim];
+            if idx.search(q, 1).unwrap().first().is_some_and(|h| h.0 == id) {
+                self_hits += 1;
+            }
+        }
+        let frac = self_hits as f64 / survivors.len() as f64;
+        assert!(
+            frac >= 0.90,
+            "patched graph stays connected: {frac:.3} self-match"
+        );
+    }
+
+    /// Writes that race a background delete-patch survive, and the result is
+    /// correct from disk alone after a reopen - the patch leaves runs/delta/WAL
+    /// untouched, so the removed rows (tombstoned or run-shadowed) still replay.
+    #[test]
+    fn delete_patch_survives_race_and_reopen() {
+        let dim = 16;
+        let n = 300usize;
+        let vecs = random_vectors(n, dim, 32);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        for id in (0..n as u64).step_by(5) {
+            idx.delete(id).unwrap(); // dead-at-begin base rows
+        }
+        let live_before = idx.len();
+
+        let job = idx
+            .delete_patch_begin()
+            .unwrap()
+            .expect("dead rows to reclaim");
+        // Race the off-thread build.
+        idx.insert(90_000, &vec![0.11f32; dim]).unwrap(); // new live
+        assert!(idx.delete(1).unwrap(), "delete a survivor mid-patch"); // 1 % 5 != 0
+        idx.insert(90_001, &vec![0.22f32; dim]).unwrap();
+        assert!(idx.delete(90_001).unwrap(), "insert+delete in the window");
+        let built = job.build(tmp.path()).unwrap();
+        idx.delete_patch_finish(built).unwrap();
+
+        // +1 (90000 live), -1 (id 1 deleted). Deletes of already-dead rows n/a.
+        assert_eq!(idx.len(), live_before + 1 - 1);
+        assert!(idx.get(90_000).unwrap().is_some(), "post-begin insert kept");
+        assert!(
+            idx.get(1).unwrap().is_none(),
+            "post-begin delete of a survivor holds"
+        );
+        assert!(
+            idx.get(90_001).unwrap().is_none(),
+            "insert+delete in window stays dead"
+        );
+        assert!(idx.get(0).unwrap().is_none(), "pre-begin delete stays gone");
+
+        // Reopen from disk: base is patched, WAL replays the full history.
+        drop(idx);
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live_before, "live count identical from disk");
+        assert!(re.get(90_000).unwrap().is_some());
+        assert!(re.get(1).unwrap().is_none());
+        assert!(re.get(0).unwrap().is_none());
+        let survivor = 2u64;
+        assert!(
+            re.get(survivor).unwrap().is_some(),
+            "a survivor is still present"
+        );
+    }
+
+    // ── Off-thread flush (feat/off-thread-flush) ────────────────────────────
+
+    // The staged delta stays searchable during the off-thread build, then lands
+    // in a run; the live set is unchanged and everything remains retrievable.
+    #[test]
+    fn off_thread_flush_stages_and_splices() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(500, dim, 7);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let more = random_vectors(300, dim, 8);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(500 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+        assert_eq!(idx.delta_len(), 300);
+
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        assert_eq!(idx.delta_len(), 0, "delta moved to staging");
+        // A staged entry is still found DURING the flush (search + get).
+        let x = 600u64;
+        let qv = &more[(x - 500) as usize * dim..(x - 500 + 1) as usize * dim];
+        assert_eq!(
+            idx.search(qv, 1).unwrap()[0].0,
+            x,
+            "staged searchable mid-flush"
+        );
+        assert!(idx.get(x).unwrap().is_some(), "staged get() mid-flush");
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 1, "flushed into one run");
+        assert_eq!(idx.len(), live, "live set unchanged");
+        assert_eq!(
+            idx.search(qv, 1).unwrap()[0].0,
+            x,
+            "searchable after finish"
+        );
+    }
+
+    // Inserts, deletes, and re-inserts that race the off-thread flush all resolve
+    // correctly (delta > flushing > run precedence), and a reopen from disk gives
+    // the same live set (the WAL was never truncated by the flush).
+    #[test]
+    fn writes_during_off_thread_flush_survive() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(500, dim, 9);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let more = random_vectors(300, dim, 10);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(500 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+
+        let job = idx.flush_begin().unwrap().unwrap();
+        idx.insert(9000, &vec![0.5f32; dim]).unwrap(); // new
+        assert!(idx.delete(500).unwrap(), "delete a staged id"); // 500 is staged
+        idx.insert(501, &vec![0.7f32; dim]).unwrap(); // overwrite a staged id
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+
+        assert!(idx.get(9000).unwrap().is_some(), "post-begin insert kept");
+        assert!(idx.get(500).unwrap().is_none(), "deleted staged id gone");
+        assert_eq!(
+            idx.get(501).unwrap().unwrap(),
+            vec![0.7f32; dim],
+            "re-insert wins over run"
+        );
+        assert_eq!(idx.len(), live + 1 - 1, "one new, one deleted");
+
+        drop(idx);
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live, "same live set from disk");
+        assert!(re.get(9000).unwrap().is_some());
+        assert!(re.get(500).unwrap().is_none());
+        assert_eq!(re.get(501).unwrap().unwrap(), vec![0.7f32; dim]);
+    }
+
+    // A crash between flush_begin and flush_finish loses nothing: the staged
+    // batch's inserts are still in the WAL, so a reopen replays them.
+    #[test]
+    fn off_thread_flush_crash_before_finish_recovers() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(400, dim, 11);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let more = random_vectors(300, dim, 12);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(400 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+        let job = idx.flush_begin().unwrap().unwrap();
+        let _built = job.build(tmp.path()).unwrap(); // built but NEVER finished
+        drop(idx); // crash
+
+        let re = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(re.len(), live, "live set recovered from the WAL");
+        assert!(re.get(500).unwrap().is_some(), "a staged id recovered");
+    }
+
+    // set_auto_flush(false) stops the inline flush; the default keeps it.
+    #[test]
+    fn set_auto_flush_off_disables_inline_flush() {
+        let dim = 16;
+        let n = DiskVamanaIndex::FLUSH + 500;
+        let vecs = random_vectors(n, dim, 13);
+        let tmp0 = tempfile::TempDir::new().unwrap();
+        let mut off = DiskVamanaIndex::create_empty(tmp0.path(), dim, 64).unwrap();
+        off.set_auto_flush(false);
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            off.insert(i as u64, v).unwrap();
+        }
+        assert_eq!(off.run_count(), 0, "auto_flush off => no inline flush");
+        assert!(
+            off.delta_len() >= DiskVamanaIndex::FLUSH,
+            "delta grew past FLUSH"
+        );
+
+        let tmp1 = tempfile::TempDir::new().unwrap();
+        let mut on = DiskVamanaIndex::create_empty(tmp1.path(), dim, 64).unwrap();
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            on.insert(i as u64, v).unwrap();
+        }
+        assert!(on.run_count() >= 1, "default auto_flush flushes inline");
     }
 }

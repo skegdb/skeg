@@ -11,6 +11,14 @@ pub enum RecordKind {
     VecF32 = 2,
     VecInt8 = 3,
     VecBinary = 4,
+    /// Header of an atomic multi-key write (see `VLog::set_many`). Its value is
+    /// the `u32` LE count `N` of the records that immediately follow it as one
+    /// contiguous group. Recovery buffers those `N` records and applies them
+    /// only if all `N` are intact; a batch torn by a crash (fewer than `N`
+    /// durable) is dropped whole, giving all-or-nothing semantics. Carries no
+    /// key and is never indexed; compaction drops it like any unreferenced
+    /// record, and the members it introduced live on as ordinary `Scalar`s.
+    BatchBegin = 5,
 }
 
 impl RecordKind {
@@ -26,6 +34,7 @@ impl RecordKind {
             2 => Ok(Self::VecF32),
             3 => Ok(Self::VecInt8),
             4 => Ok(Self::VecBinary),
+            5 => Ok(Self::BatchBegin),
             _ => Err(crate::Error::UnknownKind { kind: k }),
         }
     }
