@@ -27,7 +27,7 @@ path = "src/main.rs"
 skeg-server = { path = "../skeg-server", version = "0.7" }
 skeg-tenant = { path = "../skeg-tenant", version = "0.1" }
 skeg-vector = { path = "../skeg-vector", version = "0.1.7" }
-skeg-platform = { path = "../skeg-platform", version = "0.1" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.4" }
 
 tokio = { workspace = true }
 parking_lot = { workspace = true }
