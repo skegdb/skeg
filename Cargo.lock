@@ -1592,7 +1592,7 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "proptest",
- "skeg-platform 0.1.3",
+ "skeg-platform 0.1.4",
  "skeg-proto",
  "skeg-telemetry",
  "smallvec",
@@ -1621,10 +1621,11 @@ dependencies = [
 [[package]]
 name = "skeg-platform"
 version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c91697adc382f2d5a7c667b0c8f7ea9064c7abb1b355e81138be80c77a807f"
 dependencies = [
  "libc",
  "memmap2",
- "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1632,12 +1633,11 @@ dependencies = [
 
 [[package]]
 name = "skeg-platform"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c91697adc382f2d5a7c667b0c8f7ea9064c7abb1b355e81138be80c77a807f"
+version = "0.1.4"
 dependencies = [
  "libc",
  "memmap2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1740,7 +1740,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "skeg-core",
- "skeg-platform 0.1.3",
+ "skeg-platform 0.1.4",
  "skeg-proto",
  "skeg-resp3 0.2.3",
  "skeg-telemetry",
@@ -1761,7 +1761,7 @@ name = "skeg-server-tenant"
 version = "0.2.3"
 dependencies = [
  "parking_lot",
- "skeg-platform 0.1.3",
+ "skeg-platform 0.1.4",
  "skeg-server",
  "skeg-tenant",
  "skeg-vector 0.1.7",
@@ -1832,7 +1832,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "rayon",
- "skeg-platform 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "skeg-platform 0.1.3",
  "skeg-simd 0.1.4",
  "smallvec",
  "thiserror",
@@ -1853,7 +1853,7 @@ dependencies = [
  "proptest",
  "rand",
  "rayon",
- "skeg-platform 0.1.3",
+ "skeg-platform 0.1.4",
  "skeg-simd 0.1.5",
  "smallvec",
  "tempfile",
