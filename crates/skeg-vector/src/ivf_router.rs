@@ -216,8 +216,17 @@ impl IvfRouter {
     /// fully-covered cell are taken wholesale; a straddling cell is filtered by
     /// `attr`. Returns base rows. Empty (not a panic) if no zone-map is attached.
     #[must_use]
-    pub fn probe_range(&self, query: &[f32], lo: u64, hi: u64, attr: &[u64], budget: usize) -> Vec<u64> {
-        let Some(z) = &self.zone else { return Vec::new() };
+    pub fn probe_range(
+        &self,
+        query: &[f32],
+        lo: u64,
+        hi: u64,
+        attr: &[u64],
+        budget: usize,
+    ) -> Vec<u64> {
+        let Some(z) = &self.zone else {
+            return Vec::new();
+        };
         // Rank the overlapping cells by query-centroid cosine (nearest first).
         let mut cells: Vec<(f32, usize, bool)> = Vec::new(); // (score, cell, fully_covered)
         for c in 0..self.n_cells {
@@ -416,7 +425,10 @@ mod tests {
 
         // probe_range returns ONLY in-range rows (no false positives).
         let got = ivf.probe_range(&query, lo, hi, &attr, 10_000);
-        assert!(got.iter().all(|&r| (lo..=hi).contains(&attr[r as usize])), "no out-of-range rows");
+        assert!(
+            got.iter().all(|&r| (lo..=hi).contains(&attr[r as usize])),
+            "no out-of-range rows"
+        );
         // Budget above the match count -> every in-range row surfaces.
         assert_eq!(got.len(), 500, "all 500 matches within budget");
 

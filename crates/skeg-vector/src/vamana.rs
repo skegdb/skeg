@@ -1509,7 +1509,10 @@ impl IvfJob {
         for r in 0..n as usize {
             let off = HEADER_LEN as u64 + r as u64 * dim as u64 * 4;
             seg_file.read_exact_at(&mut buf, off)?;
-            for (slot, c) in all[r * dim..r * dim + dim].iter_mut().zip(buf.chunks_exact(4)) {
+            for (slot, c) in all[r * dim..r * dim + dim]
+                .iter_mut()
+                .zip(buf.chunks_exact(4))
+            {
                 *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             }
         }
@@ -1699,8 +1702,10 @@ fn patch_graph(
                 }
             }
             let pv = old_src.row(p);
-            let mut scored: Vec<(f32, VecId)> =
-                cand.iter().map(|&c| (dist(pv, old_src.row(c)), c)).collect();
+            let mut scored: Vec<(f32, VecId)> = cand
+                .iter()
+                .map(|&c| (dist(pv, old_src.row(c)), c))
+                .collect();
             let picked = robust_prune(p, &mut scored, cfg.alpha2, cfg.r, &old_src);
             let remapped: SmallVec<[VecId; MAX_R]> =
                 picked.iter().map(|&w| remap[w as usize]).collect();
@@ -3674,7 +3679,11 @@ impl DiskVamanaIndex {
     /// # Panics
     /// Panics if `attr.len()` does not equal the base row count.
     pub fn set_attr(&mut self, attr: &[u64]) -> io::Result<()> {
-        assert_eq!(attr.len(), self.base.main_n as usize, "attr/base-rows mismatch");
+        assert_eq!(
+            attr.len(),
+            self.base.main_n as usize,
+            "attr/base-rows mismatch"
+        );
         let mut bytes = Vec::with_capacity(attr.len() * 8);
         for &a in attr {
             bytes.extend_from_slice(&a.to_le_bytes());
@@ -3780,7 +3789,10 @@ impl DiskVamanaIndex {
             // Wide: zone-map path, no id set built.
             let q = normalized(query);
             let short_rows = router.probe_range(&q, lo, hi, attr, SHORTLIST.max(rerank));
-            let ids: Vec<u64> = short_rows.iter().map(|&r| self.base.ids[r as usize]).collect();
+            let ids: Vec<u64> = short_rows
+                .iter()
+                .map(|&r| self.base.ids[r as usize])
+                .collect();
             self.score_ids_quantized(query, &ids, k, rerank)
         } else {
             // Narrow: materialise the matching ids, reuse the filtered path.
@@ -4059,14 +4071,28 @@ mod tests {
             let (mut hits, mut total) = (0usize, 0usize);
             for _ in 0..30 {
                 let q: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
-                let got: Vec<u64> = d.search_range(&q, lo, hi, 10, 80).unwrap().into_iter().map(|(id, _)| id).collect();
-                assert!(got.iter().all(|&id| (lo..=hi).contains(&id)), "result out of [{lo},{hi}]");
+                let got: Vec<u64> = d
+                    .search_range(&q, lo, hi, 10, 80)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert!(
+                    got.iter().all(|&id| (lo..=hi).contains(&id)),
+                    "result out of [{lo},{hi}]"
+                );
                 // brute filtered truth
                 let mut truth: Vec<(f32, u64)> = (lo..=hi)
-                    .map(|id| (cosine_f32(&q, &vectors[id as usize * dim..id as usize * dim + dim]), id))
+                    .map(|id| {
+                        (
+                            cosine_f32(&q, &vectors[id as usize * dim..id as usize * dim + dim]),
+                            id,
+                        )
+                    })
                     .collect();
                 truth.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-                let want: std::collections::HashSet<u64> = truth.iter().take(10).map(|&(_, id)| id).collect();
+                let want: std::collections::HashSet<u64> =
+                    truth.iter().take(10).map(|&(_, id)| id).collect();
                 hits += got.iter().filter(|id| want.contains(id)).count();
                 total += want.len().min(10);
             }
@@ -4081,7 +4107,10 @@ mod tests {
         drop(disk);
         let disk2 = DiskVamanaIndex::open(tmp.path()).unwrap();
         assert!(disk2.attr.is_some(), "attr column must survive reopen");
-        assert!(check(&disk2, 1000, 3500) >= 0.9, "wide-range recall after reopen");
+        assert!(
+            check(&disk2, 1000, 3500) >= 0.9,
+            "wide-range recall after reopen"
+        );
     }
 
     // RW disk index with a TurboQuant tier: the live write path (create -> insert
@@ -4746,7 +4775,10 @@ mod tests {
         }
         let live_before = idx.len();
         let runs_before = idx.run_count();
-        assert!(runs_before >= 2, "need multiple runs to merge, got {runs_before}");
+        assert!(
+            runs_before >= 2,
+            "need multiple runs to merge, got {runs_before}"
+        );
 
         let job = idx.merge_runs_begin().unwrap().expect("runs to merge");
         let built = job.build(tmp.path()).unwrap();
@@ -4788,10 +4820,20 @@ mod tests {
         let built = job.build(tmp.path()).unwrap();
         idx.merge_runs_finish(built).unwrap();
 
-        assert_eq!(idx.len(), live_before + 1 - 1, "one new live (90000), one folded id deleted");
+        assert_eq!(
+            idx.len(),
+            live_before + 1 - 1,
+            "one new live (90000), one folded id deleted"
+        );
         assert!(idx.get(90_000).unwrap().is_some(), "post-begin insert kept");
-        assert!(idx.get(1).unwrap().is_none(), "post-begin delete of a folded id holds");
-        assert!(idx.get(90_001).unwrap().is_none(), "insert+delete in window stays dead");
+        assert!(
+            idx.get(1).unwrap().is_none(),
+            "post-begin delete of a folded id holds"
+        );
+        assert!(
+            idx.get(90_001).unwrap().is_none(),
+            "insert+delete in window stays dead"
+        );
 
         // Reopen: the merge is transient (no WAL touch); the WAL replays the full
         // history, so the live set is identical from disk alone.
@@ -4824,11 +4866,18 @@ mod tests {
         }
         let live_before = idx.len();
 
-        let job = idx.delete_patch_begin().unwrap().expect("dead rows to reclaim");
+        let job = idx
+            .delete_patch_begin()
+            .unwrap()
+            .expect("dead rows to reclaim");
         let built = job.build(tmp.path()).unwrap();
         idx.delete_patch_finish(built).unwrap();
 
-        assert_eq!(idx.main_len(), n - deleted.len(), "base shrank by the deletes");
+        assert_eq!(
+            idx.main_len(),
+            n - deleted.len(),
+            "base shrank by the deletes"
+        );
         assert_eq!(idx.len(), live_before, "live set unchanged by the patch");
         for &id in &deleted {
             assert!(idx.get(id).unwrap().is_none(), "deleted id {id} stays gone");
@@ -4844,7 +4893,10 @@ mod tests {
             }
         }
         let frac = self_hits as f64 / survivors.len() as f64;
-        assert!(frac >= 0.90, "patched graph stays connected: {frac:.3} self-match");
+        assert!(
+            frac >= 0.90,
+            "patched graph stays connected: {frac:.3} self-match"
+        );
     }
 
     /// Writes that race a background delete-patch survive, and the result is
@@ -4866,7 +4918,10 @@ mod tests {
         }
         let live_before = idx.len();
 
-        let job = idx.delete_patch_begin().unwrap().expect("dead rows to reclaim");
+        let job = idx
+            .delete_patch_begin()
+            .unwrap()
+            .expect("dead rows to reclaim");
         // Race the off-thread build.
         idx.insert(90_000, &vec![0.11f32; dim]).unwrap(); // new live
         assert!(idx.delete(1).unwrap(), "delete a survivor mid-patch"); // 1 % 5 != 0
@@ -4878,8 +4933,14 @@ mod tests {
         // +1 (90000 live), -1 (id 1 deleted). Deletes of already-dead rows n/a.
         assert_eq!(idx.len(), live_before + 1 - 1);
         assert!(idx.get(90_000).unwrap().is_some(), "post-begin insert kept");
-        assert!(idx.get(1).unwrap().is_none(), "post-begin delete of a survivor holds");
-        assert!(idx.get(90_001).unwrap().is_none(), "insert+delete in window stays dead");
+        assert!(
+            idx.get(1).unwrap().is_none(),
+            "post-begin delete of a survivor holds"
+        );
+        assert!(
+            idx.get(90_001).unwrap().is_none(),
+            "insert+delete in window stays dead"
+        );
         assert!(idx.get(0).unwrap().is_none(), "pre-begin delete stays gone");
 
         // Reopen from disk: base is patched, WAL replays the full history.
@@ -4890,7 +4951,10 @@ mod tests {
         assert!(re.get(1).unwrap().is_none());
         assert!(re.get(0).unwrap().is_none());
         let survivor = 2u64;
-        assert!(re.get(survivor).unwrap().is_some(), "a survivor is still present");
+        assert!(
+            re.get(survivor).unwrap().is_some(),
+            "a survivor is still present"
+        );
     }
 
     // ── Off-thread flush (feat/off-thread-flush) ────────────────────────────
@@ -4926,14 +4990,22 @@ mod tests {
         // A staged entry is still found DURING the flush (search + get).
         let x = 600u64;
         let qv = &more[(x - 500) as usize * dim..(x - 500 + 1) as usize * dim];
-        assert_eq!(idx.search(qv, 1).unwrap()[0].0, x, "staged searchable mid-flush");
+        assert_eq!(
+            idx.search(qv, 1).unwrap()[0].0,
+            x,
+            "staged searchable mid-flush"
+        );
         assert!(idx.get(x).unwrap().is_some(), "staged get() mid-flush");
 
         let built = job.build(tmp.path()).unwrap();
         idx.flush_finish(built).unwrap();
         assert_eq!(idx.run_count(), 1, "flushed into one run");
         assert_eq!(idx.len(), live, "live set unchanged");
-        assert_eq!(idx.search(qv, 1).unwrap()[0].0, x, "searchable after finish");
+        assert_eq!(
+            idx.search(qv, 1).unwrap()[0].0,
+            x,
+            "searchable after finish"
+        );
     }
 
     // Inserts, deletes, and re-inserts that race the off-thread flush all resolve
@@ -4971,7 +5043,11 @@ mod tests {
 
         assert!(idx.get(9000).unwrap().is_some(), "post-begin insert kept");
         assert!(idx.get(500).unwrap().is_none(), "deleted staged id gone");
-        assert_eq!(idx.get(501).unwrap().unwrap(), vec![0.7f32; dim], "re-insert wins over run");
+        assert_eq!(
+            idx.get(501).unwrap().unwrap(),
+            vec![0.7f32; dim],
+            "re-insert wins over run"
+        );
         assert_eq!(idx.len(), live + 1 - 1, "one new, one deleted");
 
         drop(idx);
@@ -5028,7 +5104,10 @@ mod tests {
             off.insert(i as u64, v).unwrap();
         }
         assert_eq!(off.run_count(), 0, "auto_flush off => no inline flush");
-        assert!(off.delta_len() >= DiskVamanaIndex::FLUSH, "delta grew past FLUSH");
+        assert!(
+            off.delta_len() >= DiskVamanaIndex::FLUSH,
+            "delta grew past FLUSH"
+        );
 
         let tmp1 = tempfile::TempDir::new().unwrap();
         let mut on = DiskVamanaIndex::create_empty(tmp1.path(), dim, 64).unwrap();

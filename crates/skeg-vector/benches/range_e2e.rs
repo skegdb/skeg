@@ -31,7 +31,10 @@ fn load(path: &str, cap: usize) -> (Vec<f32>, usize, usize) {
     let sh = header.find("'shape':").unwrap();
     let lp = header[sh..].find('(').unwrap() + sh + 1;
     let rp = header[lp..].find(')').unwrap() + lp;
-    let dims: Vec<usize> = header[lp..rp].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let dims: Vec<usize> = header[lp..rp]
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     let (rows, dim) = (dims[0], dims[1]);
     let raw: Vec<f32> = bytes[10 + hl..]
         .chunks_exact(4)
@@ -58,7 +61,10 @@ fn splitmix(mut x: u64) -> u64 {
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -86,7 +92,10 @@ fn main() {
     disk.build_ivf(0, 8).unwrap();
     eprintln!("build+attr+ivf: {:.1}s\n", t.elapsed().as_secs_f64());
 
-    eprintln!("{:>4}  {:>10}  {:>10}  {:>8}  {:>8}", "sel", "old(ms)", "new(ms)", "speedup", "overlap");
+    eprintln!(
+        "{:>4}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "sel", "old(ms)", "new(ms)", "speedup", "overlap"
+    );
     for &sel in &sels {
         let width = ATTR_RANGE * sel as u64 / 100;
         let range = |qi: usize| {
@@ -98,7 +107,9 @@ fn main() {
         for qi in 0..nq {
             let (lo, hi) = range(qi);
             let q = &queries[qi * dim..qi * dim + dim];
-            let mut s: Vec<u64> = (0..n as u64).filter(|&r| (lo..=hi).contains(&attr[r as usize])).collect();
+            let mut s: Vec<u64> = (0..n as u64)
+                .filter(|&r| (lo..=hi).contains(&attr[r as usize]))
+                .collect();
             s.sort_unstable();
             let _ = disk.search_filtered_hybrid(q, &s, K, RERANK).unwrap();
             let _ = disk.search_range(q, lo, hi, K, RERANK).unwrap();
@@ -125,7 +136,9 @@ fn main() {
         for qi in 0..nq {
             let (lo, hi) = range(qi);
             let q = &queries[qi * dim..qi * dim + dim];
-            let mut s: Vec<u64> = (0..n as u64).filter(|&r| (lo..=hi).contains(&attr[r as usize])).collect();
+            let mut s: Vec<u64> = (0..n as u64)
+                .filter(|&r| (lo..=hi).contains(&attr[r as usize]))
+                .collect();
             s.sort_unstable();
             let old = disk.search_filtered_hybrid(q, &s, K, RERANK).unwrap();
             let a: Vec<u64> = old.iter().map(|(id, _)| *id).collect();

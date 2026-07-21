@@ -309,8 +309,12 @@ fn main() {
     let mode = std::env::var("SKEG_MODE").unwrap_or_else(|_| "full".into());
     if mode == "l3" {
         let del: f64 = env("SKEG_DELFRAC", 0.4);
-        println!("# scale_churn L3 reclaim: dim={dim} tq{bits} | consolidate O(live) vs delete-patch O(deleted)");
-        println!("# del% deleted before reclaim; cons/patch = reclaim wall seconds; base = rows after");
+        println!(
+            "# scale_churn L3 reclaim: dim={dim} tq{bits} | consolidate O(live) vs delete-patch O(deleted)"
+        );
+        println!(
+            "# del% deleted before reclaim; cons/patch = reclaim wall seconds; base = rows after"
+        );
         println!("| live    | del% | cons_s   | patch_s  | speedup | base_c  | base_p  |");
         println!("|---------|-----:|---------:|---------:|--------:|--------:|--------:|");
         for &n in &sizes {

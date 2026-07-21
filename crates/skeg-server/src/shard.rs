@@ -890,7 +890,9 @@ fn recover_vindexes(
                 idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
                 set.insert(
                     name,
-                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(Box::new(idx))))),
+                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(
+                        Box::new(idx),
+                    )))),
                 );
             }
             Err(e) => error!("shard {shard_id}: recovering vindex '{name}' failed: {e}"),
@@ -971,7 +973,9 @@ async fn get_or_reopen(
         return Some(entry);
     }
     idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
-    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(Box::new(idx)))));
+    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(
+        Box::new(idx),
+    ))));
     entry.read().touch();
     w.insert(name.to_owned(), entry.clone());
     Some(entry)
@@ -4078,7 +4082,8 @@ mod tests {
             idx.run_count()
         );
 
-        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(Box::new(idx)))));
+        let arc: VectorEntry =
+            Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(Box::new(idx)))));
 
         // L2: runs fold into one.
         let d = vdir.clone();

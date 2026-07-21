@@ -139,8 +139,9 @@ fn build_churned(
     let mut base_job: Option<
         std::thread::JoinHandle<std::io::Result<skeg_vector::ConsolidateBuilt>>,
     > = None;
-    let mut merge_job: Option<std::thread::JoinHandle<std::io::Result<skeg_vector::RunMergeBuilt>>> =
-        None;
+    let mut merge_job: Option<
+        std::thread::JoinHandle<std::io::Result<skeg_vector::RunMergeBuilt>>,
+    > = None;
     let mut next_base = n; // op index for the next rare base rebuild (l2)
     for (op, &(succ, victim)) in ops.iter().enumerate() {
         idx.insert(succ, &vat(corpus, succ, dim)).unwrap();

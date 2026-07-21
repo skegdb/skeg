@@ -88,7 +88,10 @@ fn topk(query: &[f32], rows: &[u64], data: &[f32], dim: usize, k: usize) -> Vec<
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -102,7 +105,11 @@ fn main() {
     assert_eq!(dim, qdim, "corpus/query dim mismatch");
     let nq = nq.min(nq_have);
 
-    let n_cells = if cells == 0 { IvfRouter::cells_for(n) } else { cells };
+    let n_cells = if cells == 0 {
+        IvfRouter::cells_for(n)
+    } else {
+        cells
+    };
     eprintln!("N={n} dim={dim} cells={n_cells} nq={nq} sel={sel}% budget={BUDGET}");
 
     let corr = env_usize("SKEG_CORR", 0) == 1;
@@ -116,7 +123,14 @@ fn main() {
     } else {
         (0..n).map(|r| splitmix(r as u64) % ATTR_RANGE).collect()
     };
-    eprintln!("attr: {}", if corr { "correlated (time axis)" } else { "uniform (conservative)" });
+    eprintln!(
+        "attr: {}",
+        if corr {
+            "correlated (time axis)"
+        } else {
+            "uniform (conservative)"
+        }
+    );
     router.set_zonemap(&attr);
     eprintln!("build+zonemap: {:.2}s", t.elapsed().as_secs_f64());
 
@@ -137,7 +151,9 @@ fn main() {
 
         // --- Baseline: materialise s (O(n) scan + sorted alloc), then probe.
         let t0 = Instant::now();
-        let mut s: Vec<u64> = (0..n as u64).filter(|&r| (lo..=hi).contains(&attr[r as usize])).collect();
+        let mut s: Vec<u64> = (0..n as u64)
+            .filter(|&r| (lo..=hi).contains(&attr[r as usize]))
+            .collect();
         s.sort_unstable(); // contract: s is sorted
         let base_short = router.probe(q, &s, BUDGET);
         base_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -157,7 +173,9 @@ fn main() {
             let _ = router.probe_range(q, lo, hi, &attr, BUDGET);
             chose_range += 1;
         } else {
-            let mut s2: Vec<u64> = (0..n as u64).filter(|&r| (lo..=hi).contains(&attr[r as usize])).collect();
+            let mut s2: Vec<u64> = (0..n as u64)
+                .filter(|&r| (lo..=hi).contains(&attr[r as usize]))
+                .collect();
             s2.sort_unstable();
             let _ = router.probe(q, &s2, BUDGET);
         }
@@ -171,9 +189,29 @@ fn main() {
 
     let nqf = nq as f64;
     eprintln!("\n--- per-query averages ({nq} queries, sel={sel}%) ---");
-    eprintln!("baseline (scan+probe): {:.3} ms   | id-set materialised: {} ids/query", base_ms / nqf, s_total / nq);
-    eprintln!("zone-map (probe_range): {:.3} ms   | candidates: {} rows/query", zone_ms / nqf, cand_total / nq);
-    eprintln!("auto (estimate+route): {:.3} ms   | chose range path: {}/{} queries", auto_ms / nqf, chose_range, nq);
-    eprintln!("speedup zone vs base: {:.2}x   | speedup AUTO vs base: {:.2}x", base_ms / zone_ms.max(1e-9), base_ms / auto_ms.max(1e-9));
-    eprintln!("top-{K} overlap (quality, want ~1.0): {:.3}", overlap as f64 / (nqf * K as f64));
+    eprintln!(
+        "baseline (scan+probe): {:.3} ms   | id-set materialised: {} ids/query",
+        base_ms / nqf,
+        s_total / nq
+    );
+    eprintln!(
+        "zone-map (probe_range): {:.3} ms   | candidates: {} rows/query",
+        zone_ms / nqf,
+        cand_total / nq
+    );
+    eprintln!(
+        "auto (estimate+route): {:.3} ms   | chose range path: {}/{} queries",
+        auto_ms / nqf,
+        chose_range,
+        nq
+    );
+    eprintln!(
+        "speedup zone vs base: {:.2}x   | speedup AUTO vs base: {:.2}x",
+        base_ms / zone_ms.max(1e-9),
+        base_ms / auto_ms.max(1e-9)
+    );
+    eprintln!(
+        "top-{K} overlap (quality, want ~1.0): {:.3}",
+        overlap as f64 / (nqf * K as f64)
+    );
 }
