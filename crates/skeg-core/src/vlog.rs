@@ -62,7 +62,7 @@ type RelocOutcome = Result<Option<(u16, u32, bool)>>;
 /// Recovery-time gate for atomic batches ([`VLog::set_many`]). A `BatchBegin(N)`
 /// header opens a run of `N` records; the gate withholds them until all `N`
 /// have been scanned, then releases them for application. A run torn by a crash
-/// — fewer than `N` durable before the scan hits the corrupt tail — is never
+/// (fewer than `N` durable before the scan hits the corrupt tail) is never
 /// released, which is what makes `set_many` all-or-nothing on reopen. A batch
 /// never spans segments (its blob is written to one segment), so a fresh gate
 /// per segment is enough; anything still pending when a segment ends is dropped.
@@ -74,7 +74,7 @@ struct BatchGate {
 
 impl BatchGate {
     /// Feed one scanned record, invoking `apply` on each record that is ready.
-    /// A record outside a batch is applied straight through (zero allocation —
+    /// A record outside a batch is applied straight through (zero allocation -
     /// the hot path for every normal recovery); a batch's members are held in
     /// `pending` and applied together once the batch completes.
     fn feed(&mut self, offset: u64, rec: Record, mut apply: impl FnMut(u64, Record)) {
@@ -511,7 +511,7 @@ impl VLog {
     /// return the new value's length, mirroring Redis `APPEND`.
     ///
     /// Read-modify-write: it reads the whole current value, concatenates, and
-    /// writes the whole result as one new record — so a single append is
+    /// writes the whole result as one new record - so a single append is
     /// O(current value length). A key whose value grows over many appends costs
     /// O(n^2) in total; that is the naive log-store cost, fine for bounded
     /// values (e.g. a capped adjacency list) but not for an unbounded one.
@@ -554,13 +554,13 @@ impl VLog {
 
     /// Atomically write every `(key, value)` pair, or none. The pairs are
     /// encoded behind a single `BatchBegin(N)` header and submitted as one
-    /// group-commit append — one contiguous write, one flush. If a crash tears
+    /// group-commit append - one contiguous write, one flush. If a crash tears
     /// the write, recovery finds fewer than `N` members after the header and
     /// drops the whole batch, so a reopened store never shows a partial MSET.
     ///
     /// All-or-nothing holds for THIS store only. A caller that shards keys
     /// across several `VLog`s gets per-store atomicity, not a global
-    /// transaction — there is no cross-store coordination here.
+    /// transaction - there is no cross-store coordination here.
     ///
     /// Later pairs win over earlier ones for a duplicate key (each carries a
     /// higher timestamp), matching last-write-wins.
@@ -568,7 +568,7 @@ impl VLog {
     /// # Errors
     ///
     /// Returns an error on IO failure, or if the encoded batch exceeds one
-    /// segment (`max_seg_size`) — split into smaller batches.
+    /// segment (`max_seg_size`) - split into smaller batches.
     pub async fn set_many(&self, pairs: &[(&[u8], &[u8])], durability: Durability) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
@@ -923,7 +923,7 @@ impl VLog {
     /// Store-wide, not scoped: a segment interleaves every tenant's records in
     /// write order, so "reclaim only tenant T" is not expressible at this
     /// layer. Reclaiming other tenants' already-dead bytes too is harmless.
-    /// O(bytes in segments that have any dead record) — heavy; call it after a
+    /// O(bytes in segments that have any dead record) - heavy; call it after a
     /// batch of deletes, not per key.
     ///
     /// # Errors
@@ -936,7 +936,7 @@ impl VLog {
         // case it holds nothing to reclaim anyway.
         self.maybe_rotate(self.inner.max_seg_size).await?;
 
-        // Snapshot the targets up front — sealed segments with any dead byte —
+        // Snapshot the targets up front - sealed segments with any dead byte -
         // so freshly written relocation segments are never re-picked and the
         // loop cannot diverge.
         let targets: Vec<(u16, u64)> = {
@@ -1100,7 +1100,7 @@ impl VLog {
         // callers on the same store (the background maintenance loop and
         // `reclaim_all_dead`). They interleave at the `await`s above, so both
         // can pass the `find` guard on the same seg_id with a cloned file
-        // handle, relocate its records (harmless — the recheck-CAS dedups), and
+        // handle, relocate its records (harmless - the recheck-CAS dedups), and
         // then both reach here. The second unlink would be `ENOENT`; that is the
         // work already done, not an error.
         match std::fs::remove_file(segment_path(&self.inner.dir, seg_id)) {
@@ -1752,7 +1752,7 @@ mod tests {
         assert_eq!(v.len(), 1);
     }
 
-    /// Concatenate every segment `.seg` file's raw bytes — what a verbatim
+    /// Concatenate every segment `.seg` file's raw bytes - what a verbatim
     /// backup of the data dir would capture.
     fn raw_disk_bytes(dir: &std::path::Path) -> Vec<u8> {
         let mut all = Vec::new();
@@ -1983,7 +1983,7 @@ mod tests {
         }
         v.flush().await.unwrap();
 
-        // join! polls both on this one task, interleaving them at every await —
+        // join! polls both on this one task, interleaving them at every await -
         // the exact contention the shard's background loop creates against a
         // reclaim. Neither must error on a segment the other already unlinked.
         let (reclaimed, compacted) = tokio::join!(v.reclaim_all_dead(), v.maybe_compact());

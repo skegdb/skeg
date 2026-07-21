@@ -3648,7 +3648,7 @@ impl DiskVamanaIndex {
         };
         let n = self.base.main_n as usize;
         if bytes.len() != n * 8 {
-            return; // stale (base resized) — ignore
+            return; // stale (base resized) - ignore
         }
         let attr: Vec<u64> = bytes
             .chunks_exact(8)
@@ -3670,7 +3670,7 @@ impl DiskVamanaIndex {
 
     /// Attach a u64 attribute column (one value per BASE row, in row order) for
     /// range-filtered search. Persists a sidecar and builds the router zone-map
-    /// if the IVF router is present. The column is opaque — a time axis, an
+    /// if the IVF router is present. The column is opaque - a time axis, an
     /// importance score, any monotone-comparable key.
     ///
     /// # Errors

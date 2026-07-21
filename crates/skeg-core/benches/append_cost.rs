@@ -60,7 +60,7 @@ fn main() {
     // At these (KiB-range) sizes us/append is near-flat: it is dominated by the
     // per-append group-commit round-trip (~1.6ms), and the O(value) copy is a
     // rounding error next to it. The O(N^2) copy only overtakes the flush once
-    // the value reaches MB scale — the regime where the chunked/delta variant
+    // the value reaches MB scale - the regime where the chunked/delta variant
     // would pay off. For bounded values (a fan-out-capped adjacency list) naive
     // RMW is flush-bound like any single write.
     println!(

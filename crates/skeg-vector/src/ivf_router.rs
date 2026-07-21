@@ -163,7 +163,7 @@ impl IvfRouter {
     /// cell->rows inverted index, so [`probe_range`](Self::probe_range) can skip
     /// whole cells unread. `attr[row]` is the attribute of base row `row`; its
     /// length must equal [`len`](Self::len). O(n) one pass. The column is opaque
-    /// (time, importance, ...) — the router only compares it.
+    /// (time, importance, ...) - the router only compares it.
     ///
     /// # Panics
     /// Panics if `attr.len() != self.len()`.
@@ -211,7 +211,7 @@ impl IvfRouter {
 
     /// Zone-map probe: rows whose attribute is in `[lo, hi]`, drawn from the
     /// query-nearest cells that OVERLAP the range and gathered up to `budget`.
-    /// Cells whose `[min,max]` misses `[lo,hi]` are skipped unread — no match
+    /// Cells whose `[min,max]` misses `[lo,hi]` are skipped unread - no match
     /// id-set is ever materialised, unlike [`probe`](Self::probe). Members of a
     /// fully-covered cell are taken wholesale; a straddling cell is filtered by
     /// `attr`. Returns base rows. Empty (not a panic) if no zone-map is attached.

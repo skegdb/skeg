@@ -3,9 +3,9 @@
 //! Writing a multi-key MSET as N separate `set` calls pays one group-commit
 //! flush PER KEY. `set_many` puts the whole batch in one append -> one flush,
 //! and it is atomic on top. Two honest baselines:
-//!   - sequential: N awaited `set`s (one flush each) — what MSET used to do.
+//!   - sequential: N awaited `set`s (one flush each) - what MSET used to do.
 //!   - concurrent: N `set`s in flight via buffer_unordered (the committer
-//!     batches them, so flushes are already shared) — the fair rival.
+//!     batches them, so flushes are already shared) - the fair rival.
 //!
 //! `set_many` should match or beat concurrent while ALSO being atomic, and
 //! crush sequential.

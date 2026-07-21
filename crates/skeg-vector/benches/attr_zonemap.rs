@@ -12,7 +12,7 @@
 //!
 //! Real vectors (mxbai-wiki), SYNTHETIC uniform-random u64 attribute standing in
 //! for a time axis. Uniform is the CONSERVATIVE case: the attribute spreads
-//! evenly across every cell, so almost no cell falls fully outside a range —
+//! evenly across every cell, so almost no cell falls fully outside a range -
 //! the worst case for zone-map skipping. A real time axis correlates with
 //! ingest order and would skip far more. If the zone-map wins here, it wins.
 //!
@@ -63,7 +63,7 @@ fn load(path: &str, cap: usize) -> (Vec<f32>, usize, usize) {
     (out, n, dim)
 }
 
-/// Deterministic splitmix64 — a synthetic attribute without Math.random-style
+/// Deterministic splitmix64 - a synthetic attribute without Math.random-style
 /// nondeterminism, so runs reproduce.
 fn splitmix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);

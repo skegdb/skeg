@@ -1,4 +1,4 @@
-//! Recovery (cold reopen) time vs key count — the regression guard for the
+//! Recovery (cold reopen) time vs key count - the regression guard for the
 //! batch-aware recovery scan. Every reopened record now passes through the
 //! `BatchGate`; this measures whether that one extra branch per record costs
 //! anything on the normal (no-batch) path that every store pays on open.

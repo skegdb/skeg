@@ -1404,7 +1404,7 @@ async fn drop_vindex(
 /// keys are materialised, then release the borrow before deleting: the
 /// `for_each_key` callback is sync and `del` is async (and takes the index
 /// mutably anyway). Deletes run `buffer_unordered` so they share the group
-/// committer's flushes — awaiting each in turn put one record per batch and
+/// committer's flushes - awaiting each in turn put one record per batch and
 /// paid a flush per key (~1.4 ms each, ~14 s per 10k). The bound stays inside
 /// the concurrency ordinary client writes already drive the shard at.
 ///
@@ -1676,7 +1676,7 @@ async fn process(
                 return ShardResp::Err("cannot erase under the anonymous tenant (0)".to_owned());
             }
             // Subject-scoped erase: the tenant's 16 bytes followed by the
-            // caller's subject bytes. No vindex drop — a subject is a slice of a
+            // caller's subject bytes. No vindex drop - a subject is a slice of a
             // tenant, not the tenant; the caller reclaims a subject's vectors
             // with vdel + vindex_consolidate. This sweeps only the app's own KV
             // keys namespaced under the subject.
@@ -2632,7 +2632,7 @@ impl ShardSet {
 
     /// Erase a subject within a tenant: every KV key whose bytes are
     /// `tenant` (16B LE) followed by `subject`. Returns the count deleted,
-    /// summed over the shards. Logical only — follow with [`reclaim`] when the
+    /// summed over the shards. Logical only - follow with [`reclaim`] when the
     /// value bytes must physically leave the disk (GDPR).
     ///
     /// KV keys only. A subject's *vectors* live in the tenant's shared vindex;
@@ -2680,7 +2680,7 @@ impl ShardSet {
     /// bytes sit in their segments until compaction rewrites them, and the
     /// background loop only compacts a segment once it is mostly dead. For a
     /// GDPR guarantee, call this after the deletes. Store-wide and heavy
-    /// (O(bytes in segments with any dead record)) — batch your deletes, then
+    /// (O(bytes in segments with any dead record)) - batch your deletes, then
     /// reclaim once.
     ///
     /// Does not touch backups already taken, or vector f32 bytes (use

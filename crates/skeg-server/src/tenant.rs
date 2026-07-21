@@ -192,7 +192,7 @@ pub trait TenantBackend: Send + Sync {
 
     /// Remove `id` from the identity store: drop its logins and its stored
     /// limits/QoS. The DATA-plane erasure (`ShardSet::erase_tenant`) is the
-    /// caller's job — this is only the auth/quota side. Returns the number of
+    /// caller's job - this is only the auth/quota side. Returns the number of
     /// logins removed (0 if the tenant was already absent). Default:
     /// unsupported (no writable store).
     ///

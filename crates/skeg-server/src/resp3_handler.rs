@@ -787,7 +787,7 @@ async fn skeg_tenant_erase(
 ///
 /// Data is erased *before* the identity is removed: if the identity went first
 /// and the erase failed, the data would be orphaned under a tenant that can no
-/// longer log in — the exact leak this command closes. This way a failure
+/// longer log in - the exact leak this command closes. This way a failure
 /// leaves a still-valid tenant with erased data, which a retry finishes.
 /// Erasure is logical (tombstones); run `SKEG.RECLAIM` to reclaim the bytes.
 async fn skeg_tenant_delete(
@@ -823,7 +823,7 @@ async fn skeg_tenant_delete(
 }
 
 /// `SKEG.RECLAIM`. Admin only. Physically reclaim every dead byte across the
-/// store — the durable half of an erase. Store-wide (a segment interleaves all
+/// store - the durable half of an erase. Store-wide (a segment interleaves all
 /// tenants), so it is admin-gated, not tenant-facing. Returns bytes reclaimed.
 async fn skeg_reclaim(
     shards: &ShardSet,
@@ -1761,7 +1761,7 @@ mod tests {
                 CommandKind::Admin,
             ),
             // A subject erase is the caller acting on its own data: a KV write,
-            // not admin. The two store-wide / cross-tenant ops ARE admin — a
+            // not admin. The two store-wide / cross-tenant ops ARE admin - a
             // misclassification here would let a tenant erase or reclaim across
             // the whole store.
             (

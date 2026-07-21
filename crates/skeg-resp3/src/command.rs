@@ -150,7 +150,7 @@ pub enum Command {
         args: Vec<Bytes>,
     },
     /// `SKEG.TENANT.DELETE tenant`. Arity 1. Admin only; the full offboarding
-    /// lifecycle — erase the tenant's data (as ERASE) AND remove its logins and
+    /// lifecycle - erase the tenant's data (as ERASE) AND remove its logins and
     /// limits from the identity store, so the tenant ceases to exist. Inner
     /// parsing in the dispatcher.
     SkegTenantDelete {
