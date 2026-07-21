@@ -14,7 +14,7 @@ categories = ["database", "algorithms"]
 
 [dependencies]
 skeg-simd = { path = "../skeg-simd", version = "0.1.5" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.2" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.4" }
 parking_lot = { workspace = true }
 smallvec = { workspace = true }
 fixedbitset = { workspace = true }
