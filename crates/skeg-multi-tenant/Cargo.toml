@@ -27,7 +27,7 @@ path = "src/lib.rs"
 live-attach = ["dep:skeg-rigging-net", "dep:skeg-rigging-net-resp3"]
 
 [dependencies]
-skeg-tenant = { path = "../skeg-tenant", version = "0.1" }
+skeg-tenant = { path = "../skeg-tenant", version = "0.1.3" }
 # skeg-rigging and friends come from crates.io so a single resolved
 # instance is shared with skeg-rigging-net-resp3's transitive view of
 # it. Use `[patch.crates-io]` in a local workspace overlay if you need
