@@ -50,6 +50,7 @@ impl DirLock {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false) // lock file holds no content; never clobber
             .open(&path)?;
         // SAFETY: `flock` is a syscall on a valid fd owned by `file`. LOCK_NB
         // makes it non-blocking: it returns 0 on success, or -1 with errno

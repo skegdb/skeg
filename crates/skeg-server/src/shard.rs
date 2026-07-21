@@ -4148,6 +4148,7 @@ mod tests {
     // -p skeg-server -- --ignored stress_churn_maintenance --nocapture
     #[tokio::test]
     #[ignore = "stress; run with SKEG_IDLE_MAINT_MS=50 in release"]
+    #[allow(clippy::explicit_counter_loop)] // `next` is an id generator, not an index
     async fn stress_churn_maintenance() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 1).unwrap();
@@ -4224,6 +4225,7 @@ mod tests {
     // skeg-server -- --ignored stress_concurrent_query --nocapture
     #[tokio::test]
     #[ignore = "stress; run in release with SKEG_STRESS_N set"]
+    #[allow(clippy::explicit_counter_loop)] // `next` is an id generator, not an index
     async fn stress_concurrent_query_during_churn() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = TempDir::new().unwrap();
@@ -4654,6 +4656,7 @@ mod tests {
     // return EXACTLY the live matching set: no dead id, no wrong-group leak,
     // none missing.
     #[tokio::test]
+    #[allow(clippy::explicit_counter_loop)] // `next` is an id generator, not an index
     async fn filtered_search_correct_under_churn_and_consolidate() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 1).unwrap();

@@ -7,6 +7,8 @@
 //!      SKEG_MAXRUNS, SKEG_FSYNC (1 = the candidate fix is compiled in, see note).
 //! Run: SKEG_MODE=inline SKEG_ITERS=30 cargo bench -p skeg-vector --bench trunc_hunt
 
+#![allow(clippy::explicit_counter_loop)] // `next` is an id generator, not an index
+
 use std::path::Path;
 
 use skeg_vector::{ConsolidateBuilt, DiskVamanaIndex, QuantKind};
@@ -66,10 +68,9 @@ fn check_dir(dir: &Path) -> Vec<String> {
             if p.is_dir()
                 && p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with("run-"))
+                && let Some(m) = check_vbin(&p.join("vectors.bin"))
             {
-                if let Some(m) = check_vbin(&p.join("vectors.bin")) {
-                    bad.push(format!("RUN  {m}"));
-                }
+                bad.push(format!("RUN  {m}"));
             }
         }
     }
@@ -104,11 +105,12 @@ fn build_churned(
         idx.delete(ids[j]).unwrap();
         ids[j] = succ;
         if background {
-            if job.is_none() && idx.run_count() >= max_runs {
-                if let Some(jb) = idx.consolidate_begin().unwrap() {
-                    let d = dir.to_path_buf();
-                    job = Some(std::thread::spawn(move || jb.build(&d)));
-                }
+            if job.is_none()
+                && idx.run_count() >= max_runs
+                && let Some(jb) = idx.consolidate_begin().unwrap()
+            {
+                let d = dir.to_path_buf();
+                job = Some(std::thread::spawn(move || jb.build(&d)));
             }
             if job
                 .as_ref()

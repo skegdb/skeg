@@ -13,6 +13,8 @@
 //! Env: SKEG_SIZES (csv), SKEG_TURNS, SKEG_DIM, SKEG_MAXRUNS, SKEG_BITS.
 //! Run: cargo bench -p skeg-vector --bench scale_churn
 
+#![allow(clippy::explicit_counter_loop)] // `next` is an id generator, not an index
+
 use std::time::Instant;
 
 use skeg_vector::{ConsolidateBuilt, DiskVamanaIndex, QuantKind, RunMergeBuilt};
@@ -134,12 +136,13 @@ fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind, mod
         let rc = idx.run_count();
         max_runs_seen = max_runs_seen.max(rc);
 
-        if job.is_none() && rc >= max_runs {
-            if let Some(jb) = idx.consolidate_begin().unwrap() {
-                let d = dir.clone();
-                fold_start = Instant::now();
-                job = Some(std::thread::spawn(move || jb.build(&d)));
-            }
+        if job.is_none()
+            && rc >= max_runs
+            && let Some(jb) = idx.consolidate_begin().unwrap()
+        {
+            let d = dir.clone();
+            fold_start = Instant::now();
+            job = Some(std::thread::spawn(move || jb.build(&d)));
         }
         if job
             .as_ref()

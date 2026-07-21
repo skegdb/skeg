@@ -14,6 +14,8 @@
 //!      (bg fold trigger), SKEG_CORPUS, SKEG_QUERY.
 //! Run: cargo bench -p skeg-vector --bench churn_recall
 
+#![allow(clippy::too_many_arguments, clippy::explicit_counter_loop)] // bench harness
+
 use std::time::Instant;
 
 use skeg_vector::{DiskVamanaIndex, QuantKind};
@@ -148,11 +150,12 @@ fn build_churned(
         idx.delete(victim).unwrap();
         match mode {
             "bg" => {
-                if base_job.is_none() && idx.run_count() >= max_runs {
-                    if let Some(jb) = idx.consolidate_begin().unwrap() {
-                        let d = dir.clone();
-                        base_job = Some(std::thread::spawn(move || jb.build(&d)));
-                    }
+                if base_job.is_none()
+                    && idx.run_count() >= max_runs
+                    && let Some(jb) = idx.consolidate_begin().unwrap()
+                {
+                    let d = dir.clone();
+                    base_job = Some(std::thread::spawn(move || jb.build(&d)));
                 }
                 if base_job
                     .as_ref()
@@ -184,11 +187,11 @@ fn build_churned(
                             base_job = Some(std::thread::spawn(move || jb.build(&d)));
                             next_base += n;
                         }
-                    } else if idx.run_count() >= max_runs {
-                        if let Some(jb) = idx.merge_runs_begin().unwrap() {
-                            let d = dir.clone();
-                            merge_job = Some(std::thread::spawn(move || jb.build(&d)));
-                        }
+                    } else if idx.run_count() >= max_runs
+                        && let Some(jb) = idx.merge_runs_begin().unwrap()
+                    {
+                        let d = dir.clone();
+                        merge_job = Some(std::thread::spawn(move || jb.build(&d)));
                     }
                 }
             }

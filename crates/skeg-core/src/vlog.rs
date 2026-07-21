@@ -625,7 +625,7 @@ impl VLog {
         let mut disk = self.inner.tenant_disk.lock();
         for ((key, value), (rel, padded)) in pairs.iter().zip(&member_rel) {
             let offset = start + u64::from(*rel);
-            if let Some(prev) = index.get(*key).copied() {
+            if let Some(prev) = index.get(key).copied() {
                 self.dec_live(prev.segment_id, prev.size);
                 let dtenant = tenant_from_key(key);
                 if let Some(e) = disk.get_mut(&dtenant) {
