@@ -7,9 +7,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
-## [0.7.0] - 2026-07-14
+## [0.7.0] - 2026-07-21
 
 ### Added
+
+- **Subject and tenant erasure with physical reclaim (GDPR).** `SKEG.SUBJECT.ERASE
+  <prefix>` (tenant-facing) tombstones a subject's keys; `SKEG.TENANT.ERASE` and
+  `SKEG.TENANT.DELETE` (admin) erase a whole tenant's footprint, the latter also
+  removing its identity so an out-of-band delete can no longer orphan data.
+  `SKEG.RECLAIM` (admin) then reclaims the bytes. Erasure is a fast logical
+  delete; reclaim is a heavy offline pass (tens of seconds on a large store), so
+  they are separate calls. Backed by `ShardSet::{erase_tenant, erase_prefix,
+  reclaim}` and zero-alloc key enumeration (`VLog::keys` / `for_each_key`). Three
+  latent concurrency bugs in compaction and relocation were fixed along the way.
+
+- **Atomic multi-key write (honest MSET).** `VLog::set_many` writes all pairs
+  behind one batch header as a single group-commit append; recovery applies a
+  batch only if all its members survived, dropping a torn batch whole. MSET is
+  now atomic per shard (was N sequential sets, partial on crash), matching
+  Redis's contract for single-shard deployments. Keys hashing across shards are
+  still not globally atomic (no cross-shard coordination).
+
+- **APPEND.** The Redis `APPEND` command, serialised per key so concurrent
+  same-key appends never drop a delta.
+
+- **Range-filtered VSEARCH.** An optional per-vector `u64` attribute column with
+  zone-map pruning, so a vector search can be bounded to an attribute range
+  without scanning filtered-out rows.
+
+- **Store hardening.** An advisory open lock bars concurrent opens of the same
+  store; startup fails loudly when a shard cannot open its store;
+  `VLog::write_seq` exposes a monotonic per-store write counter.
 
 - **Off-thread maintenance.** Every graph rebuild (consolidate, runs-merge,
   delete-patch, and the new delta flush) now runs as begin then build then

@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ahash",
  "bytes",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-resp3"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "proptest",
@@ -1742,7 +1742,7 @@ dependencies = [
  "skeg-core",
  "skeg-platform 0.1.3",
  "skeg-proto",
- "skeg-resp3 0.2.2",
+ "skeg-resp3 0.2.3",
  "skeg-telemetry",
  "skeg-vector 0.1.7",
  "socket2 0.5.10",
