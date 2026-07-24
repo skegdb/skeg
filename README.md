@@ -16,6 +16,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
   <a href="https://github.com/skegdb/skeg-bench"><img src="https://img.shields.io/badge/benchmarks-reproducible-brightgreen.svg" alt="benchmarks"></a>
 </p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/github-449?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-skeg" target="_blank" rel="noopener noreferrer"><img alt="Skeg - The memory-efficient vector DB with high recall. | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1202792&amp;theme=neutral&amp;t=1784904821678"></a>
+</p>
 <!-- markdownlint-enable MD033 MD041 -->
 
 ---
