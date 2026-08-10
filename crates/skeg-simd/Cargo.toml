@@ -1,6 +1,6 @@
 [package]
 name = "skeg-simd"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,6 +22,13 @@ criterion = { workspace = true }
 [[bench]]
 name = "distances"
 harness = false
+
+[features]
+# AVX-512 kernels (P4 Slice F): off by default. Runtime detection is
+# mandatory regardless of this feature - it only controls whether the
+# AVX-512 code exists in the binary at all. Validated on Zen 4 and Zen 5:
+# see the coverage test for which kernels are dispatched and why.
+avx512 = []
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "skeg-vector"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,6 +11,11 @@ description = "Vector tier for skeg: Vamana graph, int8/PQ/TurboQuant quantizers
 readme = "../../README.md"
 keywords = ["vector-database", "ann", "vamana", "quantization", "skeg"]
 categories = ["database", "algorithms"]
+
+[features]
+# Build the optional AVX-512 kernels into the vector tier. They still select
+# themselves only after runtime CPU-feature detection.
+avx512 = ["skeg-simd/avx512"]
 
 [dependencies]
 skeg-simd = { path = "../skeg-simd", version = "0.1.5" }
@@ -25,6 +30,7 @@ rayon = "1"
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+crc32c = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -167,6 +173,10 @@ harness = false
 
 [[bench]]
 name = "consolidate_timing"
+harness = false
+
+[[bench]]
+name = "wal_append"
 harness = false
 
 [[bench]]

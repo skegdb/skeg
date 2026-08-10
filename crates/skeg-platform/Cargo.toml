@@ -1,6 +1,6 @@
 [package]
 name = "skeg-platform"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,15 +19,35 @@ tracing = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Optional, feature-gated (see `uring` below): a low-level, widely-used
+# binding to the io_uring syscalls (submission/completion ring setup and
+# SQE/CQE handling), not a runtime replacement - skeg still drives it from
+# `tokio::task::spawn_blocking`. Kept off by default; there is no x86
+# hardware available to this team to run/validate it (see the P4 handoff).
+io-uring = { version = "0.7", optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+# Blocking against io_uring on the engine's real batch shape. Plain `main`,
+# no criterion: the interesting variable is page-cache state, which criterion's
+# warm-up loop would destroy.
+[[bench]]
+name = "batch_read"
+harness = false
 
 [features]
 # Exposes the `set_durability_model_for_tests` /
 # `reset_durability_model_cache_for_tests` helpers in release builds.
 # Used by `skeg-core`'s committer tests; not needed by end users.
 testing = []
+# Linux io_uring batch-read backend (P4 Slice D). Off by default: probes
+# the required opcodes at runtime and falls back silently to the
+# spawn_blocking backend when unsupported, but the code itself has never
+# executed on real hardware - see `uring.rs`'s module docs.
+uring = ["dep:io-uring"]
 
 [lints]
 workspace = true

@@ -25,12 +25,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # aarch64 only (NEON SIMD path). See release.yml for the
-        # rationale.
+        # aarch64 (NEON) plus x86_64 linux (AVX2). See release.yml.
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     steps:

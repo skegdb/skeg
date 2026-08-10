@@ -16,12 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
+use crc32c::crc32c;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use skeg_platform::advise_sequential_file;
 use skeg_simd::cosine_f32;
 use smallvec::SmallVec;
 
@@ -1067,6 +1069,150 @@ const GRAPH_FILE: &str = "graph.vmn";
 const VECTORS_FILE: &str = "vectors.bin";
 /// Append-only WAL of delta inserts/deletes (replayed on open).
 const DELTA_LOG_FILE: &str = "delta.log";
+/// V2 vector WAL header.
+const DELTA_WAL_V2_MAGIC: &[u8] = b"SKWL\x02";
+
+/// V1 is headerless. V2 has per-record CRC32C.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeltaWalFormat {
+    LegacyV1,
+    FramedV2,
+}
+
+#[derive(Debug)]
+enum DeltaWalOp {
+    Insert { id: u64, vector: Vec<f32> },
+    Delete { id: u64 },
+}
+
+impl DeltaWalFormat {
+    fn detect(bytes: &[u8]) -> io::Result<(Self, &[u8])> {
+        if bytes.starts_with(DELTA_WAL_V2_MAGIC) {
+            return Ok((Self::FramedV2, &bytes[DELTA_WAL_V2_MAGIC.len()..]));
+        }
+        // Never parse a malformed V2 header as V1.
+        if bytes.starts_with(b"SKWL") || bytes.first().is_some_and(|b| *b > 1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid vector delta WAL header",
+            ));
+        }
+        Ok((Self::LegacyV1, bytes))
+    }
+}
+
+fn wal_record_body_len(op: u8, dim: usize) -> io::Result<usize> {
+    match op {
+        0 => 1usize
+            .checked_add(8)
+            .and_then(|n| dim.checked_mul(4).and_then(|v| n.checked_add(v)))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "vector WAL record too large")
+            }),
+        1 => Ok(1 + 8),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown vector WAL operation {op}"),
+        )),
+    }
+}
+
+fn decode_wal_op(body: &[u8]) -> DeltaWalOp {
+    let id = u64::from_le_bytes(body[1..9].try_into().expect("record body length checked"));
+    match body[0] {
+        0 => DeltaWalOp::Insert {
+            id,
+            vector: body[9..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        },
+        1 => DeltaWalOp::Delete { id },
+        _ => unreachable!("operation byte validated before decoding"),
+    }
+}
+
+/// A short tail is ignored. A bad V2 checksum fails recovery.
+fn decode_wal_payload(
+    format: DeltaWalFormat,
+    payload: &[u8],
+    dim: usize,
+) -> io::Result<Vec<DeltaWalOp>> {
+    let mut ops = Vec::new();
+    let mut pos = 0;
+    while pos < payload.len() {
+        let op = payload[pos];
+        let body_len = wal_record_body_len(op, dim)?;
+        let record_len = match format {
+            DeltaWalFormat::LegacyV1 => body_len,
+            DeltaWalFormat::FramedV2 => body_len.checked_add(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "vector WAL record too large")
+            })?,
+        };
+        if payload.len() - pos < record_len {
+            break; // crash during the final append: no complete record to apply
+        }
+        let body = &payload[pos..pos + body_len];
+        if format == DeltaWalFormat::FramedV2 {
+            let stored = u32::from_le_bytes(
+                payload[pos + body_len..pos + record_len]
+                    .try_into()
+                    .expect("checksum window length checked"),
+            );
+            let actual = crc32c(body);
+            if stored != actual {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("vector WAL checksum mismatch at byte {pos}"),
+                ));
+            }
+        }
+        ops.push(decode_wal_op(body));
+        pos += record_len;
+    }
+    Ok(ops)
+}
+
+fn decode_wal(bytes: &[u8], dim: usize) -> io::Result<(DeltaWalFormat, Vec<DeltaWalOp>)> {
+    let (format, payload) = DeltaWalFormat::detect(bytes)?;
+    Ok((format, decode_wal_payload(format, payload, dim)?))
+}
+
+fn encode_wal_body(op: &DeltaWalOp) -> Vec<u8> {
+    match op {
+        DeltaWalOp::Insert { id, vector } => {
+            let mut body = Vec::with_capacity(1 + 8 + vector.len() * 4);
+            body.push(0);
+            body.extend_from_slice(&id.to_le_bytes());
+            for &x in vector {
+                body.extend_from_slice(&x.to_le_bytes());
+            }
+            body
+        }
+        DeltaWalOp::Delete { id } => {
+            let mut body = Vec::with_capacity(9);
+            body.push(1);
+            body.extend_from_slice(&id.to_le_bytes());
+            body
+        }
+    }
+}
+
+fn encode_wal_record(format: DeltaWalFormat, op: &DeltaWalOp) -> Vec<u8> {
+    let mut record = encode_wal_body(op);
+    if format == DeltaWalFormat::FramedV2 {
+        record.extend_from_slice(&crc32c(&record).to_le_bytes());
+    }
+    record
+}
+
+fn write_framed_wal(path: &Path, ops: &[DeltaWalOp]) -> io::Result<()> {
+    let mut bytes = DELTA_WAL_V2_MAGIC.to_vec();
+    for op in ops {
+        bytes.extend_from_slice(&encode_wal_record(DeltaWalFormat::FramedV2, op));
+    }
+    std::fs::write(path, bytes)
+}
 /// Persisted IVF router sidecar (centroids + cell assignment).
 const IVF_FILE: &str = "ivf.bin";
 /// Optional per-base-row u64 attribute column (little-endian), for range-filtered
@@ -1112,6 +1258,100 @@ const HEADER_LEN: usize = 64;
 /// Bounds peak open-path RAM to one chunk (`TIER_CHUNK_ROWS * dim * 4` bytes)
 /// plus the tier itself, instead of a transient the size of the f32 set.
 const TIER_CHUNK_ROWS: usize = 4096;
+/// Buffered sequential write size for `vectors.bin`. This bounds save-path
+/// staging while avoiding the 8 KiB default buffer on large persistent volumes.
+const VECTOR_WRITE_BUFFER_BYTES: usize = 1 << 20;
+/// Upper bound for one positioned read during a sequential maintenance scan.
+/// The output vectors are retained by the caller, but this staging buffer stays
+/// bounded so a large index does not transiently double its f32 footprint.
+const SEQUENTIAL_VECTOR_READ_BYTES: usize = 1 << 20;
+
+/// Read contiguous f32 rows from `vectors.bin` in bounded positioned-read
+/// blocks. Used only by maintenance jobs that consume a full row range in order.
+fn read_f32_rows_sequential(
+    file: &File,
+    start_row: usize,
+    rows: usize,
+    dim: usize,
+) -> io::Result<Vec<f32>> {
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    if dim == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vector dimension must be positive",
+        ));
+    }
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "vector row size overflow"))?;
+    let value_count = rows
+        .checked_mul(dim)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "vector range size overflow"))?;
+    let start_bytes = start_row
+        .checked_mul(row_bytes)
+        .and_then(|n| n.checked_add(HEADER_LEN))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "vector range offset overflow")
+        })?;
+    let total_bytes = rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "vector range size overflow"))?;
+    let start_bytes = u64::try_from(start_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vector range offset is too large",
+        )
+    })?;
+    let total_bytes_u64 = u64::try_from(total_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "vector range is too large"))?;
+    advise_sequential_file(file, start_bytes, total_bytes_u64)?;
+
+    let rows_per_read = (SEQUENTIAL_VECTOR_READ_BYTES / row_bytes).max(1);
+    let mut vectors = vec![0.0f32; value_count];
+    let mut read_rows = 0usize;
+    #[cfg(target_endian = "little")]
+    // `f32` is Pod, so the initialized result allocation can safely receive
+    // the little-endian bytes written by `write_vectors_bin` without decoding
+    // every element into a second buffer.
+    let bytes = bytemuck::cast_slice_mut(&mut vectors);
+    #[cfg(target_endian = "big")]
+    let mut raw = Vec::with_capacity(SEQUENTIAL_VECTOR_READ_BYTES);
+    while read_rows < rows {
+        let chunk_rows = (rows - read_rows).min(rows_per_read);
+        let chunk_bytes = chunk_rows.checked_mul(row_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "vector chunk size overflow")
+        })?;
+        let chunk_offset = read_rows.checked_mul(row_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "vector range offset overflow")
+        })?;
+        let offset = start_bytes
+            + u64::try_from(chunk_offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "vector range offset is too large",
+                )
+            })?;
+        #[cfg(target_endian = "little")]
+        file.read_exact_at(&mut bytes[chunk_offset..chunk_offset + chunk_bytes], offset)?;
+        #[cfg(target_endian = "big")]
+        {
+            raw.resize(chunk_bytes, 0);
+            file.read_exact_at(&mut raw, offset)?;
+            let output_offset = read_rows.checked_mul(dim).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "vector output offset overflow")
+            })?;
+            vectors[output_offset..output_offset + chunk_rows * dim].copy_from_slice(
+                &raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        read_rows += chunk_rows;
+    }
+    Ok(vectors)
+}
 
 #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 fn write_graph_vmn(
@@ -1150,7 +1390,7 @@ fn write_graph_vmn(
 fn write_vectors_bin(path: &Path, source: &dyn VectorSource) -> io::Result<()> {
     let n = source.len() as u32;
     let dim = source.dim() as u32;
-    let mut f = BufWriter::new(File::create(path)?);
+    let mut f = BufWriter::with_capacity(VECTOR_WRITE_BUFFER_BYTES, File::create(path)?);
     let mut hdr = [0u8; HEADER_LEN];
     hdr[0..4].copy_from_slice(&VEC_MAGIC.to_le_bytes());
     hdr[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -1504,18 +1744,7 @@ impl IvfJob {
             n_cells,
             iters,
         } = self;
-        let mut all = vec![0f32; n as usize * dim];
-        let mut buf = vec![0u8; dim * 4];
-        for r in 0..n as usize {
-            let off = HEADER_LEN as u64 + r as u64 * dim as u64 * 4;
-            seg_file.read_exact_at(&mut buf, off)?;
-            for (slot, c) in all[r * dim..r * dim + dim]
-                .iter_mut()
-                .zip(buf.chunks_exact(4))
-            {
-                *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            }
-        }
+        let all = read_f32_rows_sequential(&seg_file, 0, n as usize, dim)?;
         let n_cells = if n_cells == 0 {
             IvfRouter::cells_for(n as usize)
         } else {
@@ -1611,16 +1840,7 @@ impl DeletePatchJob {
             tier,
         } = self;
         // O(live) vector read, OFF-THREAD (was on the shard thread in begin).
-        let mut vectors: Vec<f32> = Vec::with_capacity(n_rows * dim);
-        let mut buf = vec![0u8; dim * 4];
-        for row in 0..n_rows as u64 {
-            let off = HEADER_LEN as u64 + row * dim as u64 * 4;
-            seg_file.read_exact_at(&mut buf, off)?;
-            vectors.extend(
-                buf.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-            );
-        }
+        let vectors = read_f32_rows_sequential(&seg_file, 0, n_rows, dim)?;
         let cfg = disk_build_config();
         // Same rayon cap as the consolidate: keep a background patch from
         // starving the foreground of every core while it runs.
@@ -1768,6 +1988,8 @@ pub struct DiskVamanaIndex {
     /// Append-only log of delta mutations, replayed on `open` so streaming
     /// inserts/deletes survive a restart. `consolidate` truncates it.
     delta_log: File,
+    /// Encoding used by `delta_log`.
+    wal_format: DeltaWalFormat,
     /// Online tq1 proxy controller, `None` unless enabled via
     /// [`enable_tq1_controller`](Self::enable_tq1_controller). Behind a mutex
     /// because `search` is `&self`; only touched on shadow queries.
@@ -2032,6 +2254,7 @@ impl DiskVamanaIndex {
         // consolidation that have not yet been folded into the graph.
         let log_path = dir.join(DELTA_LOG_FILE);
         let wal = std::fs::read(&log_path).unwrap_or_default();
+        let (wal_format, wal_ops) = decode_wal(&wal, dim)?;
         let delta_log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2060,11 +2283,12 @@ impl DiskVamanaIndex {
             tombstones: AHashSet::new(),
             live_count: n as usize,
             delta_log,
+            wal_format,
             tq1: Box::default(),
             ivf: None,
             attr: None,
         };
-        index.replay_wal(&wal);
+        index.replay_wal_ops(wal_ops);
         // Runs flushed before a restart are not reloaded; the WAL replay above
         // already put their vectors back in L0, so the stale dirs are redundant
         // (and would collide with `run-0` of this session). See the flush ADR.
@@ -2088,37 +2312,14 @@ impl DiskVamanaIndex {
         }
     }
 
-    /// Replay the delta WAL into the in-RAM delta. Tolerant of a truncated
-    /// trailing record (a crash mid-append): parsing stops at the first
-    /// incomplete record.
-    fn replay_wal(&mut self, wal: &[u8]) {
-        let insert_len = 1 + 8 + self.dim * 4;
-        let mut pos = 0;
-        while pos < wal.len() {
-            match wal[pos] {
-                0 if pos + insert_len <= wal.len() => {
-                    let id = u64::from_le_bytes(
-                        wal[pos + 1..pos + 9]
-                            .try_into()
-                            .expect("8-byte window guarded by insert_len check"),
-                    );
-                    let v: Vec<f32> = wal[pos + 9..pos + insert_len]
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
-                    self.apply_insert(id, v);
-                    pos += insert_len;
-                }
-                1 if pos + 9 <= wal.len() => {
-                    let id = u64::from_le_bytes(
-                        wal[pos + 1..pos + 9]
-                            .try_into()
-                            .expect("8-byte window guarded by len check"),
-                    );
+    /// Apply decoded WAL operations to the in-memory delta state.
+    fn replay_wal_ops(&mut self, ops: Vec<DeltaWalOp>) {
+        for op in ops {
+            match op {
+                DeltaWalOp::Insert { id, vector } => self.apply_insert(id, vector),
+                DeltaWalOp::Delete { id } => {
                     self.apply_delete(id);
-                    pos += 9;
                 }
-                _ => break, // truncated or corrupt trailing record
             }
         }
     }
@@ -2188,7 +2389,7 @@ impl DiskVamanaIndex {
             &dir.join(VECTORS_FILE),
             &InMemoryVectorSource::new(Vec::new(), dim),
         )?;
-        std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
+        write_framed_wal(&dir.join(DELTA_LOG_FILE), &[])?;
         DiskVamanaIndex::open(dir)
     }
 
@@ -2426,22 +2627,24 @@ impl DiskVamanaIndex {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the WAL append fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `vector.len()` does not equal the index dimension.
+    /// Returns an I/O error if the WAL append fails, or `InvalidInput` if
+    /// `vector.len()` does not equal the index dimension. It returns rather
+    /// than panics because the caller is a server thread holding other
+    /// vindexes: a bad dimension from one client must not take them down.
     pub fn insert(&mut self, id: u64, vector: &[f32]) -> io::Result<()> {
-        assert_eq!(vector.len(), self.dim, "vector dim mismatch");
-        // WAL record: [0x00][id u64 LE][f32 x dim LE].
-        let mut rec = Vec::with_capacity(1 + 8 + self.dim * 4);
-        rec.push(0u8);
-        rec.extend_from_slice(&id.to_le_bytes());
-        for &x in vector {
-            rec.extend_from_slice(&x.to_le_bytes());
+        if vector.len() != self.dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("vector has {} dims, index has {}", vector.len(), self.dim),
+            ));
         }
+        let op = DeltaWalOp::Insert {
+            id,
+            vector: vector.to_vec(),
+        };
+        let rec = encode_wal_record(self.wal_format, &op);
         self.delta_log.write_all(&rec)?;
-        self.apply_insert(id, vector.to_vec());
+        self.replay_wal_ops(vec![op]);
         // Keep the brute-forced L0 small: once it fills, fold it into a navigable
         // run so search stays sub-linear. INLINE (synchronous) - fine for direct
         // use (benches, bulk load). A server sets `auto_flush(false)` and drives
@@ -2466,10 +2669,8 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if the WAL append fails.
     pub fn delete(&mut self, id: u64) -> io::Result<bool> {
-        // WAL record: [0x01][id u64 LE].
-        let mut rec = [0u8; 9];
-        rec[0] = 1;
-        rec[1..9].copy_from_slice(&id.to_le_bytes());
+        let op = DeltaWalOp::Delete { id };
+        let rec = encode_wal_record(self.wal_format, &op);
         self.delta_log.write_all(&rec)?;
         Ok(self.apply_delete(id))
     }
@@ -2720,7 +2921,12 @@ impl DiskVamanaIndex {
         /// near the query, so one navigate-all walk + filter-at-rerank suffices.
         const DENSE_SELECTIVITY: f32 = 0.10;
         let dense = matches.is_some() && selectivity >= DENSE_SELECTIVITY;
-        assert_eq!(query.len(), self.dim, "query dim mismatch");
+        if query.len() != self.dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("query has {} dims, index has {}", query.len(), self.dim),
+            ));
+        }
         let filtered = matches.is_some();
         if self.live_count == 0 || k == 0 {
             return Ok(Vec::new());
@@ -3095,6 +3301,11 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
+    /// Survivor locations that are not a segment index: the in-RAM layers.
+    const LOC_DELTA: usize = usize::MAX;
+    /// The staging map an in-flight flush moved the delta into.
+    const LOC_FLUSHING: usize = usize::MAX - 1;
+
     /// Fold the base, every run, the delta, and tombstones into one fresh
     /// on-disk graph, then re-open. The newest version of each id wins (delta,
     /// then runs newest-to-oldest, then base); tombstoned ids are dropped.
@@ -3114,9 +3325,21 @@ impl DiskVamanaIndex {
             .collect();
         let mut seen: AHashSet<u64> = AHashSet::new();
         let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        // `delta`, then `flushing`: the documented precedence is
+        // `delta > flushing > runs > base`. Skipping the staging map here loses
+        // every vector an in-flight `flush_begin` moved out of the delta, since
+        // this function truncates the WAL and reopens from disk, which drops
+        // the in-memory map too. The window is reachable: the engine releases
+        // the write lock while a flush builds off-thread, and the client
+        // command `SKEG.VINDEX.CONSOLIDATE` takes that lock and lands here.
         for &id in self.delta.keys() {
             if seen.insert(id) {
-                survivors.push((id, usize::MAX, 0));
+                survivors.push((id, Self::LOC_DELTA, 0));
+            }
+        }
+        for &id in self.flushing.keys() {
+            if seen.insert(id) {
+                survivors.push((id, Self::LOC_FLUSHING, 0));
             }
         }
         for (ri, run) in self.runs.iter().enumerate().rev() {
@@ -3146,10 +3369,10 @@ impl DiskVamanaIndex {
         let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
         let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
         for (id, loc, row) in survivors {
-            if loc == usize::MAX {
-                vectors.extend_from_slice(&self.delta[&id]);
-            } else {
-                vectors.extend(self.read_vector(segs[loc], row)?);
+            match loc {
+                Self::LOC_DELTA => vectors.extend_from_slice(&self.delta[&id]),
+                Self::LOC_FLUSHING => vectors.extend_from_slice(&self.flushing[&id]),
+                seg => vectors.extend(self.read_vector(segs[seg], row)?),
             }
             ids.push(id);
         }
@@ -3177,7 +3400,7 @@ impl DiskVamanaIndex {
         self.discard_runs()?;
         // The delta + runs are now folded into the graph: the WAL must start
         // empty so the reopen below does not replay stale records.
-        std::fs::write(dir.join(DELTA_LOG_FILE), [])?;
+        write_framed_wal(&dir.join(DELTA_LOG_FILE), &[])?;
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         if timing {
             let reopen_ms = t.elapsed().as_millis() - save_ms;
@@ -3287,6 +3510,7 @@ impl DiskVamanaIndex {
         let wal = std::fs::read(&wal_path)?;
         let suffix_start = usize::try_from(built.wal_offset).unwrap_or(wal.len());
         let suffix = wal.get(suffix_start..).unwrap_or(&[]).to_vec();
+        let suffix_ops = decode_wal_payload(self.wal_format, &suffix, self.dim)?;
         // Swap in the built base, drop every run dir (pre-begin runs are folded
         // into the new base; post-begin runs replay from the WAL suffix).
         std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
@@ -3294,7 +3518,8 @@ impl DiskVamanaIndex {
         let _ = std::fs::remove_dir_all(&built.tmp);
         self.run_seq = built.run_seq_high.max(self.run_seq);
         self.discard_runs()?;
-        std::fs::write(&wal_path, &suffix)?;
+        // Re-encode the post-begin suffix as V2.
+        write_framed_wal(&wal_path, &suffix_ops)?;
         // Surgical swap: install the prebuilt base (tier already built off-thread)
         // and reconstruct the in-RAM state the way `open` would, then replay the
         // WAL suffix - WITHOUT a full reopen, so the O(live) tier rebuild does not
@@ -3310,9 +3535,10 @@ impl DiskVamanaIndex {
         self.tombstones.clear();
         self.live_count = self.base.main_n as usize;
         self.delta_log = delta_log;
+        self.wal_format = DeltaWalFormat::FramedV2;
         *self.tq1 = Default::default();
         self.ivf = None;
-        self.replay_wal(&suffix);
+        self.replay_wal_ops(suffix_ops);
         Ok(())
     }
 
@@ -3835,6 +4061,90 @@ impl DiskVamanaIndex {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // test sizes are tiny
 mod tests {
+
+    /// A wrong dimension is a client mistake, not a reason to abort. The
+    /// server used to pre-check it purely because these two entry points
+    /// asserted, and a panic here takes down a shard thread that is serving
+    /// every other vindex on it.
+    #[test]
+    fn wrong_dimension_is_an_error_not_a_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-dim");
+        let dim = 16;
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.insert(1, &vec![0.5f32; dim]).unwrap();
+
+        let short = idx.insert(2, &vec![0.5f32; dim - 1]).unwrap_err();
+        assert_eq!(short.kind(), io::ErrorKind::InvalidInput);
+        let long = idx.insert(3, &vec![0.5f32; dim + 1]).unwrap_err();
+        assert_eq!(long.kind(), io::ErrorKind::InvalidInput);
+
+        let bad_query = idx.search(&vec![0.5f32; dim + 4], 5).unwrap_err();
+        assert_eq!(bad_query.kind(), io::ErrorKind::InvalidInput);
+
+        // The index is still usable: the rejected calls changed nothing.
+        assert!(idx.get(1).unwrap().is_some());
+        assert_eq!(idx.search(&vec![0.5f32; dim], 5).unwrap().len(), 1);
+    }
+
+    /// The documented precedence is `delta > flushing > runs > base`. The
+    /// synchronous `consolidate` collected survivors from `delta`, `runs` and
+    /// `base` only, so anything staged in `flushing` by an in-flight
+    /// `flush_begin` was outside the fold. `consolidate` then truncates the WAL
+    /// and reopens from disk, which drops the in-memory staging map.
+    ///
+    /// The window is reachable: `off_thread_maintenance` releases the write
+    /// lock while the flush builds off-thread, and the client command
+    /// `SKEG.VINDEX.CONSOLIDATE` takes that lock and calls this exact path.
+    #[test]
+    fn consolidate_keeps_vectors_staged_by_an_in_flight_flush() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-flush-consolidate");
+        let dim = 16;
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        let vec_for =
+            |id: u64| -> Vec<f32> { (0..dim).map(|d| (id as f32 + d as f32) / 100.0).collect() };
+        // A non-empty base first: otherwise the fold finds no survivors at all
+        // and `consolidate` returns early without truncating the WAL, which
+        // walks past the window this test is about.
+        for id in 0u64..200 {
+            idx.insert(id, &vec_for(id)).unwrap();
+        }
+        idx.consolidate().unwrap();
+        assert!(
+            idx.get(0).unwrap().is_some(),
+            "base did not survive its fold"
+        );
+
+        // Now stage a second batch for a flush, and consolidate before the
+        // flush lands. The staged ids live only in `flushing` and the WAL.
+        for id in 200u64..400 {
+            idx.insert(id, &vec_for(id)).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("delta is non-empty");
+        idx.consolidate().unwrap();
+        // Every id must still be retrievable. Before the fix the fold missed
+        // them, the WAL was truncated, and the reopen dropped the staging map.
+        for id in 0u64..400 {
+            assert!(
+                idx.get(id).unwrap().is_some(),
+                "id {id} was staged for flush and lost by consolidate",
+            );
+        }
+        drop(job);
+    }
     use super::*;
     use ordered_float::OrderedFloat;
     use rand::rngs::StdRng;
@@ -3864,6 +4174,64 @@ mod tests {
             .collect();
         scored.sort_unstable();
         scored.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn vector_writer_preserves_header_and_row_major_payload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.bin");
+        let values = vec![1.25f32, -2.5, 0.0, 3.75, 4.5, -6.25];
+        let source = InMemoryVectorSource::new(values.clone(), 3);
+        write_vectors_bin(&path, &source).unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(
+            bytes.len(),
+            HEADER_LEN + values.len() * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            VEC_MAGIC
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            FORMAT_VERSION
+        );
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+        let payload: Vec<f32> = bytes[HEADER_LEN..]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(payload, values);
+    }
+
+    #[test]
+    fn sequential_row_reader_preserves_a_multi_block_range() {
+        let dim = 7;
+        let n = 80_000;
+        let values: Vec<f32> = (0..n * dim).map(|i| i as f32 * 0.25).collect();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.bin");
+        let source = InMemoryVectorSource::new(values.clone(), dim);
+        write_vectors_bin(&path, &source).unwrap();
+        let file = File::open(path).unwrap();
+
+        let start = 123usize;
+        let rows = 60_000usize;
+        let got = read_f32_rows_sequential(&file, start, rows, dim).unwrap();
+        assert_eq!(got, values[start * dim..(start + rows) * dim]);
+    }
+
+    #[test]
+    fn sequential_row_reader_rejects_a_zero_dimension() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("vectors.bin");
+        std::fs::write(&path, []).unwrap();
+        let file = File::open(path).unwrap();
+
+        let error = read_f32_rows_sequential(&file, 0, 1, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -4457,6 +4825,77 @@ mod tests {
         assert_eq!(hits[0].0, 5000, "the WAL-recovered vector is searchable");
     }
 
+    #[test]
+    fn disk_reopen_rejects_corrupt_framed_wal_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wal_path = tmp.path().join(DELTA_LOG_FILE);
+        {
+            let mut disk = DiskVamanaIndex::create_empty(tmp.path(), 4, 64).unwrap();
+            disk.insert(7, &[1.0; 4]).unwrap();
+            disk.insert(8, &[2.0; 4]).unwrap();
+        }
+        let mut wal = std::fs::read(&wal_path).unwrap();
+        assert!(
+            wal.starts_with(b"SKWL\x02"),
+            "new vector WALs are framed and versioned"
+        );
+        // Corrupt the first record; id 8 must not be silently skipped.
+        wal[DELTA_WAL_V2_MAGIC.len() + 9] ^= 0x01;
+        std::fs::write(wal_path, wal).unwrap();
+
+        let Err(err) = DiskVamanaIndex::open(tmp.path()) else {
+            panic!("corrupt framed WAL must refuse recovery");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn disk_reopen_ignores_only_torn_framed_wal_tail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wal_path = tmp.path().join(DELTA_LOG_FILE);
+        {
+            let mut disk = DiskVamanaIndex::create_empty(tmp.path(), 4, 64).unwrap();
+            disk.insert(1, &[1.0; 4]).unwrap();
+            disk.insert(2, &[2.0; 4]).unwrap();
+        }
+        let mut wal = std::fs::read(&wal_path).unwrap();
+        assert!(wal.starts_with(b"SKWL\x02"));
+        wal.truncate(wal.len() - 3);
+        std::fs::write(wal_path, wal).unwrap();
+
+        let reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert!(
+            reopened.get(1).unwrap().is_some(),
+            "completed record survives"
+        );
+        assert!(reopened.get(2).unwrap().is_none(), "torn tail is ignored");
+    }
+
+    #[test]
+    fn disk_reopen_accepts_legacy_wal_and_upgrades_on_consolidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wal_path = tmp.path().join(DELTA_LOG_FILE);
+        {
+            let _disk = DiskVamanaIndex::create_empty(tmp.path(), 4, 64).unwrap();
+        }
+        let mut legacy = vec![0];
+        legacy.extend_from_slice(&7u64.to_le_bytes());
+        for x in [1.0f32; 4] {
+            legacy.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(&wal_path, legacy).unwrap();
+
+        let mut reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
+        assert_eq!(reopened.get(7).unwrap(), Some(vec![1.0; 4]));
+        reopened.consolidate().unwrap();
+        assert!(
+            std::fs::read(wal_path)
+                .unwrap()
+                .starts_with(DELTA_WAL_V2_MAGIC),
+            "a successful consolidate migrates the legacy WAL"
+        );
+    }
+
     // Insert past the L0 flush threshold so at least one run is built; returns
     // the corpus so callers can probe specific vectors.
     fn fill_past_flush(disk: &mut DiskVamanaIndex, n: usize, dim: usize) -> Vec<f32> {
@@ -4557,10 +4996,12 @@ mod tests {
                 .unwrap();
         }
         disk.consolidate().unwrap();
-        // After consolidation the WAL is empty: a reopen replays nothing and
-        // the (now graph-resident) vectors are still all there.
+        // Consolidation leaves only the V2 header.
         let wal = std::fs::read(tmp.path().join("delta.log")).unwrap();
-        assert!(wal.is_empty(), "WAL must be truncated by consolidation");
+        assert_eq!(
+            wal, DELTA_WAL_V2_MAGIC,
+            "consolidation leaves a V2 WAL header with no records"
+        );
         let reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
         assert_eq!(reopened.len(), n + 20);
         assert_eq!(reopened.delta_len(), 0, "reopen replays an empty WAL");

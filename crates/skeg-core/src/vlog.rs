@@ -54,10 +54,14 @@ const COMPACTION_LIVE_RATIO: f64 = 0.5;
 /// writes already drive.
 const RELOCATE_CONCURRENCY: usize = 256;
 
-/// One relocation's contribution: `(dest_segment, padded_bytes, is_data)`.
-/// `None` when the record was skipped (a re-SET tombstone or a stale data
-/// record the index no longer points at).
-type RelocOutcome = Result<Option<(u16, u32, bool)>>;
+/// One relocation's contribution: `(dest_segment, dest_file, padded_bytes,
+/// is_data)`. `dest_file` is captured right after the write that produced
+/// it, in the same tick - not re-looked-up later by id, which could race a
+/// *different*, concurrent `compact_segment` call deleting that very
+/// destination out of `read_segments` in the meantime. `None` when the
+/// record was skipped (a re-SET tombstone or a stale data record the index
+/// no longer points at).
+type RelocOutcome = Result<Option<(u16, Arc<PlatformFile>, u32, bool)>>;
 
 /// Recovery-time gate for atomic batches ([`VLog::set_many`]). A `BatchBegin(N)`
 /// header opens a run of `N` records; the gate withholds them until all `N`
@@ -276,6 +280,12 @@ impl VLog {
 
         let mut index = Index::new();
         let mut max_ts = 0u64;
+        // The active/last segment's true used-byte length, captured from the
+        // scan below (whichever branch runs). `None` when the scan never
+        // visited it (e.g. it is entirely covered by the snapshot's hwm) -
+        // in that case the fallback below reads it straight from the file,
+        // matching the pre-preallocation behaviour.
+        let mut active_used: Option<u64> = None;
 
         if let Some(snap) = snap {
             // Seed the index from the snapshot, then rescan only the segments
@@ -309,6 +319,11 @@ impl VLog {
                 })?;
                 if Some(id) == last_id {
                     seg.file.truncate_sync(last_valid)?;
+                    // Re-arm full capacity (and the fdatasync fast path) on
+                    // the segment that resumes as active.
+                    seg.file.preallocate_sync(max_seg_size)?;
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
+                    active_used = Some(last_valid);
                 }
             }
         } else {
@@ -337,6 +352,9 @@ impl VLog {
                 })?;
                 if Some(id) == last_id {
                     seg.file.truncate_sync(last_valid)?;
+                    seg.file.preallocate_sync(max_seg_size)?;
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
+                    active_used = Some(last_valid);
                 }
             }
             for (key, (_ts, kind, entry)) in winners {
@@ -354,9 +372,18 @@ impl VLog {
         }
 
         let (active_id, active_size, active_file) = if let Some(seg) = read_segments.last() {
-            (seg.id, seg.file.size()?, seg.file.clone())
+            // Prefer the size the recovery scan just established: after the
+            // preallocate above, `seg.file.size()` would report
+            // `max_seg_size`, not the true used length.
+            let size = match active_used {
+                Some(v) => v,
+                None => seg.file.size()?,
+            };
+            (seg.id, size, seg.file.clone())
         } else {
             let pf = Arc::new(PlatformFile::create(&segment_path(dir, 0))?);
+            pf.preallocate_sync(max_seg_size)?;
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
             read_segments.push(ReadSegment {
                 id: 0,
                 file: pf.clone(),
@@ -612,11 +639,20 @@ impl VLog {
         // recovery.
         self.maybe_rotate(blob_len).await?;
         let (committer, seg_id) = {
-            let a = self.inner.active.borrow();
+            // Reserve synchronously - see the matching comment in
+            // `append_raw` for why this must happen in the same
+            // (non-`await`-ing) `RefCell` borrow that reads the committer,
+            // not after the write completes.
+            let mut a = self.inner.active.borrow_mut();
+            a.size += blob_len;
             (a.committer.clone(), a.id)
         };
         let (start, padded_total) = committer.append(blob, durability).await?;
-        self.bump_active_size(seg_id, start + u64::from(padded_total));
+        debug_assert_eq!(
+            u64::from(padded_total),
+            blob_len,
+            "padded write size must match the blob_len maybe_rotate checked against"
+        );
 
         // Now durable: apply each member to the index + accounting. Same steps
         // as `set_scoped`, minus the per-key durability wait (already paid once).
@@ -871,6 +907,18 @@ impl VLog {
     // ── Compaction ────────────────────────────────────────────────────────────
 
     /// Pick a non-active segment whose live-bytes ratio is below `threshold`.
+    ///
+    /// `total` below reads `s.file.size()`, the segment's on-disk length. A
+    /// sealed segment that was preallocated to `max_seg_size` while it was
+    /// still active (see `maybe_rotate`) keeps reporting `max_seg_size` here
+    /// forever - rotation never truncates it back down (that would race an
+    /// in-flight write still landing through the old committer). This makes
+    /// `total` an over-estimate for a segment that rotated out before
+    /// filling up, which under-estimates its live ratio and biases toward
+    /// compacting it *sooner* than strictly necessary - never later, so
+    /// never a correctness issue, only a small efficiency one that a
+    /// completed compaction (which deletes the source file outright)
+    /// resolves anyway.
     #[must_use]
     pub fn pick_compaction_candidate(&self, threshold: f64) -> Option<u16> {
         let active_id = self.inner.active.borrow().id;
@@ -1000,12 +1048,6 @@ impl VLog {
         // tick the `CompactionBytesTotal` counter once at the end. Padded
         // sizes are what we actually wrote to the destination segment.
         let mut moved_bytes: u64 = 0;
-        let mut dest_segments: Vec<u16> = Vec::new();
-        let note_dest = |seg: u16, dests: &mut Vec<u16>| {
-            if !dests.contains(&seg) {
-                dests.push(seg);
-            }
-        };
 
         // Relocate concurrently. Each record awaits its own `append_raw`; doing
         // them one at a time puts a single record in every group-commit batch
@@ -1032,7 +1074,10 @@ impl VLog {
                                 Durability::Relaxed,
                             )
                             .await?;
-                        return Ok(Some((nseg, 0u32, false)));
+                        let dest_file = self.segment_file(nseg).ok_or(Error::InvalidRecord {
+                            msg: "relocation target segment vanished mid-write",
+                        })?;
+                        return Ok(Some((nseg, dest_file, 0u32, false)));
                     }
                     return Ok(None);
                 }
@@ -1044,6 +1089,12 @@ impl VLog {
                 let (nseg, noff, npad) = self
                     .append_raw(&rec.key, &rec.value, rec.kind, rec.ts, Durability::Relaxed)
                     .await?;
+                // Captured immediately after the write that produced `nseg`,
+                // not re-looked-up later by id - see the `RelocOutcome` doc
+                // comment for why that distinction matters.
+                let dest_file = self.segment_file(nseg).ok_or(Error::InvalidRecord {
+                    msg: "relocation target segment vanished mid-write",
+                })?;
                 // Recheck-CAS: a concurrent SET may have moved the key during
                 // the await above. Only adopt the relocated copy if nothing
                 // changed; otherwise it is dead bytes in the active segment,
@@ -1059,15 +1110,18 @@ impl VLog {
                     self.inner.index.borrow_mut().set(rec.key.clone(), entry);
                     self.inc_live(nseg, npad);
                 }
-                Ok(Some((nseg, npad, true)))
+                Ok(Some((nseg, dest_file, npad, true)))
             })
             .buffer_unordered(RELOCATE_CONCURRENCY)
             .collect()
             .await;
 
+        let mut dest_files: Vec<(u16, Arc<PlatformFile>)> = Vec::new();
         for outcome in outcomes {
-            if let Some((nseg, npad, is_data)) = outcome? {
-                note_dest(nseg, &mut dest_segments);
+            if let Some((nseg, dest_file, npad, is_data)) = outcome? {
+                if !dest_files.iter().any(|&(id, _)| id == nseg) {
+                    dest_files.push((nseg, dest_file));
+                }
                 moved_bytes += u64::from(npad);
                 if is_data {
                     moved += 1;
@@ -1075,17 +1129,37 @@ impl VLog {
             }
         }
 
+        // Each relocation's `append_raw` used `Durability::Relaxed` (no
+        // per-record fsync), so a compaction that moves many records can
+        // leave a large run of dirty pages sitting entirely unflushed. Nudge
+        // writeback for each destination now, before the blocking durability
+        // call below - by the time that call actually waits, the kernel has
+        // already had a head start pushing the pages out, instead of the
+        // wait absorbing the whole compaction's writeback in one go.
+        // Best-effort: `sync_file_range` gives no durability guarantee on
+        // its own and its failure does not change the correctness of the
+        // `sync_durable` call that follows, so errors are not propagated.
+        //
+        // Both loops below use the file handle captured per-relocation in
+        // `dest_files`, not a fresh by-id lookup into `read_segments` - a
+        // *different*, concurrent `compact_segment` call can delete a
+        // destination out of `read_segments` (and unlink its path) between
+        // this compaction's relocation phase and this point, and unlinking
+        // does not invalidate an already-open fd: `sync_durable` on the
+        // captured handle still flushes whatever this compaction wrote to
+        // it. A fresh `find(|s| s.id == dest)` lookup here would instead
+        // silently skip that destination's fsync entirely.
+        for (_, dest_file) in &dest_files {
+            if dest_file.hint_writeback(0, 0).await.is_ok() {
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogWritebackHints);
+            }
+        }
+
         // Each relocation's `append_raw` resolved only after its `write_at`, so
         // every relocated byte is in the page cache. One `F_FULLFSYNC` per
         // destination segment makes them power-durable before the source goes.
-        for dest in dest_segments {
-            let dest_file = {
-                let segs = self.inner.read_segments.borrow();
-                segs.iter().find(|s| s.id == dest).map(|s| s.file.clone())
-            };
-            if let Some(dest_file) = dest_file {
-                dest_file.sync_durable().await?;
-            }
+        for (_, dest_file) in &dest_files {
+            dest_file.sync_durable().await?;
         }
 
         // Telemetry: amount of live data the compaction moved across to
@@ -1133,15 +1207,33 @@ impl VLog {
         ts: u64,
         durability: Durability,
     ) -> Result<(u16, u32, u32)> {
-        self.maybe_rotate(padded_record_size(key.len(), value.len()) as u64)
-            .await?;
+        let incoming = padded_record_size(key.len(), value.len()) as u64;
+        self.maybe_rotate(incoming).await?;
         let encoded = encode_record(key, value, kind, ts);
+        debug_assert_eq!(
+            encoded.len() as u64,
+            incoming,
+            "encoded size must match the padded estimate maybe_rotate checked against"
+        );
         let (committer, seg_id) = {
-            let a = self.inner.active.borrow();
+            // Reserve `incoming` bytes of the active segment's tracked size
+            // *synchronously*, in the same `RefCell` borrow that reads the
+            // committer - not after the write completes. `VLog` is `Rc`-backed
+            // (single-threaded; see the struct def), so this borrow_mut is
+            // atomic with respect to every other in-flight `append_raw`: none
+            // of them can observe a `maybe_rotate`-sized "does it fit" gap
+            // against a size this call already reserved but hasn't finished
+            // writing. Without this, two concurrent callers can each read the
+            // same pre-reservation size, each pass their own `maybe_rotate`
+            // check independently, and jointly write past `max_seg_size` -
+            // silently outgrowing the segment's preallocated capacity (see
+            // `PlatformFile::preallocate`'s documented invariant that a
+            // size-fixed handle is never written past its fixed length).
+            let mut a = self.inner.active.borrow_mut();
+            a.size += incoming;
             (a.committer.clone(), a.id)
         };
         let (offset, padded) = committer.append(encoded, durability).await?;
-        self.bump_active_size(seg_id, offset + u64::from(padded));
         Ok((seg_id, offset as u32, padded))
     }
 
@@ -1149,6 +1241,17 @@ impl VLog {
         let t = self.inner.clock.get();
         self.inner.clock.set(t + 1);
         t
+    }
+
+    /// Look up the currently-open file handle for `seg_id`, if the segment
+    /// is still present in `read_segments`.
+    fn segment_file(&self, seg_id: u16) -> Option<Arc<PlatformFile>> {
+        self.inner
+            .read_segments
+            .borrow()
+            .iter()
+            .find(|s| s.id == seg_id)
+            .map(|s| s.file.clone())
     }
 
     fn inc_live(&self, seg_id: u16, bytes: u32) {
@@ -1175,14 +1278,11 @@ impl VLog {
         }
     }
 
-    /// Update the tracked active-segment size, but only if `seg_id` is still
-    /// the active segment (a rotation may have happened during the `.await`).
-    fn bump_active_size(&self, seg_id: u16, end_offset: u64) {
-        let mut a = self.inner.active.borrow_mut();
-        if a.id == seg_id {
-            a.size = a.size.max(end_offset);
-        }
-    }
+    // `bump_active_size` (post-await size update) removed: `active.size` is
+    // now reserved synchronously in `append_raw` / `set_many`, before the
+    // `.await` on the committer, closing a race where two concurrent
+    // callers could both pass `maybe_rotate`'s "does it fit" check against
+    // the same stale size and jointly write past `max_seg_size`.
 
     /// Rotate to a fresh segment if the next record would overflow the active
     /// one. Awaits when the new committer is `DeviceGlobal`-backed (the
@@ -1219,6 +1319,15 @@ impl VLog {
             &self.inner.dir,
             new_id,
         ))?);
+        // Fix the new segment's length at the rotation cap up front: later
+        // appends into it never change its length, so the Power tier can
+        // downgrade to fdatasync on Linux (see `PlatformFile::preallocate`).
+        // The old segment is deliberately left untouched (not truncated to
+        // its true used length) - shrinking it here would race a write that
+        // is still in flight through its own committer; the wasted tail is
+        // reclaimed whenever that segment is later compacted away.
+        pf.preallocate_sync(self.inner.max_seg_size)?;
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
         let committer = GroupCommitter::start(pf.clone(), 0).await;
         self.inner.read_segments.borrow_mut().push(ReadSegment {
             id: new_id,

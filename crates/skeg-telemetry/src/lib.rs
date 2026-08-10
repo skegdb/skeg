@@ -207,10 +207,26 @@ pub enum Counter {
     CompactionBytesTotal = 4,
     VlogSyncs = 5,
     VlogGroupCommitBatches = 6,
+    /// `Durability::Power` flushes that took the Linux `fdatasync` fast path
+    /// (the file's length was fixed by `PlatformFile::preallocate`) rather
+    /// than the full `fsync`/`F_FULLFSYNC`. Compare against `VlogSyncs` to
+    /// see how much of the durability traffic is on the cheap path.
+    VlogFdatasyncFastPath = 7,
+    /// Segment files preallocated to the rotation cap: fresh
+    /// stores, rotations, and the active segment re-armed on recovery.
+    VlogPreallocations = 8,
+    /// Bytes written through `pwritev` instead of a
+    /// combined-buffer copy - one flush_batch's total payload per tick.
+    VlogPwritevBytesTotal = 9,
+    /// `sync_file_range` writeback hints issued, one per
+    /// destination segment per compaction run - paces dirty-page writeback
+    /// ahead of the durability call that follows, instead of letting a
+    /// whole compaction's worth of dirty pages pile up unflushed.
+    VlogWritebackHints = 10,
 }
 
 impl Counter {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 11;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -219,6 +235,10 @@ impl Counter {
         Counter::CompactionBytesTotal,
         Counter::VlogSyncs,
         Counter::VlogGroupCommitBatches,
+        Counter::VlogFdatasyncFastPath,
+        Counter::VlogPreallocations,
+        Counter::VlogPwritevBytesTotal,
+        Counter::VlogWritebackHints,
     ];
 
     #[inline]
@@ -231,6 +251,10 @@ impl Counter {
             Counter::CompactionBytesTotal => "skeg_compaction_bytes_total",
             Counter::VlogSyncs => "skeg_vlog_syncs_total",
             Counter::VlogGroupCommitBatches => "skeg_vlog_group_commit_batches_total",
+            Counter::VlogFdatasyncFastPath => "skeg_vlog_fdatasync_fastpath_total",
+            Counter::VlogPreallocations => "skeg_vlog_preallocations_total",
+            Counter::VlogPwritevBytesTotal => "skeg_vlog_pwritev_bytes_total",
+            Counter::VlogWritebackHints => "skeg_vlog_writeback_hints_total",
         }
     }
 }

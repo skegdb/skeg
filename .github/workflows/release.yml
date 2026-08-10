@@ -115,14 +115,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v0.1 targets aarch64 only. NEON SIMD kernels are aarch64-
-        # specific; x86_64 builds would compile via the scalar
-        # fallback and the published bench numbers would not apply.
-        # Add x86_64 once an AVX2 path lands.
+        # aarch64 runs the NEON kernels, x86_64 linux the AVX2 ones
+        # (runtime-detected, scalar fallback below AVX2). The published
+        # bench numbers are per-target; x86 numbers need their own run.
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     needs: guard

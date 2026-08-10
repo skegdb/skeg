@@ -85,12 +85,14 @@ pub fn interleave_tq4_codes(rows_codes: &[&[u8]], dim: usize, out: &mut [u8]) {
     }
 }
 
-/// Flush window for the u8 accumulator. Each iteration adds at most
-/// `2 * 255 = 510` to the per-vector u8 accumulator. With
-/// `FLUSH_EVERY = 32` the worst-case accumulator before flush is
-/// `32 * 510 = 16'320`, well below the `u16::MAX = 65'535` ceiling,
-/// so the widen-then-flush step is safe. The same constant doubles
-/// as the unroll factor in the NEON kernel.
+/// Flush window for the u8 accumulator. [`quantize_tq4_lut_u8`] caps
+/// every LUT entry at 127, so one low + one high nibble lookup sums to
+/// at most `254` and the byte add (`vaddq_u8` / `_mm256_add_epi8`)
+/// never wraps. With `FLUSH_EVERY = 32` the worst-case u16 accumulator
+/// before flush is `32 * 254 = 8'128`, well below the
+/// `u16::MAX = 65'535` ceiling, so the widen-then-flush step is safe.
+/// The same constant doubles as the unroll factor in the NEON and AVX2
+/// kernels.
 pub const FLUSH_EVERY: usize = 32;
 
 /// Pre-compute the u8 LUT for a single query plus the scale+bias
@@ -100,16 +102,17 @@ pub const FLUSH_EVERY: usize = 32;
 /// `[g * 32, g * 32 + 16)` low-nibble window and
 /// `[g * 32 + 16, g * 32 + 32)` high-nibble window. The whole table
 /// is quantized with a single shared (min, range) so we can recover
-/// `f32_score = (sum_u8 - bias_per_group * n_groups) / scale` after
+/// `f32_score = sum_u8 * inv_scale + bias_per_group * n_groups` after
 /// the dot-product loop.
 ///
-/// `scale_out` returns `255 / range` such that
-/// `u8_v = ((f32_v - min) * scale_out).round().clamp(0, 255)`.
-/// `bias_per_group_out` returns the per-byte-group constant
-/// `2 * min` (one for each nibble), so the reconstruction subtracts
-/// `n_groups * bias_per_group_out * 0.5` total - encapsulated in
-/// the scoring routines below to keep callers from getting the
-/// scaling wrong.
+/// `scale_out` returns `range / 127` (named `inv_scale`: it is the
+/// factor the reconstruction *multiplies* the u8 sum by) such that
+/// `u8_v = ((f32_v - min) / inv_scale).round().clamp(0, 127)`.
+/// `bias_per_group_out` returns the per-byte-group constant `2 * min`
+/// (one `min` contribution per nibble looked up in a group), so the
+/// reconstruction adds `n_groups * bias_per_group_out` total -
+/// encapsulated in the scoring routines below to keep callers from
+/// getting the scaling wrong.
 ///
 /// # Panics
 ///
@@ -206,8 +209,8 @@ pub fn tq4_block32_score_u8_scalar(
             acc_f32[v] += acc_u32[v] as f32;
         }
     }
-    // Reconstruct f32 scores: undo the LUT quantisation and subtract
-    // the per-group bias that the quantizer folded into the u8 LUT.
+    // Reconstruct f32 scores: undo the LUT quantisation and add back
+    // the per-group bias the quantizer subtracted when building the u8 LUT.
     let bias_total = bias_per_group * n_groups as f32;
     for v in 0..BLOCK {
         out[v] = acc_f32[v] * inv_scale + bias_total;
@@ -348,6 +351,238 @@ pub fn tq4_block32_score_u8_neon(
             let scaled = vfmaq_f32(bias_v, *fa_i, inv_scale_v);
             vst1q_f32(out.as_mut_ptr().add(i * 4), scaled);
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+/// TQ4 block scorer for AVX2.
+///
+/// # Safety
+///
+/// The current CPU must support AVX2.
+pub unsafe fn tq4_block32_score_u8_avx2(
+    codes: &[u8],
+    lut_u8: &[u8],
+    inv_scale: f32,
+    bias_per_group: f32,
+    dim: usize,
+    out: &mut [f32; BLOCK],
+) {
+    use std::arch::x86_64::{
+        _mm_loadu_si128, _mm256_add_epi8, _mm256_add_epi16, _mm256_and_si256,
+        _mm256_broadcastsi128_si256, _mm256_castsi256_si128, _mm256_cvtepu8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_set1_epi8, _mm256_setzero_si256,
+        _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
+    };
+
+    assert_eq!(dim % 2, 0, "dim must be even for 4-bit codes");
+    let n_groups = dim / 2;
+    assert_eq!(codes.len(), n_groups * BLOCK, "codes length mismatch");
+    assert_eq!(lut_u8.len(), n_groups * 32, "lut length mismatch");
+
+    // SAFETY: the caller selected AVX2. Bounds are validated above: each loop
+    // reads one 32-byte block from `codes` and two 16-byte LUTs. The u16
+    // accumulators flush every 32 groups, below their overflow limit.
+    unsafe {
+        let mask = _mm256_set1_epi8(0x0f);
+        let zero = _mm256_setzero_si256();
+        let mut accumulated = [zero; 2];
+        let mut scores = [0.0f32; BLOCK];
+        let mut window = 0;
+
+        for g in 0..n_groups {
+            let lut_base = lut_u8.as_ptr().add(g * 32);
+            let lut_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut_base.cast()));
+            let lut_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut_base.add(16).cast()));
+            let code = _mm256_loadu_si256(codes.as_ptr().add(g * BLOCK).cast());
+            let low = _mm256_and_si256(code, mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16(code, 4), mask);
+            let sum = _mm256_add_epi8(
+                _mm256_shuffle_epi8(lut_lo, low),
+                _mm256_shuffle_epi8(lut_hi, high),
+            );
+            accumulated[0] = _mm256_add_epi16(
+                accumulated[0],
+                _mm256_cvtepu8_epi16(_mm256_castsi256_si128(sum)),
+            );
+            accumulated[1] = _mm256_add_epi16(
+                accumulated[1],
+                _mm256_cvtepu8_epi16(_mm256_extracti128_si256(sum, 1)),
+            );
+
+            window += 1;
+            if window == FLUSH_EVERY {
+                for (block, acc) in accumulated.iter_mut().enumerate() {
+                    let mut lanes = [0u16; 16];
+                    _mm256_storeu_si256(lanes.as_mut_ptr().cast(), *acc);
+                    for (lane, value) in lanes.into_iter().enumerate() {
+                        scores[block * 16 + lane] += f32::from(value);
+                    }
+                    *acc = zero;
+                }
+                window = 0;
+            }
+        }
+        if window != 0 {
+            for (block, acc) in accumulated.iter().enumerate() {
+                let mut lanes = [0u16; 16];
+                _mm256_storeu_si256(lanes.as_mut_ptr().cast(), *acc);
+                for (lane, value) in lanes.into_iter().enumerate() {
+                    scores[block * 16 + lane] += f32::from(value);
+                }
+            }
+        }
+        let bias = bias_per_group * n_groups as f32;
+        for (out, score) in out.iter_mut().zip(scores) {
+            *out = score * inv_scale + bias;
+        }
+    }
+}
+
+/// AVX-512 TQ4 block scorer. Same `vpshufb` lookup as the AVX2 kernel, but a
+/// zmm holds two groups' worth of codes, so each iteration consumes two
+/// groups and two LUTs (broadcast into the matching 128-bit lanes, since
+/// `vpshufb` is per-lane). Both halves accumulate into the same 32 rows.
+///
+/// # Safety
+///
+/// The current CPU must support AVX-512F, AVX-512BW and AVX2.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f,avx512bw,avx2")]
+pub unsafe fn tq4_block32_score_u8_avx512(
+    codes: &[u8],
+    lut_u8: &[u8],
+    inv_scale: f32,
+    bias_per_group: f32,
+    dim: usize,
+    out: &mut [f32; BLOCK],
+) {
+    use std::arch::x86_64::{
+        __m512i, _mm_loadu_si128, _mm256_broadcastsi128_si256, _mm512_add_epi8, _mm512_add_epi16,
+        _mm512_and_si512, _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_cvtepu8_epi16,
+        _mm512_extracti64x4_epi64, _mm512_inserti64x4, _mm512_loadu_si512, _mm512_set1_epi8,
+        _mm512_setzero_si512, _mm512_shuffle_epi8, _mm512_srli_epi16, _mm512_storeu_si512,
+    };
+
+    assert_eq!(dim % 2, 0, "dim must be even for 4-bit codes");
+    let n_groups = dim / 2;
+    assert_eq!(codes.len(), n_groups * BLOCK, "codes length mismatch");
+    assert_eq!(lut_u8.len(), n_groups * 32, "lut length mismatch");
+
+    let pairs = n_groups / 2;
+    let mut scores = [0.0f32; BLOCK];
+    // SAFETY: the caller selected AVX-512F/BW and AVX2. Bounds are validated
+    // above: each iteration reads two 32-byte code blocks at `g * BLOCK` with
+    // `g + 1 < n_groups`, and four 16-byte LUTs inside `n_groups * 32`. The
+    // u16 accumulators flush every `FLUSH_EVERY` groups, below overflow.
+    unsafe {
+        let mask = _mm512_set1_epi8(0x0f);
+        let zero = _mm512_setzero_si512();
+        // One accumulator per zmm half: both index rows 0..32, they are summed
+        // together at flush time.
+        let mut accumulated = [zero; 2];
+        let mut window = 0;
+
+        let widen_pair = |lo_ptr: *const u8, hi_ptr: *const u8| -> __m512i {
+            let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lo_ptr.cast()));
+            let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(hi_ptr.cast()));
+            _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1)
+        };
+
+        let flush = |accumulated: &mut [__m512i; 2], scores: &mut [f32; BLOCK]| {
+            for acc in accumulated.iter_mut() {
+                let mut lanes = [0u16; 32];
+                _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc);
+                for (row, value) in lanes.into_iter().enumerate() {
+                    scores[row] += f32::from(value);
+                }
+                *acc = zero;
+            }
+        };
+
+        for pair in 0..pairs {
+            let g = pair * 2;
+            let lut_base = lut_u8.as_ptr().add(g * 32);
+            let lut_lo = widen_pair(lut_base, lut_base.add(32));
+            let lut_hi = widen_pair(lut_base.add(16), lut_base.add(48));
+            let code = _mm512_loadu_si512(codes.as_ptr().add(g * BLOCK).cast());
+            let low = _mm512_and_si512(code, mask);
+            let high = _mm512_and_si512(_mm512_srli_epi16::<4>(code), mask);
+            let sum = _mm512_add_epi8(
+                _mm512_shuffle_epi8(lut_lo, low),
+                _mm512_shuffle_epi8(lut_hi, high),
+            );
+            accumulated[0] = _mm512_add_epi16(
+                accumulated[0],
+                _mm512_cvtepu8_epi16(_mm512_castsi512_si256(sum)),
+            );
+            accumulated[1] = _mm512_add_epi16(
+                accumulated[1],
+                _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64::<1>(sum)),
+            );
+
+            window += 2;
+            if window >= FLUSH_EVERY {
+                flush(&mut accumulated, &mut scores);
+                window = 0;
+            }
+        }
+        if window != 0 {
+            flush(&mut accumulated, &mut scores);
+        }
+        // Odd group count: the leftover group has no partner to fill the
+        // upper half, so it goes through the scalar reference.
+        if n_groups % 2 == 1 {
+            let g = n_groups - 1;
+            for (row, score) in scores.iter_mut().enumerate() {
+                let code = codes[g * BLOCK + row];
+                let low = usize::from(code & 0x0f);
+                let high = usize::from(code >> 4);
+                *score += f32::from(lut_u8[g * 32 + low]) + f32::from(lut_u8[g * 32 + 16 + high]);
+            }
+        }
+    }
+    let bias = bias_per_group * n_groups as f32;
+    for (out, score) in out.iter_mut().zip(scores) {
+        *out = score * inv_scale + bias;
+    }
+}
+
+/// Score one TQ4 block through the best available kernel for this CPU.
+pub fn tq4_block32_score_u8(
+    codes: &[u8],
+    lut_u8: &[u8],
+    inv_scale: f32,
+    bias_per_group: f32,
+    dim: usize,
+    out: &mut [f32; BLOCK],
+) {
+    // No AVX-512 arm. The rule this crate follows is that AVX-512 earns its
+    // place only where the ISA gives an instruction AVX2 lacks: VNNI for the
+    // int8 dot, VPOPCNTDQ for hamming, a mask register for tq1 and
+    // flip_signs, `vpermps` over a 16-entry table for the ADC. This kernel is
+    // `vpshufb` either way, so 512-bit registers only add pressure: measured
+    // on a Threadripper 7960X (Zen 4, 2026-08-09) at 681 ns against AVX2's
+    // 600 ns in the quietest of three runs, and never faster in any of them.
+    // `tq4_block32_score_u8_avx512` stays public, tested and benched.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was checked immediately above.
+            unsafe {
+                tq4_block32_score_u8_avx2(codes, lut_u8, inv_scale, bias_per_group, dim, out);
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        tq4_block32_score_u8_neon(codes, lut_u8, inv_scale, bias_per_group, dim, out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        tq4_block32_score_u8_scalar(codes, lut_u8, inv_scale, bias_per_group, dim, out);
     }
 }
 
@@ -558,6 +793,69 @@ mod tests {
                 scores_neon[v],
                 delta
             );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn block32_avx2_matches_u8_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let dim = 258;
+        let n_groups = dim / 2;
+        let codes: Vec<u8> = (0..n_groups * BLOCK)
+            .map(|i| (i as u8).wrapping_mul(37))
+            .collect();
+        let lut: Vec<u8> = (0..n_groups * 32)
+            .map(|i| ((i * 13 + 7) % 128) as u8)
+            .collect();
+        let inv_scale = 0.013;
+        let bias_per_group = -1.7;
+        let mut scalar = [0.0; BLOCK];
+        let mut avx2 = [0.0; BLOCK];
+        tq4_block32_score_u8_scalar(&codes, &lut, inv_scale, bias_per_group, dim, &mut scalar);
+        unsafe {
+            tq4_block32_score_u8_avx2(&codes, &lut, inv_scale, bias_per_group, dim, &mut avx2);
+        }
+        assert_eq!(avx2, scalar);
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    #[test]
+    fn block32_avx512_matches_u8_scalar() {
+        if !(std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx2"))
+        {
+            return;
+        }
+        // 258 gives 129 groups (odd, so the scalar leftover group runs) and
+        // 256 gives 128 (even, and a multiple of FLUSH_EVERY).
+        for dim in [258usize, 256] {
+            let n_groups = dim / 2;
+            let codes: Vec<u8> = (0..n_groups * BLOCK)
+                .map(|i| (i as u8).wrapping_mul(37))
+                .collect();
+            let lut: Vec<u8> = (0..n_groups * 32)
+                .map(|i| ((i * 13 + 7) % 128) as u8)
+                .collect();
+            let inv_scale = 0.013;
+            let bias_per_group = -1.7;
+            let mut scalar = [0.0; BLOCK];
+            let mut avx512 = [0.0; BLOCK];
+            tq4_block32_score_u8_scalar(&codes, &lut, inv_scale, bias_per_group, dim, &mut scalar);
+            unsafe {
+                tq4_block32_score_u8_avx512(
+                    &codes,
+                    &lut,
+                    inv_scale,
+                    bias_per_group,
+                    dim,
+                    &mut avx512,
+                );
+            }
+            assert_eq!(avx512, scalar, "dim {dim}");
         }
     }
 
