@@ -7,6 +7,135 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.7.1] - 2026-08-10
+
+x86 support for the SIMD kernels, validated on real hardware for the first
+time, and a cleanup pass over the engine that turned up a data-loss bug.
+
+### Fixed
+
+- **Consolidate dropped vectors staged by an in-flight flush.** `flush_begin`
+  moves the delta into a staging map and releases the write lock while the new
+  segment builds off-thread; a `SKEG.VINDEX.CONSOLIDATE` arriving in that
+  window folded `delta > runs > base`, skipping the staging map, then truncated
+  the WAL and reopened from disk. The staged vectors were left in neither the
+  rebuilt graph, the log, nor memory. Silent: no error, no crash, the ids
+  simply stopped being found. The fold now follows the documented precedence,
+  `delta > flushing > runs > base`.
+
+- **A wrong vector dimension aborted a shard thread.** `DiskVamanaIndex::insert`
+  and the search path asserted on a dimension mismatch, so one client's bad
+  request could take down a thread serving every other vindex on that shard.
+  Both already returned `io::Result`; they now return `InvalidInput`. The flat
+  backend is guarded at the seam, where its signature cannot change.
+
+- **NaN was bucketed to the top instead of the bottom on AVX-512 builds.**
+  `bucketize_x8_avx512` used an unordered compare as if it were an ordered `>`,
+  which is true for NaN, so any vector containing one was silently mis-encoded.
+  Only on AVX-512 builds, only on x86. It had passed clippy, an assembly
+  read-through and an instruction-selection guard in CI; executing it on x86
+  found it in one run.
+
+- **Public SIMD kernels did not enforce the preconditions their dispatchers
+  checked.** `skeg-simd` exports the individual kernels, not only the
+  dispatchers, and eleven of them index with `get_unchecked` or raw pointer
+  loads. They took a loop bound from one slice and read from another, assumed
+  a bit-packed layout, or relied on a `debug_assert` that a release build
+  compiles away: `tq1_masked_sum_neon` given a short slice aborted the process
+  instead of panicking, and a non-power-of-two length walked the FWHT
+  butterfly stages off the end of its slice. The ADC entry points had a
+  related gap, accepting a dimension with no packed representation at all,
+  because `dim * BITS / 8` truncates to zero for `dim = 1`. Every caller
+  inside the workspace goes through a dispatcher or a quantizer that
+  validates, so the engine was not exposed; a direct `skeg-simd` user was.
+  Each public kernel now validates for itself through the same helper its
+  dispatcher uses, and the FWHT and bit-plane preconditions are runtime
+  asserts rather than debug-only ones. Verified by walking every public path
+  to an unchecked access: 47 reach one, none through an unguarded route.
+
+- **The AVX-512 ADC declared fewer target features than it uses.** The kernel
+  is compiled with AVX-512F, BW, VL and SSSE3, but the tq4 wrapper declared two
+  of those and the tq2 wrapper three, and the tq4 dispatcher did not check
+  SSSE3. Zen 4 and Zen 5 have all four so nothing surfaced there, but a CPU
+  with a partial combination, or a caller following the documented contract of
+  the unsafe entry point, could execute an instruction it does not have. All
+  five sites now read one shared predicate, `avx512_adc_supported`.
+
+- **VSEARCH had two separately written paths**, one for the worker pool and one
+  inline. They agreed, but nothing kept them agreeing, and a fix applied to one
+  and not the other would surface only where `workers > 0`. Now one path, with
+  the equivalence test extended to cover filters and payloads.
+
+- **The io_uring batch reader rebuilt its ring on every call**, an
+  `io_uring_setup` plus two mmaps and two munmaps per batch, which erased the
+  overlap it exists for. With the ring reused, a cold batch of 800 reads costs
+  3.5 us per read against `pread`'s 100 us; the backend had measured slower
+  than `pread` before the fix.
+
+### Added
+
+- **AVX2 and AVX-512 kernels for x86**, dispatched at runtime, with the
+  `avx512` feature off by default. AVX-512 is selected only where the wider
+  instruction set offers something AVX2 lacks: VNNI for the int8 dot,
+  VPOPCNTDQ for Hamming, mask registers for tq1 and sign flips, and a
+  register-resident 16-entry table for the ADC. Where it is only the same trick
+  at twice the width it loses on cores that split 512-bit operations, so those
+  kernels ship built and tested but not dispatched.
+
+- **NEON kernels for the rotation path** (`fwht_f32`, `flip_signs`,
+  `bucketize_x8`), which ran scalar on aarch64. At dim 1536 on an M1 Pro:
+  `flip_signs` 950 ns to 157 ns, `bucketize_x8` 6.22 us to 1.59 us, `fwht_f32`
+  1.94 us to 1.39 us.
+
+- **A batch-read seam in the platform layer** with a blocking implementation
+  and an optional `io_uring` one, plus `preallocate_sync`,
+  `write_vectored_at_sync`, `advise_huge` and `open_populated`. The vLog
+  preallocates and fsyncs segments through it.
+
+- **A kernel coverage test**: which kernel exists for which instruction set and
+  which one the dispatcher picks. A gap has to carry a reason, and a kernel
+  that exists but loses to its neighbour is recorded as present-but-not-chosen
+  rather than as coverage.
+
+### Changed
+
+- **The ADC kernels keep their centroid table in a register** and permute it
+  instead of gathering it from memory and unpacking codes in a scalar loop. At
+  dim 1536 on a Zen 4 EPYC the AVX-512 kernel went from 464 ns to 63.7 ns and
+  AVX2 from 431 ns to 147 ns, so machines without AVX-512 gain too. End to end
+  on 99k vectors, an AVX-512 build serves tq2 and tq4 36% to 61% more queries
+  per second than an AVX2 one, at identical recall and RSS.
+
+- **Flat 4-bit TurboQuant search uses the block-32 kernel**, which scores 32
+  rows against one pre-computed table: 939 ns against 11.9 us for the scalar
+  reference at dim 1536. Same candidate width and same exact-f32 rerank, so the
+  answer is unchanged.
+
+- **One ADC kernel per instruction set** over a code-width parameter, instead
+  of one per tier, so a technique fix lands once per instruction set. Kernels
+  are grouped by operation, each module holding every instruction set for it.
+
+- **One source of truth for the quantization wire encoding**
+  (`QuantKind::from_wire` / `to_wire` / `wire_kinds`), replacing four
+  hand-written byte tables. The byte values are unchanged and now pinned by a
+  test, because on-disk registries written by earlier versions depend on them.
+
+- **The idle maintenance decision is a named function**, not a 110-line closure
+  nested inside the shard loop. It chooses flush against consolidate against
+  runs-merge against delete-patch, so it is what gets read during a memory or
+  latency incident, and it used to appear in traces as an anonymous closure.
+
+### Removed
+
+- `crossbeam-channel` and `lz4_flex` from the workspace manifest. Neither was
+  referenced by any crate or any source file.
+
+### Versions bumped
+
+- `skeg-simd` 0.1.6, `skeg-platform` 0.1.5, `skeg-core` 0.3.4,
+  `skeg-telemetry` 0.2.2, `skeg-vector` 0.1.8, `skeg-server` 0.7.1,
+  `skeg-server-tenant` 0.2.4
+
 ## [0.7.0] - 2026-07-21
 
 ### Added

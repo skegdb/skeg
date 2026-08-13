@@ -5,10 +5,6 @@ release; these are the next things to reach for when a workload demands them.
 
 ## Planned
 
-- **x86_64 native tuning.** AVX2 / AVX-512 kernels and native Linux validation.
-  Release binaries are aarch64 (Apple Silicon, Linux ARM) today; the source
-  builds on x86_64 but the SIMD paths are not tuned for it and native Linux
-  validation is not done.
 - **VSEARCH child spans.** Break the query internals out as child spans through
   the OTLP exporter, so a trace shows the walk, re-rank, and filter phases
   separately.

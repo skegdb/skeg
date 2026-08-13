@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-server"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1756,7 +1756,7 @@ dependencies = [
  "skeg-proto",
  "skeg-resp3 0.2.3",
  "skeg-telemetry",
- "skeg-vector 0.1.7",
+ "skeg-vector 0.1.8",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
@@ -1770,13 +1770,13 @@ dependencies = [
 
 [[package]]
 name = "skeg-server-tenant"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "parking_lot",
  "skeg-platform 0.1.5",
  "skeg-server",
  "skeg-tenant",
- "skeg-vector 0.1.7",
+ "skeg-vector 0.1.8",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-vector"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "bytemuck",
