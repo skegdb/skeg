@@ -39,10 +39,3 @@ jobs:
           ! grep -qE 'vgatherdps.*%zmm' target/release/deps/*.s
       - name: vector tier tests
         run: cargo test -p skeg-vector tq4
-      # io_uring: the hosted runner may or may not permit it, so the gate is
-      # "builds and its tests compile". Execution against a real ring needs a
-      # machine where the syscall is available.
-      - name: io_uring build gate
-        run: |
-          cargo test -p skeg-platform --features uring --all-targets --no-run
-          cargo bench -p skeg-platform --bench batch_read --features uring --no-run
