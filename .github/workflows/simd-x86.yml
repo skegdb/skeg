@@ -1,0 +1,48 @@
+name: SIMD x86
+# The main CI matrix runs on aarch64, where every #[cfg(target_arch = "x86_64")]
+# kernel is compiled out. This job executes the AVX2 kernels and their
+# scalar-equivalence tests on a real x86 CPU. It gates correctness only:
+# performance claims still need a dedicated bare-metal run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  x86:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: report cpu features
+        run: grep -m1 -o 'avx2\|avx512f\|fma' /proc/cpuinfo | sort -u
+      - name: skeg-simd tests
+        run: cargo test -p skeg-simd --all-targets
+      # The hosted runner is not contractually AVX-512-capable, so compile
+      # every AVX-512 test but do not execute it here. The two assembly checks
+      # prove the intrinsics did not silently lower to the scalar/AVX2 path.
+      # Runtime scalar-equivalence is gated on a real AVX-512 machine.
+      - name: AVX-512 build gate
+        run: cargo test -p skeg-simd --all-targets --features avx512 --no-run
+      - name: AVX-512 instruction-selection guard
+        run: |
+          cargo rustc -p skeg-simd --release --features avx512 --lib -- --emit=asm
+          grep -q 'vpdpbusd' target/release/deps/*.s          # VNNI int8 dot
+          grep -q 'vpopcntq' target/release/deps/*.s          # VPOPCNTDQ hamming
+          grep -qE 'vpermd|vpermps' target/release/deps/*.s   # register-resident ADC LUT
+          grep -q 'vpmovdb' target/release/deps/*.s           # bucketize byte store
+          # Regression guard: the ADC kernels used to gather their centroids
+          # from memory, which measured 7x slower than permuting a table held
+          # in a register. A zmm gather here means that came back.
+          ! grep -qE 'vgatherdps.*%zmm' target/release/deps/*.s
+      - name: vector tier tests
+        run: cargo test -p skeg-vector tq4
+      # io_uring: the hosted runner may or may not permit it, so the gate is
+      # "builds and its tests compile". Execution against a real ring needs a
+      # machine where the syscall is available.
+      - name: io_uring build gate
+        run: |
+          cargo test -p skeg-platform --features uring --all-targets --no-run
+          cargo bench -p skeg-platform --bench batch_read --features uring --no-run

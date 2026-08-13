@@ -203,6 +203,18 @@ impl FlatIndex {
         }
         match self.kind {
             QuantKind::F32 => self.search_exact(query, k),
+            // 4-bit TurboQuant goes through the block-32 kernel, which scores
+            // 32 rows against one pre-computed LUT instead of one row per ADC
+            // call: 939 ns against 11.9 us for the scalar reference on an M1
+            // Pro. Same candidate width, same liveness filter, same exact-f32
+            // rerank, so the answer is the row-major path's answer. It returns
+            // None when the layout is unavailable (a tier mismatch, or a
+            // corpus with fewer rows than one block), and then the row-major
+            // path runs.
+            QuantKind::TurboQuant { bits: 4 } => match self.search_block_tq4(query, k) {
+                Some(hits) => hits,
+                None => self.search_quantized(query, k),
+            },
             QuantKind::Int8
             | QuantKind::Binary
             | QuantKind::Pq { .. }
@@ -266,12 +278,9 @@ impl FlatIndex {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
 
-        #[cfg(target_arch = "aarch64")]
-        use skeg_simd::tq4_block32_score_u8_neon;
-        #[cfg(not(target_arch = "aarch64"))]
-        use skeg_simd::tq4_block32_score_u8_scalar;
         use skeg_simd::{
             BLOCK as TQ4_BLOCK, build_tq4_lut_f32, interleave_tq4_codes, quantize_tq4_lut_u8,
+            tq4_block32_score_u8,
         };
 
         assert_eq!(query.len(), self.dim, "query dim mismatch");
@@ -366,17 +375,7 @@ impl FlatIndex {
             };
         for b in 0..n_blocks {
             let block_slice = &blocks[b * block_stride..(b + 1) * block_stride];
-            #[cfg(target_arch = "aarch64")]
-            tq4_block32_score_u8_neon(
-                block_slice,
-                &lut_u8,
-                inv_scale,
-                bias_per_group,
-                self.dim,
-                &mut block_out,
-            );
-            #[cfg(not(target_arch = "aarch64"))]
-            tq4_block32_score_u8_scalar(
+            tq4_block32_score_u8(
                 block_slice,
                 &lut_u8,
                 inv_scale,
@@ -636,6 +635,50 @@ mod tests {
         }
         let recall = hits as f64 / total as f64;
         assert!(recall >= 0.95, "tq4 block recall@10 = {recall:.4}");
+    }
+
+    /// The public entry point must route 4-bit TurboQuant through the block
+    /// kernel. Before this wiring the block path existed, was tested, was
+    /// 12.7x its scalar reference, and nothing outside the tests ever called
+    /// it.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn search_routes_tq4_through_the_block_path() {
+        let dim = 64;
+        let n = 256;
+        let vectors = random_vectors(n, dim, 4242);
+        let mut index = FlatIndex::new(dim, QuantKind::TurboQuant { bits: 4 });
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v);
+        }
+        for q in random_vectors(8, dim, 5150).iter() {
+            let via_search = index.search(q, 10);
+            let via_block = index
+                .search_block_tq4(q, 10)
+                .expect("tq4 path must be available");
+            assert_eq!(via_search, via_block, "search did not take the block path");
+        }
+    }
+
+    /// A corpus smaller than one 32-row block has no whole block to score, so
+    /// every row goes through the block path's row-major tail. The answer must
+    /// still be right, which is what stops the wiring above from silently
+    /// dropping the first 31 vectors of a young index.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn search_tq4_is_correct_below_one_block() {
+        let dim = 64;
+        let n = 20;
+        let vectors = random_vectors(n, dim, 909);
+        let mut index = FlatIndex::new(dim, QuantKind::TurboQuant { bits: 4 });
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v);
+        }
+        for probe in [0usize, 7, 19] {
+            let hits = index.search(&vectors[probe], 3);
+            assert_eq!(hits.len(), 3, "expected 3 hits from a 20-row corpus");
+            assert_eq!(hits[0].0, probe as u64, "exact match not at top-1");
+        }
     }
 
     /// `search_block_tq4` must refuse to handle non-TurboQuant tiers
