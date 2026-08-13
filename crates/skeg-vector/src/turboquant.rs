@@ -257,15 +257,16 @@ impl TurboQuant4 {
             *u = x * inv;
         }
         let rotated = self.rotation.apply_alloc(&unit);
+        let mut buckets = vec![0u8; dim];
+        skeg_simd::bucketize_x8(&rotated, &self.boundaries, &mut buckets);
         let mut code = vec![0u8; dim / 2];
         let mut inner = 0.0f32;
-        for (i, &r) in rotated.iter().enumerate() {
-            let bucket = bucketize(r, &self.boundaries);
-            inner += r * self.centroids[bucket];
+        for (i, (&r, &bucket)) in rotated.iter().zip(buckets.iter()).enumerate() {
+            inner += r * self.centroids[bucket as usize];
             // Pack two nibbles per byte: even coord -> low nibble, odd -> high.
             let byte = i / 2;
             let shift = (i % 2) * 4;
-            code[byte] |= (bucket as u8) << shift;
+            code[byte] |= bucket << shift;
         }
         let inner = inner.max(1e-10);
         let scale = norm / inner;
@@ -294,20 +295,6 @@ impl TurboQuant4 {
         }
         scale * acc
     }
-}
-
-/// Map a coordinate to its 4-bit bucket index using the sorted boundaries.
-/// Linear scan: with 15 boundaries this beats a branchless binary search on
-/// short inputs because the boundary array stays in L1 and the compare-
-/// increment compiles tight.
-fn bucketize(x: f32, boundaries: &[f32]) -> usize {
-    let mut bucket = 0usize;
-    for &b in boundaries {
-        if x > b {
-            bucket += 1;
-        }
-    }
-    bucket
 }
 
 // -- Fast rotation: block Walsh-Hadamard + signed diagonals -------------------
@@ -393,9 +380,9 @@ impl FastRotation {
         assert_eq!(out.len(), self.dim);
         out.copy_from_slice(x);
         for round in 0..3 {
-            flip_signs(out, &self.sign_masks[round]);
+            skeg_simd::flip_signs(out, &self.sign_masks[round]);
             for block in out.chunks_exact_mut(self.block) {
-                fwht_inplace(block);
+                skeg_simd::fwht_f32(block);
             }
         }
         // Three FWHT passes (each scales norm by sqrt(block)) need the
@@ -430,37 +417,11 @@ fn largest_pow2_factor(n: usize) -> usize {
     p
 }
 
-/// In-place sign flip on the indices marked by `mask` (LSB-first packing
-/// matching [`FastRotation::sign_masks`]).
-fn flip_signs(x: &mut [f32], mask: &[u8]) {
-    for i in 0..x.len() {
-        if (mask[i / 8] >> (i % 8)) & 1 == 1 {
-            x[i] = -x[i];
-        }
-    }
-}
-
-/// In-place Walsh-Hadamard transform, unnormalised. `x.len()` must be a
-/// power of two. After this call `||x'|| = sqrt(n) * ||x||`; the caller
-/// scales as appropriate.
-fn fwht_inplace(x: &mut [f32]) {
-    let n = x.len();
-    debug_assert!(n.is_power_of_two(), "FWHT requires a power-of-two length");
-    let mut h = 1;
-    while h < n {
-        let mut i = 0;
-        while i < n {
-            for j in i..i + h {
-                let a = x[j];
-                let b = x[j + h];
-                x[j] = a + b;
-                x[j + h] = a - b;
-            }
-            i += h * 2;
-        }
-        h *= 2;
-    }
-}
+// Sign-flip, Walsh-Hadamard transform, and the bucket lookup all moved to
+// `skeg_simd::flip_signs` / `skeg_simd::fwht_f32` / `skeg_simd::bucketize_x8`
+// dispatched kernels instead of the fixed scalar loops that
+// used to live here, so this module stays architecture-agnostic (same
+// pattern already applied to `flat.rs`'s cosine/hamming/dot dispatch in P3).
 
 // -- SWAR ADC inner accumulators (stable Rust, no `unsafe`) -------------------
 //
@@ -776,15 +737,16 @@ impl TurboQuant2 {
             *u = x * inv;
         }
         let rotated = self.rotation.apply_alloc(&unit);
+        let mut buckets = vec![0u8; dim];
+        skeg_simd::bucketize_x8(&rotated, &self.boundaries, &mut buckets);
         let mut code = vec![0u8; dim / 4];
         let mut inner = 0.0f32;
-        for (i, &r) in rotated.iter().enumerate() {
-            let bucket = bucketize(r, &self.boundaries);
-            inner += r * self.centroids[bucket];
+        for (i, (&r, &bucket)) in rotated.iter().zip(buckets.iter()).enumerate() {
+            inner += r * self.centroids[bucket as usize];
             // Pack four 2-bit codes per byte: i%4 chooses the 2-bit slot.
             let byte = i / 4;
             let shift = (i % 4) * 2;
-            code[byte] |= (bucket as u8) << shift;
+            code[byte] |= bucket << shift;
         }
         let inner = inner.max(1e-10);
         let scale = norm / inner;

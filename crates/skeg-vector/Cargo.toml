@@ -12,6 +12,9 @@ readme = "../../README.md"
 keywords = ["vector-database", "ann", "vamana", "quantization", "skeg"]
 categories = ["database", "algorithms"]
 
+[features]
+avx512 = ["skeg-simd/avx512"]
+
 [dependencies]
 skeg-simd = { path = "../skeg-simd", version = "0.1.5" }
 skeg-platform = { path = "../skeg-platform", version = "0.1.4" }

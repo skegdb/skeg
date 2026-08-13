@@ -1783,7 +1783,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-simd"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "proptest",
@@ -1854,7 +1854,7 @@ dependencies = [
  "rand",
  "rayon",
  "skeg-platform 0.1.4",
- "skeg-simd 0.1.5",
+ "skeg-simd 0.1.6",
  "smallvec",
  "tempfile",
  "thiserror",

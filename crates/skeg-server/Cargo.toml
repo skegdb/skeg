@@ -52,6 +52,7 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 # passed. Drop it with `--no-default-features`; the `--metrics-port`
 # flag stays parseable but logs a warning instead of binding.
 default = ["metrics-http", "tracing-otlp"]
+avx512 = ["skeg-vector/avx512"]
 metrics-http = ["skeg-telemetry/http"]
 # OpenTelemetry tracing exporter. When this feature is on AND the env
 # var `SKEG_TRACE_OTLP_ENDPOINT` is set, spans flow to the configured

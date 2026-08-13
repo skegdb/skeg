@@ -35,6 +35,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
+[features]
+avx512 = ["skeg-server/avx512", "skeg-vector/avx512"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
