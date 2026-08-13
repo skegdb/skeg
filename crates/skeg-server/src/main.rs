@@ -56,8 +56,8 @@ OPTIONS:
     --speed                Opt-in early-termination in greedy walk
                              (-0.3 to -0.7% recall@10, +40-60% QPS).
                              Also: SKEG_SPEED=1.
-    --workers <N>          Dispatch SKEG.VSEARCH to a worker pool (N threads).
-                             0 (default) = inline on shard. Also: SKEG_WORKERS.
+    --workers <N>          Dedicated SKEG.VSEARCH workers per shard with bounded queues.
+                             0 (default) = inline; overload is rejected. Also: SKEG_WORKERS.
     --tier-mmap            mmap the TurboQuant tier (tier.cache.bin) instead of
                              holding it in RAM. Also: SKEG_TIER_MMAP=1.
     --graph-mmap           mmap the Vamana graph Node array. Also: SKEG_GRAPH_MMAP=1.
@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cfg.workers > 0 {
         tracing::info!(
-            "--workers {}: VSEARCH dispatched to tokio blocking pool (KV ops stay inline)",
+            "--workers {}: dedicated VSEARCH workers per shard enabled; KV ops stay inline",
             cfg.workers
         );
     }
@@ -253,9 +253,8 @@ struct Config {
     speed: bool,
     /// Opt-in VSEARCH worker pool.
     /// `0` = inline VSEARCH on the shard thread (default; matches the public
-    /// bench numbers). `> 0` = dispatch VSEARCH to tokio's blocking pool so
-    /// KV ops do not queue behind multi-ms searches. The integer value is
-    /// informational today; a future dedicated pool will honour it.
+    /// bench numbers). `> 0` creates that many dedicated VSEARCH workers per
+    /// shard so KV ops do not queue behind VSEARCH.
     workers: usize,
     /// Opt-in TurboQuant tier paging. When set, the TurboQuant
     /// `codes` buffer is persisted to `tier.cache.bin` at open and

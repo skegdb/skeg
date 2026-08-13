@@ -69,10 +69,9 @@ impl Server {
 
     /// Bind the server with an explicit shard count and worker-pool size.
     ///
-    /// `workers == 0` (default) keeps VSEARCH inline on the shard thread
-    /// (Personal AI default). `workers > 0` dispatches VSEARCH to a tokio
-    /// blocking pool so KV ops do not queue behind multi-ms vector searches
-    /// (multi-tenant pattern, opt-in via `--workers N` on the CLI).
+    /// `workers == 0` (default) keeps VSEARCH inline on the shard thread.
+    /// `workers > 0` creates dedicated bounded
+    /// VSEARCH workers per shard so KV ops do not queue behind vector searches.
     ///
     /// # Errors
     ///

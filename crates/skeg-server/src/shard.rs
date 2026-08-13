@@ -4,16 +4,16 @@
 //! performance core. Shards are shared-nothing: the `VLog` is touched only by
 //! its own worker thread, so no locking is needed on the storage fast path.
 //!
-//! Requests reach a shard over a `crossbeam-channel`; the worker replies on a
+//! Requests reach a shard over an `mpsc` channel; the worker replies on a
 //! per-request `tokio::oneshot`. Keys route deterministically by
 //! `xxh3_64(key) % n_shards`.
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -74,7 +74,7 @@ use skeg_vector::{
     FlushBuilt, FlushJob, IvfBuilt, IvfJob, QuantKind, RunMergeBuilt, RunMergeJob,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tracing::error;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -92,6 +92,9 @@ use xxhash_rust::xxh3::xxh3_64;
 /// VSET updates both atomically and a filtered VSEARCH reads a consistent view.
 struct Vindex {
     backend: VectorBackend,
+    /// Effective quantization kind exposed to clients. Disk f32/binary requests
+    /// use the int8 disk fallback, so this records the tier actually in use.
+    kind: u8,
     payload: PayloadIndex,
     /// True once the payload index reflects all stored blobs. A freshly created
     /// vindex starts loaded (VSETs fill the index directly); a recovered one
@@ -105,9 +108,10 @@ struct Vindex {
 }
 
 impl Vindex {
-    fn new(backend: VectorBackend) -> Self {
+    fn new(backend: VectorBackend, kind: u8) -> Self {
         Self {
             backend,
+            kind,
             payload: PayloadIndex::default(),
             payload_loaded: true,
             last_access: AtomicU64::new(now_ms()),
@@ -116,10 +120,10 @@ impl Vindex {
 
     /// A vindex reopened from disk: its payload index is empty and must be
     /// rebuilt from the stored blobs before a filtered search can use it.
-    fn recovered(backend: VectorBackend) -> Self {
+    fn recovered(backend: VectorBackend, kind: u8) -> Self {
         Self {
             payload_loaded: false,
-            ..Self::new(backend)
+            ..Self::new(backend, kind)
         }
     }
 
@@ -183,18 +187,6 @@ impl VectorBackend {
         }
     }
 
-    /// Wire kind byte for this VINDEX (mirrors `QuantKind::wire()` on the
-    /// disk side; flat indexes always carry full f32 in RAM).
-    fn kind_byte(&self) -> u8 {
-        match self {
-            // Flat indexes store full f32 vectors in RAM.
-            VectorBackend::Flat(_) => 0,
-            // Disk indexes carry the tier-1 quantisation choice; expose it
-            // via the wire byte that VINDEX CREATE uses.
-            VectorBackend::Disk(_) => 1, // int8 is the only on-disk tier today
-        }
-    }
-
     /// Wire backend byte: 0 = flat, 1 = disk Vamana.
     fn backend_byte(&self) -> u8 {
         match self {
@@ -218,6 +210,16 @@ impl VectorBackend {
     fn insert(&mut self, id: u64, vector: &[f32]) -> std::io::Result<()> {
         match self {
             VectorBackend::Flat(i) => {
+                // `FlatIndex::insert` panics on a dim mismatch and its
+                // signature is shared with callers that rely on that. Check
+                // here so a bad dimension from one client cannot take down a
+                // shard thread that is serving every other vindex.
+                if i.dim() != vector.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("vector has {} dims, index has {}", vector.len(), i.dim()),
+                    ));
+                }
                 i.insert(id, vector);
                 Ok(())
             }
@@ -421,7 +423,15 @@ impl VectorBackend {
         const RERANK: usize = 8;
         let rerank = (k * RERANK).max(64);
         match self {
-            VectorBackend::Flat(i) => Ok(i.score_ids(query, s, k)),
+            VectorBackend::Flat(i) => {
+                if i.dim() != query.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("query has {} dims, index has {}", query.len(), i.dim()),
+                    ));
+                }
+                Ok(i.score_ids(query, s, k))
+            }
             VectorBackend::Disk(i) => i.search_filtered_hybrid(query, s, k, rerank),
         }
     }
@@ -434,7 +444,15 @@ impl VectorBackend {
     ) -> std::io::Result<Vec<(u64, f32)>> {
         match self {
             // Flat is brute-force: no search-list, l_search does not apply.
-            VectorBackend::Flat(i) => Ok(i.search(query, k)),
+            VectorBackend::Flat(i) => {
+                if i.dim() != query.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("query has {} dims, index has {}", query.len(), i.dim()),
+                    ));
+                }
+                Ok(i.search(query, k))
+            }
             VectorBackend::Disk(i) => i.search_with_l(query, k, l_search as usize),
         }
     }
@@ -472,6 +490,8 @@ pub fn shard_for(key: &[u8], n_shards: usize) -> usize {
 pub enum ShardError {
     #[error("shard unavailable")]
     Unavailable,
+    #[error("vsearch queue is full")]
+    Busy,
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -621,6 +641,80 @@ struct ShardMsg {
     reply: oneshot::Sender<ShardResp>,
 }
 
+type VsearchResult = Result<Vec<(u64, f32)>, String>;
+type VsearchTask = Box<dyn FnOnce() -> VsearchResult + Send>;
+
+struct VsearchJob {
+    task: VsearchTask,
+    reply: oneshot::Sender<VsearchResult>,
+}
+
+struct VsearchPool {
+    sender: Option<std_mpsc::SyncSender<VsearchJob>>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl VsearchPool {
+    fn new(workers: usize) -> std::io::Result<Arc<Self>> {
+        assert!(workers > 0, "vsearch workers must be positive");
+        let (sender, receiver) = std_mpsc::sync_channel::<VsearchJob>(workers);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut handles = Vec::with_capacity(workers);
+        for id in 0..workers {
+            let receiver = receiver.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("skeg-vsearch-{id}"))
+                    .spawn(move || {
+                        loop {
+                            let job = { receiver.lock().recv() };
+                            match job {
+                                Ok(job) => {
+                                    let _ = job.reply.send((job.task)());
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                    })?,
+            );
+        }
+        Ok(Arc::new(Self {
+            sender: Some(sender),
+            handles: Mutex::new(handles),
+        }))
+    }
+
+    fn submit<F>(&self, task: F) -> Result<oneshot::Receiver<VsearchResult>, &'static str>
+    where
+        F: FnOnce() -> VsearchResult + Send + 'static,
+    {
+        let (reply, receive) = oneshot::channel();
+        let job = VsearchJob {
+            task: Box::new(task),
+            reply,
+        };
+        match self
+            .sender
+            .as_ref()
+            .ok_or("vsearch pool unavailable")?
+            .try_send(job)
+        {
+            Ok(()) => Ok(receive),
+            Err(std_mpsc::TrySendError::Full(_)) => Err("vsearch queue is full"),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => Err("vsearch pool unavailable"),
+        }
+    }
+}
+
+impl Drop for VsearchPool {
+    fn drop(&mut self) {
+        self.sender.take();
+        for handle in self.handles.get_mut().drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 // ── Vector payload sidecar ────────────────────────────────────────────────────
 //
 // An optional opaque payload blob per vector id, stored in the shard's KV vLog
@@ -744,48 +838,74 @@ async fn attach_payloads(
 // indexes are in-RAM and ephemeral by design - they are not registered.
 
 const VINDEX_REGISTRY: &str = "vindexes.registry";
+const VINDEX_REGISTRY_V2_MAGIC: [u8; 4] = *b"SVI2";
 
-/// Rewrite the registry file: `[u32 count]` then `[u16 nlen][name][u32 dim]`.
+#[derive(Clone)]
+struct RegistryEntry {
+    name: String,
+    dim: usize,
+    /// Effective VINDEX wire kind. `None` denotes the legacy registry format,
+    /// which did not persist a per-index tier.
+    kind: Option<u8>,
+}
+
+/// Rewrite the versioned registry: `[SVI2][u32 count]` then
+/// `[u16 nlen][name][u32 dim][u8 kind]` per disk-backed VINDEX.
 #[allow(clippy::cast_possible_truncation)] // index names are short, dims fit u32
-fn write_registry(dir: &Path, entries: &[(&str, usize)]) -> std::io::Result<()> {
+fn write_registry(dir: &Path, entries: &[(&str, usize, u8)]) -> std::io::Result<()> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(&VINDEX_REGISTRY_V2_MAGIC);
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (name, dim) in entries {
+    for (name, dim, kind) in entries {
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(&(*dim as u32).to_le_bytes());
+        buf.push(*kind);
     }
     let tmp = dir.join(format!("{VINDEX_REGISTRY}.tmp"));
     std::fs::write(&tmp, &buf)?;
     std::fs::rename(&tmp, dir.join(VINDEX_REGISTRY))
 }
 
-/// Read the registry: `(name, dim)` per disk-backed VINDEX. Missing or
-/// truncated registry yields whatever parsed cleanly.
-fn read_registry(dir: &Path) -> Vec<(String, usize)> {
+/// Read the registry. Missing or truncated registries yield whatever parsed
+/// cleanly. The old `[u32 count]` format is accepted with no tier metadata.
+fn read_registry(dir: &Path) -> Vec<RegistryEntry> {
     let Ok(bytes) = std::fs::read(dir.join(VINDEX_REGISTRY)) else {
         return Vec::new();
     };
-    if bytes.len() < 4 {
+    let (mut pos, versioned) = if bytes.starts_with(&VINDEX_REGISTRY_V2_MAGIC) {
+        (4usize, true)
+    } else {
+        (0usize, false)
+    };
+    if bytes.len() < pos + 4 {
         return Vec::new();
     }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
     let mut out = Vec::with_capacity(count);
-    let mut pos = 4;
+    pos += 4;
     for _ in 0..count {
         if pos + 2 > bytes.len() {
             break;
         }
         let nlen = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2;
-        if pos + nlen + 4 > bytes.len() {
+        let tail = 4 + usize::from(versioned);
+        if pos + nlen + tail > bytes.len() {
             break;
         }
         let name = String::from_utf8_lossy(&bytes[pos..pos + nlen]).into_owned();
         pos += nlen;
         let dim = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        out.push((name, dim));
+        let kind = versioned
+            .then(|| {
+                let kind = bytes[pos];
+                pos += 1;
+                kind
+            })
+            .filter(|kind| QuantKind::from_wire(*kind).is_some());
+        out.push(RegistryEntry { name, dim, kind });
     }
     out
 }
@@ -802,17 +922,24 @@ fn read_registry(dir: &Path) -> Vec<(String, usize)> {
 /// drop prunes (no dir).
 fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
     use std::collections::BTreeMap;
-    let mut by_name: BTreeMap<String, usize> = read_registry(dir).into_iter().collect();
+    let mut by_name: BTreeMap<String, (usize, u8)> = read_registry(dir)
+        .into_iter()
+        .map(|entry| (entry.name, (entry.dim, entry.kind.unwrap_or(1))))
+        .collect();
     {
         let vs = vindexes.read();
         for (name, entry) in vs.iter() {
-            if let VectorBackend::Disk(i) = &entry.read().backend {
-                by_name.insert(name.clone(), i.dim());
+            let vindex = entry.read();
+            if let VectorBackend::Disk(i) = &vindex.backend {
+                by_name.insert(name.clone(), (i.dim(), vindex.kind));
             }
         }
     }
     by_name.retain(|name, _| dir.join(format!("vindex-{name}")).exists());
-    let entries: Vec<(&str, usize)> = by_name.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+    let entries: Vec<(&str, usize, u8)> = by_name
+        .iter()
+        .map(|(name, (dim, kind))| (name.as_str(), *dim, *kind))
+        .collect();
     if let Err(e) = write_registry(dir, &entries) {
         error!("vindex registry write failed: {e}");
     }
@@ -831,6 +958,105 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
 ///
 /// No lock is held across the `.await` (the guards are confined to the sync
 /// blocks), so the shard thread is free during the build.
+/// One maintenance decision for one vindex, off the request path.
+///
+/// Priority, cheapest and most frequent first:
+///   1. flush (L0), delta past `FLUSH_ROWS`. The common case under ingest; it
+///      keeps the flat delta scan small and builds no graph on the shard thread.
+///   2. consolidate, runs grown to about base size (geometric) or an idle
+///      cleanup. Folds runs plus delta into a fresh base and truncates the WAL.
+///   3. runs-merge (L2), runs piling up while the base is fine.
+///   4. delete-patch (L3), reclaim dead base rows.
+///
+/// One operation per vindex per tick. Returns whether a consolidate ran, which
+/// is what tells the caller to reset this vindex's idle tracking.
+///
+/// This is a named function rather than a block inside the idle loop because
+/// it decides flush against consolidate against merge against patch, which
+/// makes it the code most likely to be read during a memory or latency
+/// incident. Inlined, it appeared in traces as `run_shard::{{closure}}::{{closure}}`.
+async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle: bool) -> bool {
+    let (delta, runs, run_rows, tombs, base) = {
+        let g = arc.read();
+        (
+            g.backend.delta_len(),
+            g.backend.run_count(),
+            g.backend.run_rows(),
+            g.backend.tombstone_count(),
+            g.backend.main_len(),
+        )
+    };
+    let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN)
+        || (idle && delta + run_rows >= IDLE_CONSOLIDATE_MIN);
+
+    if delta >= FLUSH_ROWS {
+        let d = vdir.to_path_buf();
+        off_thread_maintenance(
+            arc,
+            "flush",
+            shard_id,
+            |b| b.flush_begin(),
+            move |job| job.build(&d),
+            |b, built| b.flush_finish(built),
+        )
+        .await;
+        return false;
+    }
+    if consolidate_due {
+        let d = vdir.to_path_buf();
+        let ran = off_thread_maintenance(
+            arc,
+            "consolidate",
+            shard_id,
+            |b| b.consolidate_begin(),
+            move |job| job.build(&d),
+            |b, built| b.consolidate_finish(built),
+        )
+        .await;
+        if ran && arc.read().backend.wants_ivf() {
+            // Base changed: rebuild the IVF router off the request path AND off
+            // the write lock. `begin` dups the fd, `build` runs k-means
+            // off-thread, `finish` swaps under a short lock.
+            off_thread_maintenance(
+                arc,
+                "ivf",
+                shard_id,
+                |b| b.ivf_begin(),
+                |job| job.build(),
+                |b, built| b.ivf_finish(built),
+            )
+            .await;
+        }
+        return true;
+    }
+    if runs >= RUNS_MERGE_TRIGGER {
+        let d = vdir.to_path_buf();
+        off_thread_maintenance(
+            arc,
+            "runs-merge",
+            shard_id,
+            |b| b.merge_runs_begin(),
+            move |job| job.build(&d),
+            |b, built| b.merge_runs_finish(built),
+        )
+        .await;
+        return false;
+    }
+    if base >= DELETE_PATCH_MIN_BASE && tombs >= base / DELETE_PATCH_DEAD_DIVISOR {
+        let d = vdir.to_path_buf();
+        off_thread_maintenance(
+            arc,
+            "delete-patch",
+            shard_id,
+            |b| b.delete_patch_begin(),
+            move |job| job.build(&d),
+            |b, built| b.delete_patch_finish(built),
+        )
+        .await;
+    }
+    false
+}
+
 async fn off_thread_maintenance<T, B>(
     arc: &VectorEntry,
     label: &str,
@@ -881,24 +1107,34 @@ fn recover_vindexes(
     tier: QuantKind,
     mmap_tier: bool,
     mmap_graph: bool,
-) -> VindexSet {
+) -> std::io::Result<VindexSet> {
     let mut set = VindexSet::new();
-    for (name, _dim) in read_registry(dir) {
-        let vdir = dir.join(format!("vindex-{name}"));
-        match DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph) {
-            Ok(mut idx) => {
-                idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
-                set.insert(
-                    name,
-                    Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(
-                        Box::new(idx),
-                    )))),
-                );
-            }
-            Err(e) => error!("shard {shard_id}: recovering vindex '{name}' failed: {e}"),
-        }
+    for entry in read_registry(dir) {
+        let open_tier = entry.kind.and_then(QuantKind::from_wire).unwrap_or(tier);
+        let kind = entry
+            .kind
+            .unwrap_or_else(|| open_tier.to_wire().unwrap_or(1));
+        let vdir = dir.join(format!("vindex-{}", entry.name));
+        let mut idx = DiskVamanaIndex::open_with_tier_full(&vdir, open_tier, mmap_tier, mmap_graph)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "shard {shard_id}: recovering vindex '{}' failed: {e}",
+                        entry.name
+                    ),
+                )
+            })?;
+        idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
+        set.insert(
+            entry.name,
+            Arc::new(RwLock::new(Vindex::recovered(
+                VectorBackend::Disk(Box::new(idx)),
+                kind,
+            ))),
+        );
     }
-    set
+    Ok(set)
 }
 
 /// Look up a vindex by its (already tenant-scoped) name, reopening it lazily if
@@ -943,13 +1179,17 @@ async fn get_or_reopen(
     }
     // Miss. Only disk-backed indexes survive in the registry and can be
     // reopened; a flat (in-RAM) index that is gone is gone.
-    if !read_registry(dir).iter().any(|(n, _)| n == name) {
-        return None;
-    }
+    let registry = read_registry(dir)
+        .into_iter()
+        .find(|entry| entry.name == name)?;
+    let open_tier = registry.kind.and_then(QuantKind::from_wire).unwrap_or(tier);
+    let kind = registry
+        .kind
+        .unwrap_or_else(|| open_tier.to_wire().unwrap_or(1));
     // Reopen OFF the shard thread (see the doc comment). No guard is held here.
     let vdir = dir.join(format!("vindex-{name}"));
     let opened = tokio::task::spawn_blocking(move || {
-        DiskVamanaIndex::open_with_tier_full(&vdir, tier, mmap_tier, mmap_graph)
+        DiskVamanaIndex::open_with_tier_full(&vdir, open_tier, mmap_tier, mmap_graph)
     })
     .await;
     let mut idx = match opened {
@@ -973,9 +1213,10 @@ async fn get_or_reopen(
         return Some(entry);
     }
     idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
-    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(VectorBackend::Disk(
-        Box::new(idx),
-    ))));
+    let entry: VectorEntry = Arc::new(RwLock::new(Vindex::recovered(
+        VectorBackend::Disk(Box::new(idx)),
+        kind,
+    )));
     entry.read().touch();
     w.insert(name.to_owned(), entry.clone());
     Some(entry)
@@ -1046,6 +1287,15 @@ fn run_shard(
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
+    let vsearch_pool = match (workers > 0).then(|| VsearchPool::new(workers)) {
+        Some(Ok(pool)) => Some(pool),
+        Some(Err(e)) => {
+            let _ = ready.send(Err(format!("vsearch pool startup failed: {e}")));
+            return;
+        }
+        None => None,
+    };
+
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1077,13 +1327,18 @@ fn run_shard(
         // flat ones are in-RAM and start empty. Shared across the
         // per-request tasks on this single-threaded LocalSet via Rc/RefCell.
         // `Arc<RwLock>` (instead of the previous `Rc<RefCell>`) so the
-        // VindexSet is `Send + Sync`: an optional worker pool can dispatch
-        // VSEARCH to a blocking thread (`--workers N`, default 0 = inline).
+        // VindexSet is `Send + Sync`: dedicated VSEARCH workers can own an
+        // index lock while the shard runtime continues serving KV work.
         // The read/write locks are uncontended in inline mode (~10ns acquire
         // on M1), so there is no measurable cost for the default path.
-        let vindexes: Arc<RwLock<VindexSet>> = Arc::new(RwLock::new(recover_vindexes(
-            shard_id, &dir, tier, mmap_tier, mmap_graph,
-        )));
+        let vindexes: Arc<RwLock<VindexSet>> =
+            match recover_vindexes(shard_id, &dir, tier, mmap_tier, mmap_graph) {
+                Ok(vindexes) => Arc::new(RwLock::new(vindexes)),
+                Err(e) => {
+                    let _ = ready.send(Err(e.to_string()));
+                    return;
+                }
+            };
         // Recovery (incl. the multi-second quant-tier build at 500k+) is done;
         // signal ready so `open` returns and the listener can bind.
         let _ = ready.send(Ok(()));
@@ -1151,95 +1406,12 @@ fn run_shard(
                                 g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
                             };
                             for (name, arc) in snap {
-                                let (delta, runs, run_rows, tombs, base) = {
-                                    let g = arc.read();
-                                    (
-                                        g.backend.delta_len(),
-                                        g.backend.run_count(),
-                                        g.backend.run_rows(),
-                                        g.backend.tombstone_count(),
-                                        g.backend.main_len(),
-                                    )
-                                };
+                                let delta = arc.read().backend.delta_len();
                                 // Idle == delta unchanged since the previous tick.
                                 let idle = prev.insert(name.clone(), delta) == Some(delta);
                                 let vdir = kdir.join(format!("vindex-{name}"));
-
-                                // Everything off-thread now (flush too). Priority,
-                                // cheapest/most-frequent first:
-                                //   1. flush (L0) - delta >= FLUSH_ROWS. The common
-                                //      case under ingest; keeps the flat delta scan
-                                //      small. No graph build on the shard thread.
-                                //   2. consolidate - runs accumulated to ~base size
-                                //      (geometric), or an idle cleanup. Folds runs +
-                                //      delta into a fresh base and truncates the WAL.
-                                //   3. runs-merge (L2) - runs piling, base ok.
-                                //   4. delete-patch (L3) - reclaim dead base rows.
-                                // One op per vindex per tick.
-                                let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN)
-                                    || (idle && delta + run_rows >= IDLE_CONSOLIDATE_MIN);
-                                if delta >= FLUSH_ROWS {
-                                    let d = vdir.clone();
-                                    off_thread_maintenance(
-                                        &arc,
-                                        "flush",
-                                        shard_id,
-                                        |b| b.flush_begin(),
-                                        move |job| job.build(&d),
-                                        |b, built| b.flush_finish(built),
-                                    )
-                                    .await;
-                                } else if consolidate_due {
-                                    let d = vdir.clone();
-                                    let ran = off_thread_maintenance(
-                                        &arc,
-                                        "consolidate",
-                                        shard_id,
-                                        |b| b.consolidate_begin(),
-                                        move |job| job.build(&d),
-                                        |b, built| b.consolidate_finish(built),
-                                    )
-                                    .await;
-                                    if ran && arc.read().backend.wants_ivf() {
-                                        // Base changed: rebuild the IVF router off
-                                        // the request path AND off the write lock -
-                                        // begin dups the fd, build runs k-means
-                                        // off-thread, finish swaps under a short lock.
-                                        off_thread_maintenance(
-                                            &arc,
-                                            "ivf",
-                                            shard_id,
-                                            |b| b.ivf_begin(),
-                                            |job| job.build(),
-                                            |b, built| b.ivf_finish(built),
-                                        )
-                                        .await;
-                                    }
+                                if maintenance_tick(&arc, &vdir, shard_id, idle).await {
                                     prev.insert(name, 0); // folded
-                                } else if runs >= RUNS_MERGE_TRIGGER {
-                                    let d = vdir.clone();
-                                    off_thread_maintenance(
-                                        &arc,
-                                        "runs-merge",
-                                        shard_id,
-                                        |b| b.merge_runs_begin(),
-                                        move |job| job.build(&d),
-                                        |b, built| b.merge_runs_finish(built),
-                                    )
-                                    .await;
-                                } else if base >= DELETE_PATCH_MIN_BASE
-                                    && tombs >= base / DELETE_PATCH_DEAD_DIVISOR
-                                {
-                                    let d = vdir.clone();
-                                    off_thread_maintenance(
-                                        &arc,
-                                        "delete-patch",
-                                        shard_id,
-                                        |b| b.delete_patch_begin(),
-                                        move |job| job.build(&d),
-                                        |b, built| b.delete_patch_finish(built),
-                                    )
-                                    .await;
                                 }
                             }
                         }
@@ -1258,6 +1430,7 @@ fn run_shard(
                     let vindexes = vindexes.clone();
                     let dir = dir.clone();
                     let quota = quota.clone();
+                    let vsearch_pool = vsearch_pool.clone();
                     let shard_id_u16 = shard_id as u16;
                     tokio::task::spawn_local(async move {
                         // Telemetry: classify the op, time the work, record.
@@ -1266,8 +1439,16 @@ fn run_shard(
                         let op_kind = telemetry_op(&msg.req);
                         let t0 = std::time::Instant::now();
                         let resp = process(
-                            &vlog, &vindexes, &dir, msg.req, read_only, workers, &quota, tier,
-                            mmap_tier, mmap_graph,
+                            &vlog,
+                            &vindexes,
+                            &dir,
+                            msg.req,
+                            read_only,
+                            vsearch_pool.as_deref(),
+                            &quota,
+                            tier,
+                            mmap_tier,
+                            mmap_graph,
                         )
                         .await;
                         if let Some(op) = op_kind {
@@ -1443,7 +1624,7 @@ async fn process(
     dir: &Path,
     req: ShardReq,
     read_only: bool,
-    workers: usize,
+    vsearch_pool: Option<&VsearchPool>,
     quota: &Arc<crate::quota::TenantVectorQuota>,
     tier: QuantKind,
     mmap_tier: bool,
@@ -1451,53 +1632,6 @@ async fn process(
 ) -> ShardResp {
     if read_only && is_mutation(&req) {
         return ShardResp::Err("server is in serve mode (read-only)".to_owned());
-    }
-    // Optional worker-pool path for VSEARCH: when `workers > 0` the search runs on a
-    // blocking thread so it does not stall queued KV ops on the shard
-    // thread. KV ops always stay inline since they finish in microseconds.
-    if workers > 0
-        && let ShardReq::Vsearch {
-            name,
-            query,
-            k,
-            l_search,
-            tenant,
-            want_payload,
-            filter,
-        } = req
-    {
-        // Look up + clone the per-vindex Arc on the shard thread; the
-        // blocking task only holds the inner lock. This lets two
-        // concurrent VSEARCH calls on different vindexes run in
-        // parallel on the blocking pool (the previous design serialised
-        // them on the outer RwLock).
-        let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
-        // A filter reads the payload index; rebuild it from blobs first (async,
-        // before the blocking walk) if this vindex was just recovered from disk.
-        if filter.is_some()
-            && let Some(arc) = &entry
-            && let Err(e) = ensure_payload_loaded(vlog, arc, tenant, &name).await
-        {
-            return ShardResp::Err(e);
-        }
-        let walk_name = name.clone();
-        let join = tokio::task::spawn_blocking(move || -> Result<Vec<(u64, f32)>, String> {
-            let Some(arc) = entry else {
-                return Err(format!("vindex '{walk_name}' not found"));
-            };
-            search_vindex(&mut arc.write(), &walk_name, &query, k, l_search, &filter)
-        });
-        let hits = match join.await {
-            Ok(Ok(hits)) => hits,
-            Ok(Err(e)) => return ShardResp::Err(e),
-            Err(_) => return ShardResp::Err("vsearch worker task failed".to_owned()),
-        };
-        // Payload fetch stays on the async shard thread (the vLog is not Send
-        // into the blocking task).
-        return match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
-            Ok(out) => ShardResp::Vsearch(out),
-            Err(e) => ShardResp::Err(e),
-        };
     }
     let vindexes: &RwLock<VindexSet> = vindexes;
     match req {
@@ -1521,6 +1655,7 @@ async fn process(
                             QuantKind::TurboQuant { .. } => kind,
                             _ => QuantKind::Int8,
                         };
+                        let kind = tier.to_wire().expect("disk tier has a VINDEX wire kind");
                         match DiskVamanaIndex::create_empty_with_tier(
                             &vdir,
                             dim,
@@ -1529,17 +1664,19 @@ async fn process(
                         ) {
                             Ok(mut idx) => {
                                 idx.set_auto_flush(false); // flushed off-thread by the loop
-                                e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(
-                                    Box::new(idx),
-                                )))));
+                                e.insert(Arc::new(RwLock::new(Vindex::new(
+                                    VectorBackend::Disk(Box::new(idx)),
+                                    kind,
+                                ))));
                                 Ok(true)
                             }
                             Err(err) => Err(format!("vindex disk create failed: {err}")),
                         }
                     } else {
-                        e.insert(Arc::new(RwLock::new(Vindex::new(VectorBackend::Flat(
-                            Box::new(FlatIndex::new(dim, kind)),
-                        )))));
+                        e.insert(Arc::new(RwLock::new(Vindex::new(
+                            VectorBackend::Flat(Box::new(FlatIndex::new(dim, kind))),
+                            kind.to_wire().unwrap_or(0),
+                        ))));
                         Ok(false)
                     }
                 }
@@ -1559,11 +1696,12 @@ async fn process(
             let mut rows: Vec<(String, u32, u8, u8, u64)> = vs
                 .iter()
                 .map(|(name, entry)| {
-                    let backend = &entry.read().backend;
+                    let vindex = entry.read();
+                    let backend = &vindex.backend;
                     (
                         name.clone(),
                         backend.dim() as u32,
-                        backend.kind_byte(),
+                        vindex.kind,
                         backend.backend_byte(),
                         backend.len() as u64,
                     )
@@ -1828,34 +1966,49 @@ async fn process(
             want_payload,
             filter,
         } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
-            match entry {
-                None => ShardResp::Err(format!("vindex '{name}' not found")),
-                Some(arc) => {
-                    // A filter reads the payload index; rebuild it from blobs
-                    // first if this vindex was just recovered from disk.
-                    if filter.is_some()
-                        && let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &name).await
-                    {
-                        return ShardResp::Err(e);
-                    }
-                    // Run the walk (or filtered brute-force) under the lock,
-                    // then drop the guard before any payload `await`.
-                    let search_result =
-                        search_vindex(&mut arc.write(), &name, &query, k, l_search, &filter);
-                    match search_result {
-                        Err(e) => ShardResp::Err(e),
-                        Ok(hits) => {
-                            // Fetch a payload per local hit; some get
-                            // trimmed by the global top-k merge, but k is small.
-                            // Route the final-k by id if it ever bites.
-                            match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
-                                Ok(out) => ShardResp::Vsearch(out),
-                                Err(e) => ShardResp::Err(e),
-                            }
-                        }
+            // One path whether or not there is a worker pool. The pooled and
+            // inline versions used to be written out separately, which meant a
+            // fix to one could miss the other and only show up in production,
+            // where `workers > 0`, and never in a dev run, where it is 0.
+            let Some(arc) = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await
+            else {
+                return ShardResp::Err(format!("vindex '{name}' not found"));
+            };
+            // A filter reads the payload index; rebuild it from blobs first
+            // (async, before the blocking walk) if this vindex was just
+            // recovered from disk.
+            if filter.is_some()
+                && let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &name).await
+            {
+                return ShardResp::Err(e);
+            }
+            // The walk runs under the write lock; the guard is dropped before
+            // any payload `await`, on both routes.
+            let hits = match vsearch_pool {
+                Some(pool) => {
+                    let walk_name = name.clone();
+                    let reply = match pool.submit(move || {
+                        search_vindex(&mut arc.write(), &walk_name, &query, k, l_search, &filter)
+                    }) {
+                        Ok(reply) => reply,
+                        Err(e) => return ShardResp::Err(e.to_owned()),
+                    };
+                    match reply.await {
+                        Ok(inner) => inner,
+                        Err(_) => return ShardResp::Err("vsearch worker task failed".to_owned()),
                     }
                 }
+                None => search_vindex(&mut arc.write(), &name, &query, k, l_search, &filter),
+            };
+            match hits {
+                Err(e) => ShardResp::Err(e),
+                // Fetch a payload per local hit; some get trimmed by the global
+                // top-k merge, but k is small. Route the final-k by id if it
+                // ever bites.
+                Ok(hits) => match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+                    Ok(out) => ShardResp::Vsearch(out),
+                    Err(e) => ShardResp::Err(e),
+                },
             }
         }
 
@@ -1941,6 +2094,7 @@ async fn process(
 struct ShardSetInner {
     senders: Vec<Sender<ShardMsg>>,
     handles: Vec<JoinHandle<()>>,
+    vsearch_admission: Option<Arc<Semaphore>>,
     n: usize,
     /// Per-tenant vector counter, shared across shards and consulted on
     /// VSET/VDEL/VINDEX.DROP to enforce `max_vectors`.
@@ -2003,13 +2157,9 @@ impl ShardSet {
         Self::open_mode_with_workers(base_dir, n_shards, read_only, tier, 0)
     }
 
-    /// Like [`open_mode`](Self::open_mode), with an opt-in worker pool that
-    /// dispatches `VSEARCH` requests off the shard thread via
-    /// `tokio::task::spawn_blocking`. `workers == 0` (default) keeps the
-    /// inline path used by the public bench. `workers > 0` enables the pool;
-    /// the value is informational today (Tokio's blocking pool sizes itself
-    /// at runtime), but is plumbed through so a future dedicated pool can
-    /// honour it. KV ops always stay on the shard thread.
+    /// Like [`open_mode`](Self::open_mode), with optional dedicated VSEARCH
+    /// workers per shard. `workers == 0` keeps searches inline. `workers > 0`
+    /// creates that many workers per shard and rejects overload before scatter.
     ///
     /// Tradeoff: with the pool enabled, KV latency under mixed VSEARCH+KV
     /// load no longer queues behind multi-ms vector searches; in exchange
@@ -2090,6 +2240,7 @@ impl ShardSet {
         // One vector quota shared across all shards: a tenant's vectors are
         // spread over shards by id, so the counter must aggregate cross-shard.
         let quota = Arc::new(crate::quota::TenantVectorQuota::new());
+        let vsearch_admission = (workers > 0).then(|| Arc::new(Semaphore::new(workers)));
         // One disk counter shared across all shards, so the disk quota is global
         // per tenant (a tenant's keys spread over shards by hash).
         let disk_counter = skeg_core::new_shared_disk();
@@ -2153,6 +2304,7 @@ impl ShardSet {
             inner: Arc::new(ShardSetInner {
                 senders,
                 handles,
+                vsearch_admission,
                 n: n_shards,
                 quota,
                 disk_counter,
@@ -2498,15 +2650,8 @@ impl ShardSet {
                 "vindex dim must be positive".to_owned(),
             ));
         }
-        let kind = match kind {
-            0 => QuantKind::F32,
-            1 => QuantKind::Int8,
-            2 => QuantKind::Binary,
-            3 => QuantKind::TurboQuant { bits: 1 },
-            4 => QuantKind::TurboQuant { bits: 2 },
-            5 => QuantKind::TurboQuant { bits: 4 },
-            other => return Err(ShardError::Storage(format!("unknown vindex kind {other}"))),
-        };
+        let kind = QuantKind::from_wire(kind)
+            .ok_or_else(|| ShardError::Storage(format!("unknown vindex kind {kind}")))?;
         let disk = match backend {
             0 => false,
             1 => true,
@@ -2858,6 +3003,17 @@ impl ShardSet {
         want_payload: bool,
         filter: Option<Filter>,
     ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
+        let _permit = self
+            .inner
+            .vsearch_admission
+            .as_ref()
+            .map(|admission| {
+                admission
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| ShardError::Busy)
+            })
+            .transpose()?;
         let mut pending = Vec::with_capacity(self.inner.n);
         for sender in &self.inner.senders {
             let (tx, rx) = oneshot::channel();
@@ -3117,9 +3273,234 @@ impl ShardTenantView<'_> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::sync::{Barrier, mpsc};
+    use std::time::Duration;
 
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn vsearch_pool_rejects_work_when_its_queue_is_full() {
+        let pool = VsearchPool::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first = pool
+            .submit(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Vec::new())
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let second = pool.submit(|| Ok(Vec::new())).unwrap();
+        let err = pool.submit(|| Ok(Vec::new())).unwrap_err();
+        assert_eq!(err, "vsearch queue is full");
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn vsearch_pool_runs_jobs_in_parallel() {
+        let pool = VsearchPool::new(2).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let mut replies = Vec::new();
+
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let entered_tx = entered_tx.clone();
+            replies.push(
+                pool.submit(move || {
+                    entered_tx.send(()).unwrap();
+                    barrier.wait();
+                    Ok(Vec::new())
+                })
+                .unwrap(),
+            );
+        }
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        barrier.wait();
+        for reply in replies {
+            reply.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn vsearch_pool_rejects_before_scattering_when_saturated() {
+        let dir = TempDir::new().unwrap();
+        let shards =
+            ShardSet::open_mode_with_workers(dir.path(), 2, false, skeg_vector::QuantKind::Int8, 1)
+                .unwrap();
+        let permit = shards
+            .inner
+            .vsearch_admission
+            .as_ref()
+            .unwrap()
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+
+        let err = shards
+            .vsearch("idx", vec![0.0; 4], 1, 0, 0, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ShardError::Busy));
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_returns_complete_results_for_concurrent_scatter() {
+        let dir = TempDir::new().unwrap();
+        let shards =
+            ShardSet::open_mode_with_workers(dir.path(), 2, false, skeg_vector::QuantKind::Int8, 2)
+                .unwrap();
+        shards.vindex_create("idx", 4, 0, 0).await.unwrap();
+        for id in 0..8 {
+            shards
+                .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, None)
+                .await
+                .unwrap();
+        }
+
+        let left = shards.vsearch("idx", vec![1.0; 4], 8, 0, 0, false, None);
+        let right = shards.vsearch("idx", vec![1.0; 4], 8, 0, 0, false, None);
+        let (left, right) = tokio::join!(left, right);
+        assert_eq!(left.unwrap().len(), 8);
+        assert_eq!(right.unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_matches_inline_vsearch_results() {
+        let inline_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let inline = ShardSet::open_mode_with_workers(
+            inline_dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::Int8,
+            0,
+        )
+        .unwrap();
+        let pooled = ShardSet::open_mode_with_workers(
+            pool_dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::Int8,
+            2,
+        )
+        .unwrap();
+
+        for shards in [&inline, &pooled] {
+            shards.vindex_create("idx", 4, 0, 0).await.unwrap();
+            for id in 0..8 {
+                shards
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0, 1.0, 0.0, 0.0],
+                        0,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let query = vec![1.0, 0.0, 0.0, 0.0];
+        let inline_ids: Vec<_> = inline
+            .vsearch("idx", query.clone(), 8, 0, 0, false, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.0)
+            .collect();
+        let pooled_ids: Vec<_> = pooled
+            .vsearch("idx", query, 8, 0, 0, false, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.0)
+            .collect();
+
+        assert_eq!(pooled_ids, inline_ids);
+    }
+
+    /// The plain-query equivalence above misses the two branches where the
+    /// pooled and inline routes used to be written separately: the payload
+    /// index rebuild that a filter triggers, and the payload fetch. Those are
+    /// exactly where a fix applied to one route and not the other would hide,
+    /// because a dev run has `workers == 0` and production does not.
+    #[tokio::test]
+    async fn worker_pool_matches_inline_vsearch_with_filter_and_payload() {
+        let inline_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let inline = ShardSet::open_mode_with_workers(
+            inline_dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::Int8,
+            0,
+        )
+        .unwrap();
+        let pooled = ShardSet::open_mode_with_workers(
+            pool_dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::Int8,
+            2,
+        )
+        .unwrap();
+
+        for shards in [&inline, &pooled] {
+            shards.vindex_create("idx", 4, 0, 0).await.unwrap();
+            for id in 0..8u64 {
+                let colour = if id % 2 == 0 { "red" } else { "blue" };
+                // `parse_fields` reads whitespace-separated `key=value`, not JSON.
+                let payload = Bytes::from(format!("colour={colour} id={id}"));
+                shards
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0, 1.0, 0.0, 0.0],
+                        0,
+                        None,
+                        Some(payload),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let query = vec![1.0, 0.0, 0.0, 0.0];
+        let filter = Filter::Eq(
+            "colour".to_owned(),
+            crate::payload::Value::Keyword("red".to_owned()),
+        );
+        let inline_hits = inline
+            .vsearch("idx", query.clone(), 8, 0, 0, true, Some(filter.clone()))
+            .await
+            .unwrap();
+        let pooled_hits = pooled
+            .vsearch("idx", query, 8, 0, 0, true, Some(filter))
+            .await
+            .unwrap();
+
+        assert!(!inline_hits.is_empty(), "the filter matched nothing");
+        assert_eq!(
+            pooled_hits, inline_hits,
+            "pooled and inline VSEARCH disagreed under a filter with payloads",
+        );
+        for hit in &inline_hits {
+            assert_eq!(hit.0 % 2, 0, "filter let a non-red id through");
+        }
+    }
 
     #[test]
     fn test_shard_routing_deterministic() {
@@ -3151,6 +3532,50 @@ mod tests {
                 "shard {s} got {c}, expected ~{expected} (±10%)"
             );
         }
+    }
+
+    #[test]
+    fn registry_v2_ignores_unknown_kind() {
+        let dir = TempDir::new().unwrap();
+        let mut bytes = VINDEX_REGISTRY_V2_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"idx");
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        bytes.push(99); // not a supported VINDEX wire kind
+        fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
+
+        let entries = read_registry(dir.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "idx");
+        assert_eq!(
+            entries[0].kind, None,
+            "unknown kind falls back to legacy tier selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_framed_vindex_wal_refuses_shard_open() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_owned();
+        {
+            let shards = ShardSet::open(&base, 1).unwrap();
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            shards
+                .vset("idx", 7, vec![1.0; 4], 0, None, None)
+                .await
+                .unwrap();
+        }
+        let wal_path = base.join("shard-0/vindex-idx/delta.log");
+        let mut wal = fs::read(&wal_path).unwrap();
+        assert!(wal.starts_with(b"SKWL\x02"));
+        *wal.last_mut().unwrap() ^= 0x01;
+        fs::write(wal_path, wal).unwrap();
+
+        assert!(
+            ShardSet::open(&base, 1).is_err(),
+            "a corrupt registered VINDEX must refuse startup"
+        );
     }
 
     /// A tenant-scoped key, exactly as `resp3_handler::scope_key` builds it:
@@ -4056,6 +4481,63 @@ mod tests {
     // reclaimed, and liveness is correct throughout. Exercises the exact server
     // wiring (delegation + begin/build/finish orchestration), not just the
     // engine primitives.
+    /// `maintenance_tick` picks one operation per vindex per tick, in a fixed
+    /// priority order, and tells the caller whether it consolidated. That
+    /// return value is what resets idle tracking, so a wrong one silently
+    /// breaks the idle fold. Nothing else exercises this function: the idle
+    /// loop that calls it runs on a timer.
+    #[tokio::test]
+    async fn maintenance_tick_prefers_flush_then_consolidate() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-t");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        // The server drives the flush from its maintenance loop, so it turns
+        // the inline auto-flush off; without this the delta drains itself and
+        // the flush branch is never reached through `maintenance_tick`.
+        idx.set_auto_flush(false);
+        // Past FLUSH_ROWS, so flush outranks everything else this tick.
+        for id in 0u64..(FLUSH_ROWS as u64 + 100) {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        // Flush wins even with `idle` set: it is first in the chain, and it
+        // does not consolidate, so the tick reports false.
+        let delta_before = arc.read().backend.delta_len();
+        assert!(delta_before >= FLUSH_ROWS, "setup did not fill the delta");
+        assert!(
+            !maintenance_tick(&arc, &vdir, 0, true).await,
+            "flush must not report a consolidate",
+        );
+        assert!(
+            arc.read().backend.delta_len() < delta_before,
+            "flush did not drain the delta",
+        );
+
+        // The flushed rows are now a run, so an idle tick consolidates and
+        // says so.
+        assert!(
+            maintenance_tick(&arc, &vdir, 0, true).await,
+            "an idle tick over a full run must consolidate",
+        );
+        assert_eq!(arc.read().backend.run_count(), 0, "runs did not fold");
+
+        // Nothing left to do: quiet tick, no consolidate reported.
+        assert!(
+            !maintenance_tick(&arc, &vdir, 0, true).await,
+            "a quiet tick must not report work",
+        );
+    }
+
     #[tokio::test]
     async fn off_thread_maintenance_runs_merge_and_delete_patch() {
         let dir = TempDir::new().unwrap();
@@ -4082,8 +4564,10 @@ mod tests {
             idx.run_count()
         );
 
-        let arc: VectorEntry =
-            Arc::new(RwLock::new(Vindex::new(VectorBackend::Disk(Box::new(idx)))));
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
 
         // L2: runs fold into one.
         let d = vdir.clone();
@@ -4288,10 +4772,19 @@ mod tests {
             }
             let e = start.elapsed().as_secs_f64();
             c_done.store(true, Ordering::Relaxed);
-            (ops as f64 / e, e)
+            let known_live = ids[0];
+            (ops as f64 / e, e, known_live)
         };
 
-        let ((rps, secs), lat) = tokio::join!(churn, query);
+        let ((rps, secs, known_live), lat) = tokio::join!(churn, query);
+        let hits = shards
+            .vsearch("c", tvec(known_live + 1), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.0 == known_live),
+            "a live id stays retrievable after concurrent churn"
+        );
         let p50 = lat[lat.len() / 2];
         let p99 = lat[lat.len() * 99 / 100];
         let max = *lat.last().unwrap();
@@ -4798,13 +5291,13 @@ mod tests {
     /// Two VSEARCH callers hitting **different** vindexes on the same
     /// shard must not serialize against each other.
     ///
-    /// We measure two regimes back-to-back on one shard with a 2-worker
-    /// blocking pool:
+    /// We measure two regimes back-to-back on one shard with two dedicated
+    /// VSEARCH workers:
     /// - **baseline**  : both tasks search the same vindex (serialized
     ///   by the per-vindex write lock, intentionally).
     /// - **concurrent**: each task searches its own vindex (per-vindex
     ///   write locks are disjoint, so both can hold their lock at the
-    ///   same time on the blocking pool).
+    ///   same time in the worker pool).
     ///
     /// SoL gate: `baseline / concurrent >= 1.2×`. The theoretical
     /// ceiling is 2.0× (perfect parallelism on two cores); a floor of
@@ -4812,8 +5305,8 @@ mod tests {
     /// the work" (always above the floor in practice) from "the
     /// searches still serialise" (a 1.0× or sub-1.0× ratio, which
     /// would have been the result on the old single-`RwLock`
-    /// `VindexSet`). The gap below 2.0 absorbs the shared Tokio
-    /// blocking pool, allocator noise from interleaved tests, and CI
+    /// `VindexSet`). The gap below 2.0 absorbs worker scheduling,
+    /// allocator noise from interleaved tests, and CI
     /// runners with fewer real cores than the developer M1.
     ///
     /// Measured locally on M1: 1.5×–2.0× depending on warm-up and

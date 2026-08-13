@@ -30,6 +30,7 @@ use skeg_resp3::{
     Command, ConnectionState, Frame, FrameDecoder, encode_frame, handle_echo, handle_ping,
     parse_command,
 };
+use skeg_vector::QuantKind;
 
 use crate::payload::parse_filter;
 use crate::shard::ShardSet;
@@ -611,20 +612,25 @@ fn parse_usize_arg(b: &Bytes, label: &str) -> Result<usize, Frame> {
         .map_err(|_| Frame::Error(format!("ERR {label} must be a non-negative integer")))
 }
 
+/// Accepts either the wire byte as a digit ("0".."5") or its display name
+/// ("f32", "tq2", ...). Byte values come from [`QuantKind::from_wire`], the
+/// single source of truth for the persisted-registry / RESP3-wire encoding.
 fn parse_kind_arg(b: &Bytes) -> Result<u8, Frame> {
     let s = parse_utf8_arg(b, "kind")?;
-    match s.to_ascii_lowercase().as_str() {
-        "f32" | "0" => Ok(0),
-        "int8" | "1" => Ok(1),
-        "binary" | "2" => Ok(2),
-        // Disk-tier TurboQuant (sub-int8 RAM on the live write path).
-        "tq1" | "3" => Ok(3),
-        "tq2" | "4" => Ok(4),
-        "tq4" | "5" => Ok(5),
-        other => Err(Frame::Error(format!(
-            "ERR unknown kind '{other}'; expected f32 | int8 | binary | tq1 | tq2 | tq4"
-        ))),
+    let s = s.to_ascii_lowercase();
+    if let Ok(byte) = s.parse::<u8>()
+        && QuantKind::from_wire(byte).is_some()
+    {
+        return Ok(byte);
     }
+    for (byte, kind) in QuantKind::wire_kinds() {
+        if kind.wire_name() == Some(s.as_str()) {
+            return Ok(*byte);
+        }
+    }
+    Err(Frame::Error(format!(
+        "ERR unknown kind '{s}'; expected f32 | int8 | binary | tq1 | tq2 | tq4"
+    )))
 }
 
 fn parse_backend_arg(b: &Bytes) -> Result<u8, Frame> {
@@ -1247,14 +1253,10 @@ async fn skeg_vindex_list(shards: &ShardSet, tenant: TenantId) -> Frame {
                         &name
                     }
                 };
-                let kind_label = match kind {
-                    0 => "f32",
-                    1 => "int8",
-                    2 => "binary",
-                    other => {
-                        return Frame::Error(format!(
-                            "ERR unexpected kind byte {other} from shard"
-                        ));
+                let kind_label = match QuantKind::from_wire(kind).and_then(|k| k.wire_name()) {
+                    Some(name) => name,
+                    None => {
+                        return Frame::Error(format!("ERR unexpected kind byte {kind} from shard"));
                     }
                 };
                 let backend_label = match backend {
@@ -2010,6 +2012,40 @@ mod tests {
         // An 8-aligned dim is accepted.
         let ok = skeg_vindex_create(&args(&["good", "128", "tq1", "disk"]), &shards, t).await;
         assert!(matches!(ok, Frame::Simple(ref s) if s == "OK"));
+    }
+
+    #[tokio::test]
+    async fn vindex_list_reports_turboquant_tier() {
+        let (_dir, shards) = fresh_shards().await;
+        let tenant = TenantId::ZERO;
+        let created =
+            skeg_vindex_create(&args(&["tq2", "64", "tq2", "disk"]), &shards, tenant).await;
+        assert!(matches!(created, Frame::Simple(ref s) if s == "OK"));
+
+        let listed = skeg_vindex_list(&shards, tenant).await;
+        assert!(matches!(
+            listed,
+            Frame::Bulk(ref body) if std::str::from_utf8(body).unwrap().contains("kind=tq2")
+        ));
+    }
+
+    #[tokio::test]
+    async fn vindex_list_preserves_turboquant_tier_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let tenant = TenantId::ZERO;
+        {
+            let shards = ShardSet::open(dir.path(), 1).unwrap();
+            let created =
+                skeg_vindex_create(&args(&["tq1", "64", "tq1", "disk"]), &shards, tenant).await;
+            assert!(matches!(created, Frame::Simple(ref s) if s == "OK"));
+        }
+
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let listed = skeg_vindex_list(&shards, tenant).await;
+        assert!(matches!(
+            listed,
+            Frame::Bulk(ref body) if std::str::from_utf8(body).unwrap().contains("kind=tq1")
+        ));
     }
 
     async fn fresh_shards() -> (TempDir, ShardSet) {
