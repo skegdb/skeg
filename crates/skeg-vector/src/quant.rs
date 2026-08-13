@@ -131,6 +131,114 @@ impl QuantKind {
             QuantKind::F32 | QuantKind::Int8 | QuantKind::Binary => Ok(()),
         }
     }
+
+    /// Decode a persisted-registry / RESP3-wire byte into a kind. This is a
+    /// compatibility boundary: these six bytes are read back from the
+    /// on-disk VINDEX registry and sent by clients over RESP3, so a byte's
+    /// meaning (e.g. `4` == tq2) can never be renumbered once shipped.
+    /// `None` for any other byte.
+    #[must_use]
+    pub fn from_wire(byte: u8) -> Option<Self> {
+        WIRE_KINDS
+            .iter()
+            .find(|(b, _)| *b == byte)
+            .map(|(_, kind)| *kind)
+    }
+
+    /// Encode this kind as its persisted-registry / RESP3-wire byte.
+    ///
+    /// `None`, not a bug to paper over, for `Pq` and for `TurboQuant` with a
+    /// `bits` outside `{1, 2, 4}`: those are real `QuantKind` values (`Pq`
+    /// is reachable only from the `skeg-server` CLI's `--tier pq` flag, a
+    /// build-time choice, never from a client byte or the disk registry) but
+    /// they have no wire representation, so there is no byte to return. A
+    /// shard configured with `--tier pq` as its default still needs to
+    /// reason about this: see `skeg-server::shard::recover_vindexes`, which
+    /// falls back to a default wire kind when the configured tier itself
+    /// has none.
+    #[must_use]
+    pub fn to_wire(&self) -> Option<u8> {
+        WIRE_KINDS
+            .iter()
+            .find(|(_, kind)| kind == self)
+            .map(|(b, _)| *b)
+    }
+
+    /// Every kind that has a wire byte, with its byte. Callers that need to
+    /// enumerate the encoding (a parser accepting names, a help string) walk
+    /// this instead of hardcoding a range, so adding a kind stays one edit.
+    #[must_use]
+    pub const fn wire_kinds() -> &'static [(u8, QuantKind)] {
+        &WIRE_KINDS
+    }
+
+    /// Client/display name for a wire-representable kind ("f32", "tq2", ...).
+    /// `None` for kinds with no wire encoding, mirroring [`Self::to_wire`].
+    #[must_use]
+    pub fn wire_name(&self) -> Option<&'static str> {
+        match self.to_wire()? {
+            0 => Some("f32"),
+            1 => Some("int8"),
+            2 => Some("binary"),
+            3 => Some("tq1"),
+            4 => Some("tq2"),
+            5 => Some("tq4"),
+            _ => unreachable!("to_wire only returns bytes present in WIRE_KINDS"),
+        }
+    }
+}
+
+/// The six `QuantKind` values with a persisted-registry / RESP3-wire byte.
+/// Single source of truth for [`QuantKind::from_wire`], [`QuantKind::to_wire`]
+/// and [`QuantKind::wire_name`]. Do not renumber: these bytes are read back
+/// from on-disk VINDEX registries written by earlier server versions.
+const WIRE_KINDS: [(u8, QuantKind); 6] = [
+    (0, QuantKind::F32),
+    (1, QuantKind::Int8),
+    (2, QuantKind::Binary),
+    (3, QuantKind::TurboQuant { bits: 1 }),
+    (4, QuantKind::TurboQuant { bits: 2 }),
+    (5, QuantKind::TurboQuant { bits: 4 }),
+];
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// Pins the exact byte values: a future edit that renumbers a variant
+    /// (even accidentally, e.g. reordering `WIRE_KINDS`) fails loudly. These
+    /// bytes are a persisted-format guarantee, not free to change.
+    #[test]
+    fn wire_bytes_are_pinned() {
+        assert_eq!(QuantKind::F32.to_wire(), Some(0));
+        assert_eq!(QuantKind::Int8.to_wire(), Some(1));
+        assert_eq!(QuantKind::Binary.to_wire(), Some(2));
+        assert_eq!(QuantKind::TurboQuant { bits: 1 }.to_wire(), Some(3));
+        assert_eq!(QuantKind::TurboQuant { bits: 2 }.to_wire(), Some(4));
+        assert_eq!(QuantKind::TurboQuant { bits: 4 }.to_wire(), Some(5));
+    }
+
+    #[test]
+    fn round_trip_every_wire_kind() {
+        for (byte, kind) in WIRE_KINDS {
+            assert_eq!(QuantKind::from_wire(byte), Some(kind));
+            assert_eq!(kind.to_wire(), Some(byte));
+            assert_eq!(QuantKind::from_wire(kind.to_wire().unwrap()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn unknown_byte_is_none_not_a_panic() {
+        for byte in 6..=u8::MAX {
+            assert_eq!(QuantKind::from_wire(byte), None);
+        }
+    }
+
+    #[test]
+    fn non_wire_kinds_have_no_byte() {
+        assert_eq!(QuantKind::Pq { m: 128, k: 256 }.to_wire(), None);
+        assert_eq!(QuantKind::TurboQuant { bits: 8 }.to_wire(), None);
+    }
 }
 
 /// A query vector quantized to match a [`QuantizedVectors`] set.

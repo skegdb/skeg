@@ -1857,6 +1857,7 @@ version = "0.1.7"
 dependencies = [
  "ahash",
  "bytemuck",
+ "crc32c",
  "criterion",
  "fixedbitset",
  "libc",

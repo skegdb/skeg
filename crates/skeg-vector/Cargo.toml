@@ -17,7 +17,7 @@ avx512 = ["skeg-simd/avx512"]
 
 [dependencies]
 skeg-simd = { path = "../skeg-simd", version = "0.1.5" }
-skeg-platform = { path = "../skeg-platform", version = "0.1.4" }
+skeg-platform = { path = "../skeg-platform", version = "0.1.5" }
 parking_lot = { workspace = true }
 smallvec = { workspace = true }
 fixedbitset = { workspace = true }
@@ -28,6 +28,7 @@ rayon = "1"
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+crc32c = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
