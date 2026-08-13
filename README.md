@@ -76,8 +76,9 @@ a fraction of the RAM, filtered search that stays sub-linear as the corpus grows
 and per-tenant isolation that is leak-free by construction. It is not the
 lowest-latency *single-query* engine (Qdrant is comparable on p99, raw hnswlib is
 faster), one process saturates near 780 QPS at 1024-dim before you scale out with
-processes, and cold bulk-loads rebuild the index. Release binaries are aarch64;
-x86_64 AVX tuning is [on the roadmap](docs/roadmap.md).
+processes, and cold bulk-loads rebuild the index. Release binaries are aarch64
+(Apple Silicon, Linux ARM); x86_64 builds from source, with AVX2 kernels
+selected at runtime and AVX-512 behind an optional `avx512` feature.
 
 ## Multi-tenancy
 
@@ -140,6 +141,21 @@ cargo build --release --bin skeg --bin skeg-resp3
 ```
 
 Requires Rust 1.88+. Binaries land at `target/release/skeg` and `target/release/skeg-resp3`.
+
+On aarch64 the NEON kernels are always compiled in. On x86_64 the AVX2 kernels
+are selected at runtime after a CPU feature check, so one binary runs on any
+x86_64 machine. AVX-512 is opt-in:
+
+```sh
+cargo build --release --bin skeg --bin skeg-resp3 --features skeg-simd/avx512
+```
+
+It needs Rust 1.89+ (one release above the baseline) and is off by default
+because the kernels only earn their dispatch where AVX-512 offers something
+AVX2 lacks: VNNI, VPOPCNTDQ, mask registers, a 16-entry `vpermps` table. Where
+the kernel is the same trick at twice the width it loses on cores that
+double-pump 512-bit operations, so it is built and tested but not selected.
+`cargo test -p skeg-simd --test coverage` prints which kernel runs where.
 
 #### Docker
 
