@@ -233,23 +233,27 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
         return;
     }
 
-    // Assign sequential offsets, build the combined write buffer, and find the
-    // strongest durability any entry in this batch asked for.
-    let mut combined = Vec::new();
+    // Assign sequential offsets and find the strongest durability any entry
+    // in this batch asked for. Each entry's buffer is *moved* out into
+    // `chunks`, not copied into one combined buffer: `write_vectored_at`
+    // (`pwritev` on Linux) writes straight from each buffer's own memory.
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(batch.len());
     let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(batch.len());
     let mut pos = *w_offset;
     let mut batch_durability = Durability::Relaxed;
-    for req in batch.iter() {
+    let mut total_bytes: u64 = 0;
+    for req in batch.iter_mut() {
         #[allow(clippy::cast_possible_truncation)]
         offsets.push((pos, req.data.len() as u32));
         pos += req.data.len() as u64;
-        combined.extend_from_slice(&req.data);
+        total_bytes += req.data.len() as u64;
         batch_durability = batch_durability.max(req.durability);
+        chunks.push(std::mem::take(&mut req.data));
     }
 
     // One write, then one flush for the whole group at the strongest tier.
     //
-    // Disk-full semantics: if `write_at` fails with `ENOSPC` (or any other
+    // Disk-full semantics: if the write fails with `ENOSPC` (or any other
     // IO error), `w_offset` is NOT advanced (see line below); the next batch
     // will retry at the same offset, overwriting any partial bytes the
     // failed write may have left behind. After a crash mid-write, the
@@ -258,12 +262,17 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
     // be mistaken for live data. We preserve the original `ErrorKind`
     // (in particular `StorageFull`) when propagating to the waiter so the
     // caller can detect ENOSPC and surface it to its own user.
-    let write_result = file.write_at(*w_offset, combined).await;
+    let write_result = file.write_vectored_at(*w_offset, chunks).await;
     match write_result {
         Ok(()) => {
-            // Telemetry: tick one batch per call regardless of durability.
+            // Telemetry: tick one batch per call regardless of durability,
+            // plus the payload bytes moved through the zero-copy path.
             // Inexpensive (atomic fetch_add); off the hot per-op path.
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogGroupCommitBatches);
+            skeg_telemetry::add_counter(
+                skeg_telemetry::Counter::VlogPwritevBytesTotal,
+                total_bytes,
+            );
             let sync_result = match batch_durability {
                 Durability::Relaxed => Ok(()),
                 Durability::Kernel => {
@@ -272,6 +281,15 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
                 }
                 Durability::Power => {
                     skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                    // `is_size_fixed` is stable for the handle's whole
+                    // lifetime (set once by `preallocate`), so this
+                    // accurately reflects whether the flush that is about
+                    // to run will take the Linux fdatasync fast path.
+                    if file.is_size_fixed() {
+                        skeg_telemetry::tick_counter(
+                            skeg_telemetry::Counter::VlogFdatasyncFastPath,
+                        );
+                    }
                     file.sync_durable().await
                 }
             };
@@ -279,6 +297,17 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
                 .as_ref()
                 .err()
                 .map(|e| (e.kind(), e.to_string()));
+            // `w_offset` only advances when the sync *also* succeeds - not
+            // just the write - deliberately mirroring the write-failure case
+            // documented above: on a sync failure the bytes are physically
+            // on disk at `[*w_offset, pos)` but not proven durable, so the
+            // next batch reuses the same starting offset and overwrites
+            // them. Every waiter in this batch gets an `Err` below regardless
+            // (nobody is told an unsynced write is durable), so the only
+            // possible skew is in the caller's favour: if a crash happens
+            // before that overwrite, recovery's CRC scan can still pick up
+            // the well-formed-but-unacked record. Never the reverse - a
+            // record this function reports as durable always has passed sync.
             if sync_result.is_ok() {
                 *w_offset = pos;
             }

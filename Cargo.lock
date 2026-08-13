@@ -823,6 +823,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1584,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "ahash",
  "bytes",
@@ -1592,7 +1603,7 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "proptest",
- "skeg-platform 0.1.4",
+ "skeg-platform 0.1.5",
  "skeg-proto",
  "skeg-telemetry",
  "smallvec",
@@ -1633,8 +1644,9 @@ dependencies = [
 
 [[package]]
 name = "skeg-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
+ "io-uring",
  "libc",
  "memmap2",
  "tempfile",
@@ -1740,7 +1752,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "skeg-core",
- "skeg-platform 0.1.4",
+ "skeg-platform 0.1.5",
  "skeg-proto",
  "skeg-resp3 0.2.3",
  "skeg-telemetry",
@@ -1761,7 +1773,7 @@ name = "skeg-server-tenant"
 version = "0.2.3"
 dependencies = [
  "parking_lot",
- "skeg-platform 0.1.4",
+ "skeg-platform 0.1.5",
  "skeg-server",
  "skeg-tenant",
  "skeg-vector 0.1.7",
@@ -1792,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-telemetry"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "criterion",
  "tiny_http",
@@ -1853,7 +1865,7 @@ dependencies = [
  "proptest",
  "rand",
  "rayon",
- "skeg-platform 0.1.4",
+ "skeg-platform 0.1.5",
  "skeg-simd 0.1.6",
  "smallvec",
  "tempfile",

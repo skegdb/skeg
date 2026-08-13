@@ -2,9 +2,23 @@
 //!
 //! macOS does not expose explicit CPU pinning. Instead the `QoS` class steers
 //! the scheduler: `QOS_CLASS_USER_INTERACTIVE` threads are placed on
-//! performance (P-) cores. On other platforms these calls are no-ops.
+//! performance (P-) cores.
 //!
-//! unsafe here is intentional for the pthread `QoS` syscalls - see SAFETY comments.
+//! Linux has no portable P-/E-core split to hint at (hybrid core
+//! detection is Intel-specific and not exposed uniformly), so the pinning
+//! call there does something different in kind: it restricts the calling
+//! thread's affinity mask to the cgroup's effective cpuset via
+//! `sched_setaffinity`, when one is configured. Full NUMA-node-aware
+//! distribution of the tokio/rayon worker pool across a multi-socket box
+//! (so workers stop bouncing between sockets) is *not* attempted here -
+//! that needs real multi-socket hardware to validate the topology parsing
+//! against, which has not been available; only the cpuset boundary is
+//! enforced.
+//!
+//! On other platforms these calls are no-ops.
+//!
+//! unsafe here is intentional for the pthread `QoS` / `sched_setaffinity`
+//! syscalls - see SAFETY comments.
 
 /// Thread `QoS` class - mirrors macOS `qos_class_t` discriminants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +33,10 @@ pub enum QosClass {
 
 /// Hint the scheduler to run the calling thread on a performance core.
 ///
-/// On macOS sets the thread `QoS` to `USER_INTERACTIVE`. No-op on other platforms.
+/// On macOS sets the thread `QoS` to `USER_INTERACTIVE`. On Linux, restricts
+/// the calling thread's affinity mask to the cgroup's effective cpuset (a
+/// no-op if none is configured - see the module docs for what this does and
+/// does not do there). No-op on other platforms.
 pub fn pin_current_thread_to_performance_core() {
     #[cfg(target_os = "macos")]
     {
@@ -29,6 +46,31 @@ pub fn pin_current_thread_to_performance_core() {
         // return value carries no safety obligation, so it is ignored.
         unsafe {
             libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(cpus) = crate::cgroup::effective_cpu_ids(std::path::Path::new("/sys/fs/cgroup"))
+        else {
+            return; // no cpuset configured - nothing to restrict to
+        };
+        // SAFETY: `set` is a stack-local `cpu_set_t` fully initialised by
+        // `CPU_ZERO` before any `CPU_SET` call. `sched_setaffinity(0, ...)`
+        // targets the calling thread (pid 0 means "self" as an affinity
+        // target); the size argument matches `size_of::<cpu_set_t>()`
+        // exactly, matching what `&set` points to. The return value carries
+        // no safety obligation - a failure (e.g. `EINVAL` from a cpu id at
+        // or past `CPU_SETSIZE`) just leaves the thread's affinity as the
+        // kernel had already set it, which is always still valid.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            for cpu in cpus {
+                if cpu < libc::CPU_SETSIZE as usize {
+                    libc::CPU_SET(cpu, &mut set);
+                }
+            }
+            libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set);
         }
     }
 }

@@ -5,36 +5,52 @@
 
 pub mod affinity;
 pub mod aligned;
+mod cgroup;
 pub mod durability;
 pub mod file;
 pub mod lock;
+pub mod uring;
 
 pub use affinity::{QosClass, current_thread_qos, pin_current_thread_to_performance_core};
 pub use aligned::AlignedBytes;
 pub use durability::{DURABILITY_MODEL, DurabilityModel, resolve_durability_model};
-pub use file::{BUFFER_ALIGNMENT, MappedFile, PlatformFile};
+pub use file::{BUFFER_ALIGNMENT, MappedFile, PlatformFile, advise_sequential_file};
 pub use lock::{DirLock, LOCK_FILE};
+#[cfg(all(target_os = "linux", feature = "uring"))]
+pub use uring::UringBatchReader;
+pub use uring::{BatchReader, BlockingBatchReader, best_batch_reader};
 
 /// Return the number of performance (P-) cores available.
 ///
-/// On macOS reads `hw.perflevel0.physicalcpu` via sysctl.
-/// Falls back to `std::thread::available_parallelism()` on error or other OS.
+/// On macOS reads `hw.perflevel0.physicalcpu` via sysctl. On Linux reads the
+/// cgroup CPU quota (v2 `cpu.max`, falling back to v1
+/// `cpu,cpuacct/cpu.cfs_quota_us` + `cpu.cfs_period_us`), intersected with
+/// the cgroup's `cpuset` when both are set - `available_parallelism` alone
+/// reports the *host's* CPU count, which over-sizes a rayon/tokio pool
+/// inside a container that only gets a fraction of the host. Falls back to
+/// `std::thread::available_parallelism()` when no quota is set (or on
+/// error, or on other platforms).
 #[must_use]
 pub fn num_performance_cores() -> usize {
     #[cfg(target_os = "macos")]
     {
-        macos_perf_cores().unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1)
-        })
+        macos_perf_cores().unwrap_or_else(fallback_parallelism)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
+        cgroup::cpu_quota(std::path::Path::new("/sys/fs/cgroup"))
+            .unwrap_or_else(fallback_parallelism)
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        fallback_parallelism()
+    }
+}
+
+fn fallback_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
 }
 
 #[cfg(target_os = "macos")]
