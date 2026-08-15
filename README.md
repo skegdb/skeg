@@ -38,8 +38,12 @@ sits in RAM, so memory grows far more slowly than the corpus it serves.
 
 ```sh
 docker run -d --name skeg -p 6379:6379 -v skeg-data:/var/lib/skeg \
-  --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest
+  --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest \
+  --addr 0.0.0.0:6379
 ```
+
+The `--addr` is not optional: `skeg-resp3` defaults to `127.0.0.1:6379`, which
+inside a container is reachable only from inside it.
 
 It is a Redis server, so any Redis client works:
 
@@ -189,8 +193,10 @@ docker run -d --name skeg -p 7379:7379 -v skeg-data:/var/lib/skeg \
 ```
 
 The image carries both binaries and publishes for `linux/amd64` and
-`linux/arm64`. The default entrypoint is `skeg` on 7379; for RESP3 override with
-`--entrypoint /usr/local/bin/skeg-resp3` and publish 6379. An Ollama companion
+`linux/arm64`. The default entrypoint is `skeg`, which the image already points
+at `0.0.0.0:7379`. For RESP3, override the entrypoint, publish 6379, and pass
+`--addr 0.0.0.0:6379` as shown in the quickstart, because that binary reads
+`SKEG_RESP3_ADDR` rather than the `SKEG_ADDR` the image sets. An Ollama companion
 setup lives in [`docker-compose.example.yml`](docker-compose.example.yml).
 
 ### Homebrew (macOS and Linux ARM)
