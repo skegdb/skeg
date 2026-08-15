@@ -88,24 +88,32 @@ exists. Full walkthrough, command reference and filter grammar:
 
 ## Why skeg
 
-One engine, and you get all of it at once:
+**Recall 1.000 on 47 MB.** Not 0.98 with an asterisk, and not by holding the
+corpus in RAM. The vectors stay on SSD, a quantized proxy walks the graph, and
+the shortlist is re-ranked from disk at full precision, so the answer is exact
+where it counts and memory grows far more slowly than the corpus does.
 
-- **Vectors and key-value together.** One process, one protocol, one thing to
-  operate. No cache in front and no second database beside it.
-- **Tenants isolated by construction.** An index per tenant, so a query has no
-  physical path to another tenant's data, with hard quotas and eviction that
-  keeps a noisy tenant off a quiet one.
-- **Filtered search that stays sub-linear.** Payloads on the vectors, a filter
-  grammar with ranges, sets and boolean composition, and a planner that picks
-  the cheapest correct strategy from the size of the match set rather than
-  always walking the graph.
-- **Six storage tiers**, from exact `f32` down to 1-bit, chosen per index, with
-  exact rerank from disk holding recall where the quantized walk gives it up.
+That one property is what puts a vector store where it did not fit before: many
+tenants on a single box, or a RAG index on the same machine as the model
+answering from it.
 
-And a footprint the RAM-resident engines cannot reach, without paying for it in
-recall or latency. 100K vectors at 1024 dimensions, recall measured against
-exact brute force, every engine at its default configuration, with LanceDB tuned
-to recall 1.0:
+- **Tenants that cannot leak into each other.** Not a filter you must remember
+  to apply: one index per tenant, so a query has no physical path to another
+  tenant's vectors. An adversarial leak-fuzz queries one tenant's index with
+  another tenant's exact vector, and zero rows cross, every time. With hard
+  quotas per tenant and eviction that keeps a noisy neighbour off a quiet one.
+- **Filters that do not fall apart at scale.** Payloads on the vectors, a
+  grammar with ranges, sets and boolean composition, and a planner that reads
+  the size of the match set and picks the cheapest correct strategy. Work scales
+  with the shortlist, not with the number of matches.
+- **Vectors and key-value in the same process.** One protocol, one thing to
+  deploy, one thing to back up. No cache in front, no second database beside it.
+- **Six tiers, per index.** Exact `f32` down to 1-bit, so a hot index and a cold
+  archive can live in the same server at the memory each deserves.
+
+The numbers behind the first line. 100K vectors at 1024 dimensions, recall
+against exact brute force, every engine at its default configuration, LanceDB
+tuned to recall 1.0:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
