@@ -88,22 +88,24 @@ exists. Full walkthrough, command reference and filter grammar:
 
 ## Why skeg
 
-skeg is built for the case where memory is the contested resource: many tenants
-packed on one machine, or a vector store sharing a box with the model it serves.
+One engine, and you get all of it at once:
 
-That case is real enough that Qdrant ships a second product for it. Qdrant Edge
-is, in their words, "a lightweight version of Qdrant designed for edge devices
-and resource-constrained environments", running inside the application process
-with a smaller footprint. skeg does not split in two: the binary that runs a
-multi-tenant deployment is the one that fits on the constrained machine. It
-stays a server either way, so it is not an embedded library and does not try to
-be one; what it shares with that use case is the constraint, not the deployment
-model.
+- **Vectors and key-value together.** One process, one protocol, one thing to
+  operate. No cache in front and no second database beside it.
+- **Tenants isolated by construction.** An index per tenant, so a query has no
+  physical path to another tenant's data, with hard quotas and eviction that
+  keeps a noisy tenant off a quiet one.
+- **Filtered search that stays sub-linear.** Payloads on the vectors, a filter
+  grammar with ranges, sets and boolean composition, and a planner that picks
+  the cheapest correct strategy from the size of the match set rather than
+  always walking the graph.
+- **Six storage tiers**, from exact `f32` down to 1-bit, chosen per index, with
+  exact rerank from disk holding recall where the quantized walk gives it up.
 
-The reason one binary covers both is that the footprint does not come at the
-usual price. 100K vectors at 1024 dimensions, recall measured against exact
-brute force, every engine at its default configuration, with LanceDB tuned to
-recall 1.0:
+And a footprint the RAM-resident engines cannot reach, without paying for it in
+recall or latency. 100K vectors at 1024 dimensions, recall measured against
+exact brute force, every engine at its default configuration, with LanceDB tuned
+to recall 1.0:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
@@ -114,7 +116,7 @@ recall 1.0:
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Same latency band as the fastest servers in the table, at a fraction of their
+Same latency band as the fastest servers in the table, at a fraction of the
 memory. That is what makes co-residency work: a 3B LLM answering RAG over 1M
 vectors, both on one M1 Pro (16 GiB), with the index on SSD and the resident set
 flat.
