@@ -42,22 +42,20 @@ docker run -d --name skeg -p 6379:6379 -v skeg-data:/var/lib/skeg \
   --addr 0.0.0.0:6379
 ```
 
-The `--addr` is not optional: `skeg-resp3` defaults to `127.0.0.1:6379`, which
-inside a container is reachable only from inside it.
+`--addr` is not optional here: that binary defaults to `127.0.0.1:6379`, which
+inside a container only the container can reach.
 
 It is a Redis server, so any Redis client works:
 
 ```console
 $ redis-cli -3 SET greeting "hello"
 OK
-$ redis-cli -3 GET greeting
-hello
 $ redis-cli -3 INCRBY counter 7
 7
 ```
 
-And a vector database. Vectors travel as raw little-endian f32, under `SKEG.*`
-commands that stay clear of the Redis command surface:
+It is also a vector database. Vectors travel as raw little-endian f32, under
+`SKEG.*` commands that stay clear of the Redis command surface:
 
 ```python
 import struct, redis
@@ -74,47 +72,32 @@ r.execute_command("SKEG.VSEARCH", "docs", 2, 32, vec(1.0, 0.0, 0.0, 0.0))
 # [b'1', 1.0, b'3', 0.9938837289810181]
 ```
 
-`tq2` is the 2-bit TurboQuant tier and `disk` the on-disk graph: the pairing
-behind every benchmark row below. `redis-cli -3 SKEG.VINDEX.LIST` shows what
-you built:
-
-```console
-name=docs dim=4 kind=tq2 backend=disk n_vectors=3
-```
-
-The command above overrides the image entrypoint because RESP3 is the protocol
-to build against; see [Protocols](#protocols) for the other one and why it
-exists. Full walkthrough, command reference and filter grammar:
-[`docs/getting-started.md`](docs/getting-started.md).
+`tq2` is the 2-bit TurboQuant tier, `disk` the on-disk graph. That pairing is
+what the benchmarks below measure. The full command reference and the filter
+grammar are in [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Why skeg
 
-**Recall 1.000 on 47 MB.** Not 0.98 with an asterisk, and not by holding the
-corpus in RAM. The vectors stay on SSD, a quantized proxy walks the graph, and
-the shortlist is re-ranked from disk at full precision, so the answer is exact
-where it counts and memory grows far more slowly than the corpus does.
+**Recall 1.000, without the corpus in RAM.** A quantized proxy walks the graph
+and the shortlist is re-ranked from disk at full precision, so the ranking is
+exact where it decides the answer while memory tracks the working set rather
+than the corpus. That is what puts a vector store where it did not fit: many
+tenants on one machine, or a RAG index beside the model answering from it.
 
-That one property is what puts a vector store where it did not fit before: many
-tenants on a single box, or a RAG index on the same machine as the model
-answering from it.
-
-- **Tenants that cannot leak into each other.** Not a filter you must remember
-  to apply: one index per tenant, so a query has no physical path to another
-  tenant's vectors. An adversarial leak-fuzz queries one tenant's index with
-  another tenant's exact vector, and zero rows cross, every time. With hard
-  quotas per tenant and eviction that keeps a noisy neighbour off a quiet one.
-- **Filters that do not fall apart at scale.** Payloads on the vectors, a
+- **Tenants that cannot leak into each other.** One index per tenant, so a query
+  has no physical path to another tenant's vectors. Not a filter someone has to
+  remember to apply. See [Multi-tenancy](#multi-tenancy).
+- **Filters that hold up as the corpus grows.** Payloads on the vectors, a
   grammar with ranges, sets and boolean composition, and a planner that reads
   the size of the match set and picks the cheapest correct strategy. Work scales
   with the shortlist, not with the number of matches.
 - **Vectors and key-value in the same process.** One protocol, one thing to
   deploy, one thing to back up. No cache in front, no second database beside it.
-- **Six tiers, per index.** Exact `f32` down to 1-bit, so a hot index and a cold
-  archive can live in the same server at the memory each deserves.
+- **Six tiers, chosen per index.** Exact `f32` down to 1-bit, so a hot index and
+  a cold archive can share a server at the memory each deserves.
 
-The numbers behind the first line. 100K vectors at 1024 dimensions, recall
-against exact brute force, every engine at its default configuration, LanceDB
-tuned to recall 1.0:
+100K vectors at 1024 dimensions, recall against exact brute force, every engine
+at its default configuration, LanceDB tuned to recall 1.0:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
@@ -125,10 +108,9 @@ tuned to recall 1.0:
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Same latency band as the fastest servers in the table, at a fraction of the
-memory. That is what makes co-residency work: a 3B LLM answering RAG over 1M
-vectors, both on one M1 Pro (16 GiB), with the index on SSD and the resident set
-flat.
+The same latency band as the fastest servers there, at a fraction of the memory.
+Which is what makes co-residency work: a 3B LLM answering RAG over 1M vectors,
+both on one M1 Pro (16 GiB), index on SSD, resident set flat.
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
@@ -141,39 +123,33 @@ flat.
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
-Every number here is reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench):
+Every number is reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench):
 public harness, real embeddings, brute-force ground truth. Measured
 single-machine on Apple Silicon; the RAM ratios are hardware-independent. The
 full matrix, plus the multi-tenant and container-OOM runs, is on the
 [dashboard](https://skegdb.github.io/bench/).
 
-## Where it does not lead
-
-The footprint is what skeg optimises for, and three things follow from that.
-Worth knowing before you pick it:
+## Why not skeg
 
 - **Single-query latency.** 2.5 ms p50 is competitive, not a record. Qdrant
   matches it at p99 and raw hnswlib beats it. If a few hundred microseconds
-  decide your architecture, measure both.
+  decide your design, measure both.
 - **Throughput per process.** One process saturates near 780 QPS at 1024
   dimensions. Past that you add processes, not threads.
 - **Cold bulk-loads.** Loading a fresh corpus builds the graph rather than
   streaming into a finished one, so the first load costs more than the writes
   that follow it.
 
-If memory is not the resource you are short of, none of this costs you
-anything: you still get recall 1.0 at competitive latency. You just will not
-notice the part skeg is built for.
+If memory is not the resource you are short of, none of this costs you anything:
+you still get recall 1.0 at competitive latency. You just will not notice the
+part skeg is built for.
 
 ## Multi-tenancy
 
-Tenancy is a property of the storage layout rather than a filter convention.
-Each tenant gets its own index, so a query has no physical path to another
-tenant's vectors, and there is no filter to misconfigure. An adversarial leak-fuzz
-holds it to that: query one tenant's index with another tenant's exact vector
-and zero rows cross the boundary, every time.
-
-On top of that isolation:
+Tenancy is a property of the storage layout, not a filter convention. Each
+tenant gets its own index, and an adversarial leak-fuzz holds it to that: query
+one tenant's index with another tenant's exact vector, and zero rows cross the
+boundary, every time.
 
 - Hard quotas: `max_vectors` and `max_disk_bytes`, set and read at runtime
   through `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`.
@@ -185,79 +161,57 @@ Details in [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
 
 ## Install
 
-### Docker
+The quickstart above pulls the container. The other routes:
 
 ```sh
-docker run -d --name skeg -p 7379:7379 -v skeg-data:/var/lib/skeg \
-  ghcr.io/skegdb/skeg:latest
+brew tap skegdb/tap && brew install skeg     # macOS and Linux ARM
+cargo install skeg-server                    # from source, MSRV 1.88
 ```
 
-The image carries both binaries and publishes for `linux/amd64` and
-`linux/arm64`. The default entrypoint is `skeg`, which the image already points
-at `0.0.0.0:7379`. For RESP3, override the entrypoint, publish 6379, and pass
-`--addr 0.0.0.0:6379` as shown in the quickstart, because that binary reads
-`SKEG_RESP3_ADDR` rather than the `SKEG_ADDR` the image sets. An Ollama companion
-setup lives in [`docker-compose.example.yml`](docker-compose.example.yml).
+Homebrew installs both binaries and a launchd/systemd service. `cargo install`
+puts them in `$CARGO_HOME/bin`.
 
-### Homebrew (macOS and Linux ARM)
+Pre-built tarballs, one per platform, with a `.sha256` beside each:
 
 ```sh
-brew tap skegdb/tap
-brew install skeg
-```
-
-Installs both binaries and a launchd/systemd service.
-
-### Pre-built tarball
-
-```sh
-TARGET=aarch64-apple-darwin   # see Platforms below for the full list
+TARGET=aarch64-apple-darwin   # see Platforms for the full list
 TAG=$(curl -s https://api.github.com/repos/skegdb/skeg/releases/latest | grep tag_name | cut -d'"' -f4)
 curl -L -o skeg.tar.gz \
   "https://github.com/skegdb/skeg/releases/latest/download/skeg-${TAG}-${TARGET}.tar.gz"
 tar -xzf skeg.tar.gz && ./skeg --help
 ```
 
-Each tarball ships a `.sha256` next to it. Pin a version from the
-[releases page](https://github.com/skegdb/skeg/releases).
-
-### From crates.io
+Or from a checkout:
 
 ```sh
-cargo install skeg-server
-```
-
-Builds from source into `$CARGO_HOME/bin`. Needs a Rust toolchain (MSRV 1.88).
-
-### From git
-
-```sh
-git clone https://github.com/skegdb/skeg
-cd skeg
+git clone https://github.com/skegdb/skeg && cd skeg
 cargo build --release --bin skeg --bin skeg-resp3
 ```
 
-Binaries land in `target/release/`.
+The image carries both binaries. Its default entrypoint is `skeg`, the native
+protocol, already bound to `0.0.0.0:7379`; the quickstart overrides that for
+RESP3. An Ollama companion setup lives in
+[`docker-compose.example.yml`](docker-compose.example.yml).
 
 ## Platforms
 
-| your machine | tarball to download | container |
+| your machine | tarball | container |
 | --- | --- | --- |
 | Mac, Apple Silicon | `aarch64-apple-darwin` | not published |
 | Linux, ARM | `aarch64-unknown-linux-gnu` | `:latest` |
 | Linux, x86_64 | `x86_64-unknown-linux-gnu` | `:latest` |
 
-`:latest` carries both Linux architectures and resolves to the right one on
+`:latest` carries both Linux architectures and resolves the right one on
 `docker pull`. There is no Intel Mac or Windows build.
 
-One binary per platform, and it adapts: skeg checks the CPU at startup and picks
-NEON, AVX-512, AVX2 or a scalar fallback accordingly. The x86_64 build carries
-the AVX-512 kernels, and CI runs that same build on a machine without AVX-512 to
-keep "carries them" from meaning "requires them".
+One binary per platform, and it adapts: skeg checks the CPU and picks NEON,
+AVX-512, AVX2 or a scalar fallback accordingly. The x86_64 build carries the
+AVX-512 kernels, and CI runs that build on a machine without AVX-512, so
+"carries them" cannot quietly become "requires them".
 
-Building from source is where this is a choice, because the AVX-512 kernels need
-Rust 1.89 while the rest of the project builds on 1.88. They are behind a feature
-flag so the lower toolchain keeps working:
+Building from source is the one place this is a choice, because those kernels
+need Rust 1.89 while the rest of the project builds on 1.88. They sit behind a
+feature flag so the lower toolchain keeps working:
 
 ```sh
 cargo build --release --bin skeg --bin skeg-resp3 --features skeg-server/avx512
@@ -269,11 +223,11 @@ deliberately not selected, is asserted in a test rather than described in prose:
 
 ## Protocols
 
-Use **RESP3** for application integrations. It is the supported public API and
-names the vector tiers directly: `f32`, `int8`, `tq1`, `tq2`, `tq4`, `binary`.
+Build against **RESP3**. It is the supported public API and names the vector
+tiers directly: `f32`, `int8`, `tq1`, `tq2`, `tq4`, `binary`.
 
-The native transport on 7379 exists for specialised clients. It is versioned,
-and the version decides which tiers it can name:
+The native transport on 7379 is for specialised clients, and its version decides
+which tiers it can name:
 
 | | v1 | v2 |
 | --- | --- | --- |
@@ -281,12 +235,9 @@ and the version decides which tiers it can name:
 | kind `3` | rejected: historical clients used it for PQ | `tq1` |
 
 A v2 client opens with `NativeHello` (op `0x84`) and reads the tier capability
-mask it gets back. v1 byte meanings are unchanged, so an existing client keeps
-working.
+mask it gets back. No v1 byte changed meaning, so existing clients keep working.
 
 ## Documentation
-
-Guides in [`docs/`](docs/):
 
 - [`getting-started.md`](docs/getting-started.md): run it, command reference, filter grammar.
 - [`architecture.md`](docs/architecture.md): on-disk index, tiers, filtered-search planner.
