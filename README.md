@@ -24,14 +24,18 @@
 
 ---
 
-skeg stores the full vectors on SSD and keeps only a small quantized working set
-in RAM. That trade buys recall 1.0 on a memory footprint the RAM-resident
-engines cannot reach, which is what matters when memory is the contested
-resource: thousands of tenants on one box, or a vector store sharing a machine
-with the model it serves.
-
-Key-value and vectors live in the same engine, behind a Redis-compatible wire
+skeg is a vector database and key-value store in one process, speaking the Redis
 protocol.
+
+It keeps the full vectors on SSD and only a small quantized working set in RAM.
+That trade buys recall 1.0 on a memory footprint the RAM-resident engines cannot
+reach, which is what matters when memory is the contested resource: thousands of
+tenants on one box, or a vector store sharing a machine with the model it serves.
+
+[Documentation](docs/) &middot;
+[Benchmarks](https://skegdb.github.io/bench/) &middot;
+[Getting started](docs/getting-started.md) &middot;
+[Roadmap](docs/roadmap.md)
 
 ## Quickstart
 
@@ -40,25 +44,46 @@ docker run -d --name skeg -p 6379:6379 -v skeg-data:/var/lib/skeg \
   --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest
 ```
 
-Any Redis client talks to it:
+It is a Redis server, so any Redis client works:
 
-```text
-$ redis-cli -3 -p 6379
-> SET greeting "hello"
+```console
+$ redis-cli -3 SET greeting "hello"
 OK
-> SKEG.VINDEX.CREATE docs 1024 tq2 disk
-OK
-> SKEG.VSET docs 1 <1024-float vector as bytes>
-OK
-> SKEG.VSEARCH docs 10 100 <query vector bytes>
-1) "1"
-2) (double) 0.987
+$ redis-cli -3 GET greeting
+hello
+$ redis-cli -3 INCRBY counter 7
+7
 ```
 
-Vector operations sit under `SKEG.*` so they stay clear of the Redis command
-surface. The command above overrides the image entrypoint because RESP3 is the
-protocol to build against; see [Protocols](#protocols) for the other one and why
-it exists. Full walkthrough, command reference and filter grammar:
+And a vector database. Vectors travel as raw little-endian f32, under `SKEG.*`
+commands that stay clear of the Redis command surface:
+
+```python
+import struct, redis
+
+r = redis.Redis(protocol=3)
+vec = lambda *xs: struct.pack(f"<{len(xs)}f", *xs)
+
+r.execute_command("SKEG.VINDEX.CREATE", "docs", 4, "tq2", "disk")
+r.execute_command("SKEG.VSET", "docs", 1, vec(1.0, 0.0, 0.0, 0.0))
+r.execute_command("SKEG.VSET", "docs", 2, vec(0.0, 1.0, 0.0, 0.0))
+r.execute_command("SKEG.VSET", "docs", 3, vec(0.9, 0.1, 0.0, 0.0))
+
+r.execute_command("SKEG.VSEARCH", "docs", 2, 32, vec(1.0, 0.0, 0.0, 0.0))
+# [b'1', 1.0, b'3', 0.9938837289810181]
+```
+
+`tq2` is the 2-bit TurboQuant tier and `disk` the on-disk graph: the pairing
+behind every benchmark row below. `redis-cli -3 SKEG.VINDEX.LIST` shows what
+you built:
+
+```console
+name=docs dim=4 kind=tq2 backend=disk n_vectors=3
+```
+
+The command above overrides the image entrypoint because RESP3 is the protocol
+to build against; see [Protocols](#protocols) for the other one and why it
+exists. Full walkthrough, command reference and filter grammar:
 [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Benchmarks

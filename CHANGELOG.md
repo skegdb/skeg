@@ -7,7 +7,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
-## [0.7.1] - 2026-08-10
+## [0.7.1] - 2026-08-15
 
 x86 support for the SIMD kernels, validated on real hardware for the first
 time, and a cleanup pass over the engine that turned up a data-loss bug.
