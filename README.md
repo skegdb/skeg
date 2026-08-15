@@ -5,8 +5,8 @@
 
 <p align="center">
   <strong>The vector database that fits.</strong><br>
-  Recall <strong>1.000</strong> serving 100K x 1024-dim vectors on <strong>47 MB</strong>.<br>
-  Vectors on SSD, tenants isolated by construction, Redis protocol.
+  Recall 1.0 without holding the corpus in RAM.<br>
+  Tenants isolated by construction, vectors and key-value in one process.
 </p>
 
 <p align="center">
@@ -26,8 +26,8 @@
 ---
 
 skeg is a vector database and key-value store in one process, speaking the Redis
-protocol. It holds the full vectors on SSD and keeps only a small quantized
-working set in RAM, which is how the number above is possible.
+protocol. The full vectors stay on SSD and only a small quantized working set
+sits in RAM, so memory grows far more slowly than the corpus it serves.
 
 [Documentation](docs/) &middot;
 [Benchmarks](https://skegdb.github.io/bench/) &middot;
