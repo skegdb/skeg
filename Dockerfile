@@ -1,8 +1,16 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- builder ----------------------------------------------------------
-FROM rust:1.88-bookworm AS builder
+# RUST_VERSION defaults to the workspace MSRV. The AVX-512 kernels need 1.89,
+# so the avx512 image passes --build-arg RUST_VERSION=1.89.
+ARG RUST_VERSION=1.88
+FROM rust:${RUST_VERSION}-bookworm AS builder
 WORKDIR /src
+
+# Empty for the default image. Set to `avx512` to compile the AVX-512 kernels
+# in as well; they still select themselves only after a runtime CPU check, so
+# the resulting binary runs on any x86_64 machine.
+ARG CARGO_FEATURES=
 
 # Cache dependency builds: copy manifests first, fetch, then bring in sources.
 COPY Cargo.toml Cargo.lock ./
@@ -11,7 +19,8 @@ COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-        --bin skeg --bin skeg-resp3 -p skeg-server && \
+        --bin skeg --bin skeg-resp3 -p skeg-server \
+        ${CARGO_FEATURES:+--features $CARGO_FEATURES} && \
     cp target/release/skeg /usr/local/bin/skeg && \
     cp target/release/skeg-resp3 /usr/local/bin/skeg-resp3 && \
     strip /usr/local/bin/skeg /usr/local/bin/skeg-resp3

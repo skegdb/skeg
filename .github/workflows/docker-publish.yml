@@ -47,11 +47,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  publish:
-    runs-on: ubuntu-22.04-arm
+  # Tags are derived once and shared: the per-architecture builds push by
+  # digest and carry no tags of their own, so a half-finished matrix can
+  # never leave a tag pointing at one architecture.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@v5
-
       - name: derive tags
         id: meta
         run: |
@@ -79,23 +82,121 @@ jobs:
             echo EOF
           } >> "$GITHUB_OUTPUT"
 
+  # One native runner per architecture: cross-building Rust under QEMU turns a
+  # few minutes into the better part of an hour.
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+          - platform: linux/amd64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
-
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v7
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/skegdb/skeg,push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/skegdb/skeg
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.description=Vector + KV store, SSD-primary, RAM-frugal.
+      - name: export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # Bind both architectures under the real tags, so `docker pull ghcr.io/
+  # skegdb/skeg:0.7.1` resolves to arm64 or amd64 by itself.
+  merge:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: create the manifest list
+        run: |
+          cd /tmp/digests
+          refs=""
+          for d in *; do refs="$refs ghcr.io/skegdb/skeg@sha256:$d"; done
+          # shellcheck disable=SC2086
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            docker buildx imagetools create --tag "$tag" $refs
+          done <<< "${{ needs.meta.outputs.tags }}"
+      - name: report what was published
+        run: |
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            docker buildx imagetools inspect "$tag" | head -20
+          done <<< "${{ needs.meta.outputs.tags }}"
+
+  # The AVX-512 build is amd64 only - the feature gates x86 kernels, so there
+  # is nothing for it to add on arm64. It is a separate tag rather than a
+  # second architecture because both images target the same platform.
+  avx512:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: suffix the tags
+        id: tags
+        run: |
+          {
+            echo "tags<<EOF"
+            while read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "${tag}-avx512"
+            done <<< "${{ needs.meta.outputs.tags }}"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            RUST_VERSION=1.89
+            CARGO_FEATURES=avx512
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/skegdb/skeg
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.description=Vector + KV store, SSD-primary, RAM-frugal. AVX-512 kernels compiled in.

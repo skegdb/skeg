@@ -118,6 +118,12 @@ jobs:
         # aarch64 runs the NEON kernels, x86_64 linux the AVX2 ones
         # (runtime-detected, scalar fallback below AVX2). The published
         # bench numbers are per-target; x86 numbers need their own run.
+        #
+        # x86_64 ships twice. Both binaries run on any x86_64 CPU - kernel
+        # selection is a runtime feature check, not a compile-time target -
+        # so the suffix says what is compiled in, not what you must own:
+        #   (no suffix)  AVX2 kernels, builds on the 1.88 MSRV
+        #   -avx512      the above plus the AVX-512 kernels, needs 1.89
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -125,6 +131,10 @@ jobs:
             runner: ubuntu-latest
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: avx512
+            suffix: -avx512
     runs-on: ${{ matrix.runner }}
     needs: guard
     steps:
@@ -140,12 +150,13 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo build --release --target ${{ matrix.target }} \
-            --bin skeg --bin skeg-resp3 -p skeg-server --locked
+            --bin skeg --bin skeg-resp3 -p skeg-server --locked \
+            ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
       - name: package
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz skeg skeg-resp3
-          shasum -a 256 skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          tar -czf skeg-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz skeg skeg-resp3
+          shasum -a 256 skeg-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz > skeg-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz.sha256
       - uses: softprops/action-gh-release@v3
         if: github.event_name == 'push'
         with:
@@ -155,7 +166,7 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: github.event_name == 'workflow_dispatch'
         with:
-          name: skeg-${{ github.sha }}-${{ matrix.target }}
+          name: skeg-${{ github.sha }}-${{ matrix.target }}${{ matrix.suffix }}
           path: |
             target/${{ matrix.target }}/release/skeg-*.tar.gz
             target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
@@ -167,8 +178,12 @@ jobs:
   #   ghcr.io/skegdb/skeg:<version>   (e.g. 0.1.1)
   #   ghcr.io/skegdb/skeg:latest      (only on tag pushes)
   docker:
-    # Always attempts to build (validates Dockerfile on every release run).
-    # Only pushes to ghcr.io on real tag releases.
+    # Build only, never push: this job exists to fail the release run if the
+    # Dockerfile is broken. Publishing belongs to docker-publish.yml, which
+    # also fires on `v*` and is the only workflow that pushes to ghcr.io.
+    # Both used to push the same tags on a tag release, so whichever finished
+    # last won; now that one of them publishes a multi-architecture manifest,
+    # that race would decide whether `:latest` covers amd64 or only arm64.
     needs: guard
     runs-on: ubuntu-22.04-arm
     steps:
@@ -194,11 +209,9 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/arm64
-          push: ${{ github.event_name == 'push' }}
-          load:  ${{ github.event_name != 'push' }}
-          tags: |
-            ghcr.io/skegdb/skeg:${{ steps.meta.outputs.version }}
-            ${{ github.event_name == 'push' && 'ghcr.io/skegdb/skeg:latest' || '' }}
+          push: false
+          load: true
+          tags: ghcr.io/skegdb/skeg:${{ steps.meta.outputs.version }}-dockerfile-check
           labels: |
             org.opencontainers.image.source=https://github.com/skegdb/skeg
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}

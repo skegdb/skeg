@@ -24,13 +24,41 @@
 
 ---
 
-Vector search where RAM is contested: a SaaS packing thousands of tenants on one
-box, a RAG service paying for memory by the gigabyte, an agent sharing a machine
-with the model it serves. skeg keeps the full vectors on SSD and only a small,
-quantized working set in RAM, so it serves at **recall 1.0** on a memory
-footprint the RAM-resident engines can't touch. Key-value and vectors in one
-engine, a Redis-compatible wire protocol, and multi-tenancy with isolation that
-is leak-free by construction.
+skeg stores the full vectors on SSD and keeps only a small quantized working set
+in RAM. That trade buys recall 1.0 on a memory footprint the RAM-resident
+engines cannot reach, which is what matters when memory is the contested
+resource: thousands of tenants on one box, or a vector store sharing a machine
+with the model it serves.
+
+Key-value and vectors live in the same engine, behind a Redis-compatible wire
+protocol.
+
+## Quickstart
+
+```sh
+docker run -d --name skeg -p 6379:6379 -v skeg-data:/var/lib/skeg \
+  --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest
+```
+
+Any Redis client talks to it:
+
+```text
+$ redis-cli -3 -p 6379
+> SET greeting "hello"
+OK
+> SKEG.VINDEX.CREATE docs 1024 tq2 disk
+OK
+> SKEG.VSET docs 1 <1024-float vector as bytes>
+OK
+> SKEG.VSEARCH docs 10 100 <query vector bytes>
+1) "1"
+2) (double) 0.987
+```
+
+Vector operations sit under `SKEG.*` so they stay clear of the Redis command
+surface. The native protocol runs on 7379 and is the default entrypoint;
+`skeg-resp3` above serves RESP3 on 6379. Full walkthrough, command reference and
+filter grammar: [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Benchmarks
 
@@ -38,9 +66,8 @@ Reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench) (public
 harness, real embeddings, brute-force ground truth). Measured single-machine on
 Apple Silicon; the RAM ratios are hardware-independent.
 
-**Lean and fast.** Single-tenant, 100K x 1024-dim, recall against exact brute
-force. Every engine at a reasonable default (LanceDB tuned to recall 1.0 for a
-fair fight):
+Single-tenant, 100K x 1024-dim, recall against exact brute force. Every engine
+at a reasonable default, with LanceDB tuned to recall 1.0 for a fair fight:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
@@ -51,11 +78,8 @@ fair fight):
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Every other engine gives up at least one axis: RAM, recall, or latency. skeg is
-the only one that is leanest, most accurate, and fast at once.
-
-**Co-resident with a model.** A 3B LLM answering RAG over 1M vectors, both on one
-M1 Pro (16 GiB). The index stays on SSD, the resident set stays flat:
+Co-resident with a model: a 3B LLM answering RAG over 1M vectors, both on one M1
+Pro (16 GiB). The index stays on SSD and the resident set stays flat.
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
@@ -68,34 +92,46 @@ M1 Pro (16 GiB). The index stays on SSD, the resident set stays flat:
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
-The full matrix and the multi-tenant and container-OOM runs are on the
+The full matrix, plus the multi-tenant and container-OOM runs, is on the
 [dashboard](https://skegdb.github.io/bench/).
 
-**Where it stands.** skeg wins on the axes most stores trade away: recall 1.0 at
-a fraction of the RAM, filtered search that stays sub-linear as the corpus grows,
-and per-tenant isolation that is leak-free by construction. It is not the
-lowest-latency *single-query* engine (Qdrant is comparable on p99, raw hnswlib is
-faster), one process saturates near 780 QPS at 1024-dim before you scale out with
-processes, and cold bulk-loads rebuild the index. Release binaries are aarch64
-(Apple Silicon, Linux ARM); x86_64 builds from source, with AVX2 kernels
-selected at runtime and AVX-512 behind an optional `avx512` feature.
+### What it does not win
+
+skeg is not the lowest-latency single-query engine: Qdrant is comparable on p99
+and raw hnswlib is faster. One process saturates near 780 QPS at 1024-dim, past
+which you scale out with processes. Cold bulk-loads rebuild the index.
 
 ## Multi-tenancy
 
-Multi-tenancy is first-class, not a filter convention:
+Tenancy is a property of the storage layout rather than a filter convention.
+Each tenant gets its own index, so a query has no physical path to another
+tenant's vectors, and there is no filter to misconfigure. An adversarial leak-fuzz
+holds it to that: query one tenant's index with another tenant's exact vector
+and zero rows cross the boundary, every time.
 
-- **Isolation by construction:** one index per tenant, so a query physically
-  cannot reach another tenant's vectors. No filter to misconfigure, no leak path.
-  It holds under an adversarial leak-fuzz: query a tenant's index with another
-  tenant's exact vector and zero rows cross the boundary, every time.
-- **Hard quotas:** `max_vectors`, `max_disk_bytes`, set and read at runtime via
-  `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`.
-- **Fair eviction:** a noisy tenant can't starve a quiet one out of the cache.
-- **Authentication:** `HELLO 3 AUTH user pass` (argon2id), prefix-routed namespaces.
+On top of that isolation:
 
-See [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
+- Hard quotas: `max_vectors` and `max_disk_bytes`, set and read at runtime
+  through `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`.
+- Fair eviction, so a noisy tenant cannot starve a quiet one out of the cache.
+- Authentication via `HELLO 3 AUTH user pass` (argon2id), with prefix-routed
+  namespaces.
+
+Details in [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
 
 ## Install
+
+### Docker
+
+```sh
+docker run -d --name skeg -p 7379:7379 -v skeg-data:/var/lib/skeg \
+  ghcr.io/skegdb/skeg:latest
+```
+
+The image carries both binaries and publishes for `linux/amd64` and
+`linux/arm64`. The default entrypoint is `skeg` on 7379; for RESP3 override with
+`--entrypoint /usr/local/bin/skeg-resp3` and publish 6379. An Ollama companion
+setup lives in [`docker-compose.example.yml`](docker-compose.example.yml).
 
 ### Homebrew (macOS and Linux ARM)
 
@@ -104,7 +140,20 @@ brew tap skegdb/tap
 brew install skeg
 ```
 
-Installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd service.
+Installs both binaries and a launchd/systemd service.
+
+### Pre-built tarball
+
+```sh
+TARGET=aarch64-apple-darwin   # see Platforms below for the full list
+TAG=$(curl -s https://api.github.com/repos/skegdb/skeg/releases/latest | grep tag_name | cut -d'"' -f4)
+curl -L -o skeg.tar.gz \
+  "https://github.com/skegdb/skeg/releases/latest/download/skeg-${TAG}-${TARGET}.tar.gz"
+tar -xzf skeg.tar.gz && ./skeg --help
+```
+
+Each tarball ships a `.sha256` next to it. Pin a version from the
+[releases page](https://github.com/skegdb/skeg/releases).
 
 ### From crates.io
 
@@ -112,27 +161,9 @@ Installs both binaries (`skeg`, `skeg-resp3`) and a launchd/systemd service.
 cargo install skeg-server
 ```
 
-Compiles from source and installs `skeg` and `skeg-resp3` into `$CARGO_HOME/bin`.
-Requires a Rust toolchain (MSRV 1.88).
+Builds from source into `$CARGO_HOME/bin`. Needs a Rust toolchain (MSRV 1.88).
 
-<!-- markdownlint-disable MD033 -->
-<details>
-<summary>Tarball, source, Docker, and the published crate list</summary>
-
-#### Pre-built tarball
-
-```sh
-TARGET=aarch64-apple-darwin   # or aarch64-unknown-linux-gnu
-curl -L -o skeg.tar.gz \
-  "https://github.com/skegdb/skeg/releases/latest/download/skeg-$(curl -s https://api.github.com/repos/skegdb/skeg/releases/latest | grep tag_name | cut -d'"' -f4)-${TARGET}.tar.gz"
-tar -xzf skeg.tar.gz
-./skeg --help
-```
-
-SHA256 checksums are published alongside each tarball (`.sha256` suffix). Pin a
-version from the [releases page](https://github.com/skegdb/skeg/releases).
-
-#### From source
+### From git
 
 ```sh
 git clone https://github.com/skegdb/skeg
@@ -140,75 +171,69 @@ cd skeg
 cargo build --release --bin skeg --bin skeg-resp3
 ```
 
-Requires Rust 1.88+. Binaries land at `target/release/skeg` and `target/release/skeg-resp3`.
+Binaries land in `target/release/`.
 
-On aarch64 the NEON kernels are always compiled in. On x86_64 the AVX2 kernels
-are selected at runtime after a CPU feature check, so one binary runs on any
-x86_64 machine. AVX-512 is opt-in:
+## Platforms
+
+| target | tarball | container |
+| --- | --- | --- |
+| `aarch64-apple-darwin` | yes | none |
+| `aarch64-unknown-linux-gnu` | yes | `linux/arm64` |
+| `x86_64-unknown-linux-gnu` | yes | `linux/amd64` |
+| `x86_64-unknown-linux-gnu`, AVX-512 | `-avx512` suffix | `:<version>-avx512` |
+
+Kernel selection happens at runtime, after a CPU feature check, so a binary is
+never tied to the machine that built it. On aarch64 the NEON kernels are always
+compiled in. On x86_64 the AVX2 kernels are, and one binary covers every x86_64
+CPU with a scalar fallback below AVX2.
+
+The AVX-512 kernels are the exception: they are compiled in only when asked for,
+because they earn their place only where AVX-512 offers an instruction AVX2
+lacks: VNNI, VPOPCNTDQ, mask registers, a 16-entry `vpermps` table. Where a
+kernel is the same technique at twice the width it loses on cores that split
+512-bit operations, so it ships built and tested but not selected. Building them
+needs Rust 1.89, one release above the MSRV, which is why they are a separate
+artifact rather than the default.
+
+An AVX-512 build still runs on a CPU without AVX-512; the extra kernels simply
+never get selected. To build one yourself:
 
 ```sh
-cargo build --release --bin skeg --bin skeg-resp3 --features skeg-simd/avx512
+cargo build --release --bin skeg --bin skeg-resp3 --features skeg-server/avx512
 ```
 
-It needs Rust 1.89+ (one release above the baseline) and is off by default
-because the kernels only earn their dispatch where AVX-512 offers something
-AVX2 lacks: VNNI, VPOPCNTDQ, mask registers, a 16-entry `vpermps` table. Where
-the kernel is the same trick at twice the width it loses on cores that
-double-pump 512-bit operations, so it is built and tested but not selected.
-`cargo test -p skeg-simd --test coverage` prints which kernel runs where.
-
-#### Docker
-
-```sh
-docker run -d --name skeg \
-  -p 7379:7379 \
-  -v skeg-data:/var/lib/skeg \
-  ghcr.io/skegdb/skeg:latest
-```
-
-Bundles both binaries (`skeg` native on 7379, `skeg-resp3` Redis-compat on 6379).
-Default entrypoint is `skeg`; for RESP3 override with `--entrypoint
-/usr/local/bin/skeg-resp3` and publish 6379. Built for `linux/arm64`. An Ollama
-companion setup lives in [`docker-compose.example.yml`](docker-compose.example.yml).
-
-#### Published crates
-
-`skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`, `skeg-resp3`,
-`skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`, `skeg-server-tenant`,
-`skeg-multi-tenant`. Network adapters: [`skeg-rigging`](https://github.com/skegdb/skeg-rigging),
-[`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net).
-
-</details>
-<!-- markdownlint-enable MD033 -->
-
-Then follow [`docs/getting-started.md`](docs/getting-started.md) to run it and
-issue the first commands.
+`cargo test -p skeg-simd --test coverage` prints which kernel runs on which
+instruction set, and why any gap is a gap.
 
 ## Documentation
 
-Long-form design and benchmark write-ups on the [project blog](https://amanitaproject.com/):
-*Constraints as Method*, *Seven More Hypotheses*, *The Substrate*, *What Was Measured*.
-
 Guides in [`docs/`](docs/):
 
-- [`getting-started.md`](docs/getting-started.md): run it, the command reference, the filter grammar.
-- [`architecture.md`](docs/architecture.md): on-disk index, tiers (tq1 vs tq2), filtered-search planner.
+- [`getting-started.md`](docs/getting-started.md): run it, command reference, filter grammar.
+- [`architecture.md`](docs/architecture.md): on-disk index, tiers, filtered-search planner.
 - [`multi-tenancy.md`](docs/multi-tenancy.md): tenants, key scoping, quotas, fair eviction.
 - [`filtered-search.md`](docs/filtered-search.md): payloads, filter grammar, the planner.
 - [`observability.md`](docs/observability.md): Prometheus, OTel, tracing.
 - [`ecosystem.md`](docs/ecosystem.md): federation (hansa) and ingest pipelines.
-- [`roadmap.md`](docs/roadmap.md): what's planned, what's conditional, what's deliberately not.
+- [`roadmap.md`](docs/roadmap.md): planned, conditional, and deliberately not.
 
-Reproducible benchmark suite: [`skeg-bench`](https://github.com/skegdb/skeg-bench).
-Live dashboard: [`skegdb.github.io/bench`](https://skegdb.github.io/bench/).
+Long-form design and benchmark write-ups are on the
+[project blog](https://amanitaproject.com/): *Constraints as Method*, *Seven More
+Hypotheses*, *The Substrate*, *What Was Measured*.
+
+Published crates: `skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`,
+`skeg-resp3`, `skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`,
+`skeg-server-tenant`, `skeg-multi-tenant`. Network adapters live in
+[`skeg-rigging`](https://github.com/skegdb/skeg-rigging) and
+[`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net).
 
 ## Contributing
 
-Bug reports, design discussions, and pull requests are welcome. Run `cargo fmt`,
-`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
---workspace` before opening a PR. A pre-push hook at `.githooks/pre-push` runs
-the same three locally. Enable with `git config core.hooksPath .githooks`
-(bypass a docs-only push with `SKIP_PREPUSH=1`).
+Bug reports, design discussions, and pull requests are welcome. Before opening a
+PR run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`. The pre-push hook at `.githooks/pre-push` runs the same
+three; enable it with `git config core.hooksPath .githooks` (a docs-only push can
+skip it with `SKIP_PREPUSH=1`).
 
 ## Security
 

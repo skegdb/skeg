@@ -92,12 +92,28 @@ time, and a cleanup pass over the engine that turned up a data-loss bug.
   `write_vectored_at_sync`, `advise_huge` and `open_populated`. The vLog
   preallocates and fsyncs segments through it.
 
+- **An x86_64 release, in two builds.** The tarball matrix gains
+  `x86_64-unknown-linux-gnu` and an `-avx512` variant of it, and the container
+  image now publishes `linux/amd64` alongside `linux/arm64` with a
+  `:<version>-avx512` tag. Both x86 builds run on any x86_64 CPU: kernel
+  selection is a runtime feature check, so the suffix says what is compiled in,
+  not what the machine must have. AVX-512 is a separate artifact because
+  building it needs Rust 1.89, one release above the MSRV.
+
 - **A kernel coverage test**: which kernel exists for which instruction set and
   which one the dispatcher picks. A gap has to carry a reason, and a kernel
   that exists but loses to its neighbour is recorded as present-but-not-chosen
   rather than as coverage.
 
 ### Changed
+
+- **Only one workflow publishes the container image.** `release.yml` and
+  `docker-publish.yml` both fired on a `v*` tag and both pushed
+  `ghcr.io/skegdb/skeg:<version>` and `:latest`; the one that finished last
+  won. The images were identical, so it never showed. It would have started
+  showing now that one of them publishes a multi-architecture manifest and the
+  other an arm64-only image. `release.yml` still builds the Dockerfile, to fail
+  the release run if it is broken, but no longer pushes.
 
 - **The ADC kernels keep their centroid table in a register** and permute it
   instead of gathering it from memory and unpacking codes in a scalar loop. At
