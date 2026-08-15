@@ -88,9 +88,8 @@ exists. Full walkthrough, command reference and filter grammar:
 
 ## Why skeg
 
-Every other engine gives up at least one of RAM, recall, or latency. 100K
-vectors at 1024 dimensions, recall measured against exact brute force, every
-engine at a reasonable default, LanceDB tuned to recall 1.0 for a fair fight:
+100K vectors at 1024 dimensions, recall measured against exact brute force,
+every engine at its default configuration, with LanceDB tuned to recall 1.0:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
@@ -101,10 +100,8 @@ engine at a reasonable default, LanceDB tuned to recall 1.0 for a fair fight:
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Nineteen times less memory than Qdrant, at higher recall, and it holds when a
-model is sitting on the same machine: a 3B LLM answering RAG over 1M vectors,
-both on one M1 Pro (16 GiB). The index stays on SSD and the resident set stays
-flat where an HNSW graph cannot.
+Co-resident with a model: a 3B LLM answering RAG over 1M vectors, both on one M1
+Pro (16 GiB). The index stays on SSD and the resident set stays flat.
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
