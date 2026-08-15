@@ -68,7 +68,9 @@ OPTIONS:
     -h, --help             Print this help.
     -V, --version          Print the version.
 
-PROTOCOL: native binary on the listen port (use skeg-resp3 for RESP3 / Redis).
+PROTOCOL: native binary on the listen port. Use skeg-resp3 for the recommended
+          RESP3 / Redis-compatible application API. Native v1 supports f32,
+          int8, binary; native v2 adds tq1, tq2, tq4 after NativeHello.
 DOCS:     https://github.com/skegdb/skeg
 "
 );
