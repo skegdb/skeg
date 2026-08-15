@@ -88,8 +88,22 @@ exists. Full walkthrough, command reference and filter grammar:
 
 ## Why skeg
 
-100K vectors at 1024 dimensions, recall measured against exact brute force,
-every engine at its default configuration, with LanceDB tuned to recall 1.0:
+skeg is built for the case where memory is the contested resource: many tenants
+packed on one machine, or a vector store sharing a box with the model it serves.
+
+That case is real enough that Qdrant ships a second product for it. Qdrant Edge
+is, in their words, "a lightweight version of Qdrant designed for edge devices
+and resource-constrained environments", running inside the application process
+with a smaller footprint. skeg does not split in two: the binary that runs a
+multi-tenant deployment is the one that fits on the constrained machine. It
+stays a server either way, so it is not an embedded library and does not try to
+be one; what it shares with that use case is the constraint, not the deployment
+model.
+
+The reason one binary covers both is that the footprint does not come at the
+usual price. 100K vectors at 1024 dimensions, recall measured against exact
+brute force, every engine at its default configuration, with LanceDB tuned to
+recall 1.0:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
@@ -100,8 +114,10 @@ every engine at its default configuration, with LanceDB tuned to recall 1.0:
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Co-resident with a model: a 3B LLM answering RAG over 1M vectors, both on one M1
-Pro (16 GiB). The index stays on SSD and the resident set stays flat.
+Same latency band as the fastest servers in the table, at a fraction of their
+memory. That is what makes co-residency work: a 3B LLM answering RAG over 1M
+vectors, both on one M1 Pro (16 GiB), with the index on SSD and the resident set
+flat.
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
@@ -122,8 +138,8 @@ full matrix, plus the multi-tenant and container-OOM runs, is on the
 
 ## Where it does not lead
 
-skeg spends its design budget on memory. Three consequences follow, and they
-are worth knowing before you pick it:
+The footprint is what skeg optimises for, and three things follow from that.
+Worth knowing before you pick it:
 
 - **Single-query latency.** 2.5 ms p50 is competitive, not a record. Qdrant
   matches it at p99 and raw hnswlib beats it. If a few hundred microseconds
