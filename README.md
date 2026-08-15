@@ -120,13 +120,23 @@ single-machine on Apple Silicon; the RAM ratios are hardware-independent. The
 full matrix, plus the multi-tenant and container-OOM runs, is on the
 [dashboard](https://skegdb.github.io/bench/).
 
-## Why not skeg
+## Where it does not lead
 
-If you need the lowest possible latency on a single query, this is not it:
-Qdrant is comparable on p99 and raw hnswlib is faster. One process saturates
-near 780 QPS at 1024 dimensions, past which you scale out with processes. Cold
-bulk-loads rebuild the index. And if RAM is not what constrains you, most of
-what skeg trades away buys you nothing.
+skeg spends its design budget on memory. Three consequences follow, and they
+are worth knowing before you pick it:
+
+- **Single-query latency.** 2.5 ms p50 is competitive, not a record. Qdrant
+  matches it at p99 and raw hnswlib beats it. If a few hundred microseconds
+  decide your architecture, measure both.
+- **Throughput per process.** One process saturates near 780 QPS at 1024
+  dimensions. Past that you add processes, not threads.
+- **Cold bulk-loads.** Loading a fresh corpus builds the graph rather than
+  streaming into a finished one, so the first load costs more than the writes
+  that follow it.
+
+If memory is not the resource you are short of, none of this costs you
+anything: you still get recall 1.0 at competitive latency. You just will not
+notice the part skeg is built for.
 
 ## Multi-tenancy
 
