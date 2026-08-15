@@ -56,26 +56,10 @@ OK
 ```
 
 Vector operations sit under `SKEG.*` so they stay clear of the Redis command
-surface. The native protocol runs on 7379 and is the default entrypoint;
-`skeg-resp3` above serves RESP3 on 6379. Full walkthrough, command reference and
-filter grammar: [`docs/getting-started.md`](docs/getting-started.md).
-
-## Which protocol
-
-Use **RESP3** for application integrations. It is the supported public API and
-names the vector tiers directly: `f32`, `int8`, `tq1`, `tq2`, `tq4`, `binary`.
-
-The native transport on 7379 exists for specialised clients. It is versioned,
-and the version decides which tiers it can name:
-
-| | v1 | v2 |
-| --- | --- | --- |
-| kinds | `0=f32` `1=int8` `2=binary` | the same, plus `3=tq1` `4=tq2` `5=tq4` |
-| kind `3` | rejected: historical clients used it for PQ | `tq1` |
-
-A v2 client opens with `NativeHello` (op `0x84`) and reads the tier capability
-mask it gets back. v1 byte meanings are unchanged, so an existing client keeps
-working.
+surface. The command above overrides the image entrypoint because RESP3 is the
+protocol to build against; see [Protocols](#protocols) for the other one and why
+it exists. Full walkthrough, command reference and filter grammar:
+[`docs/getting-started.md`](docs/getting-started.md).
 
 ## Benchmarks
 
@@ -192,35 +176,53 @@ Binaries land in `target/release/`.
 
 ## Platforms
 
-| target | tarball | container |
+| your machine | tarball to download | container |
 | --- | --- | --- |
-| `aarch64-apple-darwin` | yes | none |
-| `aarch64-unknown-linux-gnu` | yes | `linux/arm64` |
-| `x86_64-unknown-linux-gnu` | yes | `linux/amd64` |
-| `x86_64-unknown-linux-gnu`, AVX-512 | `-avx512` suffix | `:<version>-avx512` |
+| Mac, Apple Silicon | `aarch64-apple-darwin` | not published |
+| Linux, ARM | `aarch64-unknown-linux-gnu` | `:latest` |
+| Linux, x86_64 | `x86_64-unknown-linux-gnu` | `:latest` |
 
-Kernel selection happens at runtime, after a CPU feature check, so a binary is
-never tied to the machine that built it. On aarch64 the NEON kernels are always
-compiled in. On x86_64 the AVX2 kernels are, and one binary covers every x86_64
-CPU with a scalar fallback below AVX2.
+`:latest` carries both Linux architectures and resolves to the right one on
+`docker pull`. There is no Intel Mac or Windows build.
 
-The AVX-512 kernels are the exception: they are compiled in only when asked for,
-because they earn their place only where AVX-512 offers an instruction AVX2
-lacks: VNNI, VPOPCNTDQ, mask registers, a 16-entry `vpermps` table. Where a
-kernel is the same technique at twice the width it loses on cores that split
-512-bit operations, so it ships built and tested but not selected. Building them
-needs Rust 1.89, one release above the MSRV, which is why they are a separate
-artifact rather than the default.
+### The second x86_64 build
 
-An AVX-512 build still runs on a CPU without AVX-512; the extra kernels simply
-never get selected. To build one yourself:
+x86_64 also has an `-avx512` tarball and a `:<version>-avx512` image. Take the
+plain one unless you know your CPU has AVX-512, and even then the difference is
+worth measuring rather than assuming.
+
+Both builds run on any x86_64 CPU. skeg picks its kernels at runtime after a CPU
+check, so the suffix describes what is compiled in, not what the machine must
+have; on a CPU without AVX-512 the extra kernels are simply never chosen. They
+are a separate download only because compiling them needs Rust 1.89, above the
+1.88 the rest of the project builds with.
+
+To build them yourself:
 
 ```sh
 cargo build --release --bin skeg --bin skeg-resp3 --features skeg-server/avx512
 ```
 
-`cargo test -p skeg-simd --test coverage` prints which kernel runs on which
-instruction set, and why any gap is a gap.
+Which kernel actually runs on which instruction set, and why some are built but
+deliberately not selected, is asserted in a test rather than described in prose:
+`cargo test -p skeg-simd --test coverage`.
+
+## Protocols
+
+Use **RESP3** for application integrations. It is the supported public API and
+names the vector tiers directly: `f32`, `int8`, `tq1`, `tq2`, `tq4`, `binary`.
+
+The native transport on 7379 exists for specialised clients. It is versioned,
+and the version decides which tiers it can name:
+
+| | v1 | v2 |
+| --- | --- | --- |
+| kinds | `0=f32` `1=int8` `2=binary` | the same, plus `3=tq1` `4=tq2` `5=tq4` |
+| kind `3` | rejected: historical clients used it for PQ | `tq1` |
+
+A v2 client opens with `NativeHello` (op `0x84`) and reads the tier capability
+mask it gets back. v1 byte meanings are unchanged, so an existing client keeps
+working.
 
 ## Documentation
 
