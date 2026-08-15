@@ -1,6 +1,9 @@
 <!-- markdownlint-disable MD033 MD041 -->
 <p align="center">
-  <img src="assets/skeg-logo.png" alt="skeg" width="480">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/skeg-logo-dark.webp">
+    <img src="assets/skeg-logo.webp" alt="skeg" width="420">
+  </picture>
 </p>
 
 <p align="center">
@@ -114,7 +117,7 @@ Pro (16 GiB). The index stays on SSD and the resident set stays flat.
 
 <!-- markdownlint-disable MD033 MD041 -->
 <p align="center">
-  <img src="assets/coresidence-rss.png" alt="Backend RSS while a 3B LLM serves RAG, swept from 10K to 1M vectors on an M1 Pro 16 GiB. skeg stays under 80 MiB; Qdrant climbs into multi-GiB territory." width="760">
+  <img src="assets/coresidence-rss.svg" alt="Backend RSS while a 3B LLM serves RAG, swept from 10K to 1M vectors on an M1 Pro 16 GiB. skeg stays under 80 MiB; Qdrant climbs into multi-GiB territory." width="760">
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
