@@ -185,25 +185,20 @@ Binaries land in `target/release/`.
 `:latest` carries both Linux architectures and resolves to the right one on
 `docker pull`. There is no Intel Mac or Windows build.
 
-### The second x86_64 build
+One binary per platform, and it adapts: skeg checks the CPU at startup and picks
+NEON, AVX-512, AVX2 or a scalar fallback accordingly. The x86_64 build carries
+the AVX-512 kernels, and CI runs that same build on a machine without AVX-512 to
+keep "carries them" from meaning "requires them".
 
-x86_64 also has an `-avx512` tarball and a `:<version>-avx512` image. Take the
-plain one unless you know your CPU has AVX-512, and even then the difference is
-worth measuring rather than assuming.
-
-Both builds run on any x86_64 CPU. skeg picks its kernels at runtime after a CPU
-check, so the suffix describes what is compiled in, not what the machine must
-have; on a CPU without AVX-512 the extra kernels are simply never chosen. They
-are a separate download only because compiling them needs Rust 1.89, above the
-1.88 the rest of the project builds with.
-
-To build them yourself:
+Building from source is where this is a choice, because the AVX-512 kernels need
+Rust 1.89 while the rest of the project builds on 1.88. They are behind a feature
+flag so the lower toolchain keeps working:
 
 ```sh
 cargo build --release --bin skeg --bin skeg-resp3 --features skeg-server/avx512
 ```
 
-Which kernel actually runs on which instruction set, and why some are built but
+Which kernel runs on which instruction set, and why some are built but
 deliberately not selected, is asserted in a test rather than described in prose:
 `cargo test -p skeg-simd --test coverage`.
 
