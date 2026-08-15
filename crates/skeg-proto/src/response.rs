@@ -7,10 +7,25 @@ use crate::{Flags, Op, frame::encode_frame};
 /// Error codes sent in `Err` response frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ErrCode {
     NotFound = 0x01,
     InvalidRequest = 0x02,
     Internal = 0x03,
+}
+
+/// Native protocol v2 feature set returned by `Op::NativeHello`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCapabilities {
+    pub protocol_version: u8,
+    pub vector_kind_mask: u8,
+}
+
+impl NativeCapabilities {
+    #[must_use]
+    pub const fn supports(self, kind: crate::NativeVectorKindV2) -> bool {
+        self.vector_kind_mask & (1 << kind as u8) != 0
+    }
 }
 
 // ── Encoding ────────────────────────────────────────────────────────────────
@@ -19,6 +34,29 @@ pub enum ErrCode {
 #[must_use]
 pub fn encode_ok(req_id: u64) -> Bytes {
     encode_frame(Op::Ok, Flags::empty(), req_id, &[])
+}
+
+/// Encode the successful body of a native v2 capabilities response.
+#[must_use]
+pub fn encode_ok_native_capabilities(req_id: u64, capabilities: NativeCapabilities) -> Bytes {
+    encode_frame(
+        Op::Ok,
+        Flags::empty(),
+        req_id,
+        &[capabilities.protocol_version, capabilities.vector_kind_mask],
+    )
+}
+
+/// Decode a native-v2 capabilities response body.
+#[must_use]
+pub fn decode_native_capabilities_response(payload: &Bytes) -> Option<NativeCapabilities> {
+    let [protocol_version, vector_kind_mask] = *payload.as_ref() else {
+        return None;
+    };
+    Some(NativeCapabilities {
+        protocol_version,
+        vector_kind_mask,
+    })
 }
 
 /// Encode Ok with a value payload: `[u32 value_len][value]`.
@@ -96,8 +134,9 @@ pub struct ShardStats {
 }
 
 /// One row of `Op::VindexList` response. `kind` and `backend` are the
-/// same wire bytes accepted by `VINDEX CREATE` (0=f32 / 1=int8 / 2=binary
-/// for `kind`; 0=flat / 1=disk Vamana for `backend`). `n_vectors` is the
+/// same wire bytes accepted by `VINDEX CREATE` (v1: 0=f32 / 1=int8 /
+/// 2=binary; v2 adds 3=tq1 / 4=tq2 / 5=tq4; 0=flat / 1=disk Vamana for
+/// `backend`). `n_vectors` is the
 /// live count across shards (summed by the client).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VindexInfo {
@@ -368,7 +407,7 @@ pub fn decode_mget_response(payload: &Bytes) -> Vec<Option<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FrameParser;
+    use crate::{FrameParser, NativeVectorKindV2, VERSION_V2};
     use bytes::BytesMut;
 
     fn parse_one(b: Bytes) -> crate::Frame {
@@ -383,6 +422,21 @@ mod tests {
         let frame = parse_one(encode_ok(1));
         assert_eq!(frame.header.op, Op::Ok);
         assert!(frame.payload.is_empty());
+    }
+
+    #[test]
+    fn decode_native_capabilities_reports_the_advertised_tiers() {
+        let frame = parse_one(encode_ok_native_capabilities(
+            1,
+            NativeCapabilities {
+                protocol_version: VERSION_V2,
+                vector_kind_mask: 0b0011_1111,
+            },
+        ));
+        let capabilities = decode_native_capabilities_response(&frame.payload).unwrap();
+        assert_eq!(capabilities.protocol_version, VERSION_V2);
+        assert!(capabilities.supports(NativeVectorKindV2::Tq2));
+        assert!(capabilities.supports(NativeVectorKindV2::Tq4));
     }
 
     #[test]

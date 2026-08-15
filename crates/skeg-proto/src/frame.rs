@@ -11,12 +11,19 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::{Flags, Op, ParseError};
 
 pub const MAGIC: u16 = 0x564B; // "KV" in little-endian
-pub const VERSION: u8 = 1;
+/// Native protocol version emitted by the compatibility encoder.
+pub const VERSION_V1: u8 = 1;
+/// Native protocol version with explicit TurboQuant kind discriminants.
+pub const VERSION_V2: u8 = 2;
+/// Backwards-compatible spelling for the v1 encoder version.
+pub const VERSION: u8 = VERSION_V1;
 pub const HEADER_LEN: usize = 24;
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameHeader {
+    /// Native protocol version carried by this frame.
+    pub version: u8,
     pub op: Op,
     pub flags: Flags,
     pub req_id: u64,
@@ -133,11 +140,8 @@ fn parse_header(buf: &[u8; HEADER_LEN]) -> Result<FrameHeader, ParseError> {
     }
 
     let version = buf[2];
-    if version != VERSION {
-        return Err(ParseError::InvalidVersion {
-            expected: VERSION,
-            got: version,
-        });
+    if !matches!(version, VERSION_V1 | VERSION_V2) {
+        return Err(ParseError::InvalidVersion { got: version });
     }
 
     let op_byte = buf[3];
@@ -161,6 +165,7 @@ fn parse_header(buf: &[u8; HEADER_LEN]) -> Result<FrameHeader, ParseError> {
     // buf[20..24] = reserved, ignored on read
 
     Ok(FrameHeader {
+        version,
         op,
         flags,
         req_id,
@@ -175,9 +180,28 @@ fn parse_header(buf: &[u8; HEADER_LEN]) -> Result<FrameHeader, ParseError> {
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn encode_frame(op: Op, flags: Flags, req_id: u64, payload: &[u8]) -> Bytes {
+    encode_frame_versioned(VERSION_V1, op, flags, req_id, payload)
+}
+
+/// Encode a frame using a supported native protocol version.
+///
+/// # Panics
+///
+/// Panics in debug builds if `version` is not supported. Callers choosing a
+/// version dynamically must validate it before encoding.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn encode_frame_versioned(
+    version: u8,
+    op: Op,
+    flags: Flags,
+    req_id: u64,
+    payload: &[u8],
+) -> Bytes {
+    debug_assert!(matches!(version, VERSION_V1 | VERSION_V2));
     let mut buf = BytesMut::with_capacity(HEADER_LEN + payload.len());
     buf.put_u16_le(MAGIC);
-    buf.put_u8(VERSION);
+    buf.put_u8(version);
     buf.put_u8(op as u8);
     buf.put_u32_le(flags.bits());
     buf.put_u64_le(req_id);
@@ -212,6 +236,14 @@ mod tests {
         assert_eq!(frame.header.flags, Flags::empty());
         assert!(frame.payload.is_empty());
         assert!(buf.is_empty()); // all bytes consumed
+    }
+
+    #[test]
+    fn v2_frame_roundtrips_and_preserves_its_version() {
+        let encoded = encode_frame_versioned(VERSION_V2, Op::Ping, Flags::empty(), 9, &[]);
+        let mut buf = BytesMut::from(encoded.as_ref());
+        let frame = FrameParser::new().feed(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.header.version, VERSION_V2);
     }
 
     #[test]

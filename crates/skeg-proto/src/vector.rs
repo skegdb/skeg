@@ -1,12 +1,45 @@
 //! Wire codecs for the vector ops: VINDEX CREATE/DROP, VSET, VGET, VDEL,
 //! VSEARCH.
 //!
-//! Vectors travel as little-endian f32. The `kind` byte is raw on the wire
-//! (0 = f32, 1 = int8, 2 = binary); the server maps it to its quantizer type.
+//! Vectors travel as little-endian f32. The `kind` byte is raw on the wire:
+//! native v1 permits 0 = f32, 1 = int8, 2 = binary; native v2 additionally
+//! assigns 3 = tq1, 4 = tq2, and 5 = tq4.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{Flags, Op, ParseError, frame::encode_frame};
+
+/// Stable vector-kind discriminants for native protocol v2.
+///
+/// These values are not valid to infer from a native v1 frame: v1 code 3 was
+/// historically Product Quantization, while v2 code 3 is TQ1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum NativeVectorKindV2 {
+    F32 = 0,
+    Int8 = 1,
+    Binary = 2,
+    Tq1 = 3,
+    Tq2 = 4,
+    Tq4 = 5,
+}
+
+impl TryFrom<u8> for NativeVectorKindV2 {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::F32),
+            1 => Ok(Self::Int8),
+            2 => Ok(Self::Binary),
+            3 => Ok(Self::Tq1),
+            4 => Ok(Self::Tq2),
+            5 => Ok(Self::Tq4),
+            other => Err(other),
+        }
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -307,6 +340,13 @@ pub fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::FrameParser;
+
+    #[test]
+    fn v2_kind_codes_are_complete_and_unambiguous() {
+        assert_eq!(NativeVectorKindV2::try_from(3), Ok(NativeVectorKindV2::Tq1));
+        assert_eq!(NativeVectorKindV2::try_from(5), Ok(NativeVectorKindV2::Tq4));
+        assert!(NativeVectorKindV2::try_from(6).is_err());
+    }
 
     fn parse_one(b: Bytes) -> crate::Frame {
         FrameParser::new()

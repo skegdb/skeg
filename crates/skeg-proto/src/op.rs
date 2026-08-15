@@ -6,6 +6,7 @@
 /// Response ops (0xC0..=0xFF) are sent by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Op {
     // KV scalar
     Get = 0x01,
@@ -30,6 +31,8 @@ pub enum Op {
     Stats = 0x81,
     Flush = 0x82,
     Shards = 0x83,
+    /// Native v2 capability negotiation. Valid only in a v2 frame.
+    NativeHello = 0x84,
 
     // Responses
     Ok = 0xC0,
@@ -59,6 +62,7 @@ impl Op {
             0x81 => Some(Op::Stats),
             0x82 => Some(Op::Flush),
             0x83 => Some(Op::Shards),
+            0x84 => Some(Op::NativeHello),
             0xC0 => Some(Op::Ok),
             0xC1 => Some(Op::Err),
             0xC2 => Some(Op::Continued),
@@ -92,12 +96,26 @@ mod tests {
             Op::Stats,
             Op::Flush,
             Op::Shards,
+            Op::NativeHello,
             Op::Ok,
             Op::Err,
             Op::Continued,
         ];
         for op in ops {
             assert_eq!(Op::from_u8(op as u8), Some(op));
+        }
+
+        // The list above is written by hand, so on its own it proves nothing
+        // about an op added to the enum and forgotten here. Sweeping the byte
+        // space closes that: every discriminant the decoder accepts has to be
+        // one the list already covers.
+        for byte in 0..=u8::MAX {
+            if let Some(op) = Op::from_u8(byte) {
+                assert!(
+                    ops.contains(&op),
+                    "{op:?} decodes from 0x{byte:02x} but is missing from the list above",
+                );
+            }
         }
     }
 

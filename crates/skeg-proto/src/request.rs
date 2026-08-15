@@ -2,7 +2,10 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::{Flags, Op, ParseError, frame::encode_frame};
+use crate::{
+    Flags, Op, ParseError, VERSION_V2,
+    frame::{encode_frame, encode_frame_versioned},
+};
 
 // ── Encoding ────────────────────────────────────────────────────────────────
 
@@ -23,6 +26,12 @@ pub fn encode_stats(req_id: u64) -> Bytes {
 #[must_use]
 pub fn encode_shards(req_id: u64) -> Bytes {
     encode_frame(Op::Shards, Flags::empty(), req_id, &[])
+}
+
+/// Encode a native-v2 capability request.
+#[must_use]
+pub fn encode_native_hello(req_id: u64) -> Bytes {
+    encode_frame_versioned(VERSION_V2, Op::NativeHello, Flags::empty(), req_id, &[])
 }
 
 /// Encode a GET request. Payload: `[u16 key_len][key]`.
@@ -165,7 +174,7 @@ pub fn decode_mget_payload(payload: &Bytes) -> Result<Vec<Bytes>, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FrameParser, Op};
+    use crate::{FrameParser, Op, VERSION_V2};
     use bytes::BytesMut;
 
     fn parse_one(b: Bytes) -> crate::Frame {
@@ -178,6 +187,14 @@ mod tests {
         let frame = parse_one(encode_ping(42));
         assert_eq!(frame.header.op, Op::Ping);
         assert_eq!(frame.header.req_id, 42);
+        assert!(frame.payload.is_empty());
+    }
+
+    #[test]
+    fn encode_native_hello_has_no_payload() {
+        let frame = parse_one(encode_native_hello(42));
+        assert_eq!(frame.header.op, Op::NativeHello);
+        assert_eq!(frame.header.version, VERSION_V2);
         assert!(frame.payload.is_empty());
     }
 

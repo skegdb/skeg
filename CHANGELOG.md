@@ -14,6 +14,15 @@ time, and a cleanup pass over the engine that turned up a data-loss bug.
 
 ### Fixed
 
+- **The native protocol silently created the wrong index type.** Its wire
+  contract documents three kinds (0 f32, 1 int8, 2 binary), but the server
+  passes that byte to the shared six-value table, where 3 is TQ1. Byte 3 was
+  historically PQ, so a native client asking for PQ got a TurboQuant 1-bit
+  index instead: no error, a different index. Native v1 now refuses kind 3 and
+  says where to go, and the TurboQuant tiers are reachable through native v2,
+  which states its kind map explicitly. Nothing about a v1 byte changed
+  meaning.
+
 - **Consolidate dropped vectors staged by an in-flight flush.** `flush_begin`
   moves the delta into a staging map and releases the write lock while the new
   segment builds off-thread; a `SKEG.VINDEX.CONSOLIDATE` arriving in that
@@ -73,6 +82,12 @@ time, and a cleanup pass over the engine that turned up a data-loss bug.
   than `pread` before the fix.
 
 ### Added
+
+- **Native protocol v2**, negotiated rather than assumed. The 24-byte frame
+  header already carried a version byte; the parser now accepts 1 and 2, and
+  every response goes back at the request's version. `NativeHello` reports what
+  the server supports. The default encoder still emits v1, so existing clients
+  are untouched.
 
 - **AVX2 and AVX-512 kernels for x86**, dispatched at runtime, with the
   `avx512` feature off by default. AVX-512 is selected only where the wider
@@ -148,6 +163,12 @@ time, and a cleanup pass over the engine that turned up a data-loss bug.
 
 ### Versions bumped
 
+- `skeg-proto` 0.2.0. A breaking bump for a 0.x crate: `Op`, `ParseError`,
+  `ErrCode` and `NativeVectorKindV2` gained variants, which breaks an
+  exhaustive `match` in another crate. All four are now `#[non_exhaustive]`,
+  so the next op, error code or kind is an additive change instead of another
+  breaking one. It costs nothing here: the server's dispatch already ends in a
+  catch-all, because a wire protocol has to answer an op it does not know.
 - `skeg-simd` 0.1.6, `skeg-platform` 0.1.5, `skeg-core` 0.3.4,
   `skeg-telemetry` 0.2.2, `skeg-vector` 0.1.8, `skeg-server` 0.7.1,
   `skeg-server-tenant` 0.2.4

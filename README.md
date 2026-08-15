@@ -60,6 +60,23 @@ surface. The native protocol runs on 7379 and is the default entrypoint;
 `skeg-resp3` above serves RESP3 on 6379. Full walkthrough, command reference and
 filter grammar: [`docs/getting-started.md`](docs/getting-started.md).
 
+## Which protocol
+
+Use **RESP3** for application integrations. It is the supported public API and
+names the vector tiers directly: `f32`, `int8`, `tq1`, `tq2`, `tq4`, `binary`.
+
+The native transport on 7379 exists for specialised clients. It is versioned,
+and the version decides which tiers it can name:
+
+| | v1 | v2 |
+| --- | --- | --- |
+| kinds | `0=f32` `1=int8` `2=binary` | the same, plus `3=tq1` `4=tq2` `5=tq4` |
+| kind `3` | rejected: historical clients used it for PQ | `tq1` |
+
+A v2 client opens with `NativeHello` (op `0x84`) and reads the tier capability
+mask it gets back. v1 byte meanings are unchanged, so an existing client keeps
+working.
+
 ## Benchmarks
 
 Reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench) (public
