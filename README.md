@@ -86,14 +86,11 @@ to build against; see [Protocols](#protocols) for the other one and why it
 exists. Full walkthrough, command reference and filter grammar:
 [`docs/getting-started.md`](docs/getting-started.md).
 
-## Benchmarks
+## Why skeg
 
-Reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench) (public
-harness, real embeddings, brute-force ground truth). Measured single-machine on
-Apple Silicon; the RAM ratios are hardware-independent.
-
-Single-tenant, 100K x 1024-dim, recall against exact brute force. Every engine
-at a reasonable default, with LanceDB tuned to recall 1.0 for a fair fight:
+Every other engine gives up at least one of RAM, recall, or latency. 100K
+vectors at 1024 dimensions, recall measured against exact brute force, every
+engine at a reasonable default, LanceDB tuned to recall 1.0 for a fair fight:
 
 | engine | serve RAM | recall@10 | p50 latency |
 | --- | ---: | ---: | ---: |
@@ -104,8 +101,10 @@ at a reasonable default, with LanceDB tuned to recall 1.0 for a fair fight:
 | Chroma (HNSW) | 682 MB | 0.985 | 3.9 ms |
 | Qdrant (HNSW, f32) | 885 MB | 0.997 | 2.6 ms |
 
-Co-resident with a model: a 3B LLM answering RAG over 1M vectors, both on one M1
-Pro (16 GiB). The index stays on SSD and the resident set stays flat.
+Nineteen times less memory than Qdrant, at higher recall, and it holds when a
+model is sitting on the same machine: a 3B LLM answering RAG over 1M vectors,
+both on one M1 Pro (16 GiB). The index stays on SSD and the resident set stays
+flat where an HNSW graph cannot.
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
@@ -118,14 +117,19 @@ Pro (16 GiB). The index stays on SSD and the resident set stays flat.
 </p>
 <!-- markdownlint-enable MD033 MD041 -->
 
-The full matrix, plus the multi-tenant and container-OOM runs, is on the
+Every number here is reproducible from [`skeg-bench`](https://github.com/skegdb/skeg-bench):
+public harness, real embeddings, brute-force ground truth. Measured
+single-machine on Apple Silicon; the RAM ratios are hardware-independent. The
+full matrix, plus the multi-tenant and container-OOM runs, is on the
 [dashboard](https://skegdb.github.io/bench/).
 
-### What it does not win
+## Why not skeg
 
-skeg is not the lowest-latency single-query engine: Qdrant is comparable on p99
-and raw hnswlib is faster. One process saturates near 780 QPS at 1024-dim, past
-which you scale out with processes. Cold bulk-loads rebuild the index.
+If you need the lowest possible latency on a single query, this is not it:
+Qdrant is comparable on p99 and raw hnswlib is faster. One process saturates
+near 780 QPS at 1024 dimensions, past which you scale out with processes. Cold
+bulk-loads rebuild the index. And if RAM is not what constrains you, most of
+what skeg trades away buys you nothing.
 
 ## Multi-tenancy
 
