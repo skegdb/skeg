@@ -1,9 +1,6 @@
 <!-- markdownlint-disable MD033 MD041 -->
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/skeg-logo-dark.webp">
-    <img src="assets/skeg-logo.webp" alt="skeg" width="420">
-  </picture>
+  <img src="assets/skeg-logo.webp" alt="skeg" width="480">
 </p>
 
 <p align="center">
