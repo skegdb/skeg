@@ -128,7 +128,10 @@ jobs:
       - name: export digest
         run: |
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          # Bare hex: upload-artifact rejects a path containing the `:` of
+          # `sha256:`, and `merge` puts the prefix back when it builds the ref.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v5
         with:
           name: digest-${{ strategy.job-index }}
