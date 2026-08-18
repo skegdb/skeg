@@ -7,7 +7,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
-## [0.7.1] - 2026-08-10
+## [0.7.1] - 2026-08-15
 
 x86 support for the SIMD kernels, validated on real hardware for the first
 time, and a cleanup pass over the engine that turned up a data-loss bug.
@@ -107,13 +107,15 @@ time, and a cleanup pass over the engine that turned up a data-loss bug.
   `write_vectored_at_sync`, `advise_huge` and `open_populated`. The vLog
   preallocates and fsyncs segments through it.
 
-- **An x86_64 release, in two builds.** The tarball matrix gains
-  `x86_64-unknown-linux-gnu` and an `-avx512` variant of it, and the container
-  image now publishes `linux/amd64` alongside `linux/arm64` with a
-  `:<version>-avx512` tag. Both x86 builds run on any x86_64 CPU: kernel
-  selection is a runtime feature check, so the suffix says what is compiled in,
-  not what the machine must have. AVX-512 is a separate artifact because
-  building it needs Rust 1.89, one release above the MSRV.
+- **An x86_64 release.** The tarball matrix gains
+  `x86_64-unknown-linux-gnu`, and the container image now publishes
+  `linux/amd64` alongside `linux/arm64` under one manifest, so `docker pull`
+  resolves the architecture by itself. Both carry the AVX-512 kernels: kernel
+  selection is a runtime CPU check, so a machine without AVX-512 simply never
+  picks them. The x86 CI job runs that build on an AVX2-only runner, which is
+  what turns "carries the kernels" into something other than a claim. The Cargo
+  feature stays opt-in, because compiling those kernels needs Rust 1.89 and the
+  MSRV promised to people building from source is 1.88.
 
 - **A kernel coverage test**: which kernel exists for which instruction set and
   which one the dispatcher picks. A gap has to carry a reason, and a kernel
