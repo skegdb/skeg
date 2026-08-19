@@ -44,9 +44,26 @@ jobs:
           key: ${{ matrix.target }}
       - name: install linux aarch64 cross-linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # apt mirrors stall rather than fail: a bare `apt-get update` has
+          # hung this job for an hour with no timeout to stop it. Bound each
+          # call and retry, so a bad mirror costs minutes and a clear error
+          # instead of a workflow that never ends.
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout 180 sudo apt-get update \
+               && timeout 300 sudo apt-get install -y gcc-aarch64-linux-gnu; then
+              installed=1
+              break
+            fi
+            echo "apt attempt $attempt failed or timed out, retrying"
+            sleep 15
+          done
+          if [ "${installed:-0}" != "1" ]; then
+            echo "::error::could not install the aarch64 cross-linker after 3 attempts"
+            exit 1
+          fi
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
       - name: cargo build
         run: |
