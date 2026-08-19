@@ -79,7 +79,7 @@
 {"id": "vset.bad.id", "cmd": ["SKEG.VSET", "cfidxi8", "abc", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "id"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
 {"id": "vmset.bulk", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]", "p10", "11", "f32:[0,1,0,0,0,0,0,0]", "p11", "12", "f32:[0,0,1,0,0,0,0,0]", ""], "want": {"integer": 3}}
 {"id": "vmset.arity", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "want name (id vector payload)+"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
-{"id": "vsearch.flat.pairs", "cmd": ["SKEG.VSEARCH", "cfidxi8", "2", "32", "f32:[1,0,0,0,0,0,0,0]"], "want": {"array_len": 4, "items": [{"bulk": "1"}, {"double": true}, {"bulk": "2"}, {"double": true}]}}
+{"id": "vsearch.flat.pairs", "cmd": ["SKEG.VSEARCH", "cfidxi8", "2", "32", "f32:[1,0.5,0,0,0,0,0,0]"], "want": {"array_len": 4, "items": [{"bulk": "1"}, {"double": true}, {"bulk": "2"}, {"double": true}]}, "note": "query separates every candidate: ties have no defined order"}
 {"id": "vsearch.withpayload.triples", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[0,0,1,0,0,0,0,0]", "WITHPAYLOAD"], "want": {"array_len": 3, "items": [{"bulk": "3"}, {"double": true}, {"bulk": "hello"}]}}
 {"id": "vsearch.withpayload.null.when.absent", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[1,0,0,0,0,0,0,0]", "WITHPAYLOAD"], "want": {"array_len": 3, "items": [{"bulk": "1"}, {"double": true}, {"null": true}]}}
 {"id": "vsearch.bad.filter", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[1,0,0,0,0,0,0,0]", "FILTER", "this is not a filter"], "want": {"error_contains": "bad FILTER"}}
