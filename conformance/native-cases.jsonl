@@ -1,0 +1,49 @@
+{"id": "ping.v1", "op": "ping", "version": 1, "args": {}, "want": {"op": "ok", "version": 1}}
+{"id": "ping.v2", "op": "ping", "version": 2, "args": {}, "want": {"op": "ok", "version": 2}}
+{"id": "ping.req_id.echo", "op": "ping", "version": 2, "args": {}, "req_id": 123456789, "want": {"op": "ok", "req_id": 123456789}}
+{"id": "hello.v1.refused", "op": "native_hello", "version": 1, "args": {}, "want": {"error_contains": "native hello requires protocol version 2"}}
+{"id": "hello.v2.capabilities", "op": "native_hello", "version": 2, "args": {}, "want": {"capabilities": {"protocol_version": 2, "vector_kind_mask": 63}}}
+{"id": "hello.v2.error.keeps.version", "op": "native_hello", "version": 1, "args": {}, "want": {"error_contains": "native hello requires protocol version 2", "version": 1}}
+{"id": "hello.v2.payload.must.be.empty", "op": "native_hello", "version": 2, "args": {}, "raw_payload": "b64:AA==", "want": {"error_contains": "native hello payload must be empty"}}
+{"id": "kv.set", "op": "set", "version": 1, "args": {"key": "cf:k1", "value": "hello"}, "want": {"op": "ok"}}
+{"id": "kv.get", "op": "get", "version": 1, "args": {"key": "cf:k1"}, "want": {"value": "hello"}}
+{"id": "kv.get.missing", "op": "get", "version": 1, "args": {"key": "cf:nope"}, "want": {"error_code": 1}}
+{"id": "kv.set.binary", "op": "set", "version": 2, "args": {"key": "cf:bin", "value": "b64:AAECA/8="}, "want": {"op": "ok"}}
+{"id": "kv.get.binary", "op": "get", "version": 2, "args": {"key": "cf:bin"}, "want": {"value": "b64:AAECA/8="}}
+{"id": "kv.get.v2.keeps.version", "op": "get", "version": 2, "args": {"key": "cf:k1"}, "want": {"version": 2}}
+{"id": "kv.del", "op": "del", "version": 1, "args": {"key": "cf:k1"}, "want": {"bool": true}}
+{"id": "kv.del.missing", "op": "del", "version": 1, "args": {"key": "cf:k1"}, "want": {"bool": false}}
+{"id": "kv.mget.setup.a", "op": "set", "version": 1, "args": {"key": "cf:a", "value": "1"}, "want": {"op": "ok"}}
+{"id": "kv.mget.setup.c", "op": "set", "version": 1, "args": {"key": "cf:c", "value": "3"}, "want": {"op": "ok"}}
+{"id": "kv.mget.order.with.hole", "op": "mget", "version": 1, "args": {"keys": ["cf:a", "cf:missing", "cf:c"]}, "want": {"mget": ["1", null, "3"]}}
+{"id": "kv.exists.not.implemented", "op": "exists", "version": 1, "args": {"key": "cf:a"}, "want": {"error_contains": "op Exists not implemented"}, "note": "Op::Exists is defined in skeg-proto but the server has no arm for it; skeg-py declares OP_EXISTS in _wire.py without ever using it", "wire_only": "the SDK exposes no method for an op the server does not implement; validate_native.py covers it"}
+{"id": "stats", "op": "stats", "version": 1, "args": {}, "want": {"op": "ok"}}
+{"id": "stats.v2.keeps.version", "op": "stats", "version": 2, "args": {}, "want": {"version": 2}}
+{"id": "shards", "op": "shards", "version": 1, "args": {}, "want": {"op": "ok"}}
+{"id": "vindex.create.v1.f32", "op": "vindex_create", "version": 1, "args": {"name": "cfnf32", "dim": 8, "kind": 0, "backend": 0}, "want": {"op": "ok"}}
+{"id": "vindex.create.v1.int8", "op": "vindex_create", "version": 1, "args": {"name": "cfni8", "dim": 8, "kind": 1, "backend": 0}, "want": {"op": "ok"}}
+{"id": "vindex.create.v1.binary", "op": "vindex_create", "version": 1, "args": {"name": "cfnbin", "dim": 8, "kind": 2, "backend": 0}, "want": {"op": "ok"}}
+{"id": "vindex.create.v1.rejects.pq.code", "op": "vindex_create", "version": 1, "args": {"name": "cfnpq", "dim": 8, "kind": 3, "backend": 0}, "want": {"error_contains": "native v1 kind 3 is PQ"}}
+{"id": "vindex.create.v1.rejects.tq2.code", "op": "vindex_create", "version": 1, "args": {"name": "cfnbad", "dim": 8, "kind": 4, "backend": 0}, "want": {"error_contains": "native v1 supports only f32, int8, and binary"}}
+{"id": "vindex.create.v2.tq1", "op": "vindex_create", "version": 2, "args": {"name": "cfntq1", "dim": 8, "kind": 3, "backend": 1}, "want": {"op": "ok"}}
+{"id": "vindex.create.v2.tq2", "op": "vindex_create", "version": 2, "args": {"name": "cfntq2", "dim": 8, "kind": 4, "backend": 1}, "want": {"op": "ok"}}
+{"id": "vindex.create.v2.tq4", "op": "vindex_create", "version": 2, "args": {"name": "cfntq4", "dim": 8, "kind": 5, "backend": 1}, "want": {"op": "ok"}}
+{"id": "vindex.create.v2.rejects.unknown.kind", "op": "vindex_create", "version": 2, "args": {"name": "cfnbad", "dim": 8, "kind": 6, "backend": 0}, "want": {"error_contains": "native v2 kind must be"}}
+{"id": "vindex.list.v1.refuses.turboquant", "op": "vindex_list", "version": 1, "args": {}, "want": {"error_contains": "native v1 cannot represent TurboQuant indexes"}}
+{"id": "vindex.list.v2.reports.rows", "op": "vindex_list", "version": 2, "args": {}, "want": {"rows_contain": ["cfntq4", "cfni8"]}}
+{"id": "vset.v1", "op": "vset", "version": 1, "args": {"name": "cfni8", "id": 1, "vector": [1, 0, 0, 0, 0, 0, 0, 0]}, "want": {"op": "ok"}}
+{"id": "vset.v1.second", "op": "vset", "version": 1, "args": {"name": "cfni8", "id": 2, "vector": [0, 1, 0, 0, 0, 0, 0, 0]}, "want": {"op": "ok"}}
+{"id": "vset.v2.on.tq.index", "op": "vset", "version": 2, "args": {"name": "cfntq2", "id": 1, "vector": [1, 0, 0, 0, 0, 0, 0, 0]}, "want": {"op": "ok"}}
+{"id": "vset.dim.mismatch", "op": "vset", "version": 1, "args": {"name": "cfni8", "id": 3, "vector": [1, 0, 0]}, "want": {"error_contains": "dim"}}
+{"id": "vget", "op": "vget", "version": 1, "args": {"name": "cfni8", "id": 1}, "want": {"op": "ok"}}
+{"id": "vget.missing", "op": "vget", "version": 1, "args": {"name": "cfni8", "id": 999}, "want": {"error_code": 1}}
+{"id": "vsearch.top1", "op": "vsearch", "version": 1, "args": {"name": "cfni8", "k": 2, "query": [1, 0, 0, 0, 0, 0, 0, 0]}, "want": {"hits_top_id": 1, "hits_len": 2}}
+{"id": "vsearch.v2", "op": "vsearch", "version": 2, "args": {"name": "cfni8", "k": 1, "query": [0, 1, 0, 0, 0, 0, 0, 0]}, "want": {"hits_top_id": 2, "version": 2}}
+{"id": "vsearch.unknown.index", "op": "vsearch", "version": 1, "args": {"name": "cfnabsent", "k": 1, "query": [1, 0, 0, 0, 0, 0, 0, 0]}, "want": {"error_contains": "vindex 'cfnabsent' not found"}}
+{"id": "vdel", "op": "vdel", "version": 1, "args": {"name": "cfni8", "id": 2}, "want": {"op": "ok"}}
+{"id": "vindex.drop", "op": "vindex_drop", "version": 1, "args": {"name": "cfnf32"}, "want": {"op": "ok"}}
+{"id": "vindex.drop.absent", "op": "vindex_drop", "version": 1, "args": {"name": "cfnabsent"}, "want": {"error_contains": "vindex 'cfnabsent' not found"}}
+{"id": "frame.unsupported.version", "op": "ping", "version": 3, "args": {}, "want": {"closed_or_error": true}, "wire_only": "the SDK exposes no method for an op the server does not implement; validate_native.py covers it"}
+{"id": "kv.mset.not.implemented", "op": "mset", "version": 1, "args": {"key": "cf:a", "value": "1"}, "want": {"error_contains": "op Mset not implemented"}, "note": "Op::Mset is defined in skeg-proto but unimplemented server-side", "wire_only": "the SDK exposes no method for an op the server does not implement; validate_native.py covers it"}
+{"id": "kv.mexists.not.implemented", "op": "mexists", "version": 1, "args": {"keys": ["cf:a"]}, "want": {"error_contains": "op Mexists not implemented"}, "note": "Op::Mexists is defined in skeg-proto but unimplemented server-side", "wire_only": "the SDK exposes no method for an op the server does not implement; validate_native.py covers it"}
+{"id": "kv.flush.not.implemented", "op": "flush", "version": 1, "args": {}, "want": {"error_contains": "op Flush not implemented"}, "note": "Op::Flush is defined in skeg-proto but unimplemented server-side", "wire_only": "the SDK exposes no method for an op the server does not implement; validate_native.py covers it"}
