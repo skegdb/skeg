@@ -100,8 +100,9 @@ pub enum Command {
     // ── SKEG.* vector namespace ─────────────────────────────────────
     /// `SKEG.VINDEX.LIST` - enumerate vindexes for the calling tenant.
     SkegVindexList,
-    /// `SKEG.VINDEX.CREATE name dim kind backend`. The parser checks
-    /// arity (4 args) and forwards the raw bytes; inner argument
+    /// `SKEG.VINDEX.CREATE name dim [kind] backend`. The parser checks
+    /// arity (3 or 4 args; 3 omits `kind` and takes the server default)
+    /// and forwards the raw bytes; inner argument
     /// parsing (UTF-8 name, u32 dim, kind/backend label) stays in the
     /// dispatcher because the error strings embed per-argument labels
     /// the existing clients rely on.
@@ -326,10 +327,13 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
             Ok(Command::SkegVindexList)
         }
         "VINDEX.CREATE" => {
-            if args.len() != 4 {
+            // 3 args omits `kind` and takes the server's default tier; 4 sets it
+            // explicitly. Arity (not token shape) disambiguates, because kind and
+            // backend share the numeric aliases 0 and 1.
+            if args.len() != 3 && args.len() != 4 {
                 return Err(CommandError::WrongAritySkeg {
                     command: "SKEG.VINDEX.CREATE",
-                    want: "name dim kind backend",
+                    want: "name dim [kind] backend",
                 });
             }
             Ok(Command::SkegVindexCreate { args })
@@ -1338,11 +1342,24 @@ mod tests {
     }
 
     #[test]
+    fn skeg_vindex_create_three_args_omits_kind() {
+        // `name dim backend`: the dispatcher implements this form with a tq2
+        // default, and `skeg-resp3 --help` documents it. The parser must let it
+        // through, or the default is unreachable from the wire.
+        let cmd = parse_command(arr(&[b"SKEG.VINDEX.CREATE", b"x", b"1024", b"flat"])).unwrap();
+        let Command::SkegVindexCreate { args } = cmd else {
+            panic!("expected SkegVindexCreate");
+        };
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[2], Bytes::from_static(b"flat"));
+    }
+
+    #[test]
     fn skeg_vindex_create_wrong_arity_error_string() {
         let err = parse_command(arr(&[b"SKEG.VINDEX.CREATE", b"x"])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim kind backend"
+            "wrong number of arguments for 'SKEG.VINDEX.CREATE'; want name dim [kind] backend"
         );
     }
 
