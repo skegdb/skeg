@@ -144,7 +144,21 @@ jobs:
       - name: build
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+            # Same bounded retry as build-artifacts.yml: an apt mirror that
+            # stalls must not hang a release.
+            for attempt in 1 2 3; do
+              if timeout 180 sudo apt-get update \
+                 && timeout 300 sudo apt-get install -y gcc-aarch64-linux-gnu; then
+                installed=1
+                break
+              fi
+              echo "apt attempt $attempt failed or timed out, retrying"
+              sleep 15
+            done
+            if [ "${installed:-0}" != "1" ]; then
+              echo "::error::could not install the aarch64 cross-linker"
+              exit 1
+            fi
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo build --release --target ${{ matrix.target }} \
