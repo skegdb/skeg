@@ -7,6 +7,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.7.2] - 2026-08-19
+
+### Fixed
+
+- **`SKEG.VINDEX.CREATE` rejected its own documented default.** The three-arg
+  form `name dim backend`, which takes the server's default tier, is
+  implemented in the dispatcher and documented in `skeg-resp3 --help`, but the
+  command parser refused arity 3 before the dispatcher ran. The default was
+  unreachable from the wire and the code implementing it was dead. Arity
+  disambiguates the two forms: kind and backend share the numeric aliases 0
+  and 1, so a three-arg call is always `[name, dim, backend]`.
+
+### Added
+
+- `conformance/`: the case files every skeg client is checked against (106
+  RESP3, 49 native) and two standalone validators that speak the wire
+  directly. They were in a private repo, where no public client's CI could
+  read them.
+
 ## [0.7.1] - 2026-08-15
 
 x86 support for the SIMD kernels, validated on real hardware for the first
