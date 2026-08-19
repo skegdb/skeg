@@ -1,0 +1,118 @@
+{"id": "hello.resp2.default", "cmd": ["PING"], "want": {"simple": "PONG"}}
+{"id": "hello.v3", "cmd": ["HELLO", "3"], "want": {"map_has": ["server", "version", "proto", "id", "mode", "role", "modules"]}}
+{"id": "hello.v3.proto", "cmd": ["HELLO", "3"], "want": {"map_field": {"proto": 3}}}
+{"id": "hello.v2", "cmd": ["HELLO", "2"], "want": {"array_len": 14}}
+{"id": "hello.setname", "cmd": ["HELLO", "3", "SETNAME", "cfconn"], "want": {"map_field": {"proto": 3}}}
+{"id": "hello.bad.protover", "cmd": ["HELLO", "5"], "want": {"error_contains": "invalid protover, expected 2 or 3"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "ping.msg", "cmd": ["PING", "cf-hi"], "want": {"bulk": "cf-hi"}}
+{"id": "echo.text", "cmd": ["ECHO", "cf-echo"], "want": {"bulk": "cf-echo"}}
+{"id": "echo.binary", "cmd": ["ECHO", "b64:AAH/"], "want": {"bulk": "b64:AAH/"}}
+{"id": "echo.arity", "cmd": ["ECHO"], "want": {"error_contains": "ECHO requires exactly 1 argument"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.set", "cmd": ["SET", "cf:k1", "hello"], "want": {"simple": "OK"}}
+{"id": "kv.get", "cmd": ["GET", "cf:k1"], "want": {"bulk": "hello"}}
+{"id": "kv.get.missing", "cmd": ["GET", "cf:nope"], "want": {"null": true}}
+{"id": "kv.set.binary", "cmd": ["SET", "cf:bin", "b64:AAECA/8="], "want": {"simple": "OK"}}
+{"id": "kv.get.binary", "cmd": ["GET", "cf:bin"], "want": {"bulk": "b64:AAECA/8="}}
+{"id": "kv.append.creates", "cmd": ["APPEND", "cf:app", "ab"], "want": {"integer": 2}}
+{"id": "kv.append.accumulates", "cmd": ["APPEND", "cf:app", "cde"], "want": {"integer": 5}}
+{"id": "kv.append.value", "cmd": ["GET", "cf:app"], "want": {"bulk": "abcde"}}
+{"id": "kv.append.arity", "cmd": ["APPEND", "cf:app"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.mset", "cmd": ["MSET", "cf:a", "1", "cf:b", "2", "cf:c", "3"], "want": {"simple": "OK"}}
+{"id": "kv.mget.order.with.hole", "cmd": ["MGET", "cf:a", "cf:b", "cf:missing", "cf:c"], "want": {"array_len": 4, "items": [{"bulk": "1"}, {"bulk": "2"}, {"null": true}, {"bulk": "3"}]}}
+{"id": "kv.mset.odd.arity", "cmd": ["MSET", "cf:x", "1", "cf:y"], "want": {"error_contains": "wrong number of arguments for 'MSET'"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.exists.counts.present.only", "cmd": ["EXISTS", "cf:k1", "cf:a", "cf:missing"], "want": {"integer": 2}}
+{"id": "kv.del.counts.removed.only", "cmd": ["DEL", "cf:k1", "cf:a", "cf:missing"], "want": {"integer": 2}}
+{"id": "kv.del.gone", "cmd": ["GET", "cf:k1"], "want": {"null": true}}
+{"id": "kv.get.arity", "cmd": ["GET"], "want": {"error_contains": "wrong number of arguments for 'GET'"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.set.arity", "cmd": ["SET", "cf:k"], "want": {"error_contains": "wrong number of arguments for 'SET'"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.del.arity", "cmd": ["DEL"], "want": {"error_contains": "wrong number of arguments for 'DEL'"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.exists.arity", "cmd": ["EXISTS"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.mget.arity", "cmd": ["MGET"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "ctr.incr.from.missing", "cmd": ["INCR", "cf:ctr"], "want": {"integer": 1}}
+{"id": "ctr.incr.stores.text", "cmd": ["GET", "cf:ctr"], "want": {"bulk": "1"}}
+{"id": "ctr.set.ten", "cmd": ["SET", "cf:ctr", "10"], "want": {"simple": "OK"}}
+{"id": "ctr.incr", "cmd": ["INCR", "cf:ctr"], "want": {"integer": 11}}
+{"id": "ctr.incrby", "cmd": ["INCRBY", "cf:ctr", "5"], "want": {"integer": 16}}
+{"id": "ctr.decr", "cmd": ["DECR", "cf:ctr"], "want": {"integer": 15}}
+{"id": "ctr.decrby", "cmd": ["DECRBY", "cf:ctr", "3"], "want": {"integer": 12}}
+{"id": "ctr.incrby.negative.delta", "cmd": ["INCRBY", "cf:ctr", "-2"], "want": {"integer": 10}}
+{"id": "ctr.incrby.not.an.integer", "cmd": ["INCRBY", "cf:ctr", "abc"], "want": {"error_contains": "value is not an integer or out of range"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "ctr.incr.on.text.value", "cmd": ["SET", "cf:txt", "abc"], "want": {"simple": "OK"}}
+{"id": "ctr.incr.rejects.text", "cmd": ["INCR", "cf:txt"], "want": {"error_contains": "not an integer"}}
+{"id": "ctr.overflow.setup", "cmd": ["SET", "cf:big", "9223372036854775807"], "want": {"simple": "OK"}}
+{"id": "ctr.overflow", "cmd": ["INCR", "cf:big"], "want": {"error_contains": "overflow"}}
+{"id": "ctr.incrby.arity", "cmd": ["INCRBY", "cf:ctr"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "select.db.zero", "cmd": ["SELECT", "0"], "want": {"simple": "OK"}}
+{"id": "select.db.nonzero", "cmd": ["SELECT", "1"], "want": {"error_contains": "DB index out of range"}}
+{"id": "select.db.invalid", "cmd": ["SELECT", "abc"], "want": {"error_contains": "index"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "admin.stats", "cmd": ["SKEG.STATS"], "want": {"bulk_contains": ["cache_bytes=", "evictions=", "n_keys=", "budget="]}}
+{"id": "admin.whoami.anonymous", "profile": "anon", "cmd": ["SKEG.WHOAMI"], "want": {"bulk_contains": ["tenant=00000000000000000000000000000000", "mode=single-tenant"]}}
+{"id": "admin.shards", "cmd": ["SKEG.SHARDS"], "want": {"any": true}}
+{"id": "admin.auth.reserved", "cmd": ["SKEG.AUTH", "u", "p"], "want": {"error_contains": "SKEG.AUTH is reserved"}}
+{"id": "admin.unknown.verb", "cmd": ["SKEG.WHATEVER"], "want": {"error_contains": "unknown command 'SKEG.WHATEVER'"}, "wire_only": "an SDK has no method for an unknown command; validate.py covers it"}
+{"id": "admin.unknown.command", "cmd": ["NOSUCHCOMMAND"], "want": {"error_contains": "unknown command"}, "wire_only": "an SDK has no method for an unknown command; validate.py covers it"}
+{"id": "vindex.create.f32.flat", "cmd": ["SKEG.VINDEX.CREATE", "cfidxf32", "8", "f32", "flat"], "want": {"simple": "OK"}}
+{"id": "vindex.create.int8.flat", "cmd": ["SKEG.VINDEX.CREATE", "cfidxi8", "8", "int8", "flat"], "want": {"simple": "OK"}}
+{"id": "vindex.create.binary.flat", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbin", "8", "binary", "flat"], "want": {"simple": "OK"}}
+{"id": "vindex.create.tq1.disk", "cmd": ["SKEG.VINDEX.CREATE", "cfidxtq1", "8", "tq1", "disk"], "want": {"simple": "OK"}}
+{"id": "vindex.create.tq2.disk", "cmd": ["SKEG.VINDEX.CREATE", "cfidxtq2", "8", "tq2", "disk"], "want": {"simple": "OK"}}
+{"id": "vindex.create.tq4.disk", "cmd": ["SKEG.VINDEX.CREATE", "cfidxtq4", "8", "tq4", "disk"], "want": {"simple": "OK"}}
+{"id": "vindex.create.kind.defaults.to.tq2", "cmd": ["SKEG.VINDEX.CREATE", "cfidxdef", "8", "flat"], "want": {"simple": "OK"}}
+{"id": "vindex.list.confirms.the.default.tier", "cmd": ["SKEG.VINDEX.LIST"], "want": {"bulk_contains": ["name=cfidxdef dim=8 kind=tq2"]}, "note": "proves the 3-arg form actually lands on tq2, not just that it parses"}
+{"id": "vindex.list.reports.default.tier", "cmd": ["SKEG.VINDEX.LIST"], "want": {"bulk_contains": ["name=cfidxtq2", "kind=tq2"]}}
+{"id": "vindex.list.reports.each.tier", "cmd": ["SKEG.VINDEX.LIST"], "want": {"bulk_contains": ["name=cfidxtq4", "kind=tq4", "dim=8", "backend=", "n_vectors="]}}
+{"id": "vindex.create.numeric.kind.alias", "cmd": ["SKEG.VINDEX.CREATE", "cfidxnum", "8", "1", "flat"], "want": {"simple": "OK"}}
+{"id": "vindex.create.numeric.backend.alias", "cmd": ["SKEG.VINDEX.CREATE", "cfidxnumb", "8", "int8", "0"], "want": {"simple": "OK"}}
+{"id": "vindex.create.unknown.kind", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbad", "8", "pq", "flat"], "want": {"error_contains": "expected f32 | int8 | binary | tq1 | tq2 | tq4"}}
+{"id": "vindex.create.unknown.backend", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbad", "8", "int8", "nvme"], "want": {"error_contains": "expected flat | disk"}}
+{"id": "vindex.create.arity", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbad"], "want": {"error_contains": "want name dim [kind] backend"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vindex.create.bad.dim", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbad", "abc", "int8", "flat"], "want": {"error_contains": "dim"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vindex.name.rejects.tenant.separator", "cmd": ["SKEG.VINDEX.CREATE", "a::b", "8", "int8", "flat"], "want": {"error_contains": "must not contain '::'"}}
+{"id": "vindex.name.rejects.traversal", "cmd": ["SKEG.VINDEX.CREATE", "../escape", "8", "int8", "flat"], "want": {"error_contains": "[A-Za-z0-9._-] only"}}
+{"id": "vindex.name.rejects.empty", "cmd": ["SKEG.VINDEX.CREATE", "", "8", "int8", "flat"], "want": {"error_contains": "1-255 chars"}}
+{"id": "vset.basic", "cmd": ["SKEG.VSET", "cfidxi8", "1", "f32:[1,0,0,0,0,0,0,0]"], "want": {"simple": "OK"}}
+{"id": "vset.second", "cmd": ["SKEG.VSET", "cfidxi8", "2", "f32:[0,1,0,0,0,0,0,0]"], "want": {"simple": "OK"}}
+{"id": "vset.with.payload", "cmd": ["SKEG.VSET", "cfidxi8", "3", "f32:[0,0,1,0,0,0,0,0]", "PAYLOAD", "hello"], "want": {"simple": "OK"}}
+{"id": "vset.payload.keyword.required", "cmd": ["SKEG.VSET", "cfidxi8", "4", "f32:[0,0,0,1,0,0,0,0]", "NOPE", "x"], "want": {"error_contains": "expected PAYLOAD before the blob"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vset.arity", "cmd": ["SKEG.VSET", "cfidxi8", "4"], "want": {"error_contains": "want name id vector [PAYLOAD blob]"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vset.dim.mismatch", "cmd": ["SKEG.VSET", "cfidxi8", "4", "f32:[1,0,0]"], "want": {"error_contains": "ERR"}}
+{"id": "vset.bad.id", "cmd": ["SKEG.VSET", "cfidxi8", "abc", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "id"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vmset.bulk", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]", "p10", "11", "f32:[0,1,0,0,0,0,0,0]", "p11", "12", "f32:[0,0,1,0,0,0,0,0]", ""], "want": {"integer": 3}}
+{"id": "vmset.arity", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "want name (id vector payload)+"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vsearch.flat.pairs", "cmd": ["SKEG.VSEARCH", "cfidxi8", "2", "32", "f32:[1,0,0,0,0,0,0,0]"], "want": {"array_len": 4, "items": [{"bulk": "1"}, {"double": true}, {"bulk": "2"}, {"double": true}]}}
+{"id": "vsearch.withpayload.triples", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[0,0,1,0,0,0,0,0]", "WITHPAYLOAD"], "want": {"array_len": 3, "items": [{"bulk": "3"}, {"double": true}, {"bulk": "hello"}]}}
+{"id": "vsearch.withpayload.null.when.absent", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[1,0,0,0,0,0,0,0]", "WITHPAYLOAD"], "want": {"array_len": 3, "items": [{"bulk": "1"}, {"double": true}, {"null": true}]}}
+{"id": "vsearch.bad.filter", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[1,0,0,0,0,0,0,0]", "FILTER", "this is not a filter"], "want": {"error_contains": "bad FILTER"}}
+{"id": "vsearch.filter.needs.expression", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[1,0,0,0,0,0,0,0]", "FILTER"], "want": {"error_contains": "FILTER needs an expression"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vsearch.unexpected.tail", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[1,0,0,0,0,0,0,0]", "NOPE"], "want": {"error_contains": "want WITHPAYLOAD or FILTER"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vsearch.arity", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1"], "want": {"error_contains": "want name k l_search vector"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vsearch.unknown.index", "cmd": ["SKEG.VSEARCH", "cfidxabsent", "1", "32", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "ERR"}}
+{"id": "vdel.removes", "cmd": ["SKEG.VDEL", "cfidxi8", "2"], "want": {"integer": 1}}
+{"id": "vdel.absent.is.zero", "cmd": ["SKEG.VDEL", "cfidxi8", "999"], "want": {"integer": 0}}
+{"id": "vdel.arity", "cmd": ["SKEG.VDEL", "cfidxi8"], "want": {"error_contains": "want name id"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "vindex.consolidate.disk", "cmd": ["SKEG.VINDEX.CONSOLIDATE", "cfidxtq2"], "want": {"simple": "OK"}}
+{"id": "vindex.consolidate.flat.is.noop", "cmd": ["SKEG.VINDEX.CONSOLIDATE", "cfidxi8"], "want": {"simple": "OK"}}
+{"id": "vindex.consolidate.arity", "cmd": ["SKEG.VINDEX.CONSOLIDATE"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "subject.erase.needs.tenant", "profile": "anon", "cmd": ["SKEG.SUBJECT.ERASE", "cf:"], "want": {"error_contains": "requires an authenticated tenant"}}
+{"id": "tenant.erase.needs.backend", "profile": "anon", "cmd": ["SKEG.TENANT.ERASE", "someone"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "tenant.delete.needs.backend", "profile": "anon", "cmd": ["SKEG.TENANT.DELETE", "someone"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "reclaim.needs.backend", "profile": "anon", "cmd": ["SKEG.RECLAIM"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "quota.get.needs.backend", "profile": "anon", "cmd": ["SKEG.QUOTA.GET", "someone"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "quota.set.needs.backend", "profile": "anon", "cmd": ["SKEG.QUOTA.SET", "someone", "100", "1000"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "qos.get.needs.backend", "profile": "anon", "cmd": ["SKEG.QOS.GET", "someone"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "qos.set.needs.backend", "profile": "anon", "cmd": ["SKEG.QOS.SET", "someone", "10", "20", "2"], "want": {"error_contains": "multi-tenant backend not configured"}}
+{"id": "subject.erase.scoped", "profile": "tenant", "cmd": ["SKEG.SUBJECT.ERASE", "cf:"], "want": {"integer_min": 0}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "tenant.erase.not.admin", "profile": "tenant", "cmd": ["SKEG.TENANT.ERASE", "other"], "want": {"error_contains": "admin privileges required"}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "quota.get.admin", "profile": "admin", "cmd": ["SKEG.QUOTA.GET", "cftenant"], "want": {"array_len": 2}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "quota.set.admin", "profile": "admin", "cmd": ["SKEG.QUOTA.SET", "cftenant", "1000", "*"], "want": {"simple": "OK"}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "quota.get.after.set", "profile": "admin", "cmd": ["SKEG.QUOTA.GET", "cftenant"], "want": {"array_len": 2, "items": [{"bulk": "1000"}, {"bulk": "*"}]}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "quota.set.bad.limit", "profile": "admin", "cmd": ["SKEG.QUOTA.SET", "cftenant", "abc", "*"], "want": {"error_contains": "non-negative integer or '*'"}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "qos.get.admin", "profile": "admin", "cmd": ["SKEG.QOS.GET", "cftenant"], "want": {"array_len": 3}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "qos.set.admin", "profile": "admin", "cmd": ["SKEG.QOS.SET", "cftenant", "10", "20", "*"], "want": {"simple": "OK"}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "qos.get.after.set", "profile": "admin", "cmd": ["SKEG.QOS.GET", "cftenant"], "want": {"array_len": 3, "items": [{"bulk": "10"}, {"bulk": "20"}, {"bulk": "*"}]}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "qos.set.bad.limit", "profile": "admin", "cmd": ["SKEG.QOS.SET", "cftenant", "10", "20", "abc"], "want": {"error_contains": "qos limit must be"}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "tenant.unknown", "profile": "admin", "cmd": ["SKEG.QUOTA.GET", "cf-no-such-tenant"], "want": {"error_contains": "unknown tenant"}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "reclaim.admin", "profile": "admin", "cmd": ["SKEG.RECLAIM"], "want": {"integer_min": 0}, "unvalidated": "no CLI creates an auth.kdb; written from the source, never run"}
+{"id": "cleanup.drop.f32", "cmd": ["SKEG.VINDEX.DROP", "cfidxf32"], "want": {"simple": "OK"}}
+{"id": "cleanup.drop.absent", "cmd": ["SKEG.VINDEX.DROP", "cfidxabsent"], "want": {"error_contains": "ERR"}}
+{"id": "cleanup.drop.arity", "cmd": ["SKEG.VINDEX.DROP"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
