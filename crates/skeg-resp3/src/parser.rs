@@ -23,7 +23,7 @@ pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 pub const MAX_NESTING_DEPTH: usize = 128;
 /// Cap on the *speculative* pre-allocation for an aggregate. The declared count
 /// is checked against `MAX_AGGREGATE_LEN` but that still permits ~1M-element
-/// reservations, and one per nesting level held live at once — GiBs of heap
+/// reservations, and one per nesting level held live at once - GiBs of heap
 /// from a few bytes of headers. Reserve at most this, then grow as real
 /// elements arrive (bounded anyway by the bytes actually sent).
 const PREALLOC_CAP: usize = 1024;

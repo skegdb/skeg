@@ -76,7 +76,7 @@ pub fn scan_file(pf: &PlatformFile, mut f: impl FnMut(u64, Record)) -> io::Resul
         // `ksz`/`vsz` are two raw u32s straight off disk, read *before* the CRC
         // that would reject them. A bit-flip (or a crafted file) can drive
         // `padded` toward 8 GiB, so the allocation below OOM-aborts the whole
-        // process at startup. A record can never exceed the segment ceiling —
+        // process at startup. A record can never exceed the segment ceiling -
         // treat an implausible length as the corrupt-tail recovery boundary.
         if padded as u64 > MAX_SEGMENT_SIZE {
             break;

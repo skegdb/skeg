@@ -2128,7 +2128,11 @@ impl DiskVamanaIndex {
         let node_len = std::mem::size_of::<Node>();
         let need = (n as usize)
             .checked_mul(8)
-            .and_then(|ids| (n as usize).checked_mul(node_len).and_then(|nd| ids.checked_add(nd)))
+            .and_then(|ids| {
+                (n as usize)
+                    .checked_mul(node_len)
+                    .and_then(|nd| ids.checked_add(nd))
+            })
             .and_then(|body| body.checked_add(HEADER_LEN))
             .ok_or_else(bad)?;
         if graph_bytes.len() < need {

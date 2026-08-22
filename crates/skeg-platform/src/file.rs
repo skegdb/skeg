@@ -736,8 +736,8 @@ fn sync_durable_sync_inner(file: &File, size_fixed: bool) -> io::Result<()> {
 
 /// fsync a directory so a newly created or renamed entry within it survives
 /// power loss. Syncing a *file* does not persist its directory entry on ext4
-/// (data=ordered) or APFS, so a segment created during rotation — or a
-/// snapshot just renamed into place — can vanish on reboot even after the file
+/// (data=ordered) or APFS, so a segment created during rotation - or a
+/// snapshot just renamed into place - can vanish on reboot even after the file
 /// itself was fsynced, silently dropping a write acked as `Durability::Power`.
 /// Call this once after creating/renaming, before the write is acked durable.
 ///

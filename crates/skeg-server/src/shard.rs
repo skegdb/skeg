@@ -502,7 +502,7 @@ pub fn shard_for(key: &[u8], n_shards: usize) -> usize {
 /// Reject a vindex name that would escape the data dir. The name flows into
 /// `dir.join(format!("vindex-{name}"))` for create / `File::create` /
 /// `remove_dir_all`. The RESP3 layer already applies a strict charset, but the
-/// native binary protocol does not — this is the choke point both protocols
+/// native binary protocol does not - this is the choke point both protocols
 /// cross, so it must hold on its own. Permits `:` for the `{tenant}::{name}`
 /// scope prefix the RESP3 layer prepends; rejects anything that could traverse.
 fn validate_vindex_name(name: &str) -> Result<(), ShardError> {

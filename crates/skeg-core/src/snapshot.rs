@@ -99,7 +99,7 @@ pub fn decode(buf: &[u8]) -> Option<Snapshot> {
 
     let end = buf.len() - 4;
     // `n` is an untrusted u32 (~4.29e9 → ~171 GiB reservation). crc32c is
-    // unkeyed, so it does not gate a crafted file — clamp the pre-allocation to
+    // unkeyed, so it does not gate a crafted file - clamp the pre-allocation to
     // what the body could physically hold: each entry is at least 18 bytes
     // (klen u32 + the 14-byte fixed tail, with a zero-length key).
     const MIN_ENTRY_BYTES: usize = 18;

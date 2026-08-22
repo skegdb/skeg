@@ -1714,7 +1714,10 @@ mod tests {
         }
         assert!(auth_is_blocked(ip), "IP must be blocked after MAX failures");
         auth_clear(ip);
-        assert!(!auth_is_blocked(ip), "successful login must clear the block");
+        assert!(
+            !auth_is_blocked(ip),
+            "successful login must clear the block"
+        );
     }
 
     /// Path-traversal / cross-tenant guard: the index name flows into a
