@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "ahash",
  "bytes",
@@ -1603,7 +1603,7 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "proptest",
- "skeg-platform 0.1.5",
+ "skeg-platform 0.1.6",
  "skeg-proto",
  "skeg-telemetry",
  "smallvec",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-platform"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "io-uring",
  "libc",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-resp3"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bytes",
  "proptest",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-server"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1752,11 +1752,11 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "skeg-core",
- "skeg-platform 0.1.5",
+ "skeg-platform 0.1.6",
  "skeg-proto",
- "skeg-resp3 0.2.4",
+ "skeg-resp3 0.2.5",
  "skeg-telemetry",
- "skeg-vector 0.1.8",
+ "skeg-vector 0.1.9",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
@@ -1773,10 +1773,10 @@ name = "skeg-server-tenant"
 version = "0.2.4"
 dependencies = [
  "parking_lot",
- "skeg-platform 0.1.5",
+ "skeg-platform 0.1.6",
  "skeg-server",
  "skeg-tenant",
- "skeg-vector 0.1.8",
+ "skeg-vector 0.1.9",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-vector"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1866,7 +1866,7 @@ dependencies = [
  "proptest",
  "rand",
  "rayon",
- "skeg-platform 0.1.5",
+ "skeg-platform 0.1.6",
  "skeg-simd 0.1.6",
  "smallvec",
  "tempfile",
