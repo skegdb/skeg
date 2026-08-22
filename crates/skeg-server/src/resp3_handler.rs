@@ -56,6 +56,16 @@ fn scoped_vindex_name(tenant: TenantId, name: &str) -> String {
 /// path and the registry key.
 const MAX_VINDEX_NAME_LEN: usize = 255;
 
+/// Delay applied before returning a failed-auth error, to throttle online
+/// password guessing on the HELLO/AUTH path (which bypasses the QoS gate).
+const AUTH_FAIL_PENALTY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Per-connection input-buffer ceiling: one max-size bulk (`MAX_BULK_LEN`) plus
+/// framing headroom. Caps how much a single connection can pin while a frame is
+/// mid-flight, so a desynced or dribbled never-completing frame cannot grow the
+/// buffer without bound (and N connections cannot each pin more than this).
+const MAX_CONN_BUFFER: usize = skeg_resp3::MAX_BULK_LEN + (1 << 20);
+
 fn scope_vindex_or_reject(tenant: TenantId, raw_name: &str) -> Result<String, Frame> {
     if raw_name.contains("::") {
         return Err(Frame::Error(
@@ -278,7 +288,19 @@ pub async fn handle_connection_resp3(
                 decoder.buf_mut().reserve(256 * 1024);
                 match stream.read_buf(decoder.buf_mut()).await {
                     Ok(0) => break,
-                    Ok(_) => continue,
+                    Ok(_) => {
+                        // Bound per-connection buffering. A frame that never
+                        // completes (protocol desync, or a bulk whose declared
+                        // length is dribbled forever) would otherwise let one
+                        // connection pin ~512 MiB, and N connections N× that.
+                        // One max-size bulk plus headroom is the legitimate
+                        // ceiling; past it the peer is misbehaving.
+                        if decoder.buffered() > MAX_CONN_BUFFER {
+                            warn!(?peer, "input buffer ceiling exceeded, closing");
+                            break;
+                        }
+                        continue;
+                    }
                     Err(e) => {
                         warn!(?peer, "read error: {e}");
                         break;
@@ -477,6 +499,13 @@ async fn dispatch_command(
                     Some((user, pass)) => match ctx.verify_login(user, pass.as_bytes()) {
                         Some(tid) => *tenant = tid,
                         None => {
+                            // Tarpit failed auth. HELLO/AUTH bypass the admission
+                            // gate, so this fixed penalty is the only throttle on
+                            // pipelined online guessing (on top of Argon2's
+                            // ~50 ms verify). ponytail: per-connection flat delay;
+                            // add a shared per-IP window if reconnect-flood
+                            // guessing shows up in practice.
+                            tokio::time::sleep(AUTH_FAIL_PENALTY).await;
                             return Frame::Error("WRONGPASS invalid username-password pair".into());
                         }
                     },

@@ -61,11 +61,17 @@ impl PlatformFile {
     ///
     /// Returns an IO error if the file cannot be created or `F_NOCACHE` fails.
     pub fn create(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).read(true).write(true);
+        // Data/WAL segments hold every tenant's KV and vector values. Without an
+        // explicit mode they inherit the umask (typically 0644), leaving them
+        // world-readable on a shared host. Owner-only, matching the auth store.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path)?;
         let pf = Self {
             inner: Arc::new(file),
             sync_count: Arc::new(AtomicU64::new(0)),
@@ -82,7 +88,18 @@ impl PlatformFile {
     ///
     /// Returns an IO error if the file does not exist or `F_NOCACHE` fails.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        // Segment/WAL files in the data dir are never symlinks in normal
+        // operation. Refusing to follow one closes a local symlink-swap attack
+        // where an attacker with write access to the data dir points a segment
+        // at a victim file we then truncate/extend with the process's rights.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(path)?;
         let pf = Self {
             inner: Arc::new(file),
             sync_count: Arc::new(AtomicU64::new(0)),
@@ -714,6 +731,35 @@ fn sync_durable_sync_inner(file: &File, size_fixed: bool) -> io::Result<()> {
     {
         let _ = size_fixed;
         file.sync_all()
+    }
+}
+
+/// fsync a directory so a newly created or renamed entry within it survives
+/// power loss. Syncing a *file* does not persist its directory entry on ext4
+/// (data=ordered) or APFS, so a segment created during rotation — or a
+/// snapshot just renamed into place — can vanish on reboot even after the file
+/// itself was fsynced, silently dropping a write acked as `Durability::Power`.
+/// Call this once after creating/renaming, before the write is acked durable.
+///
+/// # Errors
+///
+/// Returns an IO error if the directory cannot be opened or synced.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    let d = File::open(dir)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `d` owns a valid fd for the call; F_FULLFSYNC on a directory
+        // fd flushes its metadata (the new dirent) to hardware.
+        let ret = unsafe { libc::fcntl(d.as_raw_fd(), libc::F_FULLFSYNC) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        d.sync_all()
     }
 }
 

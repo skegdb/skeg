@@ -1327,6 +1327,11 @@ impl VLog {
         // is still in flight through its own committer; the wasted tail is
         // reclaimed whenever that segment is later compacted away.
         pf.preallocate_sync(self.inner.max_seg_size)?;
+        // Persist the new segment's directory entry before any Power-durable
+        // write lands in it. fsync of the file alone does not commit the dirent
+        // on ext4/APFS, so without this a just-rotated segment (and the acked
+        // record it holds) could vanish on power loss.
+        skeg_platform::sync_dir(&self.inner.dir)?;
         skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
         let committer = GroupCommitter::start(pf.clone(), 0).await;
         self.inner.read_segments.borrow_mut().push(ReadSegment {

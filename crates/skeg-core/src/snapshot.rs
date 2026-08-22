@@ -97,9 +97,15 @@ pub fn decode(buf: &[u8]) -> Option<Snapshot> {
     let max_ts = u64::from_le_bytes(buf[7..15].try_into().ok()?);
     let n = u32::from_le_bytes(buf[15..19].try_into().ok()?) as usize;
 
-    let mut entries = Vec::with_capacity(n);
-    let mut pos = HEADER_LEN;
     let end = buf.len() - 4;
+    // `n` is an untrusted u32 (~4.29e9 → ~171 GiB reservation). crc32c is
+    // unkeyed, so it does not gate a crafted file — clamp the pre-allocation to
+    // what the body could physically hold: each entry is at least 18 bytes
+    // (klen u32 + the 14-byte fixed tail, with a zero-length key).
+    const MIN_ENTRY_BYTES: usize = 18;
+    let max_entries = end.saturating_sub(HEADER_LEN) / MIN_ENTRY_BYTES;
+    let mut entries = Vec::with_capacity(n.min(max_entries));
+    let mut pos = HEADER_LEN;
     for _ in 0..n {
         if pos + 4 > end {
             return None;
@@ -151,11 +157,22 @@ pub fn write(
     let buf = encode(hwm, max_ts, entries);
     let tmp = snapshot_tmp_path(dir);
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        // The snapshot holds tenant key names and fingerprints; create it
+        // owner-only rather than inheriting the umask (typically world-readable).
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(&buf)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, snapshot_path(dir))?;
+    // Persist the rename so the snapshot is not lost on power failure.
+    skeg_platform::sync_dir(dir)?;
     Ok(())
 }
 

@@ -21,6 +21,12 @@ pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 /// nested aggregate headers (e.g. `*1\r\n` repeated) cannot overflow the stack
 /// and abort the process. Redis uses 128.
 pub const MAX_NESTING_DEPTH: usize = 128;
+/// Cap on the *speculative* pre-allocation for an aggregate. The declared count
+/// is checked against `MAX_AGGREGATE_LEN` but that still permits ~1M-element
+/// reservations, and one per nesting level held live at once — GiBs of heap
+/// from a few bytes of headers. Reserve at most this, then grow as real
+/// elements arrive (bounded anyway by the bytes actually sent).
+const PREALLOC_CAP: usize = 1024;
 
 pub type ParseResult = Result<Option<(Frame, usize)>, ParseError>;
 
@@ -195,7 +201,7 @@ fn parse_aggregate(body: &[u8], kind: AggKind, depth: usize) -> ParseResult {
     } else {
         count
     };
-    let mut items = Vec::with_capacity(frame_count);
+    let mut items = Vec::with_capacity(frame_count.min(PREALLOC_CAP));
     let mut consumed = len_end + 2;
     for _ in 0..frame_count {
         match parse_frame_depth(&body[consumed..], depth + 1)? {
@@ -211,7 +217,7 @@ fn parse_aggregate(body: &[u8], kind: AggKind, depth: usize) -> ParseResult {
         AggKind::Set => Frame::Set(items),
         AggKind::Push => Frame::Push(items),
         AggKind::Map => {
-            let mut pairs = Vec::with_capacity(count);
+            let mut pairs = Vec::with_capacity(count.min(PREALLOC_CAP));
             let mut iter = items.into_iter();
             while let Some(k) = iter.next() {
                 // frame_count = 2 * count, so the value is always present.
