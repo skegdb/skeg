@@ -24,6 +24,13 @@ fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Upper bounds on the attacker-controlled VSEARCH knobs. `l_search` sizes the
+/// disk-graph beam (and thus a `SmallVec::with_capacity`); `k` sizes the result
+/// set and rerank pool. Generous enough for any real query, low enough that a
+/// single request cannot drive a multi-GiB allocation into `panic=abort`.
+const MAX_VSEARCH_K: usize = 4_096;
+const MAX_VSEARCH_L_SEARCH: u32 = 8_192;
+
 /// How often each shard checks whether a segment needs compacting.
 const COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -421,6 +428,7 @@ impl VectorBackend {
         s: &[u64],
     ) -> std::io::Result<Vec<(u64, f32)>> {
         const RERANK: usize = 8;
+        let k = k.min(MAX_VSEARCH_K);
         let rerank = (k * RERANK).max(64);
         match self {
             VectorBackend::Flat(i) => {
@@ -442,6 +450,12 @@ impl VectorBackend {
         k: usize,
         l_search: u32,
     ) -> std::io::Result<Vec<(u64, f32)>> {
+        // `k` and `l_search` are attacker-controlled wire fields. On the Disk
+        // backend `l_search` becomes the beam width, sized straight into a
+        // `SmallVec::with_capacity`, so an unclamped `u32::MAX` requests tens of
+        // GiB and (panic=abort) takes down the whole server on one packet.
+        let k = k.min(MAX_VSEARCH_K);
+        let l_search = l_search.min(MAX_VSEARCH_L_SEARCH);
         match self {
             // Flat is brute-force: no search-list, l_search does not apply.
             VectorBackend::Flat(i) => {
@@ -483,6 +497,30 @@ pub fn shard_for(key: &[u8], n_shards: usize) -> usize {
     #[allow(clippy::cast_possible_truncation)]
     let idx = (xxh3_64(key) % n_shards as u64) as usize;
     idx
+}
+
+/// Reject a vindex name that would escape the data dir. The name flows into
+/// `dir.join(format!("vindex-{name}"))` for create / `File::create` /
+/// `remove_dir_all`. The RESP3 layer already applies a strict charset, but the
+/// native binary protocol does not - this is the choke point both protocols
+/// cross, so it must hold on its own. Permits `:` for the `{tenant}::{name}`
+/// scope prefix the RESP3 layer prepends; rejects anything that could traverse.
+fn validate_vindex_name(name: &str) -> Result<(), ShardError> {
+    let ok = !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ShardError::Storage(
+            "vindex name: 1-255 chars, [A-Za-z0-9._:-] only, no '..'".to_owned(),
+        ))
+    }
 }
 
 /// Error returned by `ShardSet` operations.
@@ -2645,6 +2683,7 @@ impl ShardSet {
         kind: u8,
         backend: u8,
     ) -> Result<(), ShardError> {
+        validate_vindex_name(name)?;
         if dim == 0 {
             return Err(ShardError::Storage(
                 "vindex dim must be positive".to_owned(),
@@ -2684,6 +2723,7 @@ impl ShardSet {
     ///
     /// Returns an error if the index does not exist or a shard is unavailable.
     pub async fn vindex_drop(&self, name: &str, tenant: u128) -> Result<(), ShardError> {
+        validate_vindex_name(name)?;
         let name = name.to_owned();
         self.broadcast(|| ShardReq::VindexDrop {
             name: name.clone(),
@@ -2699,6 +2739,7 @@ impl ShardSet {
     ///
     /// Returns an error if the index is missing or a shard is unavailable.
     pub async fn vindex_consolidate(&self, name: &str) -> Result<(), ShardError> {
+        validate_vindex_name(name)?;
         let name = name.to_owned();
         self.broadcast(|| ShardReq::VindexConsolidate { name: name.clone() })
             .await
@@ -3279,6 +3320,33 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn validate_vindex_name_blocks_path_traversal() {
+        // The traversal vectors the native protocol could previously reach.
+        for bad in [
+            "..",
+            ".",
+            "../x",
+            "../../../../tmp/pwned",
+            "a/b",
+            "a\\b",
+            "with space",
+            "nul\0byte",
+            "",
+        ] {
+            assert!(
+                validate_vindex_name(bad).is_err(),
+                "expected reject: {bad:?}"
+            );
+        }
+        // Legit names, including the `{tenant}::{name}` scoped form RESP3 builds.
+        for ok in ["idx", "my-index_1", "v.2", "deadbeefcafe::user_idx"] {
+            assert!(validate_vindex_name(ok).is_ok(), "expected accept: {ok:?}");
+        }
+        // Over-long is rejected.
+        assert!(validate_vindex_name(&"a".repeat(256)).is_err());
+    }
 
     #[tokio::test]
     async fn vsearch_pool_rejects_work_when_its_queue_is_full() {

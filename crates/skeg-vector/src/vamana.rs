@@ -2119,6 +2119,29 @@ impl DiskVamanaIndex {
         let medoid = read_u32(&graph_bytes, 16);
         let l_search = read_u32(&graph_bytes, 24) as usize;
 
+        // Every field below is read straight off disk. Validate up front so a
+        // truncated or crafted file becomes a clean `InvalidData`, not an
+        // out-of-bounds slice/index panic that (panic=abort) kills the process
+        // on open or on the first search. The mmap path already checks its
+        // length; the owned path did not.
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "corrupt graph.vmn");
+        let node_len = std::mem::size_of::<Node>();
+        let need = (n as usize)
+            .checked_mul(8)
+            .and_then(|ids| {
+                (n as usize)
+                    .checked_mul(node_len)
+                    .and_then(|nd| ids.checked_add(nd))
+            })
+            .and_then(|body| body.checked_add(HEADER_LEN))
+            .ok_or_else(bad)?;
+        if graph_bytes.len() < need {
+            return Err(bad());
+        }
+        if n != 0 && medoid >= n {
+            return Err(bad());
+        }
+
         let mut pos = HEADER_LEN;
         let mut ids = Vec::with_capacity(n as usize);
         for _ in 0..n {
@@ -2129,7 +2152,6 @@ impl DiskVamanaIndex {
             ));
             pos += 8;
         }
-        let node_len = std::mem::size_of::<Node>();
         debug_assert_eq!(
             node_len,
             4 + MAX_R * 4,
@@ -2165,9 +2187,18 @@ impl DiskVamanaIndex {
             let mut v = Vec::with_capacity(n as usize);
             for _ in 0..n {
                 let degree = read_u32(&graph_bytes, pos);
+                // `degree` indexes `neighbors[..degree]` (a `[u32; MAX_R]`) on
+                // every walk; a disk value > MAX_R is an out-of-range slice.
+                if degree as usize > MAX_R {
+                    return Err(bad());
+                }
                 let mut neighbors = [0u32; MAX_R];
                 for (k, slot) in neighbors.iter_mut().enumerate() {
                     *slot = read_u32(&graph_bytes, pos + 4 + k * 4);
+                }
+                // Neighbor ids index `nodes[id]` / `ids[id]` during a walk.
+                if neighbors[..degree as usize].iter().any(|&nb| nb >= n) {
+                    return Err(bad());
                 }
                 v.push(Node { degree, neighbors });
                 pos += node_len;
@@ -2187,12 +2218,12 @@ impl DiskVamanaIndex {
                 "bad vectors.bin header",
             ));
         }
-        assert_eq!(read_u32(&vhdr, 8), n, "graph/vectors disagree on n");
-        assert_eq!(
-            read_u32(&vhdr, 12) as usize,
-            dim,
-            "graph/vectors disagree on dim"
-        );
+        if read_u32(&vhdr, 8) != n || read_u32(&vhdr, 12) as usize != dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "graph.vmn and vectors.bin disagree on n/dim",
+            ));
+        }
 
         // Build the int8 tier from unit-normalised vectors (so its dot-product
         // proxy tracks the cosine ordering the graph was built with). The file

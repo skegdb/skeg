@@ -7,6 +7,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [0.7.3] - 2026-08-22
+
+Hardens the boundaries where skeg trusts network bytes or on-disk data, from a
+security review of the workspace. No protocol or API changes; published SDKs and
+adapters are unaffected.
+
+### Security
+
+- **Path traversal via vindex names on the native binary protocol.** Name
+  validation lived only in the RESP3 layer, so a native-protocol
+  `VINDEX.CREATE "../../x"` escaped the data dir. Validation now runs in the
+  shard layer (create/drop/consolidate), the choke point both protocols cross.
+- **Unbounded `k`/`l_search` on the disk VSEARCH path** sized an allocation
+  straight from the wire (a large `l_search` could request tens of GiB and
+  abort the process). Both are now clamped.
+- **Recovery allocated from on-disk length fields before the CRC.** A bit-flip
+  in a record header could drive a multi-GiB allocation and OOM at startup; the
+  length is now bounded against the segment ceiling first. The snapshot decoder
+  clamps its entry count the same way.
+- **No throttle on failed authentication.** HELLO/AUTH bypass the QoS gate, so
+  online guessing was unbounded. Failed attempts are now counted per source IP
+  over a rolling window (blocked before the password verify) and each failure is
+  tarpitted.
+- **Crafted `graph.vmn` could crash the server** on open or first search: the
+  owned open path trusted `n`/`degree`/`medoid`/neighbour ids off disk. These
+  are validated, returning a clean error instead of an out-of-bounds panic.
+- **Data and WAL files inherited the umask** (world-readable on a shared host);
+  they are now created `0600`, matching the auth store. Segment opens use
+  `O_NOFOLLOW`.
+- **Missing parent-directory fsync** on segment rotation and snapshot rename
+  could drop a `Durability::Power` write on power loss; the directory entry is
+  now persisted.
+- Bounded the speculative RESP3 aggregate pre-allocation and added a
+  per-connection input-buffer ceiling.
+
 ## [0.7.2] - 2026-08-19
 
 ### Fixed

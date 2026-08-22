@@ -73,6 +73,15 @@ pub fn scan_file(pf: &PlatformFile, mut f: impl FnMut(u64, Record)) -> io::Resul
         let vsz = u32::from_le_bytes(header[16..20].try_into().expect("4 bytes")) as usize;
         let padded = padded_record_size(ksz, vsz);
 
+        // `ksz`/`vsz` are two raw u32s straight off disk, read *before* the CRC
+        // that would reject them. A bit-flip (or a crafted file) can drive
+        // `padded` toward 8 GiB, so the allocation below OOM-aborts the whole
+        // process at startup. A record can never exceed the segment ceiling -
+        // treat an implausible length as the corrupt-tail recovery boundary.
+        if padded as u64 > MAX_SEGMENT_SIZE {
+            break;
+        }
+
         let mut buf = vec![0u8; padded];
         let n2 = pf.pread_sync(offset, &mut buf)?;
         if n2 < padded {
