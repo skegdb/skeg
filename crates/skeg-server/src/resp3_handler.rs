@@ -16,9 +16,11 @@
 //! Out of scope here (later v0.1 / v0.2): SET options (EX/PX/NX/XX), EXPIRE/TTL,
 //! INFO/STATS/DBSIZE/COMMAND, SHUTDOWN, vector ops, async maintenance, AUTH model.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,7 +60,62 @@ const MAX_VINDEX_NAME_LEN: usize = 255;
 
 /// Delay applied before returning a failed-auth error, to throttle online
 /// password guessing on the HELLO/AUTH path (which bypasses the QoS gate).
-const AUTH_FAIL_PENALTY: std::time::Duration = std::time::Duration::from_secs(1);
+const AUTH_FAIL_PENALTY: Duration = Duration::from_secs(1);
+
+/// Rolling window over which failed auth attempts from one source IP are
+/// counted, and the count that trips the block for the rest of the window.
+/// HELLO/AUTH bypass the QoS admission gate, so this shared per-IP counter is
+/// the throttle that survives reconnects (the per-connection tarpit alone does
+/// not): a flood that opens a fresh connection per guess still lands here.
+const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(30);
+const AUTH_FAIL_MAX: u32 = 5;
+
+struct AuthFail {
+    count: u32,
+    window_start: Instant,
+}
+
+/// Failed-auth counters keyed by source IP. Process-global so every connection
+/// task shares it. Small: only IPs with recent failures, pruned as they expire.
+fn auth_failures() -> &'static Mutex<HashMap<IpAddr, AuthFail>> {
+    static M: OnceLock<Mutex<HashMap<IpAddr, AuthFail>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True if `ip` has hit `AUTH_FAIL_MAX` failures inside the current window.
+fn auth_is_blocked(ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let map = auth_failures().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ip).is_some_and(|r| {
+        now.duration_since(r.window_start) < AUTH_FAIL_WINDOW && r.count >= AUTH_FAIL_MAX
+    })
+}
+
+/// Record one failed attempt from `ip`, starting a fresh window if the last one
+/// elapsed. Opportunistically drops entries whose window has expired so the map
+/// cannot grow without bound.
+fn auth_record_failure(ip: IpAddr) {
+    let now = Instant::now();
+    let mut map = auth_failures().lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, r| now.duration_since(r.window_start) < AUTH_FAIL_WINDOW);
+    let entry = map.entry(ip).or_insert(AuthFail {
+        count: 0,
+        window_start: now,
+    });
+    if now.duration_since(entry.window_start) >= AUTH_FAIL_WINDOW {
+        entry.count = 0;
+        entry.window_start = now;
+    }
+    entry.count = entry.count.saturating_add(1);
+}
+
+/// Clear an IP's counter after a successful login.
+fn auth_clear(ip: IpAddr) {
+    auth_failures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&ip);
+}
 
 /// Per-connection input-buffer ceiling: one max-size bulk (`MAX_BULK_LEN`) plus
 /// framing headroom. Caps how much a single connection can pin while a frame is
@@ -262,6 +319,7 @@ pub async fn handle_connection_resp3(
                                 &mut tenant,
                                 &shards,
                                 tenant_backend.as_ref(),
+                                peer.map(|p| p.ip()),
                             )
                             .await
                         }
@@ -470,6 +528,7 @@ async fn dispatch_command(
     tenant: &mut TenantId,
     shards: &ShardSet,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
+    peer_ip: Option<IpAddr>,
 ) -> Frame {
     // Per-command admission (multi-tenant QoS). Hello/SkegAuth establish or
     // change the tenant and are never gated. Single-tenant (no backend) skips
@@ -496,19 +555,38 @@ async fn dispatch_command(
             // connection with -NOAUTH (RESP3 standard error).
             if let Some(ctx) = tenant_backend {
                 match args.auth.as_ref() {
-                    Some((user, pass)) => match ctx.verify_login(user, pass.as_bytes()) {
-                        Some(tid) => *tenant = tid,
-                        None => {
-                            // Tarpit failed auth. HELLO/AUTH bypass the admission
-                            // gate, so this fixed penalty is the only throttle on
-                            // pipelined online guessing (on top of Argon2's
-                            // ~50 ms verify). ponytail: per-connection flat delay;
-                            // add a shared per-IP window if reconnect-flood
-                            // guessing shows up in practice.
+                    Some((user, pass)) => {
+                        // Block a source IP that has burst past AUTH_FAIL_MAX in
+                        // the window before paying the Argon2 verify cost, so a
+                        // reconnect flood cannot burn CPU. Still tarpit the reply.
+                        if peer_ip.is_some_and(auth_is_blocked) {
                             tokio::time::sleep(AUTH_FAIL_PENALTY).await;
-                            return Frame::Error("WRONGPASS invalid username-password pair".into());
+                            return Frame::Error(
+                                "WRONGPASS too many failed attempts, try again later".into(),
+                            );
                         }
-                    },
+                        match ctx.verify_login(user, pass.as_bytes()) {
+                            Some(tid) => {
+                                if let Some(ip) = peer_ip {
+                                    auth_clear(ip);
+                                }
+                                *tenant = tid;
+                            }
+                            None => {
+                                // Count the failure against the source IP and
+                                // tarpit the reply. HELLO/AUTH bypass the QoS
+                                // gate, so this is the only online-guessing
+                                // throttle.
+                                if let Some(ip) = peer_ip {
+                                    auth_record_failure(ip);
+                                }
+                                tokio::time::sleep(AUTH_FAIL_PENALTY).await;
+                                return Frame::Error(
+                                    "WRONGPASS invalid username-password pair".into(),
+                                );
+                            }
+                        }
+                    }
                     None => {
                         if matches!(ctx.anonymous_policy(), AnonymousPolicy::Strict) {
                             return Frame::Error(
@@ -1618,8 +1696,26 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, TenantId, is_pipelineable, scope_vindex_or_reject};
+    use super::{
+        AUTH_FAIL_MAX, Command, TenantId, auth_clear, auth_is_blocked, auth_record_failure,
+        is_pipelineable, scope_vindex_or_reject,
+    };
     use bytes::Bytes;
+
+    #[test]
+    fn auth_throttle_blocks_after_max_failures_and_clears_on_success() {
+        // Use a fixed, otherwise-unused IP so the process-global map is not
+        // perturbed by (or perturbing) other tests.
+        let ip = std::net::IpAddr::from([203, 0, 113, 7]);
+        auth_clear(ip);
+        assert!(!auth_is_blocked(ip));
+        for _ in 0..AUTH_FAIL_MAX {
+            auth_record_failure(ip);
+        }
+        assert!(auth_is_blocked(ip), "IP must be blocked after MAX failures");
+        auth_clear(ip);
+        assert!(!auth_is_blocked(ip), "successful login must clear the block");
+    }
 
     /// Path-traversal / cross-tenant guard: the index name flows into a
     /// filesystem path (`vindex-<name>`) and must never carry `..`, a path
@@ -1877,6 +1973,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
         )
         .await;
         assert!(
@@ -1894,6 +1991,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
         )
         .await;
         assert!(
@@ -1927,6 +2025,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
         )
         .await;
         assert!(
@@ -1941,6 +2040,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
         )
         .await;
         assert!(
@@ -1955,6 +2055,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
         )
         .await;
         assert!(
@@ -1973,6 +2074,7 @@ mod tests {
             &mut anon,
             &shards,
             Some(&backend),
+            None,
         )
         .await;
         assert!(
@@ -2001,6 +2103,7 @@ mod tests {
                 &mut state,
                 &mut tenant,
                 &shards,
+                None,
                 None,
             )
             .await;
