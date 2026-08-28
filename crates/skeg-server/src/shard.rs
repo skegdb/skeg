@@ -273,13 +273,6 @@ impl VectorBackend {
 
     /// Fold a disk index's streaming delta into the graph (one full rebuild),
     /// leaving it in its fast fully-indexed state. Flat has no delta: no-op.
-    fn consolidate(&mut self) -> std::io::Result<()> {
-        match self {
-            VectorBackend::Flat(_) => Ok(()),
-            VectorBackend::Disk(i) => i.consolidate(),
-        }
-    }
-
     /// Consolidated base-graph size (flat: its full length). Sizes the
     /// delete-patch trigger against the tombstone count.
     fn main_len(&self) -> usize {
@@ -1095,6 +1088,50 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     false
 }
 
+/// The three phases (begin under a short lock, build off the lock, finish under
+/// a short lock), with the error propagated rather than only logged.
+///
+/// Automatic maintenance can afford to log and retry on the next tick; an
+/// explicit command cannot: it has to tell the client what went wrong. One
+/// implementation for both: it is the same dance.
+///
+/// `Ok(false)` means there was nothing to do (begin returned None).
+async fn try_off_thread_maintenance<T, B>(
+    arc: &VectorEntry,
+    label: &str,
+    begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
+    build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
+    finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
+) -> Result<bool, String>
+where
+    T: Send + 'static,
+    B: Send + 'static,
+{
+    // Short lock: snapshot only, no O(live) reads and no graph build.
+    let job = {
+        let mut g = arc.write();
+        match begin(&mut g.backend) {
+            Ok(Some(j)) => j,
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(format!("{label} begin failed: {e}")),
+        }
+    };
+    // NO lock is held here: this is what lets reads proceed while the graph
+    // is rebuilt.
+    let built = match tokio::task::spawn_blocking(move || build(job)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return Err(format!("{label} build failed: {e}")),
+        Err(e) => return Err(format!("{label} build task panicked: {e}")),
+    };
+    {
+        let mut g = arc.write();
+        if let Err(e) = finish(&mut g.backend, built) {
+            return Err(format!("{label} finish failed: {e}"));
+        }
+    }
+    Ok(true)
+}
+
 async fn off_thread_maintenance<T, B>(
     arc: &VectorEntry,
     label: &str,
@@ -1107,36 +1144,14 @@ where
     T: Send + 'static,
     B: Send + 'static,
 {
-    let job = {
-        let mut g = arc.write();
-        match begin(&mut g.backend) {
-            Ok(Some(j)) => j,
-            Ok(None) => return false,
-            Err(e) => {
-                error!("shard {shard_id}: {label} begin failed: {e}");
-                return false;
-            }
-        }
-    };
-    let built = match tokio::task::spawn_blocking(move || build(job)).await {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            error!("shard {shard_id}: {label} build failed: {e}");
-            return false;
-        }
+    match try_off_thread_maintenance(arc, label, begin, build, finish).await {
+        Ok(ran) => ran,
         Err(e) => {
-            error!("shard {shard_id}: {label} build task panicked: {e}");
-            return false;
-        }
-    };
-    {
-        let mut g = arc.write();
-        if let Err(e) = finish(&mut g.backend, built) {
-            error!("shard {shard_id}: {label} finish failed: {e}");
-            return false;
+            // Automatic maintenance retries on the next tick.
+            error!("shard {shard_id}: {e}");
+            false
         }
     }
-    true
 }
 
 fn recover_vindexes(
@@ -1423,10 +1438,10 @@ fn run_shard(
                     // so the served index is lean BY DEFAULT, not only after an
                     // explicit VINDEX.CONSOLIDATE. The fold runs on a blocking
                     // thread so the build does not stall the shard runtime.
-                    // The swap still holds the per-vindex write lock for
-                    // the rebuild, so a query to THAT vindex mid-fold waits; it
-                    // fires only when idle, so collisions are rare. Upgrade path:
-                    // background build + atomic swap (no lock during the build).
+                    // The rebuild runs off the write lock (begin/build/finish via
+                    // off_thread_maintenance), so a query to that vindex does not
+                    // wait for the fold. The lock is taken only for the initial
+                    // snapshot and the final swap, both short.
                     let kvindexes = vindexes.clone();
                     let kdir = dir.clone();
                     tokio::task::spawn_local(async move {
@@ -1753,10 +1768,27 @@ async fn process(
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
-                Some(arc) => match arc.write().backend.consolidate() {
-                    Ok(()) => ShardResp::Done,
-                    Err(e) => ShardResp::Err(format!("consolidate failed: {e}")),
-                },
+                Some(arc) => {
+                    // This used to be `arc.write().backend.consolidate()`, which
+                    // held the per-vindex write lock for the WHOLE rebuild: every
+                    // query to that vindex queued behind it. Measured on 4,000
+                    // vectors, a read waited 3.81s on a 3.81s consolidate. The
+                    // automatic maintenance path already did this right; the
+                    // explicit command did not.
+                    let vdir = dir.join(format!("vindex-{name}"));
+                    match try_off_thread_maintenance(
+                        &arc,
+                        "consolidate",
+                        |b| b.consolidate_begin(),
+                        move |job| job.build(&vdir),
+                        |b, built| b.consolidate_finish(built),
+                    )
+                    .await
+                    {
+                        Ok(_) => ShardResp::Done,
+                        Err(e) => ShardResp::Err(e),
+                    }
+                }
             }
         }
         ShardReq::Evict { name } => {
@@ -4542,6 +4574,60 @@ mod tests {
         shards.vindex_consolidate("idx").await.unwrap();
         shards.vindex_create("flat", 64, 0, 0).await.unwrap();
         shards.vindex_consolidate("flat").await.unwrap();
+    }
+
+    /// An explicit `SKEG.VINDEX.CONSOLIDATE` must not block reads on that vindex
+    /// for the duration of the rebuild.
+    ///
+    /// The idle path already builds off-thread via `off_thread_maintenance`
+    /// (brief write lock for begin, `spawn_blocking` for the build, brief lock
+    /// for finish). The explicit command instead called
+    /// `arc.write().backend.consolidate()`, holding the per-vindex write lock
+    /// for the WHOLE rebuild: every query to that vindex queued behind it. On a
+    /// public service taking nightly updates that is minutes of stalled reads.
+    ///
+    /// Timing-based on purpose: the property under test IS "reads proceed while
+    /// the build runs", and there is no way to observe that structurally from
+    /// outside. The margin is wide (a search must be at least 5x faster than the
+    /// consolidate) so it does not flake on a loaded machine.
+    #[tokio::test]
+    async fn explicit_consolidate_does_not_block_reads() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // disk
+        // Enough vectors that the rebuild is measurably slower than a search.
+        for id in 0u64..4000 {
+            shards.vset("idx", id, tvec(id + 1), 0, None, None).await.unwrap();
+        }
+
+        let reader = {
+            let s = shards.clone();
+            tokio::spawn(async move {
+                let mut worst = std::time::Duration::ZERO;
+                for i in 0..40u64 {
+                    let t = std::time::Instant::now();
+                    s.vsearch("idx", tvec(i * 7 + 1), 5, 0, 0, false, None).await.unwrap();
+                    worst = worst.max(t.elapsed());
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                worst
+            })
+        };
+
+        let t0 = std::time::Instant::now();
+        shards.vindex_consolidate("idx").await.unwrap();
+        let consolidate = t0.elapsed();
+        let worst_read = reader.await.unwrap();
+
+        assert!(
+            worst_read * 5 < consolidate,
+            "a read waited {worst_read:?} while the consolidate took \
+             {consolidate:?}: the write lock is held for the whole rebuild"
+        );
+
+        // and the result must stay correct
+        let hits = shards.vsearch("idx", tvec(90), 5, 0, 0, false, None).await.unwrap();
+        assert_eq!(hits[0].0, 89, "nearest neighbour still found");
     }
 
     // The off-thread maintenance helper drives a runs-merge and a delete-patch
