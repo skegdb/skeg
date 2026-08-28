@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use skeg_platform::PlatformFile;
@@ -151,6 +151,12 @@ struct VLogInner {
     /// set/get/del are untouched.
     append_lock: tokio::sync::Mutex<()>,
     clock: Cell<u64>,
+    /// The `(hwm, hwm_offset)` of the snapshot this store recovered from, and
+    /// the keys the replay of the log tail touched after it. Together they say
+    /// exactly which keys a caller's own cache, stamped with the same pair,
+    /// must not trust. `None` means recovery did not use a snapshot (or the
+    /// tail was too long to track), so no such cache is usable.
+    recovered: Option<RecoveredFrom>,
     /// Exclusive advisory lock on the store directory, held for the lifetime of
     /// the open store so a second process cannot open it concurrently and race
     /// appends into the same segments. Released when the last `VLog` clone drops
@@ -158,6 +164,29 @@ struct VLogInner {
     /// the store state.
     _lock: skeg_platform::DirLock,
 }
+
+/// Where recovery started and what it had to replay on top.
+///
+/// A caller that keeps its own derived state on disk (the vindex payload
+/// index) can stamp it with `stamp` and, at open, reuse every entry whose key
+/// is absent from `tail_keys`. Anything the tail touched changed after the
+/// stamp and has to be read again.
+pub struct RecoveredFrom {
+    /// `(hwm segment id, hwm_offset)` of the snapshot recovery seeded from.
+    pub stamp: (u64, u64),
+    /// Keys written or deleted after that point.
+    pub tail_keys: AHashSet<Vec<u8>>,
+}
+
+/// Ceiling on the bytes of key material tracked from the log tail. Past it the
+/// set is dropped and no stamped cache is reusable.
+///
+/// A long tail means the snapshot is stale, so the full scan is the honest
+/// path; holding an unbounded key set to avoid it would trade a slow open for
+/// an unbounded allocation at the worst possible moment. Bounded in bytes and
+/// not in keys because key length is not fixed: a million keys is a small set
+/// or a huge one depending on what is in them.
+const MAX_TRACKED_TAIL_BYTES: usize = 64 << 20;
 
 /// A per-tenant live-disk-byte counter shared across a shard set, so the disk
 /// quota is global per tenant. Create with [`new_shared_disk`].
@@ -287,10 +316,17 @@ impl VLog {
         // matching the pre-preallocation behaviour.
         let mut active_used: Option<u64> = None;
 
+        // What a caller's stamped cache may reuse. Populated only on the
+        // snapshot path: without a snapshot there is no stamp to match.
+        let mut recovered: Option<RecoveredFrom> = None;
         if let Some(snap) = snap {
             // Seed the index from the snapshot, then rescan only the segments
             // written since (id >= hwm), applying records last-wins.
             max_ts = snap.max_ts;
+            let (snap_hwm, snap_hwm_offset) = (snap.hwm, snap.hwm_offset);
+            let mut tail_keys = AHashSet::new();
+            let mut tail_bytes = 0usize;
+            let mut tail_overflowed = false;
             for (key, entry) in snap.entries {
                 index.set(key, entry);
             }
@@ -313,6 +349,15 @@ impl VLog {
                     skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogRecoveryRecords);
                     max_ts = max_ts.max(rec.ts);
                     gate.feed(offset, rec, |off, r| {
+                        if !tail_overflowed {
+                            tail_bytes += r.key.len();
+                            if tail_bytes > MAX_TRACKED_TAIL_BYTES {
+                                tail_overflowed = true;
+                                tail_keys = AHashSet::new();
+                            } else {
+                                tail_keys.insert(r.key.clone());
+                            }
+                        }
                         if r.kind == RecordKind::Tombstone {
                             index.remove(&r.key);
                         } else {
@@ -335,6 +380,12 @@ impl VLog {
                     skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
                     active_used = Some(last_valid);
                 }
+            }
+            if !tail_overflowed {
+                recovered = Some(RecoveredFrom {
+                    stamp: (u64::from(snap_hwm), snap_hwm_offset),
+                    tail_keys,
+                });
             }
         } else {
             // Full scan: keep the highest-timestamp record per key.
@@ -423,6 +474,7 @@ impl VLog {
                 rotate_lock: tokio::sync::Mutex::new(()),
                 append_lock: tokio::sync::Mutex::new(()),
                 clock: Cell::new(max_ts + 1),
+                recovered,
                 _lock: store_lock,
             }),
         })
@@ -789,7 +841,7 @@ impl VLog {
     /// # Errors
     ///
     /// Returns an error if the snapshot file cannot be written.
-    pub async fn write_snapshot(&self) -> Result<()> {
+    pub async fn write_snapshot(&self) -> Result<(u64, u64)> {
         // `hwm` alone (a segment id) only lets recovery skip WHOLE segments,
         // so before the first roll it saves nothing: the active segment is
         // rescanned in full however recent the snapshot is. `size` is how much
@@ -811,7 +863,18 @@ impl VLog {
         tokio::task::spawn_blocking(move || snapshot::write(&dir, hwm, hwm_offset, max_ts, &entries))
             .await
             .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
-        Ok(())
+        // Returned so a caller can stamp its own derived state with the exact
+        // position this snapshot covers, which is what makes that state
+        // reusable at the next open.
+        Ok((u64::from(hwm), hwm_offset))
+    }
+
+    /// Where recovery started and what it replayed on top, when it seeded from
+    /// a snapshot and the tail was short enough to track. `None` means no
+    /// stamped cache may be reused.
+    #[must_use]
+    pub fn recovered_from(&self) -> Option<&RecoveredFrom> {
+        self.inner.recovered.as_ref()
     }
 
     /// Number of live keys in the index.

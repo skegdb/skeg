@@ -95,6 +95,38 @@ impl PayloadIndex {
         }
     }
 
+    /// Rebuild `id`'s payload in the blob form `parse_fields` accepts.
+    ///
+    /// Used to persist the index without reading a single blob back from the
+    /// log: everything the index knows about an id is already here, and the
+    /// text form is the canonical one, so parsing the result returns exactly
+    /// these fields. Tokens the parser skipped when the blob first arrived are
+    /// not here and are not missed: they were never indexed, so an index built
+    /// from this is the same index.
+    ///
+    /// An id with nothing indexed yields an empty blob, which is the honest
+    /// answer and lets a caller record that the id is covered rather than
+    /// unknown.
+    #[must_use]
+    pub fn field_blob(&self, id: u64) -> Vec<u8> {
+        let Some(fields) = self.by_id.get(&id) else {
+            return Vec::new();
+        };
+        let mut out = String::new();
+        for (f, v) in fields {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(f);
+            out.push('=');
+            match v {
+                Value::Keyword(s) => out.push_str(s),
+                Value::Int(n) => out.push_str(&n.to_string()),
+            }
+        }
+        out.into_bytes()
+    }
+
     fn postings(&self, field: &str, value: &Value) -> Option<&BTreeSet<u64>> {
         self.by_field.get(field).and_then(|vs| vs.get(value))
     }
@@ -581,5 +613,46 @@ mod tests {
         // NOT complements against the indexed universe {1,2,3,4}.
         assert_eq!(eval("NOT u = a"), BTreeSet::from([3, 4]));
         assert!(eval("u = nobody").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod blob_roundtrip_tests {
+    use super::*;
+
+    /// Persisting the index depends on this: the reconstructed blob must parse
+    /// back to exactly the fields it came from, or a restart would serve a
+    /// different index than the one that was running.
+    #[test]
+    fn field_blob_round_trips_through_the_parser() {
+        let cases: &[&[u8]] = &[
+            b"dl=10 likes=0 lic=apache-2.0 task=text-generation",
+            b"params_m=7000 alive=1 enr=0",
+            b"k=-42 neg=-0 big=9223372036854775807",
+            b"single=x",
+            b"",
+            b"no_equals_token dl=5",       // the parser skips the bare token
+            b"=novalue dl=5",              // and an empty key
+        ];
+        for blob in cases {
+            let mut idx = PayloadIndex::default();
+            let fields = parse_fields(blob);
+            idx.upsert(1, fields.clone());
+            let again = parse_fields(&idx.field_blob(1));
+            assert_eq!(again, fields, "blob {:?} did not round trip", String::from_utf8_lossy(blob));
+        }
+    }
+
+    /// A value that looks like an integer must not come back as a keyword, and
+    /// the other way round: the two are ordered differently, so a swap would
+    /// quietly change what a range filter matches.
+    #[test]
+    fn field_blob_preserves_the_value_type() {
+        let mut idx = PayloadIndex::default();
+        idx.upsert(1, parse_fields(b"n=7 s=seven z=007"));
+        let back = parse_fields(&idx.field_blob(1));
+        assert_eq!(back[0], ("n".into(), Value::Int(7)));
+        assert_eq!(back[1], ("s".into(), Value::Keyword("seven".into())));
+        assert_eq!(back[2], ("z".into(), Value::Int(7)), "leading zeros parse as the number");
     }
 }

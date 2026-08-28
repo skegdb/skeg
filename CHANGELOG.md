@@ -88,6 +88,33 @@ restart with a filtered query.
 
 ### Added
 
+- **Persisted payload index.** A vindex's payload index was rebuilt at every
+  open by reading each live id's blob back from the log, one random read per
+  id. It is now written next to the vindex as `payload.cache.bin` and read back
+  sequentially. Open on the 471.918-vector artifact went from 9,4s to 4,8s, and
+  `skeg_payload_cache_entries_total` reports all 471.918 entries served from
+  the file with nothing re-read from the log. The file is 54 MB.
+
+  Staleness is the whole problem here, because payload blobs live in the log
+  and keep changing after the file is written, and a payload index that is
+  quietly wrong makes filtered searches drop results with no error anywhere.
+  Three rules keep it honest, and each has a test that fails without it:
+
+  - the file is stamped with the log snapshot position it reflects, written in
+    the same step as that snapshot, and refused unless recovery seeded from
+    exactly that snapshot;
+  - an id whose payload key appears in the replayed log tail is refused and
+    read from the log instead, so anything written after the stamp is never
+    taken from the file;
+  - it is consulted only during the open-time warm, never when a vindex is
+    reopened after an eviction: by then writes may have landed that no tail
+    records.
+
+  The file is built from the in-memory index rather than by reading blobs back,
+  so writing it costs no reads at all; and it is skipped when the stamp has not
+  moved, which on a store that is only being read means it is written once and
+  left alone.
+
 - **Quantised tier cache.** The `tq2` tier was recomputed from the source
   vectors on every open; it is now serialised to `tier.cache.bin` in the vindex
   directory and read back, with a fingerprint (vector count, dim, tier tag,

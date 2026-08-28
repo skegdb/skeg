@@ -12,6 +12,7 @@
 
 pub mod handler;
 pub mod payload;
+pub mod payload_cache;
 pub mod quota;
 pub mod resp3_handler;
 pub mod shard;

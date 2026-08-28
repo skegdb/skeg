@@ -582,6 +582,11 @@ enum ShardReq {
     /// shards so callers can ask any one shard.
     VindexList,
     /// Fold a disk vindex's streaming delta into its graph on this shard.
+    /// Write the vlog snapshot and a payload cache per vindex, both stamped
+    /// with the same log position. Normally the background task's job; exposed
+    /// so a caller (and the tests that check the cache cannot go stale) can
+    /// force one at a known point.
+    SnapshotAndPayloadCaches,
     VindexConsolidate {
         name: String,
     },
@@ -779,9 +784,11 @@ fn payload_key(tenant: u128, name: &str, id: u64) -> Vec<u8> {
 /// blob reads outside the lock, then populates under it.
 async fn ensure_payload_loaded(
     vlog: &VLog,
+    vdir: &Path,
     arc: &VectorEntry,
     tenant: u128,
     name: &str,
+    allow_cache: bool,
 ) -> Result<(), String> {
     if arc.read().payload_loaded {
         return Ok(());
@@ -794,8 +801,36 @@ async fn ensure_payload_loaded(
     // `get` is a RefCell, so in-flight reads do not overlap on the device, they
     // just add scheduling and cache churn. Shards already warm in parallel with
     // each other, which is where the parallelism actually is.
+    // The persisted cache, when the store recovered from the snapshot it was
+    // stamped with. `cached` holds only ids the replayed tail did not touch:
+    // anything the tail wrote changed after the stamp, so its cached blob is a
+    // dead value and has to come from the vlog. Both conditions must hold; a
+    // filtered search served from a stale payload index drops results with no
+    // error anywhere, which is far worse than a slow open.
+    let mut cached: HashMap<u64, Vec<u8>> = HashMap::new();
+    if allow_cache
+        && let Some(rec) = vlog.recovered_from()
+        && let Some(entries) = crate::payload_cache::read(vdir, rec.stamp, ids.len())
+    {
+        cached.reserve(entries.len());
+        for (id, blob) in entries {
+            if !rec.tail_keys.contains(&payload_key(tenant, name, id)) {
+                cached.insert(id, blob);
+            }
+        }
+    }
+    let from_cache = cached.len();
+    skeg_telemetry::add_counter(
+        skeg_telemetry::Counter::PayloadCacheEntries,
+        from_cache as u64,
+    );
+
     let mut parsed = Vec::with_capacity(ids.len());
     for id in ids {
+        if let Some(blob) = cached.remove(&id) {
+            parsed.push((id, parse_fields(&blob)));
+            continue;
+        }
         let key = payload_key(tenant, name, id);
         // `get_uncached`: this reads every blob exactly once and keeps the
         // parsed fields in the payload index, so caching the blobs stores a
@@ -807,6 +842,7 @@ async fn ensure_payload_loaded(
             Err(e) => return Err(format!("payload index rebuild failed: {e}")),
         }
     }
+
     let mut g = arc.write();
     // Re-check under the write lock: another task may have loaded it meanwhile.
     if !g.payload_loaded {
@@ -819,6 +855,78 @@ async fn ensure_payload_loaded(
     Ok(())
 }
 
+/// Write the vlog snapshot, then a payload cache per vindex stamped with the
+/// position that snapshot covers.
+///
+/// The two must carry the same stamp, which is why they are written together
+/// here rather than on their own schedules: the stamp is the only thing that
+/// tells the next open whether the cached payloads still describe the log it
+/// recovered from.
+///
+/// Writing the cache is best effort. It is an optimisation for the next open,
+/// so a failure is logged and the store carries on; the worst outcome is a slow
+/// warm, and the snapshot itself has already succeeded by then.
+async fn snapshot_and_payload_caches(
+    vlog: &VLog,
+    vindexes: &RwLock<VindexSet>,
+    dir: &Path,
+    shard_id: usize,
+    written: &mut HashMap<String, (u64, u64)>,
+) {
+    let stamp = match vlog.write_snapshot().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("shard {shard_id}: snapshot failed: {e}");
+            return;
+        }
+    };
+    let entries: Vec<(String, VectorEntry)> = vindexes
+        .read()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (scoped, arc) in entries {
+        // Built from the in-memory index, not by reading the blobs back. A
+        // rebuild-from-log here would repeat the whole open-time read storm on
+        // a server that is serving traffic, every snapshot interval, which is
+        // a worse problem than the one this file solves. The index already
+        // holds everything, and `field_blob` returns it in the form the parser
+        // accepts.
+        //
+        // An index that was never loaded has nothing to persist, and writing
+        // an empty file for it would look like "this vindex has no payloads"
+        // at the next open. Skip it instead.
+        // Nothing was appended since the last write, so the stamp is the same
+        // and the file would come out byte for byte identical. On a store that
+        // is only being read, snapshots keep firing and rewriting hundreds of
+        // megabytes for no reason; the stamp is exactly the signal that says
+        // so, because it only moves when the log does.
+        if written.get(&scoped) == Some(&stamp) {
+            continue;
+        }
+        let blobs: Vec<(u64, Vec<u8>)> = {
+            let g = arc.read();
+            if !g.payload_loaded {
+                continue;
+            }
+            g.backend
+                .live_ids()
+                .into_iter()
+                .map(|id| (id, g.payload.field_blob(id)))
+                .collect()
+        };
+        let vdir = dir.join(format!("vindex-{scoped}"));
+        match crate::payload_cache::write(&vdir, stamp, &blobs) {
+            Ok(()) => {
+                written.insert(scoped.clone(), stamp);
+            }
+            Err(e) => {
+                tracing::warn!("shard {shard_id}: writing payload cache for '{scoped}' failed: {e}");
+            }
+        }
+    }
+}
+
 /// Load every recovered vindex's payload index before the shard reports ready.
 ///
 /// The rebuild reads each live id's payload blob, and deferring it to the first
@@ -829,17 +937,30 @@ async fn ensure_payload_loaded(
 /// Best effort by design: a vindex that cannot be warmed is logged and left
 /// alone, and it still loads lazily on its first filtered search. Readiness
 /// must not hinge on an optimisation.
-async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>) {
+async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>, dir: &Path) {
     let entries: Vec<(String, VectorEntry)> = vindexes
         .read()
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     for (scoped, arc) in entries {
-        let (tenant, index) = unscope_key(&scoped);
+        // The scoped name, not the bare index name: the query path builds its
+        // payload keys from what `get_or_reopen` was given, which is scoped.
+        // Warming with the bare name would build different keys, find nothing,
+        // and still mark the index loaded, leaving every filtered search for
+        // that tenant silently empty. Only tenant 0 makes the two the same,
+        // which is exactly why this hid.
+        let (tenant, _) = unscope_key(&scoped);
         let n = arc.read().backend.live_ids().len();
         let t0 = std::time::Instant::now();
-        if let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &index).await {
+        let vdir = dir.join(format!("vindex-{scoped}"));
+        // `true` only here. This runs inside the readiness barrier, before the
+        // shard has served anything, so the store is still exactly where
+        // recovery left it and `tail_keys` describes every change since the
+        // stamp. A vindex reopened later, after an eviction, is a different
+        // situation: hours of writes may have landed that no tail records, so
+        // it rebuilds from the log and the cache is not consulted.
+        if let Err(e) = ensure_payload_loaded(vlog, &vdir, &arc, tenant, &scoped, true).await {
             tracing::warn!("warming payload index for vindex '{scoped}' failed: {e}");
             continue;
         }
@@ -1448,7 +1569,7 @@ fn run_shard(
                 // there so the port opening means queryable, and a search that
                 // still has to rebuild an index is not being served, it is
                 // finishing the startup someone else skipped.
-                warm_payload_indexes(&vlog, &vindexes).await;
+                warm_payload_indexes(&vlog, &vindexes, &dir).await;
                 let _ = ready.send(Ok(()));
                 // Background compaction and snapshots only earn their keep when
                 // the shard accepts writes; a serve-mode shard skips both.
@@ -1475,12 +1596,18 @@ fn run_shard(
 
                     // Background snapshot: keep restart recovery fast.
                     let svlog = vlog.clone();
+                    let svindexes = vindexes.clone();
+                    let sdir = dir.clone();
                     tokio::task::spawn_local(async move {
+                        // Stamp of the last cache written per vindex, so an
+                        // idle store stops rewriting the same bytes.
+                        let mut written: HashMap<String, (u64, u64)> = HashMap::new();
                         loop {
                             tokio::time::sleep(SNAPSHOT_INTERVAL).await;
-                            if let Err(e) = svlog.write_snapshot().await {
-                                error!("shard {shard_id}: snapshot failed: {e}");
-                            }
+                            snapshot_and_payload_caches(
+                                &svlog, &svindexes, &sdir, shard_id, &mut written,
+                            )
+                            .await;
                         }
                     });
 
@@ -1594,6 +1721,7 @@ fn is_mutation(req: &ShardReq) -> bool {
             | ShardReq::VindexCreate { .. }
             | ShardReq::VindexDrop { .. }
             | ShardReq::VindexConsolidate { .. }
+            | ShardReq::SnapshotAndPayloadCaches
             | ShardReq::Vset { .. }
             | ShardReq::Vdel { .. }
     )
@@ -1626,6 +1754,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
         | ShardReq::VindexConsolidate { .. }
+        | ShardReq::SnapshotAndPayloadCaches
         | ShardReq::Evict { .. }
         | ShardReq::IndexStats
         | ShardReq::TenantCacheBytes(_)
@@ -1824,6 +1953,11 @@ async fn process(
             // Stable order so the TUI doesn't flicker between polls.
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             ShardResp::VindexList(rows)
+        }
+        ShardReq::SnapshotAndPayloadCaches => {
+            // Forced: no memo, so it always writes.
+            snapshot_and_payload_caches(vlog, vindexes, dir, 0, &mut HashMap::new()).await;
+            ShardResp::Done
         }
         ShardReq::VindexConsolidate { name } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
@@ -2109,7 +2243,15 @@ async fn process(
             // (async, before the blocking walk) if this vindex was just
             // recovered from disk.
             if filter.is_some()
-                && let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &name).await
+                && let Err(e) = ensure_payload_loaded(
+                    vlog,
+                    &dir.join(format!("vindex-{name}")),
+                    &arc,
+                    tenant,
+                    &name,
+                    false,
+                )
+                .await
             {
                 return ShardResp::Err(e);
             }
@@ -2831,6 +2973,16 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index is missing or a shard is unavailable.
+    /// Force a snapshot plus the payload caches that go with it, on every
+    /// shard. Best effort per shard: failures are logged, not returned, since
+    /// the result is only ever an optimisation for the next open.
+    pub async fn write_snapshot_and_payload_caches(&self) {
+        let _ = self
+            .broadcast(|| ShardReq::SnapshotAndPayloadCaches)
+            .await;
+    }
+
+    /// Consolidate a VINDEX on every shard.
     pub async fn vindex_consolidate(&self, name: &str) -> Result<(), ShardError> {
         validate_vindex_name(name)?;
         let name = name.to_owned();
@@ -3583,13 +3735,305 @@ mod tests {
             .vsearch("idx", vec![1.0; 4], 4, 32, 0, false, Some(crate::payload::parse_filter("n EXISTS").unwrap()))
             .await
             .unwrap();
-        assert!(!hits.is_empty(), "il filtro deve trovare i payload ricaricati");
+        assert!(!hits.is_empty(), "the filter must find the reloaded payloads");
         assert_eq!(
             skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexRebuilds) - before,
             0,
-            "la prima ricerca filtrata ha ricostruito l'indice dei payload: \
-             quel costo va pagato all'apertura, non da chi interroga"
+            "the first filtered search rebuilt the payload index: that cost belongs \
+             at open, not on whoever queries first"
         );
+    }
+
+    /// A payload overwritten after the cache was stamped must never be served
+    /// from the cache.
+    ///
+    /// This is the failure the whole design is built around. The payload blobs
+    /// live in the vlog and keep changing after the cache file is written, so a
+    /// cache trusted on age alone would answer filtered searches from values
+    /// that no longer exist: results silently missing, no error anywhere. The
+    /// cache is therefore stamped with the vlog snapshot position and an id
+    /// whose key appears in the replayed tail is refused.
+    #[tokio::test]
+    async fn a_payload_changed_after_the_snapshot_is_not_served_from_the_cache() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = ShardSet::open_mode_with_workers(
+                dir.path(),
+                1,
+                false,
+                skeg_vector::QuantKind::Int8,
+                1,
+            )
+            .unwrap();
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            for id in 0..8u64 {
+                shards
+                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("t=old")))
+                    .await
+                    .unwrap();
+            }
+            shards.write_snapshot_and_payload_caches().await;
+            // After the stamp: this id's payload changes, the cache still says
+            // "t=old" for it.
+            shards
+                .vset("idx", 3, vec![4.0; 4], 0, None, Some(Bytes::from("t=new")))
+                .await
+                .unwrap();
+        }
+
+        let cached_before =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadCacheEntries);
+        let shards =
+            ShardSet::open_mode_with_workers(dir.path(), 1, false, skeg_vector::QuantKind::Int8, 1)
+                .unwrap();
+        let old = shards
+            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false,
+                     Some(crate::payload::parse_filter("t = old").unwrap()))
+            .await
+            .unwrap();
+        let new = shards
+            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false,
+                     Some(crate::payload::parse_filter("t = new").unwrap()))
+            .await
+            .unwrap();
+        assert!(
+            new.iter().any(|(id, _, _)| *id == 3),
+            "id 3 was rewritten to t=new and the filter misses it: the cache served a dead value"
+        );
+        assert!(
+            !old.iter().any(|(id, _, _)| *id == 3),
+            "id 3 still reads t=old: the cache overrode what the log says"
+        );
+        assert_eq!(old.len(), 7, "the other seven must stay t=old");
+        // Without this the test would also pass with the cache never read: green,
+        // and proving nothing.
+        assert!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadCacheEntries)
+                - cached_before
+                >= 7,
+            "the cache was never read: this test is not proving what it claims"
+        );
+    }
+
+    /// A tenant's filtered search must still work after a restart.
+    ///
+    /// Payload keys are built from the tenant-scoped vindex name. Warming with
+    /// the bare name builds different keys, finds nothing, and still marks the
+    /// index loaded, so every filtered search for that tenant comes back empty
+    /// with no error anywhere. Tenant 0 makes scoped and bare identical, so a
+    /// single-tenant test cannot see it.
+    #[tokio::test]
+    async fn a_tenant_filtered_search_survives_a_restart() {
+        const T: u128 = 0x2b;
+        let dir = TempDir::new().unwrap();
+        let scoped = scope_key(T, "idx");
+        {
+            let shards = ShardSet::open_mode_with_workers(
+                dir.path(),
+                1,
+                false,
+                skeg_vector::QuantKind::Int8,
+                1,
+            )
+            .unwrap();
+            shards.vindex_create(&scoped, 4, 0, 1).await.unwrap();
+            for id in 0..6u64 {
+                shards
+                    .vset(&scoped, id, vec![id as f32 + 1.0; 4], T, None,
+                          Some(Bytes::from("lic=mit")))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let shards =
+            ShardSet::open_mode_with_workers(dir.path(), 1, false, skeg_vector::QuantKind::Int8, 1)
+                .unwrap();
+        let hits = shards
+            .vsearch(&scoped, vec![1.0; 4], 6, 32, T, false,
+                     Some(crate::payload::parse_filter("lic = mit").unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            6,
+            "the tenant's filtered search came back with {} of 6 payloads after a restart",
+            hits.len()
+        );
+    }
+
+    /// Helper: a one-shard set over `dir` with a disk-backed vindex.
+    async fn open_one(dir: &std::path::Path) -> ShardSet {
+        ShardSet::open_mode_with_workers(dir, 1, false, skeg_vector::QuantKind::Int8, 1).unwrap()
+    }
+
+    fn filt(s: &str) -> Option<Filter> {
+        Some(crate::payload::parse_filter(s).unwrap())
+    }
+
+    /// A vindex evicted and reopened while the server runs must reflect writes
+    /// that landed after the store opened.
+    ///
+    /// The persisted payload cache is only safe during the open-time warm,
+    /// where the log tail describes every change since the stamp. A vindex
+    /// reopened hours later has no such record: writes since then are invisible
+    /// to that tail, so trusting the cache would serve values that were
+    /// overwritten. This is the case that says the cache must stay out of the
+    /// lazy reopen path.
+    #[tokio::test]
+    async fn an_evicted_vindex_reopens_with_writes_that_came_after_open() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = open_one(dir.path()).await;
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            for id in 0..6u64 {
+                shards
+                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("t=old")))
+                    .await
+                    .unwrap();
+            }
+            shards.write_snapshot_and_payload_caches().await;
+        }
+
+        let shards = open_one(dir.path()).await;
+        // Warm has run and the cache says every id is t=old. Now change one and
+        // force the vindex through the evict/reopen path.
+        shards
+            .vset("idx", 2, vec![3.0; 4], 0, None, Some(Bytes::from("t=new")))
+            .await
+            .unwrap();
+        assert!(
+            shards.control_handle().evict(0, "idx").await.unwrap(),
+            "the vindex should have been evicted"
+        );
+
+        let new = shards
+            .vsearch("idx", vec![1.0; 4], 6, 32, 0, false, filt("t = new"))
+            .await
+            .unwrap();
+        assert!(
+            new.iter().any(|(id, _, _)| *id == 2),
+            "id 2 was rewritten before the evict and the reopen lost it"
+        );
+        let old = shards
+            .vsearch("idx", vec![1.0; 4], 6, 32, 0, false, filt("t = old"))
+            .await
+            .unwrap();
+        assert!(!old.iter().any(|(id, _, _)| *id == 2), "id 2 came back as t=old");
+        assert_eq!(old.len(), 5);
+    }
+
+    /// Dropping a vindex and creating another with the same name must not
+    /// resurrect the old payloads through the cache file.
+    #[tokio::test]
+    async fn a_dropped_name_reused_does_not_resurrect_old_payloads() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = open_one(dir.path()).await;
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            for id in 0..4u64 {
+                shards
+                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("gen=one")))
+                    .await
+                    .unwrap();
+            }
+            shards.write_snapshot_and_payload_caches().await;
+            shards.vindex_drop("idx", 0).await.unwrap();
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            for id in 0..4u64 {
+                shards
+                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("gen=two")))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let shards = open_one(dir.path()).await;
+        let one = shards
+            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false, filt("gen = one"))
+            .await
+            .unwrap_or_default();
+        let two = shards
+            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false, filt("gen = two"))
+            .await
+            .unwrap();
+        assert!(one.is_empty(), "the dropped generation came back: {} hits", one.len());
+        assert_eq!(two.len(), 4, "the live generation is incomplete");
+    }
+
+    /// A deleted vector must not come back through the payload cache.
+    #[tokio::test]
+    async fn a_deleted_vector_stays_deleted_across_a_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = open_one(dir.path()).await;
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            for id in 0..5u64 {
+                shards
+                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("k=v")))
+                    .await
+                    .unwrap();
+            }
+            shards.write_snapshot_and_payload_caches().await;
+            assert!(shards.vdel("idx", 3, 0).await.unwrap());
+        }
+
+        let shards = open_one(dir.path()).await;
+        let hits = shards
+            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false, filt("k = v"))
+            .await
+            .unwrap();
+        assert!(!hits.iter().any(|(id, _, _)| *id == 3), "the deleted id came back");
+        assert_eq!(hits.len(), 4);
+    }
+
+    /// Plain KV must behave the same as before the uncached read path existed:
+    /// a normal get still caches, a delete still hides the key, and neither is
+    /// confused by a scan having read the same key.
+    #[tokio::test]
+    async fn kv_semantics_are_unchanged_by_the_uncached_read_path() {
+        let dir = TempDir::new().unwrap();
+        let shards = open_one(dir.path()).await;
+        shards.set(b"a", b"1", Durability::Kernel).await.unwrap();
+        shards.set(b"b", b"2", Durability::Kernel).await.unwrap();
+        assert_eq!(shards.get(b"a").await.unwrap().as_deref(), Some(b"1".as_slice()));
+        shards.set(b"a", b"3", Durability::Kernel).await.unwrap();
+        assert_eq!(
+            shards.get(b"a").await.unwrap().as_deref(),
+            Some(b"3".as_slice()),
+            "an overwrite must be visible through the cache"
+        );
+        assert!(shards.del(b"a", Durability::Kernel).await.unwrap());
+        assert_eq!(shards.get(b"a").await.unwrap(), None, "a deleted key must stay deleted");
+        assert_eq!(shards.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(shards.get(b"missing").await.unwrap(), None);
+    }
+
+    /// Consolidating rebuilds the graph; the payload index must survive it and
+    /// keep answering filters over the same ids.
+    #[tokio::test]
+    async fn consolidate_keeps_the_payload_index_answering() {
+        let dir = TempDir::new().unwrap();
+        let shards = open_one(dir.path()).await;
+        shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+        for id in 0..40u64 {
+            let tag = if id % 2 == 0 { "p=even" } else { "p=odd" };
+            shards
+                .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from(tag)))
+                .await
+                .unwrap();
+        }
+        let before = shards
+            .vsearch("idx", vec![1.0; 4], 40, 64, 0, false, filt("p = even"))
+            .await
+            .unwrap();
+        shards.vindex_consolidate("idx").await.unwrap();
+        let after = shards
+            .vsearch("idx", vec![1.0; 4], 40, 64, 0, false, filt("p = even"))
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 20, "half the vectors are even");
+        assert_eq!(after.len(), before.len(), "consolidate changed what the filter matches");
     }
 
     #[tokio::test]
