@@ -128,17 +128,19 @@ pub fn record_op(op: Op, shard_id: u16, duration: core::time::Duration) {
     }
 }
 
-/// Total `vsearch` operations recorded so far.
+/// Operations of one kind recorded so far.
 ///
-/// Exposed so callers can assert on the counter without reaching into the
-/// `stats` internals; returns 0 when metrics are compiled out.
-pub fn vsearch_total() -> u64 {
+/// The read side of [`record_op`], next to [`counter_value`]: callers can
+/// assert on either without reaching into the `stats` internals. Returns 0
+/// when metrics are compiled out.
+pub fn op_total(op: Op) -> u64 {
     #[cfg(any(feature = "stats", feature = "http"))]
     {
-        metrics::op_total(Op::VSearch)
+        metrics::op_total(op)
     }
     #[cfg(not(any(feature = "stats", feature = "http")))]
     {
+        let _ = op;
         0
     }
 }

@@ -505,6 +505,9 @@ impl VLog {
     /// its own structure. An existing cache entry is still used: skipping a hit
     /// would be a pointless read.
     ///
+    /// Not tenant-scoped, and it does not need to be: the tenant only decides
+    /// which tenant a cache insert is charged to, and there is no insert here.
+    ///
     /// # Errors
     ///
     /// Returns an error on IO failure, CRC mismatch, or corrupt record.

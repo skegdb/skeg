@@ -3692,7 +3692,7 @@ mod tests {
                 .unwrap();
         }
 
-        let before = skeg_telemetry::vsearch_total();
+        let before = skeg_telemetry::op_total(skeg_telemetry::Op::VSearch);
         for _ in 0..3 {
             shards
                 .vsearch("idx", vec![1.0; 4], 2, 16, 0, false, None)
@@ -3700,7 +3700,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            skeg_telemetry::vsearch_total() - before,
+            skeg_telemetry::op_total(skeg_telemetry::Op::VSearch) - before,
             3,
             "3 searches on {SHARDS} shards must count as 3 operations"
         );
