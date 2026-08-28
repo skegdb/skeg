@@ -442,6 +442,30 @@ impl VLog {
     /// GET a key, charging any read-path cache insert to `tenant`. Tenant `0` is
     /// the unscoped default; reach this via [`VLog::tenant`] for a scoped view.
     async fn get_scoped(&self, key: &[u8], tenant: u128) -> Result<Option<Bytes>> {
+        self.get_scoped_full(key, tenant, true).await
+    }
+
+    /// GET a key without letting the read populate the hot-key cache.
+    ///
+    /// For bulk scans that read every value once. The cache exists to keep hot
+    /// keys close; a scan has no hot keys, so populating it evicts whatever was
+    /// actually hot and leaves a copy of data the caller is about to hold in
+    /// its own structure. An existing cache entry is still used: skipping a hit
+    /// would be a pointless read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn get_uncached(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_scoped_full(key, 0, false).await
+    }
+
+    async fn get_scoped_full(
+        &self,
+        key: &[u8],
+        tenant: u128,
+        populate_cache: bool,
+    ) -> Result<Option<Bytes>> {
         if let Some(value) = self.inner.cache.borrow_mut().get(key) {
             return Ok(Some(value));
         }
@@ -463,10 +487,12 @@ impl VLog {
             .await?;
         let rec = decode_record(&buf)?;
         let value = Bytes::from(rec.value);
-        self.inner
-            .cache
-            .borrow_mut()
-            .insert_for(key, value.clone(), value.len(), tenant);
+        if populate_cache {
+            self.inner
+                .cache
+                .borrow_mut()
+                .insert_for(key, value.clone(), value.len(), tenant);
+        }
         Ok(Some(value))
     }
 
@@ -2341,6 +2367,50 @@ mod tests {
         let got2 = v.get(b"k").await.unwrap();
         assert_eq!(got2.as_deref(), Some(b"v".as_slice()));
         assert_eq!(v.disk_reads(), 1, "warm hit must not touch disk");
+    }
+
+    /// A bulk scan must not evict the hot keys it does not care about.
+    ///
+    /// Warming a vindex's payload index reads every stored blob once. Doing it
+    /// through the normal `get` put all 471.918 of them in the hot-key cache
+    /// (97 MB on that corpus), which is both a copy of data the caller is about
+    /// to hold in its own index and, past the byte budget, an eviction of
+    /// whatever was actually hot.
+    #[tokio::test]
+    async fn uncached_get_reads_without_populating_the_cache() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            for i in 0..8u32 {
+                v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                    .await
+                    .unwrap();
+            }
+        }
+        let v = VLog::open(dir.path()).await.unwrap();
+        let hot = b"k0";
+        assert_eq!(v.get(hot).await.unwrap().as_deref(), Some(b"v".as_slice()));
+        let after_hot = v.disk_reads();
+
+        for i in 1..8u32 {
+            let got = v.get_uncached(format!("k{i}").as_bytes()).await.unwrap();
+            assert_eq!(got.as_deref(), Some(b"v".as_slice()), "the scan must still read values");
+        }
+        assert_eq!(
+            v.disk_reads() - after_hot,
+            7,
+            "each scanned key is read once"
+        );
+
+        // Re-reading a scanned key still costs a disk read: it was never cached.
+        let before = v.disk_reads();
+        assert_eq!(v.get_uncached(b"k1").await.unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(v.disk_reads() - before, 1, "the scan must leave nothing behind");
+
+        // The key that was hot before the scan is still cached.
+        let before = v.disk_reads();
+        assert_eq!(v.get(hot).await.unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(v.disk_reads(), before, "the scan must not evict a hot key");
     }
 
     // ── compaction ───────────────────────────────────────────────────────────

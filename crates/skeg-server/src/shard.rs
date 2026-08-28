@@ -797,7 +797,11 @@ async fn ensure_payload_loaded(
     let mut parsed = Vec::with_capacity(ids.len());
     for id in ids {
         let key = payload_key(tenant, name, id);
-        match vlog.tenant(tenant).get(&key).await {
+        // `get_uncached`: this reads every blob exactly once and keeps the
+        // parsed fields in the payload index, so caching the blobs stores a
+        // second copy of data we already hold, and past the cache's byte
+        // budget it evicts whatever was genuinely hot to do it.
+        match vlog.get_uncached(&key).await {
             Ok(Some(blob)) => parsed.push((id, parse_fields(&blob))),
             Ok(None) => {}
             Err(e) => return Err(format!("payload index rebuild failed: {e}")),
