@@ -115,6 +115,20 @@ restart with a filtered query.
   moved, which on a store that is only being read means it is written once and
   left alone.
 
+  Stressed on the real corpus, not only in unit tests: payloads rewritten
+  around a snapshot, the store restarted, and the filter's view compared
+  against the stored blobs. Three rounds, no defects, and
+  `skeg_payload_cache_entries_total` reads 471.818 every round, the total minus
+  exactly the 100 ids rewritten after the stamp, so the refusal is visible in
+  the number rather than only asserted. 240 marked ids read back with their
+  blobs: no disagreement between what the filter matched and what was stored.
+
+  It is created `0600`, carries a crc32c over its body, and its header is
+  validated and its entry count bounded before the body is read, so a length
+  field on disk cannot drive an allocation. A refused file is logged: silently
+  reading the whole log back while a cache sits there unused is the kind of
+  thing that goes unnoticed.
+
 - **Quantised tier cache.** The `tq2` tier was recomputed from the source
   vectors on every open; it is now serialised to `tier.cache.bin` in the vindex
   directory and read back, with a fingerprint (vector count, dim, tier tag,
