@@ -128,6 +128,21 @@ pub fn record_op(op: Op, shard_id: u16, duration: core::time::Duration) {
     }
 }
 
+/// Total `vsearch` operations recorded so far.
+///
+/// Exposed so callers can assert on the counter without reaching into the
+/// `stats` internals; returns 0 when metrics are compiled out.
+pub fn vsearch_total() -> u64 {
+    #[cfg(any(feature = "stats", feature = "http"))]
+    {
+        metrics::op_total(Op::VSearch)
+    }
+    #[cfg(not(any(feature = "stats", feature = "http")))]
+    {
+        0
+    }
+}
+
 /// Set the current value of a gauge metric (overwrites; not a counter).
 #[inline(always)]
 pub fn set_gauge(g: Gauge, value: u64) {

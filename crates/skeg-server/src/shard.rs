@@ -1504,7 +1504,16 @@ fn run_shard(
                             mmap_graph,
                         )
                         .await;
-                        if let Some(op) = op_kind {
+                        // VSearch is recorded once by the scatter in `vsearch`,
+                        // not once per shard: it is the only op that fans out to
+                        // every worker, so a per-shard tick multiplies the count
+                        // by the shard number and times a fragment of the search
+                        // instead of the search. Per-shard counters carry no
+                        // information for it either, since every shard receives
+                        // exactly one message per search.
+                        if let Some(op) = op_kind
+                            && op != skeg_telemetry::Op::VSearch
+                        {
                             skeg_telemetry::record_op(op, shard_id_u16, t0.elapsed());
                         }
                         let _ = msg.reply.send(resp);
@@ -3087,6 +3096,9 @@ impl ShardSet {
                     .map_err(|_| ShardError::Busy)
             })
             .transpose()?;
+        // The client waits for the scatter, every reply, and the merge: that
+        // whole span is the search, and it is what the histogram must observe.
+        let started = std::time::Instant::now();
         let mut pending = Vec::with_capacity(self.inner.n);
         for sender in &self.inner.senders {
             let (tx, rx) = oneshot::channel();
@@ -3125,6 +3137,8 @@ impl ShardSet {
         }
         merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
+        // Shard 0 by convention: a scattered op belongs to no single shard.
+        skeg_telemetry::record_op(skeg_telemetry::Op::VSearch, 0, started.elapsed());
         Ok(merged)
     }
 
@@ -3429,6 +3443,48 @@ mod tests {
         for reply in replies {
             reply.await.unwrap().unwrap();
         }
+    }
+
+    /// One client search must move the vsearch counter by one, not by the
+    /// shard count.
+    ///
+    /// vsearch is the only op that scatters to every shard, and the counter was
+    /// ticked inside each shard worker: a single search on an 8-shard server
+    /// reported 8 operations, and the latency histogram measured per-shard work
+    /// instead of what the client waited for. Both numbers are read as query
+    /// traffic and query latency, so both were wrong by the shard count.
+    #[tokio::test]
+    async fn one_search_counts_as_one_operation_not_one_per_shard() {
+        const SHARDS: usize = 4;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            SHARDS,
+            false,
+            skeg_vector::QuantKind::Int8,
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("idx", 4, 0, 0).await.unwrap();
+        for id in 0..8u64 {
+            shards
+                .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, None)
+                .await
+                .unwrap();
+        }
+
+        let before = skeg_telemetry::vsearch_total();
+        for _ in 0..3 {
+            shards
+                .vsearch("idx", vec![1.0; 4], 2, 16, 0, false, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            skeg_telemetry::vsearch_total() - before,
+            3,
+            "3 searches on {SHARDS} shards must count as 3 operations"
+        );
     }
 
     #[tokio::test]
