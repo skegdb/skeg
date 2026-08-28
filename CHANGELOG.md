@@ -7,6 +7,104 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file tracks the engine and the multi-tenant server, both in this
 repository.
 
+## [Unreleased]
+
+What a restart and a filtered search actually cost, found while running a
+471.918-vector corpus (HuggingFace model metadata, dim 1024, `tq2`, disk
+backend, 8 shards) as a live service. Every number below is measured on that
+corpus, not projected.
+
+```
+                                  before     after
+open to queryable                   ~24s     10,6s
+first filtered search after open  5247 ms     28 ms
+vlog records re-decoded at open     472k         0
+one client search counts as           8x        1x
+```
+
+Three of these were invisible in the configurations most people run: the
+snapshot only paid off after a segment rollover, the search counter only
+inflated on a multi-shard server, and the payload rebuild only showed up on a
+restart with a filtered query.
+
+### Fixed
+
+- **A restart re-read the whole active vlog segment, however recent the
+  snapshot.** `Snapshot::hwm` is a segment id, and its own documentation says it
+  lets recovery skip segments with a *lower* id. With a single active segment
+  there is no lower id, so the mechanism never engaged before the first segment
+  rollover and a 512 MB segment was decoded again on every open. Snapshots now
+  also record `hwm_offset`, the byte length of the active segment they cover,
+  and recovery resumes there. Opening the corpus above went from 39,0s to 0,5s;
+  in production the recovery counter now reports zero records replayed.
+
+- **One client search counted as one operation per shard.** `VSEARCH` is the
+  only operation that scatters to every shard, and the counter and latency
+  histogram were recorded inside each shard worker. On an 8-shard server a
+  single search reported 8 operations, and the histogram observed one shard's
+  fragment of the work rather than what the client waited for, so both
+  published query traffic and published query latency were wrong by the shard
+  count. Measured on a live server: 5 searches moved the counter by 40. The
+  measurement now happens once at the scatter, spanning fan-out, replies and
+  merge. Nothing is lost: every shard receives exactly one message per search,
+  so per-shard counters carry no information for a scattered operation.
+
+- **The first filtered search after a restart paid for the whole reopening.** A
+  filtered `VSEARCH` evaluates the payload index, and that index was rebuilt
+  lazily on the first filter to arrive, reading every live id's payload blob
+  from the vlog. On the corpus above that search took 5247 ms against 6 ms for
+  every one after it. An unfiltered search neither pays this nor prevents it:
+  without a filter only the k results' payloads are read. The rebuild now runs
+  at open, inside the readiness barrier that already waits for recovery.
+
+- **Explicit `SKEG.VINDEX.CONSOLIDATE` held the vindex write lock for the whole
+  graph rebuild**, blocking every read for its duration: on 4.000 vectors a read
+  waited 3,81s on a 3,81s consolidate. Automatic maintenance already did this
+  correctly; only the explicit command was left behind. It now uses the same
+  three-phase path (short lock to begin, build off-thread with no lock, short
+  lock to finish). The command still returns when the work is done; it just
+  stops blocking readers meanwhile.
+
+### Changed
+
+- **The readiness barrier now also waits for payload indexes to load.** The
+  barrier exists so that an open port means queryable, and a search that still
+  has to rebuild an index is not being served. Consequence to know about: there
+  is no timeout on it. On a slow or degraded disk the port stays shut rather
+  than opening and making the first filtered query pay, so a health check will
+  time out where it previously saw one slow response. Warming is best effort per
+  vindex: one that fails is logged and still loads lazily on first use.
+
+- **Payload indexes are resident from open, for every recovered vindex.**
+  Measured at 338 MB for 471.918 records across two indexes, which extrapolates
+  to roughly 2 GB at 3M. Previously this was paid lazily and only for vindexes
+  actually filtered on, so a deployment that never uses `FILTER` now pays memory
+  and open time for nothing. On macOS the compressor hides this: an idle process
+  reports 3 MB resident until the index is touched.
+
+- **Snapshot format is now v2** (adds `hwm_offset`). A v1 file is rejected and
+  recovery falls back to a full scan, which is correct and only slower, so
+  downgrading is safe but gives up the faster open.
+
+### Added
+
+- **Quantised tier cache.** The `tq2` tier was recomputed from the source
+  vectors on every open; it is now serialised to `tier.cache.bin` in the vindex
+  directory and read back, with a fingerprint (vector count, dim, tier tag,
+  source length and mtime) that invalidates it when the corpus changes. A
+  foreign, truncated or corrupt cache is ignored rather than trusted. Worth 21%
+  of open time on the corpus above.
+
+- **`skeg_vlog_recovery_records_total`** counts records decoded while replaying
+  the log at open. A value close to the total key count means the snapshot is
+  not doing its job.
+
+- **`skeg_payload_index_rebuilds_total`** counts payload indexes rebuilt from
+  blobs. Any increase while serving traffic means a query paid for a rebuild.
+
+- Each payload warm logs its vector count and duration at `info`, since it is
+  now a visible share of open time.
+
 ## [0.7.3] - 2026-08-22
 
 Hardens the boundaries where skeg trusts network bytes or on-disk data, from a
