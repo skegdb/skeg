@@ -143,6 +143,22 @@ pub fn vsearch_total() -> u64 {
     }
 }
 
+/// Current value of one counter.
+///
+/// Exposed so callers can assert on a counter without reaching into the
+/// `stats` internals; returns 0 when metrics are compiled out.
+pub fn counter_value(c: Counter) -> u64 {
+    #[cfg(any(feature = "stats", feature = "http"))]
+    {
+        metrics::counter(c)
+    }
+    #[cfg(not(any(feature = "stats", feature = "http")))]
+    {
+        let _ = c;
+        0
+    }
+}
+
 /// Set the current value of a gauge metric (overwrites; not a counter).
 #[inline(always)]
 pub fn set_gauge(g: Gauge, value: u64) {
@@ -242,10 +258,14 @@ pub enum Counter {
     /// restart slow: a snapshot is supposed to cover most of them, and a value
     /// close to the total key count means it is not doing its job.
     VlogRecoveryRecords = 11,
+    /// Payload indexes rebuilt from stored blobs. The rebuild reads every live
+    /// id's payload, so it belongs at open, not on a user's query: a non-zero
+    /// value while serving means some search paid for it.
+    PayloadIndexRebuilds = 12,
 }
 
 impl Counter {
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -259,6 +279,7 @@ impl Counter {
         Counter::VlogPwritevBytesTotal,
         Counter::VlogWritebackHints,
         Counter::VlogRecoveryRecords,
+        Counter::PayloadIndexRebuilds,
     ];
 
     #[inline]
@@ -276,6 +297,7 @@ impl Counter {
             Counter::VlogPwritevBytesTotal => "skeg_vlog_pwritev_bytes_total",
             Counter::VlogWritebackHints => "skeg_vlog_writeback_hints_total",
             Counter::VlogRecoveryRecords => "skeg_vlog_recovery_records_total",
+            Counter::PayloadIndexRebuilds => "skeg_payload_index_rebuilds_total",
         }
     }
 }

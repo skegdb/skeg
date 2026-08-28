@@ -483,6 +483,11 @@ const MAX_INFLIGHT_PER_SHARD: usize = 1024;
 /// regime it is already exercised at.
 const ERASE_CONCURRENCY: usize = 256;
 
+/// Payload blob reads kept in flight while rebuilding a vindex's payload index.
+/// Same reasoning as `ERASE_CONCURRENCY`: the reads are independent, so the
+/// only thing a serial loop buys is idle time between them.
+const PAYLOAD_LOAD_CONCURRENCY: usize = 256;
+
 /// Route a key to a shard index.
 #[must_use]
 pub fn shard_for(key: &[u8], n_shards: usize) -> usize {
@@ -786,12 +791,21 @@ async fn ensure_payload_loaded(
         return Ok(());
     }
     let ids = arc.read().backend.live_ids();
-    let mut parsed = Vec::with_capacity(ids.len());
-    for id in ids {
+    // One await per id served every read in turn, so the rebuild cost the sum
+    // of ~223k independent disk reads. They do not depend on each other: keep
+    // many in flight and the device sees a queue instead of a single request.
+    let scoped = vlog.tenant(tenant);
+    let mut stream = futures_util::stream::iter(ids.into_iter().map(|id| {
         let key = payload_key(tenant, name, id);
-        match vlog.tenant(tenant).get(&key).await {
-            Ok(Some(blob)) => parsed.push((id, parse_fields(&blob))),
-            Ok(None) => {}
+        let scoped = &scoped;
+        async move { scoped.get(&key).await.map(|blob| (id, blob)) }
+    }))
+    .buffer_unordered(PAYLOAD_LOAD_CONCURRENCY);
+    let mut parsed = Vec::new();
+    while let Some(next) = futures_util::StreamExt::next(&mut stream).await {
+        match next {
+            Ok((id, Some(blob))) => parsed.push((id, parse_fields(&blob))),
+            Ok((_, None)) => {}
             Err(e) => return Err(format!("payload index rebuild failed: {e}")),
         }
     }
@@ -802,8 +816,33 @@ async fn ensure_payload_loaded(
             g.payload.upsert(id, fields);
         }
         g.payload_loaded = true;
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::PayloadIndexRebuilds);
     }
     Ok(())
+}
+
+/// Load every recovered vindex's payload index before the shard reports ready.
+///
+/// The rebuild reads each live id's payload blob, and deferring it to the first
+/// filtered search put the whole cost on one user's query: measured 5.2s
+/// against 6ms for every search after it, on 223k vectors. The readiness
+/// barrier already waits for recovery, so this belongs there.
+///
+/// Best effort by design: a vindex that cannot be warmed is logged and left
+/// alone, and it still loads lazily on its first filtered search. Readiness
+/// must not hinge on an optimisation.
+async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>) {
+    let entries: Vec<(String, VectorEntry)> = vindexes
+        .read()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (scoped, arc) in entries {
+        let (tenant, index) = unscope_key(&scoped);
+        if let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &index).await {
+            tracing::warn!("warming payload index for vindex '{scoped}' failed: {e}");
+        }
+    }
 }
 
 /// Run a VSEARCH against one vindex: exact brute-force over a filter's matching
@@ -1392,12 +1431,17 @@ fn run_shard(
                     return;
                 }
             };
-        // Recovery (incl. the multi-second quant-tier build at 500k+) is done;
-        // signal ready so `open` returns and the listener can bind.
-        let _ = ready.send(Ok(()));
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                // Recovery (incl. the multi-second quant-tier build at 500k+)
+                // is done. Warm the payload indexes too, then signal ready so
+                // `open` returns and the listener can bind: the barrier is
+                // there so the port opening means queryable, and a search that
+                // still has to rebuild an index is not being served, it is
+                // finishing the startup someone else skipped.
+                warm_payload_indexes(&vlog, &vindexes).await;
+                let _ = ready.send(Ok(()));
                 // Background compaction and snapshots only earn their keep when
                 // the shard accepts writes; a serve-mode shard skips both.
                 if !read_only {
@@ -3484,6 +3528,59 @@ mod tests {
             skeg_telemetry::vsearch_total() - before,
             3,
             "3 searches on {SHARDS} shards must count as 3 operations"
+        );
+    }
+
+    /// A reopened index must serve a filtered search without rebuilding its
+    /// payload index first.
+    ///
+    /// The rebuild reads every live id's payload from the vlog, one await per
+    /// record, and it was deferred to the first filtered search. On a 223k
+    /// corpus that first search took 5.2 seconds against 6 ms for every one
+    /// after it: the whole cost of reopening landed on whichever user arrived
+    /// first. It belongs at open, where the readiness barrier already waits.
+    #[tokio::test]
+    async fn reopen_loads_the_payload_index_before_serving() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = ShardSet::open_mode_with_workers(
+                dir.path(),
+                2,
+                false,
+                skeg_vector::QuantKind::Int8,
+                1,
+            )
+            .unwrap();
+            shards.vindex_create("idx", 4, 0, 1).await.unwrap();
+            for id in 0..16u64 {
+                shards
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        0,
+                        None,
+                        Some(Bytes::from(format!("n={id}"))),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let shards =
+            ShardSet::open_mode_with_workers(dir.path(), 2, false, skeg_vector::QuantKind::Int8, 1)
+                .unwrap();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexRebuilds);
+        let hits = shards
+            .vsearch("idx", vec![1.0; 4], 4, 32, 0, false, Some(crate::payload::parse_filter("n EXISTS").unwrap()))
+            .await
+            .unwrap();
+        assert!(!hits.is_empty(), "il filtro deve trovare i payload ricaricati");
+        assert_eq!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexRebuilds) - before,
+            0,
+            "la prima ricerca filtrata ha ricostruito l'indice dei payload: \
+             quel costo va pagato all'apertura, non da chi interroga"
         );
     }
 
