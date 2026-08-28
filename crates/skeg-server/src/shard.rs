@@ -483,10 +483,6 @@ const MAX_INFLIGHT_PER_SHARD: usize = 1024;
 /// regime it is already exercised at.
 const ERASE_CONCURRENCY: usize = 256;
 
-/// Payload blob reads kept in flight while rebuilding a vindex's payload index.
-/// Same reasoning as `ERASE_CONCURRENCY`: the reads are independent, so the
-/// only thing a serial loop buys is idle time between them.
-const PAYLOAD_LOAD_CONCURRENCY: usize = 256;
 
 /// Route a key to a shard index.
 #[must_use]
@@ -791,21 +787,19 @@ async fn ensure_payload_loaded(
         return Ok(());
     }
     let ids = arc.read().backend.live_ids();
-    // One await per id served every read in turn, so the rebuild cost the sum
-    // of ~223k independent disk reads. They do not depend on each other: keep
-    // many in flight and the device sees a queue instead of a single request.
-    let scoped = vlog.tenant(tenant);
-    let mut stream = futures_util::stream::iter(ids.into_iter().map(|id| {
+    // Serial on purpose. Running the reads `buffer_unordered` looks like the
+    // obvious win and measured the opposite on the same corpus: open took
+    // 26,7s at concurrency 256 and 15,7s at 16, against 11,1s reading one at a
+    // time. The shard runtime is single-threaded and the hot-key cache behind
+    // `get` is a RefCell, so in-flight reads do not overlap on the device, they
+    // just add scheduling and cache churn. Shards already warm in parallel with
+    // each other, which is where the parallelism actually is.
+    let mut parsed = Vec::with_capacity(ids.len());
+    for id in ids {
         let key = payload_key(tenant, name, id);
-        let scoped = &scoped;
-        async move { scoped.get(&key).await.map(|blob| (id, blob)) }
-    }))
-    .buffer_unordered(PAYLOAD_LOAD_CONCURRENCY);
-    let mut parsed = Vec::new();
-    while let Some(next) = futures_util::StreamExt::next(&mut stream).await {
-        match next {
-            Ok((id, Some(blob))) => parsed.push((id, parse_fields(&blob))),
-            Ok((_, None)) => {}
+        match vlog.tenant(tenant).get(&key).await {
+            Ok(Some(blob)) => parsed.push((id, parse_fields(&blob))),
+            Ok(None) => {}
             Err(e) => return Err(format!("payload index rebuild failed: {e}")),
         }
     }
@@ -839,9 +833,19 @@ async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>) {
         .collect();
     for (scoped, arc) in entries {
         let (tenant, index) = unscope_key(&scoped);
+        let n = arc.read().backend.live_ids().len();
+        let t0 = std::time::Instant::now();
         if let Err(e) = ensure_payload_loaded(vlog, &arc, tenant, &index).await {
             tracing::warn!("warming payload index for vindex '{scoped}' failed: {e}");
+            continue;
         }
+        // Logged because this is now a visible share of open time, and an
+        // operator staring at a slow start should not have to guess which
+        // part of it is this.
+        tracing::info!(
+            "warmed payload index for vindex '{scoped}': {n} vectors in {:?}",
+            t0.elapsed()
+        );
     }
 }
 
