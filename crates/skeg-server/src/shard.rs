@@ -808,15 +808,27 @@ async fn ensure_payload_loaded(
     // filtered search served from a stale payload index drops results with no
     // error anywhere, which is far worse than a slow open.
     let mut cached: HashMap<u64, Vec<u8>> = HashMap::new();
-    if allow_cache
-        && let Some(rec) = vlog.recovered_from()
-        && let Some(entries) = crate::payload_cache::read(vdir, rec.stamp, ids.len())
-    {
-        cached.reserve(entries.len());
-        for (id, blob) in entries {
-            if !rec.tail_keys.contains(&payload_key(tenant, name, id)) {
-                cached.insert(id, blob);
+    if allow_cache && let Some(rec) = vlog.recovered_from() {
+        match crate::payload_cache::read(vdir, rec.stamp, ids.len()) {
+            Some(entries) => {
+                cached.reserve(entries.len());
+                for (id, blob) in entries {
+                    if !rec.tail_keys.contains(&payload_key(tenant, name, id)) {
+                        cached.insert(id, blob);
+                    }
+                }
             }
+            // Refusing is always safe, so this is not an error, but silently
+            // reading the whole log back while a cache file sits there unused
+            // is the kind of thing that goes unnoticed for months. Absent is
+            // normal and says nothing; present and refused is worth a line.
+            None if vdir.join(crate::payload_cache::FILE).exists() => {
+                tracing::warn!(
+                    "payload cache for '{name}' refused (stale stamp, or damaged); \
+                     rebuilding from the log"
+                );
+            }
+            None => {}
         }
     }
     let from_cache = cached.len();
@@ -855,6 +867,19 @@ async fn ensure_payload_loaded(
     Ok(())
 }
 
+/// Snapshot the vindex map as owned handles.
+///
+/// Both callers below await while working on each vindex, and the map lives
+/// behind a lock that must not be held across an await. The clone is a name
+/// and an `Arc` per vindex, taken once.
+fn vindex_handles(vindexes: &RwLock<VindexSet>) -> Vec<(String, VectorEntry)> {
+    vindexes
+        .read()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Write the vlog snapshot, then a payload cache per vindex stamped with the
 /// position that snapshot covers.
 ///
@@ -880,12 +905,7 @@ async fn snapshot_and_payload_caches(
             return;
         }
     };
-    let entries: Vec<(String, VectorEntry)> = vindexes
-        .read()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (scoped, arc) in entries {
+    for (scoped, arc) in vindex_handles(vindexes) {
         // Built from the in-memory index, not by reading the blobs back. A
         // rebuild-from-log here would repeat the whole open-time read storm on
         // a server that is serving traffic, every snapshot interval, which is
@@ -938,12 +958,7 @@ async fn snapshot_and_payload_caches(
 /// alone, and it still loads lazily on its first filtered search. Readiness
 /// must not hinge on an optimisation.
 async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>, dir: &Path) {
-    let entries: Vec<(String, VectorEntry)> = vindexes
-        .read()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (scoped, arc) in entries {
+    for (scoped, arc) in vindex_handles(vindexes) {
         // The scoped name, not the bare index name: the query path builds its
         // payload keys from what `get_or_reopen` was given, which is scoped.
         // Warming with the bare name would build different keys, find nothing,
