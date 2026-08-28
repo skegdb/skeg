@@ -709,6 +709,21 @@ pub struct Tq1Aniso {
 }
 
 impl Tq1Aniso {
+    /// Field access for the tier cache: these three vectors are the only
+    /// data-dependent part of the aniso state.
+    pub(crate) fn shift_slice(&self) -> &[f32] {
+        &self.shift
+    }
+    pub(crate) fn inv_scale_slice(&self) -> &[f32] {
+        &self.inv_scale
+    }
+    pub(crate) fn center_slice(&self) -> &[f32] {
+        &self.center
+    }
+    pub(crate) fn from_parts(shift: Vec<f32>, inv_scale: Vec<f32>, center: Vec<f32>) -> Self {
+        Self { shift, inv_scale, center }
+    }
+
     #[must_use]
     fn is_identity(&self) -> bool {
         self.inv_scale.is_empty()
@@ -1426,6 +1441,118 @@ impl QuantizedVectors {
                 bits,
                 code_bytes,
                 aniso,
+            },
+        })
+    }
+
+    /// Serialise the data-dependent part of a TurboQuant tier.
+    ///
+    /// Only `codes`, `scales` and `aniso` come from the vectors. Everything else
+    /// (rotation, centroids, boundaries) is derived from `(dim, bits)` with a
+    /// fixed seed, so it is rebuilt on load rather than stored.
+    ///
+    /// Exists so opening an index does not re-quantise the corpus: that cost is
+    /// ~16 s per 223k x 1024 index, paid on every restart and crash recovery.
+    ///
+    /// Returns `None` for reprs other than TurboQuant: the other tiers are not
+    /// cached (they are cheaper to rebuild, and int8/pq carry different state).
+    #[must_use]
+    pub fn tier_payload(&self) -> Option<Vec<u8>> {
+        let QuantRepr::TurboQuant { codes, scales, aniso, bits, .. } = &self.repr else {
+            return None;
+        };
+        let c = codes.as_slice();
+        let mut out = Vec::with_capacity(32 + c.len() + scales.len() * 4 + 64);
+        out.extend_from_slice(&(*bits as u32).to_le_bytes());
+        out.extend_from_slice(&(self.n as u64).to_le_bytes());
+        out.extend_from_slice(&(self.dim as u64).to_le_bytes());
+        let put_f32s = |v: &[f32], out: &mut Vec<u8>| {
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        };
+        put_f32s(scales, &mut out);
+        put_f32s(aniso.shift_slice(), &mut out);
+        put_f32s(aniso.inv_scale_slice(), &mut out);
+        put_f32s(aniso.center_slice(), &mut out);
+        out.extend_from_slice(&(c.len() as u64).to_le_bytes());
+        out.extend_from_slice(c);
+        Some(out)
+    }
+
+    /// Rebuild a TurboQuant tier from [`tier_payload`](Self::tier_payload).
+    ///
+    /// Every length is validated against the buffer before it is used: the file
+    /// is untrusted input, and a truncated or crafted one must return `None`,
+    /// never panic on a slice. The caller then rebuilds from the vectors.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_tier_payload(buf: &[u8], dim: usize, bits: u8, n: usize) -> Option<Self> {
+        let mut p = 0usize;
+        let u32_at = |p: &mut usize| -> Option<u32> {
+            let e = p.checked_add(4)?;
+            let v = u32::from_le_bytes(buf.get(*p..e)?.try_into().ok()?);
+            *p = e;
+            Some(v)
+        };
+        if u32_at(&mut p)? != u32::from(bits) {
+            return None;
+        }
+        let u64_at = |p: &mut usize| -> Option<u64> {
+            let e = p.checked_add(8)?;
+            let v = u64::from_le_bytes(buf.get(*p..e)?.try_into().ok()?);
+            *p = e;
+            Some(v)
+        };
+        if u64_at(&mut p)? as usize != n || u64_at(&mut p)? as usize != dim {
+            return None;
+        }
+        let take_f32s = |p: &mut usize| -> Option<Vec<f32>> {
+            let len = u64_at(p)? as usize;
+            let bytes = len.checked_mul(4)?;
+            let e = p.checked_add(bytes)?;
+            let src = buf.get(*p..e)?;
+            *p = e;
+            Some(src.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+        let scales = take_f32s(&mut p)?;
+        if scales.len() != n {
+            return None;
+        }
+        let shift = take_f32s(&mut p)?;
+        let inv_scale = take_f32s(&mut p)?;
+        let center = take_f32s(&mut p)?;
+        let clen = u64_at(&mut p)? as usize;
+        let end = p.checked_add(clen)?;
+        let codes = buf.get(p..end)?.to_vec();
+        // Must be exactly the buffer: trailing bytes mean a format mismatch.
+        if end != buf.len() {
+            return None;
+        }
+
+        let rot_dim = tq_code_dim(dim, bits);
+        let code_bytes = rot_dim * (bits as usize) / 8;
+        if codes.len() != n.checked_mul(code_bytes)? {
+            return None;
+        }
+        let rotation = Box::new(FastRotation::new(rot_dim, TQ_ROTATION_SEED));
+        let (centroids, boundaries) = turboquant_levels(rot_dim, bits);
+        let (centroids_i8, i8_scale) = quantise_tq_centroids(&centroids, bits);
+        Some(QuantizedVectors {
+            dim,
+            n,
+            repr: QuantRepr::TurboQuant {
+                codes: CodeBacking::Owned(codes),
+                scales,
+                rotation,
+                centroids,
+                boundaries,
+                centroids_i8,
+                i8_scale,
+                bits,
+                code_bytes,
+                aniso: Tq1Aniso::from_parts(shift, inv_scale, center),
             },
         })
     }

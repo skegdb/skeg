@@ -1066,6 +1066,81 @@ impl VamanaIndex {
 // re-rank the survivors of the graph walk.
 
 const GRAPH_FILE: &str = "graph.vmn";
+/// Persisted quantised tier. Opening an index used to stream all of
+/// `vectors.bin` (f32) and rebuild the tier every time: measured at ~16 s per
+/// index for 223k x 1024 vectors, 914 MB read to produce ~26 MB of codes, and
+/// over three minutes projected at 3M. That cost is paid on every restart,
+/// crash recovery and deploy, which is exactly when a service can least afford
+/// it. The codes are deterministic from the parent index (fixed rotation seed),
+/// so they are written once and reloaded.
+const TIER_CACHE_FILE: &str = "tier.cache.bin";
+/// Header: magic, version, n, dim, tier tag, source len, source mtime.
+/// Size alone is not enough: two indexes with the same n/dim produce caches of
+/// the same length, so a stale or foreign file would be trusted.
+const TIER_CACHE_MAGIC: u32 = 0x5449_4552; // "TIER"
+const TIER_CACHE_VERSION: u32 = 1;
+const TIER_CACHE_HEADER: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8;
+
+/// Read a tier cache whose fingerprint matches this index, or `None`.
+///
+/// The file is untrusted: every field is length-checked before use, so a
+/// truncated, foreign or crafted cache returns `None` and the caller rebuilds.
+/// Never panics, never trusts.
+fn read_tier_cache(
+    path: &Path,
+    n: u32,
+    dim: usize,
+    tier_tag: u8,
+    src_len: u64,
+    src_mtime: u64,
+) -> Option<Vec<u8>> {
+    let buf = std::fs::read(path).ok()?;
+    if buf.len() < TIER_CACHE_HEADER {
+        return None;
+    }
+    if read_u32(&buf, 0) != TIER_CACHE_MAGIC || read_u32(&buf, 4) != TIER_CACHE_VERSION {
+        return None;
+    }
+    if read_u32(&buf, 8) != n || read_u32(&buf, 12) as usize != dim {
+        return None;
+    }
+    if read_u32(&buf, 16) != u32::from(tier_tag) {
+        return None;
+    }
+    let len = u64::from_le_bytes(buf.get(20..28)?.try_into().ok()?);
+    let mtime = u64::from_le_bytes(buf.get(28..36)?.try_into().ok()?);
+    // vectors.bin changed under us (a consolidate rewrites it): the codes no
+    // longer describe the vectors, and length alone would not catch it.
+    if len != src_len || mtime != src_mtime {
+        return None;
+    }
+    Some(buf[TIER_CACHE_HEADER..].to_vec())
+}
+
+/// Write the cache atomically: a half-written file must never be readable as a
+/// valid one, or the next open would load a truncated tier.
+fn write_tier_cache(
+    path: &Path,
+    n: u32,
+    dim: usize,
+    tier_tag: u8,
+    src_len: u64,
+    src_mtime: u64,
+    body: &[u8],
+) -> io::Result<()> {
+    let mut out = Vec::with_capacity(TIER_CACHE_HEADER + body.len());
+    out.extend_from_slice(&TIER_CACHE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&TIER_CACHE_VERSION.to_le_bytes());
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&(dim as u32).to_le_bytes());
+    out.extend_from_slice(&u32::from(tier_tag).to_le_bytes());
+    out.extend_from_slice(&src_len.to_le_bytes());
+    out.extend_from_slice(&src_mtime.to_le_bytes());
+    out.extend_from_slice(body);
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, &out)?;
+    std::fs::rename(&tmp, path)
+}
 const VECTORS_FILE: &str = "vectors.bin";
 /// Append-only WAL of delta inserts/deletes (replayed on open).
 const DELTA_LOG_FILE: &str = "delta.log";
@@ -2250,21 +2325,60 @@ impl DiskVamanaIndex {
             }
             Ok(())
         };
-        let mut quant = match tier {
-            QuantKind::Int8 => QuantizedVectors::build_int8_streaming(n_usize, dim, read_rows)?,
-            QuantKind::Pq { m, k } => {
-                QuantizedVectors::build_pq_streaming(n_usize, dim, m, k, read_rows)?
-            }
-            QuantKind::TurboQuant { bits } => {
-                QuantizedVectors::build_turboquant_streaming(n_usize, dim, bits, read_rows)?
-            }
-            QuantKind::F32 | QuantKind::Binary => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "disk tier supports Int8, Pq, or TurboQuant only",
-                ));
+        // Fast path: a valid cached tier skips streaming and re-quantising the
+        // whole of vectors.bin. The fingerprint ties the file to THIS index
+        // (n, dim, tier, and the source's length + mtime), because size alone
+        // would accept a cache built from different vectors of the same shape.
+        let cache_path = dir.join(TIER_CACHE_FILE);
+        let src_meta = std::fs::metadata(dir.join(VECTORS_FILE)).ok();
+        let fingerprint = |meta: Option<&std::fs::Metadata>| -> (u64, u64) {
+            match meta {
+                Some(m) => (
+                    m.len(),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_nanos() as u64),
+                ),
+                None => (0, 0),
             }
         };
+        let (src_len, src_mtime) = fingerprint(src_meta.as_ref());
+        let tier_tag = tier.to_wire().unwrap_or(0);
+        let cached = if let QuantKind::TurboQuant { bits } = tier {
+            read_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime)
+                .and_then(|body| QuantizedVectors::from_tier_payload(&body, dim, bits, n_usize))
+        } else {
+            None
+        };
+
+        let mut quant = match cached {
+            Some(q) => q,
+            None => match tier {
+                QuantKind::Int8 => QuantizedVectors::build_int8_streaming(n_usize, dim, read_rows)?,
+                QuantKind::Pq { m, k } => {
+                    QuantizedVectors::build_pq_streaming(n_usize, dim, m, k, read_rows)?
+                }
+                QuantKind::TurboQuant { bits } => {
+                    QuantizedVectors::build_turboquant_streaming(n_usize, dim, bits, read_rows)?
+                }
+                QuantKind::F32 | QuantKind::Binary => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "disk tier supports Int8, Pq, or TurboQuant only",
+                    ));
+                }
+            },
+        };
+        // Persist for the next open. Best-effort: a read-only directory or a
+        // full disk must not stop the index from opening, it only means the
+        // next open pays the rebuild again.
+        if matches!(tier, QuantKind::TurboQuant { .. })
+            && !cache_path.exists()
+            && let Some(body) = quant.tier_payload()
+        {
+            let _ = write_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime, &body);
+        }
         // TurboQuant tier only, opt-in. Persist the codes buffer to
         // `tier.cache.bin` and swap
         // the in-RAM `Vec<u8>` for a `MappedFile`; the OS page cache then
