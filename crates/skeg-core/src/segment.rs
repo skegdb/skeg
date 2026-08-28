@@ -59,8 +59,20 @@ pub fn list_segments(dir: &Path) -> io::Result<Vec<u16>> {
 ///
 /// Panics only if header slicing invariants are violated after a length check
 /// (cannot happen in practice).
-pub fn scan_file(pf: &PlatformFile, mut f: impl FnMut(u64, Record)) -> io::Result<u64> {
-    let mut offset = 0u64;
+pub fn scan_file(pf: &PlatformFile, f: impl FnMut(u64, Record)) -> io::Result<u64> {
+    scan_file_from(pf, 0, f)
+}
+
+/// Like [`scan_file`] but resumes at `start`, for recovery that already has a
+/// snapshot covering the prefix. `start` must be a record boundary; a wrong one
+/// yields a bad header and stops the scan, so callers pass an offset they wrote
+/// themselves.
+pub fn scan_file_from(
+    pf: &PlatformFile,
+    start: u64,
+    mut f: impl FnMut(u64, Record),
+) -> io::Result<u64> {
+    let mut offset = start;
     let mut header = [0u8; HEADER_SIZE];
 
     loop {

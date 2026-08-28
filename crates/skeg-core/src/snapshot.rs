@@ -29,8 +29,14 @@ use crc32c::crc32c;
 use crate::index::IndexEntry;
 
 const MAGIC: u32 = 0x534B_5350;
-const VERSION: u8 = 1;
-const HEADER_LEN: usize = 4 + 1 + 2 + 8 + 4; // magic+version+hwm+max_ts+n_entries
+/// v2 adds `hwm_offset`: how many bytes of the hwm segment the snapshot covers.
+/// v1 only had `hwm`, a segment id, and recovery skipped whole segments with a
+/// LOWER id. With a single segment there is no lower id, so the whole active
+/// segment was rescanned however recent the snapshot was: on a 512 MB segment
+/// that is the entire cost of opening. A v1 file is simply ignored (a rescan is
+/// correct, only slow), so there is no migration.
+const VERSION: u8 = 2;
+const HEADER_LEN: usize = 4 + 1 + 2 + 8 + 8 + 4; // magic+version+hwm+hwm_offset+max_ts+n_entries
 
 /// Path of the committed snapshot file.
 #[must_use]
@@ -47,6 +53,9 @@ pub struct Snapshot {
     /// Active segment id when the snapshot was taken; segments with a lower id
     /// are fully captured here and need not be rescanned.
     pub hwm: u16,
+    /// Bytes of segment `hwm` already reflected in `entries`. Recovery resumes
+    /// scanning that segment from here instead of from zero.
+    pub hwm_offset: u64,
     /// Logical clock value to resume from.
     pub max_ts: u64,
     /// `(key, entry)` pairs of the index at snapshot time.
@@ -56,11 +65,17 @@ pub struct Snapshot {
 /// Serialize `entries` into the snapshot wire format.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub fn encode(hwm: u16, max_ts: u64, entries: &[(Vec<u8>, IndexEntry)]) -> Vec<u8> {
+pub fn encode(
+    hwm: u16,
+    hwm_offset: u64,
+    max_ts: u64,
+    entries: &[(Vec<u8>, IndexEntry)],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(HEADER_LEN + entries.len() * 32 + 4);
     buf.extend_from_slice(&MAGIC.to_le_bytes());
     buf.push(VERSION);
     buf.extend_from_slice(&hwm.to_le_bytes());
+    buf.extend_from_slice(&hwm_offset.to_le_bytes());
     buf.extend_from_slice(&max_ts.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (key, e) in entries {
@@ -93,9 +108,10 @@ pub fn decode(buf: &[u8]) -> Option<Snapshot> {
     if buf[4] != VERSION {
         return None;
     }
-    let hwm = u16::from_le_bytes(buf[5..7].try_into().ok()?);
-    let max_ts = u64::from_le_bytes(buf[7..15].try_into().ok()?);
-    let n = u32::from_le_bytes(buf[15..19].try_into().ok()?) as usize;
+    let hwm = u16::from_le_bytes(buf.get(5..7)?.try_into().ok()?);
+    let hwm_offset = u64::from_le_bytes(buf.get(7..15)?.try_into().ok()?);
+    let max_ts = u64::from_le_bytes(buf.get(15..23)?.try_into().ok()?);
+    let n = u32::from_le_bytes(buf.get(23..27)?.try_into().ok()?) as usize;
 
     let end = buf.len() - 4;
     // `n` is an untrusted u32 (~4.29e9 → ~171 GiB reservation). crc32c is
@@ -135,6 +151,7 @@ pub fn decode(buf: &[u8]) -> Option<Snapshot> {
     }
     Some(Snapshot {
         hwm,
+        hwm_offset,
         max_ts,
         entries,
     })
@@ -151,10 +168,11 @@ pub fn decode(buf: &[u8]) -> Option<Snapshot> {
 pub fn write(
     dir: &Path,
     hwm: u16,
+    hwm_offset: u64,
     max_ts: u64,
     entries: &[(Vec<u8>, IndexEntry)],
 ) -> std::io::Result<()> {
-    let buf = encode(hwm, max_ts, entries);
+    let buf = encode(hwm, hwm_offset, max_ts, entries);
     let tmp = snapshot_tmp_path(dir);
     {
         // The snapshot holds tenant key names and fingerprints; create it
@@ -221,7 +239,7 @@ mod tests {
             (b"beta".to_vec(), entry(1, 256)),
             (b"".to_vec(), entry(2, 512)),
         ];
-        let buf = encode(7, 9999, &entries);
+        let buf = encode(7, 4096, 9999, &entries);
         let snap = decode(&buf).expect("decode");
         assert_eq!(snap.hwm, 7);
         assert_eq!(snap.max_ts, 9999);
@@ -234,7 +252,7 @@ mod tests {
     #[test]
     fn test_snapshot_crc_corruption_detected() {
         let entries = vec![(b"k".to_vec(), entry(0, 0))];
-        let mut buf = encode(0, 1, &entries);
+        let mut buf = encode(0, 0, 1, &entries);
         buf[HEADER_LEN + 2] ^= 0xFF; // flip a byte inside the payload
         assert!(decode(&buf).is_none(), "corruption must fail the CRC check");
     }
@@ -242,7 +260,7 @@ mod tests {
     #[test]
     fn test_snapshot_truncated_returns_none() {
         let entries = vec![(b"k".to_vec(), entry(0, 0))];
-        let buf = encode(0, 1, &entries);
+        let buf = encode(0, 0, 1, &entries);
         assert!(decode(&buf[..buf.len() / 2]).is_none());
         assert!(decode(&[]).is_none());
         assert!(decode(&[0u8; 8]).is_none());
@@ -250,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_bad_magic_returns_none() {
-        let mut buf = encode(0, 1, &[(b"k".to_vec(), entry(0, 0))]);
+        let mut buf = encode(0, 0, 1, &[(b"k".to_vec(), entry(0, 0))]);
         buf[0] = 0xEE;
         // Recompute the CRC so only the magic is wrong.
         let crc = crc32c(&buf[..buf.len() - 4]);
@@ -266,7 +284,7 @@ mod tests {
             (b"one".to_vec(), entry(0, 0)),
             (b"two".to_vec(), entry(0, 128)),
         ];
-        write(dir.path(), 3, 42, &entries).unwrap();
+        write(dir.path(), 3, 8192, 42, &entries).unwrap();
         // The tmp file must not survive a successful write.
         assert!(!snapshot_tmp_path(dir.path()).exists());
 
@@ -285,7 +303,7 @@ mod tests {
     #[test]
     fn test_snapshot_remove() {
         let dir = TempDir::new().unwrap();
-        write(dir.path(), 0, 1, &[(b"k".to_vec(), entry(0, 0))]).unwrap();
+        write(dir.path(), 0, 0, 1, &[(b"k".to_vec(), entry(0, 0))]).unwrap();
         assert!(read(dir.path()).is_some());
         remove(dir.path()).unwrap();
         assert!(read(dir.path()).is_none());

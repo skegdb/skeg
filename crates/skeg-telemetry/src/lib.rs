@@ -223,10 +223,14 @@ pub enum Counter {
     /// ahead of the durability call that follows, instead of letting a
     /// whole compaction's worth of dirty pages pile up unflushed.
     VlogWritebackHints = 10,
+    /// Records decoded while replaying the log at open. This is what makes a
+    /// restart slow: a snapshot is supposed to cover most of them, and a value
+    /// close to the total key count means it is not doing its job.
+    VlogRecoveryRecords = 11,
 }
 
 impl Counter {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -239,6 +243,7 @@ impl Counter {
         Counter::VlogPreallocations,
         Counter::VlogPwritevBytesTotal,
         Counter::VlogWritebackHints,
+        Counter::VlogRecoveryRecords,
     ];
 
     #[inline]
@@ -255,6 +260,7 @@ impl Counter {
             Counter::VlogPreallocations => "skeg_vlog_preallocations_total",
             Counter::VlogPwritevBytesTotal => "skeg_vlog_pwritev_bytes_total",
             Counter::VlogWritebackHints => "skeg_vlog_writeback_hints_total",
+            Counter::VlogRecoveryRecords => "skeg_vlog_recovery_records_total",
         }
     }
 }
