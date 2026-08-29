@@ -483,6 +483,13 @@ const MAX_INFLIGHT_PER_SHARD: usize = 1024;
 /// regime it is already exercised at.
 const ERASE_CONCURRENCY: usize = 256;
 
+/// Payload blob reads in flight while rebuilding one vindex's payload index.
+///
+/// Modest on purpose: every shard rebuilds at once, so the device already sees
+/// one stream per shard and this multiplies that. Past the point where the
+/// queue is full, more requests only add latency to each.
+const PAYLOAD_READ_CONCURRENCY: usize = 32;
+
 
 /// Route a key to a shard index.
 #[must_use]
@@ -789,9 +796,9 @@ async fn ensure_payload_loaded(
     tenant: u128,
     name: &str,
     allow_cache: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if arc.read().payload_loaded {
-        return Ok(());
+        return Ok(false);
     }
     let ids = arc.read().backend.live_ids();
 
@@ -836,16 +843,9 @@ async fn ensure_payload_loaded(
                 "payload index for '{name}' read from disk: {covered} ids, {refreshed} re-read from the log"
             );
         }
-        return Ok(());
+        return Ok(false);
     }
 
-    // Serial on purpose. Running the reads `buffer_unordered` looks like the
-    // obvious win and measured the opposite on the same corpus: open took
-    // 26,7s at concurrency 256 and 15,7s at 16, against 11,1s reading one at a
-    // time. The shard runtime is single-threaded and the hot-key cache behind
-    // `get` is a RefCell, so in-flight reads do not overlap on the device, they
-    // just add scheduling and cache churn. Shards already warm in parallel with
-    // each other, which is where the parallelism actually is.
     // The persisted cache, when the store recovered from the snapshot it was
     // stamped with. `cached` holds only ids the replayed tail did not touch:
     // anything the tail wrote changed after the stamp, so its cached blob is a
@@ -862,16 +862,31 @@ async fn ensure_payload_loaded(
         );
     }
 
-    let mut parsed = Vec::with_capacity(ids.len());
-    for id in ids {
+    // Reads in flight, because this path is latency-bound whenever the store is
+    // cold.
+    //
+    // An earlier version read them one at a time, on a measurement that said
+    // serial was faster. That measurement was taken in the wrong regime: with
+    // the payloads already in page cache a read costs ~1 us, the device is
+    // never waited on, and concurrency only adds scheduling. On a cold store
+    // the same read costs ~280 us, 212 times more, and a serial loop leaves the
+    // disk idle between every one of them. The reads are independent either
+    // way, so serialising them buys nothing but that idle time.
+    //
+    // `get_uncached`: this reads every blob exactly once and keeps the parsed
+    // fields in the payload index, so caching the blobs would store a second
+    // copy of data we already hold, and past the cache's byte budget it would
+    // evict whatever was genuinely hot to do it.
+    let mut stream = futures_util::stream::iter(ids.into_iter().map(|id| {
         let key = payload_key(tenant, name, id);
-        // `get_uncached`: this reads every blob exactly once and keeps the
-        // parsed fields in the payload index, so caching the blobs stores a
-        // second copy of data we already hold, and past the cache's byte
-        // budget it evicts whatever was genuinely hot to do it.
-        match vlog.get_uncached(&key).await {
-            Ok(Some(blob)) => parsed.push((id, parse_fields(&blob))),
-            Ok(None) => {}
+        async move { vlog.get_uncached(&key).await.map(|blob| (id, blob)) }
+    }))
+    .buffer_unordered(PAYLOAD_READ_CONCURRENCY);
+    let mut parsed = Vec::new();
+    while let Some(next) = futures_util::StreamExt::next(&mut stream).await {
+        match next {
+            Ok((id, Some(blob))) => parsed.push((id, parse_fields(&blob))),
+            Ok((_, None)) => {}
             Err(e) => return Err(format!("payload index rebuild failed: {e}")),
         }
     }
@@ -885,7 +900,7 @@ async fn ensure_payload_loaded(
         g.payload_loaded = true;
         skeg_telemetry::tick_counter(skeg_telemetry::Counter::PayloadIndexRebuilds);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Snapshot the vindex map as owned handles.
@@ -974,7 +989,11 @@ async fn snapshot_and_payload_indexes(
 /// Best effort by design: a vindex that cannot be warmed is logged and left
 /// alone, and it still loads lazily on its first filtered search. Readiness
 /// must not hinge on an optimisation.
-async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>, dir: &Path) {
+/// Returns whether any vindex had to be rebuilt from the log rather than read
+/// from its file, which is what makes persisting it straight afterwards worth
+/// the write.
+async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>, dir: &Path) -> bool {
+    let mut rebuilt_any = false;
     for (scoped, arc) in vindex_handles(vindexes) {
         // The scoped name, not the bare index name: the query path builds its
         // payload keys from what `get_or_reopen` was given, which is scoped.
@@ -992,9 +1011,12 @@ async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>, dir: &P
         // stamp. A vindex reopened later, after an eviction, is a different
         // situation: hours of writes may have landed that no tail records, so
         // it rebuilds from the log and the cache is not consulted.
-        if let Err(e) = ensure_payload_loaded(vlog, &vdir, &arc, tenant, &scoped, true).await {
-            tracing::warn!("warming payload index for vindex '{scoped}' failed: {e}");
-            continue;
+        match ensure_payload_loaded(vlog, &vdir, &arc, tenant, &scoped, true).await {
+            Ok(rebuilt) => rebuilt_any |= rebuilt,
+            Err(e) => {
+                tracing::warn!("warming payload index for vindex '{scoped}' failed: {e}");
+                continue;
+            }
         }
         // Logged because this is now a visible share of open time, and an
         // operator staring at a slow start should not have to guess which
@@ -1004,6 +1026,7 @@ async fn warm_payload_indexes(vlog: &VLog, vindexes: &RwLock<VindexSet>, dir: &P
             t0.elapsed()
         );
     }
+    rebuilt_any
 }
 
 /// Run a VSEARCH against one vindex: exact brute-force over a filter's matching
@@ -1235,12 +1258,23 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     }
     if consolidate_due {
         let d = vdir.to_path_buf();
+        // The pace depends on WHY we are folding, and the engine knows which.
+        // Triggered by quiet there is no traffic to protect and finishing
+        // sooner is better; triggered by churn there are live queries and every
+        // core taken is one they do not get. It used the same share for both,
+        // holding back when nothing needed protecting and taking the machine
+        // when something did.
+        let pace = if idle {
+            skeg_vector::ConsolidatePace::Idle
+        } else {
+            skeg_vector::ConsolidatePace::Serving
+        };
         let ran = off_thread_maintenance(
             arc,
             "consolidate",
             shard_id,
             |b| b.consolidate_begin(),
-            move |job| job.build(&d),
+            move |job| job.build_with_threads(&d, pace),
             |b, built| b.consolidate_finish(built),
         )
         .await;
@@ -1601,8 +1635,36 @@ fn run_shard(
                 // there so the port opening means queryable, and a search that
                 // still has to rebuild an index is not being served, it is
                 // finishing the startup someone else skipped.
-                warm_payload_indexes(&vlog, &vindexes, &dir).await;
+                let rebuilt = warm_payload_indexes(&vlog, &vindexes, &dir).await;
                 let _ = ready.send(Ok(()));
+                // Ready first, then persist: the file is an optimisation for the
+                // next open, never a precondition for serving this one.
+                //
+                // A warm that had to rebuild from the log just paid for the
+                // expensive path, and until now it threw the result away unless
+                // the process happened to survive to the next snapshot five
+                // minutes later. Worse, the snapshot is written on its own
+                // schedule whether or not the payload index can be persisted, so
+                // a store that kept missing that window was guaranteed a slow
+                // open every single time. Pay once.
+                // Always, not only after a rebuild. Recovery replays whatever
+                // the log holds past the last snapshot, and a store that
+                // restarts more often than the snapshot interval never gets a
+                // fresh one: this open replayed 3.667.425 records and took 21
+                // minutes for exactly that reason. Snapshotting here caps the
+                // next replay at whatever is written from now on, and the open
+                // that just finished has already paid far more than this costs.
+                let _ = rebuilt;
+                if !read_only {
+                    snapshot_and_payload_indexes(
+                        &vlog,
+                        &vindexes,
+                        &dir,
+                        shard_id,
+                        &mut HashMap::new(),
+                    )
+                    .await;
+                }
                 // Background compaction and snapshots only earn their keep when
                 // the shard accepts writes; a serve-mode shard skips both.
                 if !read_only {

@@ -1586,6 +1586,40 @@ impl ConsolidateJob {
     ///
     /// Returns an I/O error if writing the sidecar files fails.
     pub fn build(self, index_dir: &Path) -> io::Result<ConsolidateBuilt> {
+        self.build_with_threads(index_dir, ConsolidatePace::Serving)
+    }
+
+    /// Build, saying how much of the machine the rebuild may take.
+    ///
+    /// The two cases are genuinely different and the engine knows which it is
+    /// in. A fold triggered because writes went quiet has nothing to protect:
+    /// there is no traffic, and finishing sooner is strictly better. A fold
+    /// triggered by churn is running against live queries, and every core it
+    /// takes is one they do not get.
+    ///
+    /// Measured on 223.135 real vectors, searches running throughout:
+    ///
+    /// ```text
+    ///   threads   search p50   search p99   consolidate
+    ///      6        72,3 ms     237,0 ms      ~25,8 s
+    ///      4        61,8 ms     175,3 ms      ~25,6 s
+    ///      2        42,4 ms     103,0 ms      ~31,0 s
+    /// ```
+    ///
+    /// The build barely speeds up with more threads, so the extra ones buy
+    /// little and cost the tail a lot. Which is only true while something is
+    /// querying: idle, the same threads are free.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure while reading vectors or writing the
+    /// rebuilt graph.
+    pub fn build_with_threads(
+        self,
+        index_dir: &Path,
+        pace: ConsolidatePace,
+    ) -> io::Result<ConsolidateBuilt> {
+        let phase_start = std::time::Instant::now();
         let tmp = index_dir.join("consolidating");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
@@ -1632,6 +1666,7 @@ impl ConsolidateJob {
             }
             ids.push(id);
         }
+        let t_read = phase_start.elapsed();
         let cfg = disk_build_config();
         // Cap the build's rayon parallelism. The consolidate runs off the request
         // path on a background thread, but `build_disk_graph` fans out over the
@@ -1639,18 +1674,28 @@ impl ConsolidateJob {
         // foreground - streaming inserts and queries - of every core, collapsing
         // sustained ingest throughput (measured: churn drops ~10x during a fold).
         // Confine it to a bounded pool so the foreground keeps making progress.
-        let rebuilt = match consolidate_thread_cap()
+        let rebuilt = match consolidate_thread_cap(pace)
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
         {
             Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
             None => build_disk_graph(tier, vectors, ids, dim, &cfg),
         };
+        let t_graph = phase_start.elapsed();
         rebuilt.save(&tmp)?;
         // Open the freshly-saved base HERE (still off-thread): this is where the
         // O(live) quant-tier build happens now - not on the shard thread in
         // finish. The vectors.bin fd survives the finish rename (inode), so the
         // returned segment stays valid after the file moves into place.
         let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
+        // Where a fold's seconds actually go. Without this the only lever anyone
+        // can reason about is the graph build, which may not be the biggest part.
+        tracing::info!(
+            "consolidate phases: read {:?}, graph {:?}, save+tier {:?}, total {:?}",
+            t_read,
+            t_graph - t_read,
+            phase_start.elapsed() - t_graph,
+            phase_start.elapsed(),
+        );
         Ok(ConsolidateBuilt {
             base,
             tmp,
@@ -1669,18 +1714,35 @@ impl ConsolidateJob {
 /// side at the extremes. Override the fraction's numerator with
 /// `SKEG_CONSOLIDATE_THREADS` (an absolute thread count; 0 or >= parallelism
 /// means "all cores"). Machines with 1-2 cores are left uncapped.
-fn consolidate_thread_cap() -> Option<usize> {
-    /// Cores the build takes, out of every 4 available; the other 1/4 stays free
-    /// for the foreground.
-    const BUILD_NUM: usize = 3;
-    const BUILD_DEN: usize = 4;
+/// How much of the machine a rebuild may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsolidatePace {
+    /// Something is querying: leave the machine room to answer.
+    Serving,
+    /// Writes went quiet and this fold was triggered by that quiet. There is
+    /// nothing to protect, and a shorter fold is a shorter window in which
+    /// traffic could return and find the machine busy.
+    Idle,
+}
+
+fn consolidate_thread_cap(pace: ConsolidatePace) -> Option<usize> {
+    /// Cores a rebuild takes while queries are being served, out of every 4.
+    /// Low on purpose: the build scales poorly with threads, so the ones above
+    /// this buy little build speed and cost the query tail a lot.
+    const SERVING_NUM: usize = 1;
+    const SERVING_DEN: usize = 4;
     let avail = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4);
-    let n = std::env::var("SKEG_CONSOLIDATE_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| (avail * BUILD_NUM / BUILD_DEN).max(1));
+    // The override, when set, applies to the serving case: it exists to protect
+    // queries, and there are none to protect when idle.
+    let n = match pace {
+        ConsolidatePace::Idle => avail,
+        ConsolidatePace::Serving => std::env::var("SKEG_CONSOLIDATE_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| (avail * SERVING_NUM / SERVING_DEN).max(1)),
+    };
     (n >= 1 && n < avail).then_some(n)
 }
 
@@ -1748,7 +1810,9 @@ impl RunMergeJob {
             );
         }
         let cfg = disk_build_config();
-        let rebuilt = match consolidate_thread_cap()
+        // Always cautious: these two are O(runs) and short, and the window
+        // they would open by taking the machine is not worth the seconds saved.
+        let rebuilt = match consolidate_thread_cap(ConsolidatePace::Serving)
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
         {
             Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
@@ -1847,7 +1911,9 @@ impl FlushJob {
         let dir = index_dir.join(format!("run-{seq}"));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = disk_build_config();
-        let rebuilt = match consolidate_thread_cap()
+        // Always cautious: these two are O(runs) and short, and the window
+        // they would open by taking the machine is not worth the seconds saved.
+        let rebuilt = match consolidate_thread_cap(ConsolidatePace::Serving)
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
         {
             Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
@@ -1919,7 +1985,7 @@ impl DeletePatchJob {
         let cfg = disk_build_config();
         // Same rayon cap as the consolidate: keep a background patch from
         // starving the foreground of every core while it runs.
-        let patched = match consolidate_thread_cap()
+        let patched = match consolidate_thread_cap(ConsolidatePace::Serving)
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
         {
             Some(pool) => {
