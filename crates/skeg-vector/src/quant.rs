@@ -242,6 +242,12 @@ mod wire_tests {
 }
 
 /// A query vector quantized to match a [`QuantizedVectors`] set.
+/// `SKEG_TQ2_QI8=1` switches the 2-bit ADC to the i8-query sdot kernel.
+fn tq2_qi8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SKEG_TQ2_QI8").is_ok_and(|v| v == "1"))
+}
+
 #[derive(Debug, Clone)]
 pub enum QueryCode {
     /// 8-bit integer query, `dim` elements.
@@ -267,6 +273,13 @@ pub enum QueryCode {
         q_rot: Vec<f32>,
         q_sum: f32,
         qm: f32,
+        /// The query quantised to i8 with its dequantisation scale, built
+        /// only under `SKEG_TQ2_QI8=1`: the 2-bit ADC then runs the
+        /// permute-dot sdot kernel (measured 3.76x at dim 1024) instead of
+        /// the f32 widening kernel. Off by default until the recall gate at
+        /// scale clears it, since quantising the query costs accuracy the
+        /// way quantising the centroids does.
+        q_i8: Option<(Vec<i8>, f32)>,
     },
     /// TurboQuant 1-bit symmetric query: the rotated unit query reduced to its
     /// sign bits (`dim.div_ceil(8)` bytes, same LSB-first packing as the stored
@@ -1859,10 +1872,19 @@ impl QuantizedVectors {
                     }
                     Tq1ProxyMode::Asymmetric => {
                         let (q_plus, q_sum, qm) = compensate(&q_rot);
+                        let q_i8 = (*bits == 2 && tq2_qi8_enabled()).then(|| {
+                            let max_abs = q_plus.iter().fold(0f32, |m, x| m.max(x.abs()));
+                            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+                            (
+                                q_plus.iter().map(|x| (x / scale).round() as i8).collect(),
+                                scale,
+                            )
+                        });
                         QueryCode::TurboQuant {
                             q_rot: q_plus,
                             q_sum,
                             qm,
+                            q_i8,
                         }
                     }
                     Tq1ProxyMode::BitPlane => {
@@ -1946,7 +1968,7 @@ impl QuantizedVectors {
                     code_bytes,
                     ..
                 },
-                QueryCode::TurboQuant { q_rot, q_sum, qm },
+                QueryCode::TurboQuant { q_rot, q_sum, qm, q_i8 },
             ) => {
                 // Asymmetric inner product: for each coord, multiply the
                 // rotated query coord by the Lloyd-Max centroid keyed by the
@@ -1960,7 +1982,16 @@ impl QuantizedVectors {
                     // q_rot.len() = working (rotation) dim: == self.dim except
                     // low-dim 1-bit expansion where the code is wider.
                     4 => tq4_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
-                    2 => tq2_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
+                    2 => match q_i8 {
+                        // Permute-dot: exact i32 dot of i8 query x i8 levels,
+                        // dequantised by both scales in one multiply.
+                        Some((q, q_scale)) => {
+                            skeg_simd::tq2_adc_qi8(code, centroids_i8, q, q.len()) as f32
+                                * *i8_scale
+                                * *q_scale
+                        }
+                        None => tq2_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
+                    },
                     // 1-bit: algebraic reduction `c * (2*masked - q_sum)`.
                     // q_sum precomputed at query time; SWAR scalar inner.
                     1 => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),
