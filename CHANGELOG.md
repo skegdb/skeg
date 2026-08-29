@@ -21,6 +21,22 @@ nothing new to add costs 13-25ms instead of a rebuild.
 
 ### Added
 
+- **Permute-dot ADC kernels (default).** The 2- and 4-bit TurboQuant proxy
+  scored by widening every TBL-picked centroid to f32 and paying four FMAs
+  per 16 dims; the query is now quantised to i8 once per search and the
+  decoded levels feed `sdot` - sixteen multiply-accumulates per instruction,
+  exact i32 accumulation. Measured at dim 1024: tq2 151,6 -> 40,3 ns
+  (3,76x), tq4 146,7 -> 40,9 ns (3,59x). Recall gated on 50k real mxbai
+  embeddings against brute force: 0,9968 -> 0,9970. `SKEG_TQ_QI8=0`
+  restores the f32 path. An `sdot` kernel also backs `dot_int8` on aarch64
+  (the baseline-NEON `vmull` kernel measures slower than the
+  auto-vectorized scalar and stays undispatched); the 100k-vector flat
+  scan drops 23,8%.
+- **Int8 walk proxy for the build** behind `SKEG_BUILD_INT8_WALK=1`:
+  navigation ranks candidates by the i8 dot at a quarter of the memory
+  traffic; the prune re-scores in f32 (mandatory, the int8-prune verdict
+  stands). Gate at scale pending.
+
 - **Patched fold.** `ConsolidateJob` now captures the base adjacency, and the
   fold reuses it: rows whose neighbours all survive are remapped verbatim at
   zero distance computations, rows touching dead neighbours are re-pruned, and
