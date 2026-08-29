@@ -506,6 +506,145 @@ fn build_disk_graph(
     }
 }
 
+/// Fold the base, runs, and delta into one graph WITHOUT rebuilding the base.
+///
+/// The from-scratch build runs two full passes over every node, each a greedy
+/// search from the medoid, which is why a fold costs O(live) and grows
+/// superlinearly with the index. But the base already has a good graph over the
+/// very same points, and this reuses it, the way `patch_graph` already does for
+/// deletes in production:
+///
+///   - a surviving base row whose neighbours all survived keeps its edges
+///     verbatim, just remapped to new rows: zero distance computations;
+///   - one that lost a neighbour bridges through the dead neighbour's own
+///     surviving edges, then re-prunes, exactly the delete-patch repair;
+///   - a genuinely new row (delta or run) is inserted with the same
+///     greedy+prune+back-edge primitive the build uses per point, entering from
+///     the medoid.
+///
+/// Cost tracks what changed: O(kept) is a remap, O(bridged) a local re-prune,
+/// O(new) an insert each. The single pass at `alpha2` for repairs and inserts
+/// is the shape the delete-patch verdict and the June incremental-insert work
+/// both validated at full recall; alpha below 1 under churn is the documented
+/// way to degrade a graph slowly.
+///
+/// `patch_connectivity` runs at the end, unconditionally: an insert-only graph
+/// mutation cannot strand a node, but a bridge can, and a stranded node is a
+/// silent recall loss.
+fn build_patched_graph(
+    patch: PatchBase,
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    base_origin: &[u32],
+    dim: usize,
+    cfg: &VamanaConfig,
+) -> VamanaIndex {
+    let n_new = ids.len() as u32;
+    let src = InMemoryVectorSource::new(vectors, dim);
+
+    // Old base row -> new row (u32::MAX = did not survive).
+    let mut remap = vec![u32::MAX; patch.adj.len()];
+    for (new_row, &orow) in base_origin.iter().enumerate() {
+        if orow != u32::MAX {
+            remap[orow as usize] = new_row as u32;
+        }
+    }
+    let medoid = if (patch.medoid as usize) < remap.len()
+        && remap[patch.medoid as usize] != u32::MAX
+    {
+        remap[patch.medoid as usize]
+    } else {
+        approximate_medoid(&src, n_new, cfg.medoid_sample, cfg.seed)
+    };
+
+    // Surviving base rows first: verbatim remap, or bridge+re-prune where a
+    // neighbour died. Each row writes only its own node, so this is a plain
+    // parallel map, no locks.
+    let repaired: Vec<(Node, bool)> = (0..n_new as usize)
+        .into_par_iter()
+        .map(|new_row| {
+            let orow = base_origin[new_row];
+            if orow == u32::MAX {
+                return (Node::new(), false);
+            }
+            let out = patch.adj[orow as usize].slice();
+            let all_live = out.iter().all(|&w| remap[w as usize] != u32::MAX);
+            let mut node = Node::new();
+            if all_live {
+                let mapped: SmallVec<[VecId; MAX_R]> =
+                    out.iter().map(|&w| remap[w as usize]).collect();
+                node.set(&mapped);
+                return (node, false);
+            }
+            let mut cand: AHashSet<VecId> = AHashSet::new();
+            for &w in out {
+                if remap[w as usize] != u32::MAX {
+                    cand.insert(remap[w as usize]);
+                } else {
+                    for &x in patch.adj[w as usize].slice() {
+                        if x != orow && remap[x as usize] != u32::MAX {
+                            cand.insert(remap[x as usize]);
+                        }
+                    }
+                }
+            }
+            let pv = src.row(new_row as u32);
+            let mut scored: Vec<(f32, VecId)> =
+                cand.iter().map(|&c| (dist(pv, src.row(c)), c)).collect();
+            let picked = robust_prune(new_row as u32, &mut scored, cfg.alpha2, cfg.r, &src);
+            node.set(&picked);
+            (node, true)
+        })
+        .collect();
+    let bridged = repaired.iter().filter(|&&(_, b)| b).count();
+    let graph: Vec<Mutex<Node>> = repaired.into_iter().map(|(n, _)| Mutex::new(n)).collect();
+
+    // New rows: the build's own per-point insert, shuffled so concurrent
+    // inserts spread across the per-node locks instead of marching in order.
+    let mut new_points: Vec<VecId> = base_origin
+        .iter()
+        .enumerate()
+        .filter(|&(_, &o)| o == u32::MAX)
+        .map(|(i, _)| i as u32)
+        .collect();
+    let inserted = new_points.len();
+    let mut rng = StdRng::seed_from_u64(cfg.seed);
+    new_points.shuffle(&mut rng);
+    let cap = n_new as usize;
+    new_points.par_iter().for_each_init(
+        || BuildScratch::with_capacity(cap),
+        |scratch, &pt| {
+            insert_point_concurrent(
+                &graph,
+                &src,
+                &[medoid],
+                pt,
+                cfg.alpha2,
+                cfg.r,
+                cfg.l_build,
+                scratch,
+            );
+        },
+    );
+
+    let mut nodes: Vec<Node> = graph.into_iter().map(Mutex::into_inner).collect();
+    patch_connectivity(&mut nodes, &src, n_new, medoid, cfg.r);
+    tracing::info!(
+        "patched fold: {} rows kept verbatim, {bridged} bridged, {inserted} inserted",
+        n_new as usize - bridged - inserted,
+    );
+    VamanaIndex {
+        dim,
+        n: n_new,
+        vectors: Box::new(src),
+        ids,
+        nodes,
+        medoid,
+        r: cfg.r,
+        l_search: cfg.l_search,
+    }
+}
+
 fn disk_build_config() -> VamanaConfig {
     let mut cfg = VamanaConfig {
         l_build: 48,
@@ -653,7 +792,7 @@ impl Drop for BuildScratch {
 fn insert_point_concurrent(
     graph: &[Mutex<Node>],
     source: &dyn VectorSource,
-    medoid: VecId,
+    entry: &[VecId],
     p: VecId,
     alpha: f32,
     r: usize,
@@ -663,7 +802,7 @@ fn insert_point_concurrent(
     let p_vec = source.row(p);
     let t_walk = Instant::now();
     greedy_search(
-        &[medoid],
+        entry,
         l_build,
         None, // build: never early-terminate (full candidate pool for prune)
         |id| dist(p_vec, source.row(id)),
@@ -740,7 +879,7 @@ fn run_pass_parallel(
     order.par_iter().for_each_init(
         || BuildScratch::with_capacity(cap),
         |scratch, &p| {
-            insert_point_concurrent(graph, source, medoid, p, alpha, r, l_build, scratch);
+            insert_point_concurrent(graph, source, &[medoid], p, alpha, r, l_build, scratch);
         },
     );
 }
@@ -1546,6 +1685,34 @@ struct Segment {
 /// finished by [`DiskVamanaIndex::consolidate_finish`] (short, exclusive).
 /// Owns everything it needs: the surviving vectors, ids, and the WAL offset
 /// separating pre-snapshot records (folded) from post-snapshot ones (replayed).
+/// The base graph as it stood at `begin`, captured only when the fold will
+/// reuse it instead of rebuilding from scratch: the adjacency (a memcpy of the
+/// Node array, ~260 B per row) and the old medoid, both in the OLD base row
+/// space. Liveness per old row is not captured here; `build` derives it from
+/// the survivor list it already holds.
+struct PatchBase {
+    adj: Vec<Node>,
+    medoid: VecId,
+}
+
+/// Which route `consolidate_begin` picks for the coming fold.
+///
+/// The full rebuild costs O(live) greedy searches and is the reason a fold at
+/// scale takes minutes; the patched route keeps the surviving base edges and
+/// only inserts what is new, so its cost tracks what changed. The full route
+/// stays for the regimes where reuse has nothing to reuse: an empty base, or
+/// new mass at base size. `SKEG_PATCH_FOLD=off|force` overrides for A/B runs.
+fn patch_fold_route(new_rows: usize, base_live: usize) -> bool {
+    if base_live == 0 {
+        return false;
+    }
+    match std::env::var("SKEG_PATCH_FOLD").as_deref() {
+        Ok("off") => false,
+        Ok("force") => true,
+        _ => new_rows <= base_live,
+    }
+}
+
 pub struct ConsolidateJob {
     /// Newest layer: the delta captured directly at `begin` (no flush, no graph
     /// build on the caller). Row-major, paired with `delta_ids`.
@@ -1563,6 +1730,9 @@ pub struct ConsolidateJob {
     tier: QuantKind,
     run_seq_high: u64,
     wal_offset: u64,
+    /// `Some` when this fold will keep the base edges and insert only the new
+    /// rows; `None` for the from-scratch rebuild.
+    patch: Option<PatchBase>,
 }
 
 /// The output of [`ConsolidateJob::build`]: a freshly built base segment,
@@ -1575,6 +1745,10 @@ pub struct ConsolidateBuilt {
     tmp: PathBuf,
     run_seq_high: u64,
     wal_offset: u64,
+    /// Which route built this: `true` when the base edges were reused. Read by
+    /// the correctness tests so they cannot silently pass against the wrong
+    /// route, and worth reporting either way.
+    patched: bool,
 }
 
 impl ConsolidateJob {
@@ -1632,6 +1806,7 @@ impl ConsolidateJob {
             tier,
             run_seq_high,
             wal_offset,
+            patch,
         } = self;
         // Assemble the survivor set in id order (near-neighbours land at nearby
         // rows so the re-rank stays cache-local). Reads happen HERE, off-thread:
@@ -1651,10 +1826,17 @@ impl ConsolidateJob {
         items.sort_unstable_by_key(|&(id, _)| id);
         let mut vectors: Vec<f32> = Vec::with_capacity(total * dim);
         let mut ids: Vec<u64> = Vec::with_capacity(total);
+        // Per new row: the OLD base row it came from, or `u32::MAX` for a row
+        // that is new to the base (delta or run). This is what lets the patched
+        // route tell "keep your edges" from "insert yourself".
+        let mut base_origin: Vec<u32> = Vec::with_capacity(total);
         let mut buf = vec![0u8; dim * 4];
         for (id, src) in items {
             match src {
-                Src::Delta(i) => vectors.extend_from_slice(&delta_vectors[i * dim..(i + 1) * dim]),
+                Src::Delta(i) => {
+                    vectors.extend_from_slice(&delta_vectors[i * dim..(i + 1) * dim]);
+                    base_origin.push(u32::MAX);
+                }
                 Src::Seg(seg, row) => {
                     let off = HEADER_LEN as u64 + u64::from(row) * dim as u64 * 4;
                     seg_files[seg].read_exact_at(&mut buf, off)?;
@@ -1662,6 +1844,7 @@ impl ConsolidateJob {
                         buf.chunks_exact(4)
                             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
                     );
+                    base_origin.push(if seg == 0 { row } else { u32::MAX });
                 }
             }
             ids.push(id);
@@ -1674,11 +1857,20 @@ impl ConsolidateJob {
         // foreground - streaming inserts and queries - of every core, collapsing
         // sustained ingest throughput (measured: churn drops ~10x during a fold).
         // Confine it to a bounded pool so the foreground keeps making progress.
+        let was_patched = patch.is_some();
+        let build = move || match patch {
+            // Keep the surviving base edges, insert only what is new. The
+            // QuIVer tq1 variant applies only to the from-scratch route: edge
+            // repair on the patched route stays on f32, the choice the recall
+            // measurements forced (int8 pruning scored 0.31 on real data).
+            Some(pb) => build_patched_graph(pb, vectors, ids, &base_origin, dim, &cfg),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
         let rebuilt = match consolidate_thread_cap(pace)
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
         {
-            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
-            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+            Some(pool) => pool.install(build),
+            None => build(),
         };
         let t_graph = phase_start.elapsed();
         rebuilt.save(&tmp)?;
@@ -1690,7 +1882,8 @@ impl ConsolidateJob {
         // Where a fold's seconds actually go. Without this the only lever anyone
         // can reason about is the graph build, which may not be the biggest part.
         tracing::info!(
-            "consolidate phases: read {:?}, graph {:?}, save+tier {:?}, total {:?}",
+            "consolidate phases ({}): read {:?}, graph {:?}, save+tier {:?}, total {:?}",
+            if was_patched { "patched" } else { "full" },
             t_read,
             t_graph - t_read,
             phase_start.elapsed() - t_graph,
@@ -1701,6 +1894,7 @@ impl ConsolidateJob {
             tmp,
             run_seq_high,
             wal_offset,
+            patched: was_patched,
         })
     }
 }
@@ -3684,6 +3878,23 @@ impl DiskVamanaIndex {
             seg_files.push(run.vectors_file.try_clone()?);
         }
         let wal_offset = self.delta_log.metadata()?.len();
+        // Route: keep the base edges when most of the work would be redoing
+        // them. `base_live` are rows whose edges survive verbatim or bridged;
+        // everything else has to be inserted fresh either way, so it is the
+        // honest measure of what reuse can save. Capturing the adjacency is a
+        // memcpy of the Node array (~260 B/row) under this short lock; it is
+        // taken only when the patched route will actually run.
+        let base_live = survivors.iter().filter(|s| s.1 == 0).count();
+        let new_rows = delta_ids.len() + (survivors.len() - base_live);
+        let patch = if patch_fold_route(new_rows, base_live) {
+            let n = self.base.main_n as usize;
+            Some(PatchBase {
+                adj: (0..n).map(|r| self.base.nodes[r]).collect(),
+                medoid: self.base.medoid,
+            })
+        } else {
+            None
+        };
         Ok(Some(ConsolidateJob {
             delta_vectors,
             delta_ids,
@@ -3693,6 +3904,7 @@ impl DiskVamanaIndex {
             tier: self.tier,
             run_seq_high: self.run_seq,
             wal_offset,
+            patch,
         }))
     }
 
@@ -3709,6 +3921,11 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if a file move, the WAL rewrite, or the reopen fails.
     pub fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> io::Result<()> {
+        tracing::info!(
+            "consolidate_finish: installing {} base ({} rows)",
+            if built.patched { "patched" } else { "rebuilt" },
+            built.base.main_n,
+        );
         let dir = self.dir.clone();
         let tier = self.tier;
         // The rebuild reorders base rows: drop the router sidecar first, exactly
@@ -4358,6 +4575,122 @@ mod tests {
     }
     use super::*;
     use ordered_float::OrderedFloat;
+
+    /// The invariant a fold must never break, whichever route builds it: every
+    /// live id stays findable by its own vector, and a deleted id never comes
+    /// back. This is the harness that has to stay green when the fold flips
+    /// from "rebuild everything" to "keep the base edges, insert what is new".
+    ///
+    /// A wrong graph fails this loudly: a lost node stops answering for
+    /// itself, and a resurrected tombstone shows up in someone's results.
+    #[test]
+    fn incremental_fold_keeps_every_id_findable_and_no_resurrection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-patched-fold");
+        let dim = 16;
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            dim,
+            200,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        // Deterministic, well-spread vectors: self-search must return self.
+        let vec_for = |id: u64| -> Vec<f32> {
+            use rand::Rng;
+            let mut rng = StdRng::seed_from_u64(0xF01D ^ id);
+            (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect()
+        };
+
+        // First fold: empty base, so this exercises the full-build route and
+        // gives the second fold a base worth reusing.
+        for id in 0u64..2000 {
+            idx.insert(id, &vec_for(id)).unwrap();
+        }
+        let job = idx.consolidate_begin().unwrap().expect("work to fold");
+        let built = job.build(&vdir).unwrap();
+        assert!(!built.patched, "an empty base must take the full route");
+        idx.consolidate_finish(built).unwrap();
+
+        // Churn: delete some base ids, add new ones. The new mass is well under
+        // the live base, which is the regime the cheap route is for.
+        for id in (0u64..2000).step_by(40) {
+            assert!(idx.delete(id).unwrap(), "delete of {id} did not land");
+        }
+        for id in 2000u64..2600 {
+            idx.insert(id, &vec_for(id)).unwrap();
+        }
+        let job = idx.consolidate_begin().unwrap().expect("work to fold");
+        let built = job.build(&vdir).unwrap();
+        assert!(
+            built.patched,
+            "600 new rows against 1950 live base rows must take the patched route"
+        );
+        idx.consolidate_finish(built).unwrap();
+
+        // Every live id answers for itself...
+        let mut misses = Vec::new();
+        for id in 0u64..2600 {
+            let deleted = id < 2000 && id % 40 == 0;
+            if deleted {
+                continue;
+            }
+            let hits = idx.search(&vec_for(id), 1).unwrap();
+            if hits.first().map(|&(hid, _)| hid) != Some(id) {
+                misses.push(id);
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} ids no longer answer for themselves after the fold; first: {:?}",
+            misses.len(),
+            &misses[..misses.len().min(5)]
+        );
+        // ...and no tombstone rises.
+        for id in (0u64..2000).step_by(40) {
+            let hits = idx.search(&vec_for(id), 5).unwrap();
+            assert!(
+                hits.iter().all(|&(hid, _)| hid != id),
+                "deleted id {id} came back through the fold"
+            );
+        }
+
+        // Recall@10 against brute force on perturbed queries. Honest scope
+        // note: at dim 16 this does NOT falsify a degenerate build. A mutation
+        // that skipped inserting the new points entirely still passed, because
+        // `patch_connectivity` attaches each stranded node to its exact
+        // nearest neighbour and in low dimension that single edge is enough
+        // for full recall. Structural quality is guarded by the recall gate on
+        // real 100-dim embeddings (bench/inplace_gate.py), not here; this
+        // check only catches gross breakage.
+        let live: Vec<u64> = (0u64..2600)
+            .filter(|id| !(*id < 2000 && id % 40 == 0))
+            .collect();
+        let mut total_hits = 0usize;
+        let mut queries = 0usize;
+        for probe in (0..2600u64).step_by(26) {
+            let mut q = vec_for(probe);
+            for (j, v) in q.iter_mut().enumerate() {
+                *v += ((probe as f32 + j as f32).sin()) * 0.05;
+            }
+            let mut truth: Vec<(OrderedFloat<f32>, u64)> = live
+                .iter()
+                .map(|&id| (OrderedFloat(dist(&q, &vec_for(id))), id))
+                .collect();
+            truth.sort_unstable();
+            let want: AHashSet<u64> = truth[..10].iter().map(|&(_, id)| id).collect();
+            let got = idx.search(&q, 10).unwrap();
+            total_hits += got.iter().filter(|&&(id, _)| want.contains(&id)).count();
+            queries += 1;
+        }
+        let recall = total_hits as f64 / (queries * 10) as f64;
+        assert!(
+            recall >= 0.95,
+            "recall@10 vs brute force is {recall:.3} after the patched fold; \
+             the graph is navigable but structurally degraded"
+        );
+    }
+
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
