@@ -242,14 +242,13 @@ mod wire_tests {
 }
 
 /// A query vector quantized to match a [`QuantizedVectors`] set.
-/// `SKEG_TQ_QI8=1` switches the 2- and 4-bit ADC to the i8-query sdot
-/// kernels (`SKEG_TQ2_QI8` accepted as an alias from when only 2-bit had one).
+/// The 2- and 4-bit ADC run the i8-query sdot kernels by default
+/// (3.76x/3.59x at dim 1024; recall gated on 50k real mxbai embeddings:
+/// 0.9968 -> 0.9970, the query quantisation costs nothing measurable).
+/// `SKEG_TQ_QI8=0` restores the f32 widening kernels.
 fn tq_qi8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
-        on("SKEG_TQ_QI8") || on("SKEG_TQ2_QI8")
-    })
+    *ON.get_or_init(|| !std::env::var("SKEG_TQ_QI8").is_ok_and(|v| v == "0"))
 }
 
 #[derive(Debug, Clone)]
@@ -277,12 +276,10 @@ pub enum QueryCode {
         q_rot: Vec<f32>,
         q_sum: f32,
         qm: f32,
-        /// The query quantised to i8 with its dequantisation scale, built
-        /// only under `SKEG_TQ2_QI8=1`: the 2-bit ADC then runs the
-        /// permute-dot sdot kernel (measured 3.76x at dim 1024) instead of
-        /// the f32 widening kernel. Off by default until the recall gate at
-        /// scale clears it, since quantising the query costs accuracy the
-        /// way quantising the centroids does.
+        /// The query quantised to i8 with its dequantisation scale: the 2-
+        /// and 4-bit ADC run the permute-dot sdot kernels on it (default;
+        /// `SKEG_TQ_QI8=0` restores the f32 widening path). Gated on real
+        /// mxbai embeddings: recall@10 0.9968 -> 0.9970.
         q_i8: Option<(Vec<i8>, f32)>,
     },
     /// TurboQuant 1-bit symmetric query: the rotated unit query reduced to its
