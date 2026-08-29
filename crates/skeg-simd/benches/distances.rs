@@ -11,7 +11,7 @@ use skeg_simd::{
     BLOCK, bucketize_x8, bucketize_x8_scalar, cosine_f32, cosine_f32_scalar, dot_f32_scalar,
     dot_int8, dot_int8_scalar, flip_signs, flip_signs_scalar, fwht_f32, fwht_f32_scalar,
     hamming_binary, hamming_binary_scalar, simd_backend, tq1_bitplane_score,
-    tq1_bitplane_score_scalar, tq1_masked_sum, tq1_masked_sum_scalar, tq2_adc_i8, tq2_adc_qi8,
+    tq1_bitplane_score_scalar, tq1_masked_sum, tq1_masked_sum_scalar, tq2_adc_i8, tq2_adc_qi8, tq4_adc_qi8,
     tq2_adc_i8_scalar, tq4_adc_i8, tq4_adc_i8_scalar, tq4_block32_score_u8,
     tq4_block32_score_u8_scalar,
 };
@@ -288,6 +288,19 @@ fn bench_adc(c: &mut Criterion) {
                 x.iter(|| {
                     tq2_adc_qi8(
                         black_box(&tq2_code),
+                        black_box(&centroids),
+                        black_box(&q_i8),
+                        DIM,
+                    )
+                });
+            });
+        }
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            let q_i8: Vec<i8> = (0..DIM).map(|i| ((i * 13 % 255) as i16 - 127) as i8).collect();
+            g.bench_function("tq4_qi8_sdot", |x| {
+                x.iter(|| {
+                    tq4_adc_qi8(
+                        black_box(&tq4_code),
                         black_box(&centroids),
                         black_box(&q_i8),
                         DIM,

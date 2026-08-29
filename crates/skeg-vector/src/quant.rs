@@ -242,10 +242,14 @@ mod wire_tests {
 }
 
 /// A query vector quantized to match a [`QuantizedVectors`] set.
-/// `SKEG_TQ2_QI8=1` switches the 2-bit ADC to the i8-query sdot kernel.
-fn tq2_qi8_enabled() -> bool {
+/// `SKEG_TQ_QI8=1` switches the 2- and 4-bit ADC to the i8-query sdot
+/// kernels (`SKEG_TQ2_QI8` accepted as an alias from when only 2-bit had one).
+fn tq_qi8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SKEG_TQ2_QI8").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let on = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+        on("SKEG_TQ_QI8") || on("SKEG_TQ2_QI8")
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1872,7 +1876,7 @@ impl QuantizedVectors {
                     }
                     Tq1ProxyMode::Asymmetric => {
                         let (q_plus, q_sum, qm) = compensate(&q_rot);
-                        let q_i8 = (*bits == 2 && tq2_qi8_enabled()).then(|| {
+                        let q_i8 = (matches!(*bits, 2 | 4) && tq_qi8_enabled()).then(|| {
                             let max_abs = q_plus.iter().fold(0f32, |m, x| m.max(x.abs()));
                             let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
                             (
@@ -1981,7 +1985,14 @@ impl QuantizedVectors {
                     // Centroid i8 quantization introduces ~1.5% MSE, gated.
                     // q_rot.len() = working (rotation) dim: == self.dim except
                     // low-dim 1-bit expansion where the code is wider.
-                    4 => tq4_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
+                    4 => match q_i8 {
+                        Some((q, q_scale)) => {
+                            skeg_simd::tq4_adc_qi8(code, centroids_i8, q, q.len()) as f32
+                                * *i8_scale
+                                * *q_scale
+                        }
+                        None => tq4_adc_i8(code, centroids_i8, *i8_scale, q_rot, q_rot.len()),
+                    },
                     2 => match q_i8 {
                         // Permute-dot: exact i32 dot of i8 query x i8 levels,
                         // dequantised by both scales in one multiply.

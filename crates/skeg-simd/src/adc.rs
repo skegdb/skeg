@@ -823,27 +823,53 @@ pub unsafe fn tq2_adc_i8_avx512(
 /// Panics if `code.len() != dim / 4` or `q_i8.len() != dim`.
 #[must_use]
 pub fn tq2_adc_qi8(code: &[u8], centroids_i8: &[i8; 16], q_i8: &[i8], dim: usize) -> i32 {
-    assert_eq!(code.len(), dim / 4, "code length");
+    adc_qi8::<2>(code, centroids_i8, q_i8, dim)
+}
+
+/// [`tq4_adc_i8`] with the query quantised to i8: same permute-dot shape as
+/// [`tq2_adc_qi8`], one code nibble per dim.
+///
+/// # Panics
+///
+/// Panics if `code.len() != dim / 2` or `q_i8.len() != dim`.
+#[must_use]
+pub fn tq4_adc_qi8(code: &[u8], centroids_i8: &[i8; 16], q_i8: &[i8], dim: usize) -> i32 {
+    adc_qi8::<4>(code, centroids_i8, q_i8, dim)
+}
+
+fn adc_qi8<const BITS: usize>(
+    code: &[u8],
+    centroids_i8: &[i8; 16],
+    q_i8: &[i8],
+    dim: usize,
+) -> i32 {
+    assert_eq!(code.len(), dim * BITS / 8, "code length");
     assert_eq!(q_i8.len(), dim, "query length");
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("dotprod") {
             // SAFETY: dotprod was checked immediately above.
-            return unsafe { tq2_adc_qi8_sdot(code, centroids_i8, q_i8, dim) };
+            return unsafe { adc_qi8_sdot::<BITS>(code, centroids_i8, q_i8, dim) };
         }
     }
-    tq2_adc_qi8_scalar(code, centroids_i8, q_i8, dim)
+    adc_qi8_scalar::<BITS>(code, centroids_i8, q_i8, dim)
 }
 
 /// Portable scalar reference for [`tq2_adc_qi8`]. Oracle in proptest.
 #[must_use]
 pub fn tq2_adc_qi8_scalar(code: &[u8], centroids_i8: &[i8; 16], q_i8: &[i8], dim: usize) -> i32 {
+    adc_qi8_scalar::<2>(code, centroids_i8, q_i8, dim)
+}
+
+fn adc_qi8_scalar<const BITS: usize>(
+    code: &[u8],
+    centroids_i8: &[i8; 16],
+    q_i8: &[i8],
+    dim: usize,
+) -> i32 {
     let mut acc = 0i32;
     for i in 0..dim {
-        let byte = code[i / 4];
-        let shift = (i % 4) * 2;
-        let bucket = ((byte >> shift) & 0x03) as usize;
-        acc += i32::from(q_i8[i]) * i32::from(centroids_i8[bucket]);
+        acc += i32::from(q_i8[i]) * i32::from(centroids_i8[code_index::<BITS>(code, i)]);
     }
     acc
 }
@@ -860,7 +886,7 @@ pub fn tq2_adc_qi8_scalar(code: &[u8], centroids_i8: &[i8; 16], q_i8: &[i8], dim
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 #[must_use]
-pub unsafe fn tq2_adc_qi8_sdot(
+unsafe fn adc_qi8_sdot<const BITS: usize>(
     code: &[u8],
     centroids_i8: &[i8; 16],
     q_i8: &[i8],
@@ -870,7 +896,7 @@ pub unsafe fn tq2_adc_qi8_sdot(
         int32x4_t, int8x16_t, vaddq_s32, vaddvq_s32, vdupq_n_s32, vld1q_s8, vqtbl1q_s8,
     };
     use std::arch::asm;
-    assert_eq!(code.len(), dim / 4, "code length");
+    assert_eq!(code.len(), dim * BITS / 8, "code length");
     assert_eq!(q_i8.len(), dim, "query length");
     let block = dim - (dim % 64);
     // SAFETY: every load covers lanes inside the asserted lengths; `vqtbl1q_s8`
@@ -883,7 +909,7 @@ pub unsafe fn tq2_adc_qi8_sdot(
         while base < block {
             for (k, acc_k) in acc.iter_mut().enumerate() {
                 let at = base + k * 16;
-                let idx = unpack_indices_neon::<2>(code, at);
+                let idx = unpack_indices_neon::<BITS>(code, at);
                 let picked: int8x16_t = vqtbl1q_s8(lut, idx);
                 let q: int8x16_t = vld1q_s8(q_i8.as_ptr().add(at));
                 let mut a: int32x4_t = *acc_k;
@@ -901,10 +927,7 @@ pub unsafe fn tq2_adc_qi8_sdot(
         vaddvq_s32(vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3])))
     };
     for i in block..dim {
-        let byte = code[i / 4];
-        let shift = (i % 4) * 2;
-        let bucket = ((byte >> shift) & 0x03) as usize;
-        sum += i32::from(q_i8[i]) * i32::from(centroids_i8[bucket]);
+        sum += i32::from(q_i8[i]) * i32::from(centroids_i8[code_index::<BITS>(code, i)]);
     }
     sum
 }
@@ -1164,6 +1187,31 @@ mod qi8_tests {
             assert_eq!(
                 tq2_adc_qi8(&code, &centroids, &q, dim),
                 tq2_adc_qi8_scalar(&code, &centroids, &q, dim),
+                "dim {dim}"
+            );
+        }
+    }
+
+    #[test]
+    fn tq4_qi8_sdot_matches_scalar_on_random_and_ragged_dims() {
+        let mut state = 0x452821e638d01377u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        let centroids: [i8; 16] = std::array::from_fn(|i| (i as i8 - 8) * 15);
+        for dim in [2usize, 16, 64, 68, 100, 512, 1024, 1536] {
+            let code: Vec<u8> = (0..dim / 2).map(|_| next()).collect();
+            let q: Vec<i8> = (0..dim).map(|_| next() as i8).collect();
+            assert_eq!(
+                tq4_adc_qi8(&code, &centroids, &q, dim),
+                {
+                    let mut acc = 0i32;
+                    for i in 0..dim {
+                        acc += i32::from(q[i]) * i32::from(centroids[code_index::<4>(&code, i)]);
+                    }
+                    acc
+                },
                 "dim {dim}"
             );
         }
