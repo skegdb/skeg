@@ -18,6 +18,7 @@ avx512 = ["skeg-simd/avx512"]
 [dependencies]
 skeg-simd = { path = "../skeg-simd", version = "0.1.5" }
 skeg-platform = { path = "../skeg-platform", version = "0.1.6" }
+skeg-telemetry = { path = "../skeg-telemetry", version = "0.2.2" }
 parking_lot = { workspace = true }
 smallvec = { workspace = true }
 fixedbitset = { workspace = true }

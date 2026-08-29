@@ -289,10 +289,15 @@ pub enum Counter {
     /// instead of parking. A few are the budget working; a sustained climb
     /// means heavy folds are starving the cheap maintenance of its turns.
     MaintenanceBudgetSkips = 19,
+    /// Re-rank row served from the per-segment cache instead of a positioned
+    /// read.
+    RerankCacheHits = 20,
+    /// Re-rank row read from disk (and inserted into the cache).
+    RerankCacheMisses = 21,
 }
 
 impl Counter {
-    pub const COUNT: usize = 20;
+    pub const COUNT: usize = 22;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -314,6 +319,8 @@ impl Counter {
         Counter::MaintenanceRunsMerge,
         Counter::MaintenanceDeletePatch,
         Counter::MaintenanceBudgetSkips,
+        Counter::RerankCacheHits,
+        Counter::RerankCacheMisses,
     ];
 
     #[inline]
@@ -339,6 +346,8 @@ impl Counter {
             Counter::MaintenanceRunsMerge => "skeg_maintenance_runs_merge_total",
             Counter::MaintenanceDeletePatch => "skeg_maintenance_delete_patch_total",
             Counter::MaintenanceBudgetSkips => "skeg_maintenance_budget_skips_total",
+            Counter::RerankCacheHits => "skeg_rerank_cache_hits_total",
+            Counter::RerankCacheMisses => "skeg_rerank_cache_misses_total",
         }
     }
 }

@@ -1692,6 +1692,61 @@ struct Segment {
     medoid: VecId,
     quant: QuantizedVectors,
     vectors_file: File,
+    /// Re-rank row cache: the p99 at rest is dominated by cold positioned
+    /// reads of candidate rows, and popular rows (hubs, dense regions) recur
+    /// across queries. Segments are immutable - a fold replaces them
+    /// wholesale - so the cache dies with its segment and can never serve a
+    /// stale row. `None` when the budget is zero.
+    row_cache: Option<std::sync::Mutex<RowSlotCache>>,
+}
+
+/// One-probe direct-mapped row cache: slot = row % capacity, eviction is
+/// overwrite. No recency bookkeeping on purpose - the hit pattern this
+/// exists for is hub rows recurring across queries, which a direct map
+/// captures, and the miss path is exactly one probe over the disk read it
+/// was already going to do.
+struct RowSlotCache {
+    slots: Vec<Option<(VecId, Vec<f32>)>>,
+}
+
+impl RowSlotCache {
+    fn new(budget_bytes: usize, dim: usize) -> RowSlotCache {
+        let per_row = dim * 4 + std::mem::size_of::<Option<(VecId, Vec<f32>)>>();
+        let n = (budget_bytes / per_row).max(16);
+        RowSlotCache { slots: vec![None; n] }
+    }
+
+    fn get(&self, row: VecId) -> Option<Vec<f32>> {
+        match &self.slots[row as usize % self.slots.len()] {
+            Some((r, v)) if *r == row => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, row: VecId, v: Vec<f32>) {
+        let n = self.slots.len();
+        self.slots[row as usize % n] = Some((row, v));
+    }
+}
+
+/// Per-segment re-rank cache budget. `SKEG_RERANK_CACHE_MB` (default 8) is
+/// megabytes per open segment; at dim 1024 the default holds ~2k rows per
+/// shard segment. `0` disables.
+fn rerank_cache_budget() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("SKEG_RERANK_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+            * 1024
+            * 1024
+    })
+}
+
+fn new_row_cache(dim: usize) -> Option<std::sync::Mutex<RowSlotCache>> {
+    let b = rerank_cache_budget();
+    (b > 0).then(|| std::sync::Mutex::new(RowSlotCache::new(b, dim)))
 }
 
 /// The snapshot a background consolidate builds from. Produced by
@@ -2712,6 +2767,7 @@ impl DiskVamanaIndex {
                 medoid,
                 quant,
                 vectors_file,
+                row_cache: new_row_cache(dim),
             },
             runs: Vec::new(),
             run_dirs: Vec::new(),
@@ -3144,15 +3200,27 @@ impl DiskVamanaIndex {
         Ok(None)
     }
 
-    /// Read one f32 vector from `vectors.bin` by positioned read.
+    /// Read one f32 vector from `vectors.bin` by positioned read, through the
+    /// segment's row cache when one is configured.
     fn read_vector(&self, seg: &Segment, id: VecId) -> io::Result<Vec<f32>> {
+        if let Some(cache) = &seg.row_cache
+            && let Some(v) = cache.lock().expect("row cache poisoned").get(id)
+        {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::RerankCacheHits);
+            return Ok(v);
+        }
         let offset = HEADER_LEN as u64 + u64::from(id) * self.dim as u64 * 4;
         let mut buf = vec![0u8; self.dim * 4];
         seg.vectors_file.read_exact_at(&mut buf, offset)?;
-        Ok(buf
+        let v: Vec<f32> = buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+            .collect();
+        if let Some(cache) = &seg.row_cache {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::RerankCacheMisses);
+            cache.lock().expect("row cache poisoned").put(id, v.clone());
+        }
+        Ok(v)
     }
 
     /// Approximate top-`k` `(id, cosine)` for `query`. A graph walk over the

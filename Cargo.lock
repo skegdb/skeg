@@ -1869,6 +1869,7 @@ dependencies = [
  "rayon",
  "skeg-platform 0.1.6",
  "skeg-simd 0.1.6",
+ "skeg-telemetry",
  "smallvec",
  "tempfile",
  "thiserror",
