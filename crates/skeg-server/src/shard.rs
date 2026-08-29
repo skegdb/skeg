@@ -826,7 +826,11 @@ async fn ensure_payload_loaded(
             g.payload_loaded = true;
             skeg_telemetry::add_counter(
                 skeg_telemetry::Counter::PayloadIndexFromDisk,
-                covered as u64,
+                (covered.saturating_sub(refreshed)) as u64,
+            );
+            skeg_telemetry::add_counter(
+                skeg_telemetry::Counter::PayloadIndexRefreshed,
+                refreshed as u64,
             );
             tracing::info!(
                 "payload index for '{name}' read from disk: {covered} ids, {refreshed} re-read from the log"

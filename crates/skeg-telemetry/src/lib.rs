@@ -264,15 +264,23 @@ pub enum Counter {
     /// id's payload, so it belongs at open, not on a user's query: a non-zero
     /// value while serving means some search paid for it.
     PayloadIndexRebuilds = 12,
-    /// Ids whose payload index came from `payload.idx` rather than being
-    /// rebuilt by reading the log. Zero after a restart that had the file means
-    /// it was refused, and the reason is worth knowing: a stamp mismatch, a
-    /// damaged file, or a log tail long enough that nothing in it was usable.
+    /// Ids whose payload index came from `payload.idx` and was used as it
+    /// stood. Zero after a restart that had the file means it was refused, and
+    /// the reason is worth knowing: a stamp mismatch, a damaged file, or a log
+    /// tail long enough that nothing in it was usable.
+    ///
+    /// Counts ids taken, not ids covered: an id the log tail touched is read
+    /// back from the log instead, and counting it here would hide exactly the
+    /// protection that makes the file safe to trust.
     PayloadIndexFromDisk = 13,
+    /// Ids the file covered but that had to be read from the log anyway,
+    /// because the tail touched them after the file was stamped. This is what
+    /// a stale snapshot costs at open.
+    PayloadIndexRefreshed = 14,
 }
 
 impl Counter {
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -288,6 +296,7 @@ impl Counter {
         Counter::VlogRecoveryRecords,
         Counter::PayloadIndexRebuilds,
         Counter::PayloadIndexFromDisk,
+        Counter::PayloadIndexRefreshed,
     ];
 
     #[inline]
@@ -307,6 +316,7 @@ impl Counter {
             Counter::VlogRecoveryRecords => "skeg_vlog_recovery_records_total",
             Counter::PayloadIndexRebuilds => "skeg_payload_index_rebuilds_total",
             Counter::PayloadIndexFromDisk => "skeg_payload_index_from_disk_total",
+            Counter::PayloadIndexRefreshed => "skeg_payload_index_refreshed_total",
         }
     }
 }
