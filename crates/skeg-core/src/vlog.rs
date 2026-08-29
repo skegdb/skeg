@@ -750,7 +750,7 @@ impl VLog {
         let mut index = self.inner.index.borrow_mut();
         let mut cache = self.inner.cache.borrow_mut();
         let mut disk = self.inner.tenant_disk.lock();
-        for ((key, value), (rel, padded)) in pairs.iter().zip(&member_rel) {
+        for ((key, _value), (rel, padded)) in pairs.iter().zip(&member_rel) {
             let offset = start + u64::from(*rel);
             if let Some(prev) = index.get(key).copied() {
                 self.dec_live(prev.segment_id, prev.size);
@@ -770,12 +770,15 @@ impl VLog {
                     size: *padded,
                 },
             );
-            cache.insert_for(
-                key,
-                Bytes::copy_from_slice(value),
-                value.len(),
-                tenant_from_key(key),
-            );
+            // Invalidated, not cached. `set_many` is the bulk primitive: nobody
+            // writes thousands of keys expecting to read them straight back,
+            // and the cache has a byte budget, so caching the batch means
+            // pushing out whatever was actually hot. Loading 669.405 keys into
+            // a real store filled a 256 MB budget and evicted 150.760 entries.
+            //
+            // Removing rather than skipping: a key already cached would
+            // otherwise keep its old value and be served stale.
+            cache.remove(key);
             *disk.entry(tenant_from_key(key)).or_insert(0) += u64::from(*padded);
         }
         Ok(())
@@ -2477,6 +2480,52 @@ mod tests {
         let before = v.disk_reads();
         assert_eq!(v.get(hot).await.unwrap().as_deref(), Some(b"v".as_slice()));
         assert_eq!(v.disk_reads(), before, "the scan must not evict a hot key");
+    }
+
+    /// A bulk write must not evict the working set to cache what it wrote.
+    ///
+    /// `set_many` is the batch primitive: nobody writes 2000 keys expecting to
+    /// read them back immediately, but the cache has a byte budget, and
+    /// inserting the batch pushes out whatever was genuinely hot. Loading
+    /// 669.405 keys into a real store filled the 256 MB budget and evicted
+    /// 150.760 entries.
+    ///
+    /// Skipping the insert is not enough on its own: a key already in the cache
+    /// would keep its old value and be served stale. The entry has to go.
+    #[tokio::test]
+    async fn a_batch_write_evicts_its_keys_from_the_cache_instead_of_filling_it() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        // A hot key, read so it is cached, then overwritten by a batch.
+        v.set(b"hot", b"old", Durability::Kernel).await.unwrap();
+        assert_eq!(v.get(b"hot").await.unwrap().as_deref(), Some(b"old".as_slice()));
+        let reads_before = v.disk_reads();
+        assert_eq!(v.get(b"hot").await.unwrap().as_deref(), Some(b"old".as_slice()));
+        assert_eq!(v.disk_reads(), reads_before, "the key must be cached to start with");
+
+        let pairs: Vec<(&[u8], &[u8])> = vec![
+            (b"hot", b"new"),
+            (b"bulk1", b"a"),
+            (b"bulk2", b"b"),
+        ];
+        v.set_many(&pairs, Durability::Kernel).await.unwrap();
+
+        // Correctness first: the overwrite must be what a reader sees.
+        assert_eq!(
+            v.get(b"hot").await.unwrap().as_deref(),
+            Some(b"new".as_slice()),
+            "the batch overwrote the key and a cached copy served the old value"
+        );
+
+        // And the batch must not have left its own keys behind.
+        let before = v.disk_reads();
+        assert_eq!(v.get_uncached(b"bulk2").await.unwrap().as_deref(), Some(b"b".as_slice()));
+        assert_eq!(
+            v.disk_reads() - before,
+            1,
+            "the batch cached a key nobody had asked for"
+        );
     }
 
     // ── compaction ───────────────────────────────────────────────────────────
