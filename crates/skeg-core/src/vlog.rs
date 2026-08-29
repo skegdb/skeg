@@ -125,6 +125,9 @@ struct ActiveState {
 struct VLogInner {
     dir: PathBuf,
     max_seg_size: u64,
+    /// A read-only open: shared dir lock, recovery leaves the tail untouched,
+    /// and every append is refused. For N reader replicas over one directory.
+    read_only: bool,
     read_segments: RefCell<Vec<ReadSegment>>,
     index: RefCell<Index>,
     cache: RefCell<S3Fifo<Bytes>>,
@@ -247,7 +250,7 @@ impl VLog {
         dir: &Path,
         tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
     ) -> Result<Self> {
-        Self::open_shared(dir, MAX_SEGMENT_SIZE, tenant_disk).await
+        Self::open_shared_mode(dir, MAX_SEGMENT_SIZE, tenant_disk, false).await
     }
 
     /// Open with an explicit max segment size, using a fresh (per-`VLog`) disk
@@ -258,7 +261,33 @@ impl VLog {
     ///
     /// Returns an error on IO failure.
     pub async fn open_with_max_segment(dir: &Path, max_seg_size: u64) -> Result<Self> {
-        Self::open_shared(dir, max_seg_size, Arc::new(Mutex::new(AHashMap::new()))).await
+        Self::open_shared_mode(dir, max_seg_size, Arc::new(Mutex::new(AHashMap::new())), false)
+            .await
+    }
+
+    /// Open the store READ-ONLY: a shared advisory lock (many readers coexist,
+    /// a writer's exclusive lock excludes them all), recovery never truncates
+    /// or preallocates the tail (a torn record simply ends the scan), and any
+    /// append is refused. The directory must already exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, if a writer holds the store open, or if
+    /// the directory does not exist.
+    pub async fn open_read_only(dir: &Path) -> Result<Self> {
+        if !dir.is_dir() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("read-only open of a missing store: {}", dir.display()),
+            )));
+        }
+        Self::open_shared_mode(
+            dir,
+            MAX_SEGMENT_SIZE,
+            Arc::new(Mutex::new(AHashMap::new())),
+            true,
+        )
+        .await
     }
 
     /// Open sharing `tenant_disk` across a shard set, so the disk quota is global
@@ -275,15 +304,22 @@ impl VLog {
         clippy::unused_async,
         clippy::too_many_lines
     )]
-    async fn open_shared(
+    async fn open_shared_mode(
         dir: &Path,
         max_seg_size: u64,
         tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
+        read_only: bool,
     ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         // Take the store lock before touching any segment: recovery can truncate
-        // a torn tail, so even opening must be single-process.
-        let store_lock = skeg_platform::DirLock::acquire_exclusive(dir)?;
+        // a torn tail, so even opening must be single-process. A read-only open
+        // takes the shared lock instead: it never truncates, and many readers
+        // coexist while any writer is excluded.
+        let store_lock = if read_only {
+            skeg_platform::DirLock::acquire_shared(dir)?
+        } else {
+            skeg_platform::DirLock::acquire_exclusive(dir)?
+        };
         let seg_ids = list_segments(dir)?;
         let last_id = seg_ids.last().copied();
 
@@ -379,11 +415,13 @@ impl VLog {
                     });
                 })?;
                 if Some(id) == last_id {
-                    seg.file.truncate_sync(last_valid)?;
-                    // Re-arm full capacity (and the fdatasync fast path) on
-                    // the segment that resumes as active.
-                    seg.file.preallocate_sync(max_seg_size)?;
-                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
+                    if !read_only {
+                        seg.file.truncate_sync(last_valid)?;
+                        // Re-arm full capacity (and the fdatasync fast path) on
+                        // the segment that resumes as active.
+                        seg.file.preallocate_sync(max_seg_size)?;
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
+                    }
                     active_used = Some(last_valid);
                 }
             }
@@ -418,9 +456,11 @@ impl VLog {
                     });
                 })?;
                 if Some(id) == last_id {
-                    seg.file.truncate_sync(last_valid)?;
-                    seg.file.preallocate_sync(max_seg_size)?;
-                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
+                    if !read_only {
+                        seg.file.truncate_sync(last_valid)?;
+                        seg.file.preallocate_sync(max_seg_size)?;
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogPreallocations);
+                    }
                     active_used = Some(last_valid);
                 }
             }
@@ -466,6 +506,7 @@ impl VLog {
 
         Ok(Self {
             inner: Rc::new(VLogInner {
+                read_only,
                 dir: dir.to_owned(),
                 max_seg_size,
                 read_segments: RefCell::new(read_segments),
@@ -854,6 +895,12 @@ impl VLog {
     ///
     /// Returns an error if the snapshot file cannot be written.
     pub async fn write_snapshot(&self) -> Result<(u64, u64)> {
+        if self.inner.read_only {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "store opened read-only",
+            )));
+        }
         // `hwm` alone (a segment id) only lets recovery skip WHOLE segments,
         // so before the first roll it saves nothing: the active segment is
         // rescanned in full however recent the snapshot is. `size` is how much
@@ -1325,6 +1372,12 @@ impl VLog {
         ts: u64,
         durability: Durability,
     ) -> Result<(u16, u32, u32)> {
+        if self.inner.read_only {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "store opened read-only",
+            )));
+        }
         let incoming = padded_record_size(key.len(), value.len()) as u64;
         self.maybe_rotate(incoming).await?;
         let encoded = encode_record(key, value, kind, ts);
@@ -1581,6 +1634,35 @@ mod tests {
     /// segment was rescanned however recent the snapshot was. Measured on Model
     /// Graveyard: a 512 MB segment, a 3.2 MB snapshot, and ~31 s of open spent
     /// decoding records regardless.
+    /// Read-only replicas coexist over one directory; the writer excludes
+    /// them and they exclude the writer; a replica cannot write.
+    #[tokio::test]
+    async fn read_only_opens_coexist_and_refuse_writes() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"alpha", b"1", Durability::Kernel).await.unwrap();
+        }
+        let r1 = VLog::open_read_only(dir.path()).await.unwrap();
+        let r2 = VLog::open_read_only(dir.path()).await.unwrap();
+        assert_eq!(r1.get(b"alpha").await.unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(r2.get(b"alpha").await.unwrap().as_deref(), Some(&b"1"[..]));
+        assert!(
+            r1.set(b"beta", b"2", Durability::Kernel).await.is_err(),
+            "a read-only store accepted a write"
+        );
+        assert!(
+            r1.write_snapshot().await.is_err(),
+            "a read-only store wrote a snapshot"
+        );
+        assert!(
+            VLog::open(dir.path()).await.is_err(),
+            "the writer opened while readers hold the shared lock"
+        );
+        drop((r1, r2));
+        VLog::open(dir.path()).await.expect("writer reopens after readers close");
+    }
+
     #[tokio::test]
     async fn snapshot_records_the_active_segment_offset() {
         let dir = TempDir::new().unwrap();

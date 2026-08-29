@@ -70,6 +70,40 @@ impl DirLock {
     }
 }
 
+impl DirLock {
+    /// Take a SHARED advisory lock on `LOCK_FILE` inside `dir`: many readers
+    /// may hold it at once, and it excludes (and is excluded by) the
+    /// exclusive lock a writer takes. For read-only opens of a store that is
+    /// not being written - N reader replicas over one directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if a writer holds the exclusive
+    /// lock, or an I/O error if the lock file cannot be opened.
+    pub fn acquire_shared(dir: &Path) -> io::Result<Self> {
+        let path = dir.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        // SAFETY: `flock` on a valid fd owned by `file`; LOCK_NB as above.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("store is open for writing elsewhere: {}", dir.display()),
+                ));
+            }
+            return Err(err);
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +115,19 @@ mod tests {
         // A second live handle on the same directory (this process stands in for
         // a second one; flock is per open file description, so it contends).
         let err = DirLock::acquire_exclusive(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn shared_locks_coexist_but_exclude_the_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _r1 = DirLock::acquire_shared(dir.path()).unwrap();
+        let _r2 = DirLock::acquire_shared(dir.path()).unwrap();
+        let err = DirLock::acquire_exclusive(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop((_r1, _r2));
+        let _w = DirLock::acquire_exclusive(dir.path()).unwrap();
+        let err = DirLock::acquire_shared(dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
