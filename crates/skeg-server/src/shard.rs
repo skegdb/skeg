@@ -1337,7 +1337,10 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             )
             .await;
         }
-        return true;
+        // `ran`, not `true`: with the fold budget a due consolidate can skip
+        // its tick, and reporting it as done would reset the caller's idle
+        // tracking over work that never happened. The retry is the next tick.
+        return ran;
     }
     false
 }
@@ -1364,7 +1367,11 @@ fn fold_budget() -> &'static tokio::sync::Semaphore {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(2);
+            // In the test binary dozens of tests fold in parallel and two
+            // process-wide permits would be contended for the whole run,
+            // starving every tick-outcome assertion. The parking behaviour is
+            // still proven by the test that drains all permits explicitly.
+            .unwrap_or(if cfg!(test) { 64 } else { 2 });
         tokio::sync::Semaphore::new(n)
     })
 }
@@ -1388,6 +1395,7 @@ fn is_budgeted(label: &str) -> bool {
 async fn try_off_thread_maintenance<T, B>(
     arc: &VectorEntry,
     label: &str,
+    wait_for_budget: bool,
     begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
     build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
     finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
@@ -1406,13 +1414,33 @@ where
         }
     };
     // NO lock is held here: this is what lets reads proceed while the graph
-    // is rebuilt. Heavy kinds also wait their turn at the process-wide budget,
-    // so a broadcast cannot take the machine shard by shard.
+    // is rebuilt. Heavy kinds also respect the process-wide budget, and HOW
+    // they respect it depends on who asked. An explicit client request parks
+    // and waits its turn. The maintenance loop must NEVER park: it runs one
+    // op per vindex per tick, sequentially, so a parked runs-merge froze the
+    // whole shard's maintenance behind an explicit broadcast - no flushes for
+    // eight minutes, the delta grew unbounded, and every search paid a flat
+    // scan over it. That was measured, not imagined: flush_total stayed 0
+    // across 233k writes while folds_waiting read 6. If there is no permit
+    // now, maintenance skips and retries next tick; the flush always gets its
+    // turn.
     let _permit = if is_budgeted(label) {
-        skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
-        let p = fold_budget().acquire().await;
-        skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
-        Some(p.expect("fold budget semaphore is never closed"))
+        if wait_for_budget {
+            skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
+            let p = fold_budget().acquire().await;
+            skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
+            Some(p.expect("fold budget semaphore is never closed"))
+        } else {
+            match fold_budget().try_acquire() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    skeg_telemetry::tick_counter(
+                        skeg_telemetry::Counter::MaintenanceBudgetSkips,
+                    );
+                    return Ok(false);
+                }
+            }
+        }
     } else {
         None
     };
@@ -1457,7 +1485,7 @@ where
     T: Send + 'static,
     B: Send + 'static,
 {
-    match try_off_thread_maintenance(arc, label, begin, build, finish).await {
+    match try_off_thread_maintenance(arc, label, false, begin, build, finish).await {
         Ok(ran) => {
             if ran && let Some(c) = maintenance_counter(label) {
                 skeg_telemetry::tick_counter(c);
@@ -2152,6 +2180,7 @@ async fn process(
                     match try_off_thread_maintenance(
                         &arc,
                         "consolidate",
+                        true,
                         |b| b.consolidate_begin(),
                         move |job| job.build(&vdir),
                         |b, built| b.consolidate_finish(built),
@@ -4257,6 +4286,7 @@ mod tests {
         let ran = try_off_thread_maintenance(
             &arc,
             "flush",
+            true,
             |b| b.flush_begin(),
             move |job| job.build(&d),
             |b, built| b.flush_finish(built),
@@ -4272,6 +4302,7 @@ mod tests {
             try_off_thread_maintenance(
                 &arc2,
                 "consolidate",
+                true,
                 |b| b.consolidate_begin(),
                 move |job| job.build(&d2),
                 |b, built| b.consolidate_finish(built),
@@ -5539,10 +5570,17 @@ mod tests {
         // Note it is the run size that decides, not idleness; the tick is
         // passed `idle` here only because the old chain needed it, and the
         // assertion below holds either way.
-        assert!(
-            maintenance_tick(&arc, &vdir, 0, true).await,
-            "a run grown past the geometric threshold must consolidate",
-        );
+        // A tick can legitimately skip when the global fold budget is held
+        // by a concurrent test; production retries next tick, so so do we.
+        let mut folded = false;
+        for _ in 0..100 {
+            if maintenance_tick(&arc, &vdir, 0, true).await {
+                folded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(folded, "a run grown past the geometric threshold must consolidate");
         assert_eq!(arc.read().backend.run_count(), 0, "runs did not fold");
 
         // Nothing left to do: quiet tick, no consolidate reported.
@@ -5642,16 +5680,24 @@ mod tests {
         )));
 
         // L2: runs fold into one.
-        let d = vdir.clone();
-        let ran = off_thread_maintenance(
-            &arc,
-            "runs-merge",
-            0,
-            |b| b.merge_runs_begin(),
-            move |job| job.build(&d),
-            |b, built| b.merge_runs_finish(built),
-        )
-        .await;
+        let mut ran = false;
+        for _ in 0..100 {
+            let d = vdir.clone();
+            if off_thread_maintenance(
+                &arc,
+                "runs-merge",
+                0,
+                |b| b.merge_runs_begin(),
+                move |job| job.build(&d),
+                |b, built| b.merge_runs_finish(built),
+            )
+            .await
+            {
+                ran = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(ran, "runs-merge ran");
         assert_eq!(arc.read().backend.run_count(), 1, "runs folded to one");
         assert!(
@@ -5667,16 +5713,24 @@ mod tests {
             );
         }
         assert_eq!(arc.read().backend.tombstone_count(), 1000);
-        let d = vdir.clone();
-        let ran = off_thread_maintenance(
-            &arc,
-            "delete-patch",
-            0,
-            |b| b.delete_patch_begin(),
-            move |job| job.build(&d),
-            |b, built| b.delete_patch_finish(built),
-        )
-        .await;
+        let mut ran = false;
+        for _ in 0..100 {
+            let d = vdir.clone();
+            if off_thread_maintenance(
+                &arc,
+                "delete-patch",
+                0,
+                |b| b.delete_patch_begin(),
+                move |job| job.build(&d),
+                |b, built| b.delete_patch_finish(built),
+            )
+            .await
+            {
+                ran = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(ran, "delete-patch ran");
         assert_eq!(
             arc.read().backend.main_len(),

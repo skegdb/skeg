@@ -285,10 +285,14 @@ pub enum Counter {
     MaintenanceConsolidate = 16,
     MaintenanceRunsMerge = 17,
     MaintenanceDeletePatch = 18,
+    /// Maintenance ops that found the fold budget full and skipped their tick
+    /// instead of parking. A few are the budget working; a sustained climb
+    /// means heavy folds are starving the cheap maintenance of its turns.
+    MaintenanceBudgetSkips = 19,
 }
 
 impl Counter {
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -309,6 +313,7 @@ impl Counter {
         Counter::MaintenanceConsolidate,
         Counter::MaintenanceRunsMerge,
         Counter::MaintenanceDeletePatch,
+        Counter::MaintenanceBudgetSkips,
     ];
 
     #[inline]
@@ -333,6 +338,7 @@ impl Counter {
             Counter::MaintenanceConsolidate => "skeg_maintenance_consolidate_total",
             Counter::MaintenanceRunsMerge => "skeg_maintenance_runs_merge_total",
             Counter::MaintenanceDeletePatch => "skeg_maintenance_delete_patch_total",
+            Counter::MaintenanceBudgetSkips => "skeg_maintenance_budget_skips_total",
         }
     }
 }
