@@ -1700,17 +1700,38 @@ struct PatchBase {
 /// The full rebuild costs O(live) greedy searches and is the reason a fold at
 /// scale takes minutes; the patched route keeps the surviving base edges and
 /// only inserts what is new, so its cost tracks what changed. The full route
-/// stays for the regimes where reuse has nothing to reuse: an empty base, or
-/// new mass at base size. `SKEG_PATCH_FOLD=off|force` overrides for A/B runs.
-fn patch_fold_route(new_rows: usize, base_live: usize) -> bool {
+/// stays for the regimes where reuse loses, and both bounds are measured, not
+/// guessed:
+///
+/// - an empty base, or new mass above base size: nothing left worth reusing;
+/// - a base whose DEAD fraction is high. This one bit in production before it
+///   was guarded: a demo workload that had rewritten ~39% of the base ids took
+///   the patched route and spent 407-475s per shard, slower than the full
+///   rebuild would have been. With R=64 nearly every surviving row touches a
+///   dead neighbour once the dead fraction is large (1-(1-f)^64 saturates
+///   fast), the verbatim fast path never fires, and every row pays the O(R^2)
+///   bridge+re-prune. The delete-patch verdict measured the same cliff: 10,6x
+///   at 1% dead, 0,3x at 40%, crossover at 20-25%. The guard sits at 20%,
+///   inside the winning region.
+///
+/// `SKEG_PATCH_FOLD=off|force` overrides for A/B runs.
+fn patch_fold_route(new_rows: usize, base_live: usize, base_rows: usize) -> bool {
+    match std::env::var("SKEG_PATCH_FOLD").as_deref() {
+        Ok("off") => return false,
+        Ok("force") => return base_live > 0,
+        _ => {}
+    }
+    route_from_shape(new_rows, base_live, base_rows)
+}
+
+/// The route decision itself, env-free so tests can pin the boundary cases.
+fn route_from_shape(new_rows: usize, base_live: usize, base_rows: usize) -> bool {
     if base_live == 0 {
         return false;
     }
-    match std::env::var("SKEG_PATCH_FOLD").as_deref() {
-        Ok("off") => false,
-        Ok("force") => true,
-        _ => new_rows <= base_live,
-    }
+    let base_dead = base_rows.saturating_sub(base_live);
+    // dead/base_rows <= 20%, in integers.
+    base_dead * 5 <= base_rows && new_rows <= base_live
 }
 
 pub struct ConsolidateJob {
@@ -3886,7 +3907,7 @@ impl DiskVamanaIndex {
         // taken only when the patched route will actually run.
         let base_live = survivors.iter().filter(|s| s.1 == 0).count();
         let new_rows = delta_ids.len() + (survivors.len() - base_live);
-        let patch = if patch_fold_route(new_rows, base_live) {
+        let patch = if patch_fold_route(new_rows, base_live, self.base.main_n as usize) {
             let n = self.base.main_n as usize;
             Some(PatchBase {
                 adj: (0..n).map(|r| self.base.nodes[r]).collect(),
@@ -4575,6 +4596,30 @@ mod tests {
     }
     use super::*;
     use ordered_float::OrderedFloat;
+
+    /// The route decision, pinned at its measured boundaries. The dead-fraction
+    /// guard exists because its absence cost 407-475s per shard in production:
+    /// a 39%-dead base took the patched route and lost to the rebuild, exactly
+    /// where the delete-patch verdict said the bridge+re-prune regime loses
+    /// (crossover 20-25%). 20% is inside the winning region, not on the edge.
+    #[test]
+    fn fold_route_honours_the_measured_boundaries() {
+        // Empty base: nothing to reuse.
+        assert!(!route_from_shape(100, 0, 0));
+        // Growth-only, healthy base: patched.
+        assert!(route_from_shape(50_000, 100_000, 100_000));
+        // New mass above the live base: full.
+        assert!(!route_from_shape(150_000, 100_000, 100_000));
+        // Dead fraction at the guard (20%): still patched.
+        assert!(route_from_shape(10_000, 80_000, 100_000));
+        // Just past it: full. This is the case that shipped slow.
+        assert!(!route_from_shape(10_000, 79_000, 100_000));
+        // The production incident's shape: 458k base rows, ~180k of them
+        // rewritten and therefore dead (~39%). Must be full.
+        assert!(!route_from_shape(180_000, 278_000, 458_000));
+        // The same shape as one shard saw it.
+        assert!(!route_from_shape(22_000, 34_000, 56_000));
+    }
 
     /// The invariant a fold must never break, whichever route builds it: every
     /// live id stays findable by its own vector, and a deleted id never comes
