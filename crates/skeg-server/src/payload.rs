@@ -54,7 +54,17 @@ pub fn parse_fields(blob: &[u8]) -> Vec<(String, Value)> {
 #[derive(Default)]
 pub struct PayloadIndex {
     by_field: BTreeMap<String, BTreeMap<Value, BTreeSet<u64>>>,
-    by_id: BTreeMap<u64, Vec<(String, Value)>>,
+    /// What `id` currently contributes to `by_field`, kept as the canonical
+    /// `key=value` text rather than as parsed pairs.
+    ///
+    /// This map answers no query. It exists only so an overwrite knows which
+    /// postings to withdraw. Holding `Vec<(String, Value)>` for that cost 488
+    /// bytes per vector on a real corpus of 103-byte payloads: ten `String`
+    /// allocations per record for ten field names shared by every record, plus
+    /// a `Value` each. The text is the same information, and re-parsing it on
+    /// the rare path (an overwrite or a delete) is cheaper than carrying the
+    /// parse for every record for the life of the process.
+    by_id: BTreeMap<u64, Box<[u8]>>,
 }
 
 impl PayloadIndex {
@@ -62,6 +72,10 @@ impl PayloadIndex {
     /// Indexing the same id again is how an overwrite VSET stays consistent.
     pub fn upsert(&mut self, id: u64, fields: Vec<(String, Value)>) {
         self.remove(id);
+        if fields.is_empty() {
+            return;
+        }
+        let mut canonical = String::new();
         for (f, v) in &fields {
             self.by_field
                 .entry(f.clone())
@@ -69,18 +83,32 @@ impl PayloadIndex {
                 .entry(v.clone())
                 .or_default()
                 .insert(id);
+            if !canonical.is_empty() {
+                canonical.push(' ');
+            }
+            canonical.push_str(f);
+            canonical.push('=');
+            match v {
+                Value::Keyword(s) => canonical.push_str(s),
+                Value::Int(n) => {
+                    use std::fmt::Write;
+                    let _ = write!(canonical, "{n}");
+                }
+            }
         }
-        if !fields.is_empty() {
-            self.by_id.insert(id, fields);
-        }
+        self.by_id
+            .insert(id, canonical.into_bytes().into_boxed_slice());
     }
 
     /// Drop all of `id`'s postings. No-op if `id` was never indexed.
     pub fn remove(&mut self, id: u64) {
-        let Some(fields) = self.by_id.remove(&id) else {
+        let Some(blob) = self.by_id.remove(&id) else {
             return;
         };
-        for (f, v) in fields {
+        // Re-parsed rather than stored parsed: see the note on `by_id`. The
+        // text is canonical, produced by `upsert` from the same pairs, so this
+        // yields exactly the fields that were indexed.
+        for (f, v) in parse_fields(&blob) {
             if let Some(values) = self.by_field.get_mut(&f) {
                 if let Some(ids) = values.get_mut(&v) {
                     ids.remove(&id);
@@ -95,36 +123,20 @@ impl PayloadIndex {
         }
     }
 
-    /// Rebuild `id`'s payload in the blob form `parse_fields` accepts.
+    /// `id`'s payload in the blob form `parse_fields` accepts.
     ///
-    /// Used to persist the index without reading a single blob back from the
-    /// log: everything the index knows about an id is already here, and the
-    /// text form is the canonical one, so parsing the result returns exactly
-    /// these fields. Tokens the parser skipped when the blob first arrived are
-    /// not here and are not missed: they were never indexed, so an index built
-    /// from this is the same index.
+    /// Lets the index be persisted without reading a single blob back from the
+    /// log: everything the index knows about an id is already here, in the form
+    /// the parser accepts. Tokens the parser skipped when the blob first
+    /// arrived are not here and are not missed, since they were never indexed,
+    /// so an index built from this is the same index.
     ///
     /// An id with nothing indexed yields an empty blob, which is the honest
     /// answer and lets a caller record that the id is covered rather than
     /// unknown.
     #[must_use]
     pub fn field_blob(&self, id: u64) -> Vec<u8> {
-        let Some(fields) = self.by_id.get(&id) else {
-            return Vec::new();
-        };
-        let mut out = String::new();
-        for (f, v) in fields {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(f);
-            out.push('=');
-            match v {
-                Value::Keyword(s) => out.push_str(s),
-                Value::Int(n) => out.push_str(&n.to_string()),
-            }
-        }
-        out.into_bytes()
+        self.by_id.get(&id).map(|b| b.to_vec()).unwrap_or_default()
     }
 
     fn postings(&self, field: &str, value: &Value) -> Option<&BTreeSet<u64>> {
