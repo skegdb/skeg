@@ -809,6 +809,106 @@ pub unsafe fn tq2_adc_i8_avx512(
     unsafe { adc_i8_avx512::<2>(code, centroids_i8, i8_scale, q_rot, dim) }
 }
 
+/// [`tq2_adc_i8`] with the QUERY quantised to i8 too: `sum_i q_i8[i] *
+/// centroid_i8[code[i]]`, exact in i32. The f32 kernel widens every picked
+/// centroid through i16/i32 to f32 and pays four FMAs per 16 dims; here the
+/// TBL-decoded levels feed `sdot` directly - sixteen multiply-accumulates
+/// per instruction - and the caller applies `i8_scale * q_scale` once.
+///
+/// Quantising the query costs accuracy the way quantising the centroids
+/// does; the caller gates recall, as with the i8 centroids themselves.
+///
+/// # Panics
+///
+/// Panics if `code.len() != dim / 4` or `q_i8.len() != dim`.
+#[must_use]
+pub fn tq2_adc_qi8(code: &[u8], centroids_i8: &[i8; 16], q_i8: &[i8], dim: usize) -> i32 {
+    assert_eq!(code.len(), dim / 4, "code length");
+    assert_eq!(q_i8.len(), dim, "query length");
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            // SAFETY: dotprod was checked immediately above.
+            return unsafe { tq2_adc_qi8_sdot(code, centroids_i8, q_i8, dim) };
+        }
+    }
+    tq2_adc_qi8_scalar(code, centroids_i8, q_i8, dim)
+}
+
+/// Portable scalar reference for [`tq2_adc_qi8`]. Oracle in proptest.
+#[must_use]
+pub fn tq2_adc_qi8_scalar(code: &[u8], centroids_i8: &[i8; 16], q_i8: &[i8], dim: usize) -> i32 {
+    let mut acc = 0i32;
+    for i in 0..dim {
+        let byte = code[i / 4];
+        let shift = (i % 4) * 2;
+        let bucket = ((byte >> shift) & 0x03) as usize;
+        acc += i32::from(q_i8[i]) * i32::from(centroids_i8[bucket]);
+    }
+    acc
+}
+
+/// `sdot` kernel for [`tq2_adc_qi8`]: TBL-decode 16 code indices to i8
+/// levels, one `sdot` against 16 query bytes - the turbovec permute-dot
+/// shape, single-vector form. Four independent accumulators hide the
+/// 3-cycle `sdot` latency. `vdotq_s32` is still unstable in `std::arch`,
+/// so the instruction is emitted with inline asm.
+///
+/// # Safety
+///
+/// The current CPU must support the `dotprod` extension.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[must_use]
+pub unsafe fn tq2_adc_qi8_sdot(
+    code: &[u8],
+    centroids_i8: &[i8; 16],
+    q_i8: &[i8],
+    dim: usize,
+) -> i32 {
+    use std::arch::aarch64::{
+        int32x4_t, int8x16_t, vaddq_s32, vaddvq_s32, vdupq_n_s32, vld1q_s8, vqtbl1q_s8,
+    };
+    use std::arch::asm;
+    assert_eq!(code.len(), dim / 4, "code length");
+    assert_eq!(q_i8.len(), dim, "query length");
+    let block = dim - (dim % 64);
+    // SAFETY: every load covers lanes inside the asserted lengths; `vqtbl1q_s8`
+    // is total (2-bit indices cannot exceed 3); the asm is a register-only
+    // `sdot`, no memory, no stack.
+    let mut sum = unsafe {
+        let lut = vld1q_s8(centroids_i8.as_ptr());
+        let mut acc = [vdupq_n_s32(0); 4];
+        let mut base = 0;
+        while base < block {
+            for (k, acc_k) in acc.iter_mut().enumerate() {
+                let at = base + k * 16;
+                let idx = unpack_indices_neon::<2>(code, at);
+                let picked: int8x16_t = vqtbl1q_s8(lut, idx);
+                let q: int8x16_t = vld1q_s8(q_i8.as_ptr().add(at));
+                let mut a: int32x4_t = *acc_k;
+                asm!(
+                    "sdot {a:v}.4s, {p:v}.16b, {q:v}.16b",
+                    a = inout(vreg) a,
+                    p = in(vreg) picked,
+                    q = in(vreg) q,
+                    options(pure, nomem, nostack)
+                );
+                *acc_k = a;
+            }
+            base += 64;
+        }
+        vaddvq_s32(vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3])))
+    };
+    for i in block..dim {
+        let byte = code[i / 4];
+        let shift = (i % 4) * 2;
+        let bucket = ((byte >> shift) & 0x03) as usize;
+        sum += i32::from(q_i8[i]) * i32::from(centroids_i8[bucket]);
+    }
+    sum
+}
+
 /// Sum of `q_rot[i]` over coords whose code bit is set. `code.len() == dim/8`,
 /// `q_rot.len() == dim`, bits packed LSB-first (bit `i%8` of byte `i/8`).
 #[must_use]
@@ -1042,6 +1142,50 @@ pub fn quantise_centroids_i8<const N: usize>(centroids: &[f32; N]) -> ([i8; N], 
         *o = q;
     }
     (out, scale)
+}
+
+#[cfg(test)]
+mod qi8_tests {
+    use super::*;
+
+    #[test]
+    fn tq2_qi8_sdot_matches_scalar_on_random_and_ragged_dims() {
+        let mut state = 0x243f6a8885a308d3u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        let centroids: [i8; 16] =
+            std::array::from_fn(|i| if i < 4 { [-100i8, -33, 33, 100][i] } else { 0 });
+        // Ragged dims cover the 64-wide block, its tail, and small inputs.
+        for dim in [4usize, 16, 64, 68, 100, 512, 1024, 1536] {
+            let code: Vec<u8> = (0..dim / 4).map(|_| next()).collect();
+            let q: Vec<i8> = (0..dim).map(|_| next() as i8).collect();
+            assert_eq!(
+                tq2_adc_qi8(&code, &centroids, &q, dim),
+                tq2_adc_qi8_scalar(&code, &centroids, &q, dim),
+                "dim {dim}"
+            );
+        }
+    }
+
+    /// The i32 path with an exactly-representable query must agree with the
+    /// f32 kernel: same picks, same products, only the accumulation differs.
+    #[test]
+    fn tq2_qi8_agrees_with_the_f32_kernel_on_integer_queries() {
+        let centroids: [i8; 16] =
+            std::array::from_fn(|i| if i < 4 { [-90i8, -30, 30, 90][i] } else { 0 });
+        let dim = 1024;
+        let code: Vec<u8> = (0..dim / 4).map(|i| (i * 37 % 256) as u8).collect();
+        let q_i8: Vec<i8> = (0..dim).map(|i| ((i * 13 % 255) as i16 - 127) as i8).collect();
+        let q_f32: Vec<f32> = q_i8.iter().map(|&x| f32::from(x)).collect();
+        let exact = tq2_adc_qi8(&code, &centroids, &q_i8, dim) as f32;
+        let viaf32 = tq2_adc_i8(&code, &centroids, 1.0, &q_f32, dim);
+        assert!(
+            (exact - viaf32).abs() <= viaf32.abs() * 1e-4 + 1.0,
+            "i32 {exact} vs f32 {viaf32}"
+        );
+    }
 }
 
 #[cfg(test)]
