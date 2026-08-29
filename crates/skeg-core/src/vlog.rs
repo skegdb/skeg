@@ -307,7 +307,13 @@ impl VLog {
                 .all(|(_, e)| seg_ids.binary_search(&e.segment_id).is_ok())
         });
 
-        let mut index = Index::new();
+        // Sized up front from the snapshot when there is one. Grown by
+        // doubling the table keeps the slack of the next power of two forever,
+        // which on a real store measured 149 bytes per key against 86.
+        let mut index = match &snap {
+            Some(s) => Index::with_capacity(s.entries.len()),
+            None => Index::new(),
+        };
         let mut max_ts = 0u64;
         // The active/last segment's true used-byte length, captured from the
         // scan below (whichever branch runs). `None` when the scan never
