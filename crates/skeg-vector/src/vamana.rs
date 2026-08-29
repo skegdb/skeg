@@ -916,24 +916,39 @@ fn patch_connectivity(
     if count == n {
         return;
     }
+    // The walk from the medoid can only ever visit reachable nodes, so a
+    // greedy search over the graph finds each stranded node's nearest
+    // reachable neighbour without touching the rest of the index. The exact
+    // scan this replaces cost O(stranded x n) distances and was the whole
+    // graph phase of an otherwise no-op fold: ~0,5s per stranded node at
+    // 460k rows, 50s per shard with about a hundred of them.
+    let stranded = n - count;
+    let t = std::time::Instant::now();
+    let mut visited = VisitedBitset::new(n as usize);
+    let mut seen = VisitedBitset::new(n as usize);
     for u in 0..n {
         if reachable[u as usize] {
             continue;
         }
         let u_vec = source.row(u);
-        let mut best = medoid;
-        let mut best_d = f32::INFINITY;
-        for v in 0..n {
-            if reachable[v as usize] {
-                let d = dist(u_vec, source.row(v));
-                if d < best_d {
-                    best_d = d;
-                    best = v;
-                }
-            }
-        }
+        let list = greedy_search(
+            &[medoid],
+            r.max(64),
+            None,
+            |v| dist(u_vec, source.row(v)),
+            |v| SmallVec::from_slice(nodes[v as usize].slice()),
+            None,
+            &mut visited,
+            &mut seen,
+            None,
+        );
+        let best = list.iter().next().map_or(medoid, |(_, v)| v);
         nodes[best as usize].try_push(u, r);
     }
+    tracing::info!(
+        "patch_connectivity: {stranded} stranded of {n}, attached in {:?}",
+        t.elapsed()
+    );
 }
 
 // -- public index --------------------------------------------------------------
