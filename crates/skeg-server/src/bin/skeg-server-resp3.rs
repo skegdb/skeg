@@ -140,7 +140,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?
     } else {
-        let n_shards = skeg_platform::num_performance_cores();
+        // The shard count governs fan-out cost, per-shard fold size and the
+        // max-of-K tail all at once; the sweep that picks it needs to vary it
+        // without recompiling. Default stays the performance-core count.
+        let n_shards = std::env::var("SKEG_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(skeg_platform::num_performance_cores);
+        tracing::info!("shards: {n_shards}");
         Server::bind_full_mmap(
             &cfg.addr,
             data_dir,
