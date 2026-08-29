@@ -88,46 +88,72 @@ restart with a filtered query.
 
 ### Added
 
-- **Persisted payload index.** A vindex's payload index was rebuilt at every
-  open by reading each live id's blob back from the log, one random read per
-  id. It is now written next to the vindex as `payload.cache.bin` and read back
-  sequentially. Open on the 471.918-vector artifact went from 9,4s to 4,8s, and
-  `skeg_payload_cache_entries_total` reports all 471.918 entries served from
-  the file with nothing re-read from the log. The file is 54 MB.
+- **The payload index moved off the heap.** It was rebuilt at every open by
+  reading each live id's blob back from the log, one random read per id, and
+  then held entirely in memory. Both halves are fixed.
 
-  Staleness is the whole problem here, because payload blobs live in the log
-  and keep changing after the file is written, and a payload index that is
-  quietly wrong makes filtered searches drop results with no error anywhere.
-  Three rules keep it honest, and each has a test that fails without it:
+  It cost 449 bytes per vector on a real corpus whose payloads are 103 bytes of
+  text. Two thirds of that was the posting sets, many small `BTreeSet`s that
+  are mostly node overhead; the rest was a parsed copy of every payload kept
+  only so an overwrite would know which postings to withdraw. The posting ids
+  now live in `payload.idx` beside the vindex, sorted and delta-varint encoded,
+  and the parsed copy is gone: the canonical text is kept instead and re-parsed
+  on the rare path.
 
-  - the file is stamped with the log snapshot position it reflects, written in
-    the same step as that snapshot, and refused unless recovery seeded from
+  ```
+  one vindex, 28.019 vectors, index built in isolation
+    before            ~1120 B/vector
+    text not parsed     449 B/vector
+    postings on disk     56 B/vector      file 0,8 MB
+
+  production artifact, 471.918 vectors over two indexes
+    open                10,5s  ->  1,6s
+    process RSS          842 MB -> 159 MB
+  ```
+
+  The directory, which fields exist and which values, stays in memory as a
+  `BTreeMap`. Range filters depend on `Value`'s ordering, and reimplementing
+  that ordering inside a binary format is the kind of mistake that returns the
+  wrong rows and says nothing; the `BTreeMap` makes it correct by construction,
+  and it is not the part that weighs.
+
+  Staleness is the risk that governs the design, because payload blobs live in
+  the log and keep changing after the file is written, and a payload index that
+  is quietly wrong makes filtered searches drop results with no error anywhere.
+  Three rules, each with a test that fails without it:
+
+  - the file carries the log snapshot position it reflects, is written in the
+    same step as that snapshot, and is refused unless recovery seeded from
     exactly that snapshot;
   - an id whose payload key appears in the replayed log tail is refused and
-    read from the log instead, so anything written after the stamp is never
-    taken from the file;
-  - it is consulted only during the open-time warm, never when a vindex is
-    reopened after an eviction: by then writes may have landed that no tail
+    read from the log instead;
+  - it is read only during the open-time warm, never when a vindex is reopened
+    after an eviction, because by then writes may have landed that no tail
     records.
 
-  The file is built from the in-memory index rather than by reading blobs back,
-  so writing it costs no reads at all; and it is skipped when the stamp has not
-  moved, which on a store that is only being read means it is written once and
-  left alone.
+  Writes after the file was built go to an in-memory overlay whose ids shadow
+  the file, so an overwrite never rewrites it and a delete never has to know
+  which postings to withdraw. Writing it again folds the previous file in
+  rather than chaining.
 
-  Stressed on the real corpus, not only in unit tests: payloads rewritten
-  around a snapshot, the store restarted, and the filter's view compared
-  against the stored blobs. Three rounds, no defects, and
-  `skeg_payload_cache_entries_total` reads 471.818 every round, the total minus
-  exactly the 100 ids rewritten after the stamp, so the refusal is visible in
-  the number rather than only asserted. 240 marked ids read back with their
-  blobs: no disagreement between what the filter matched and what was stored.
+  The gate is equivalence rather than "it works": a disk-backed index is
+  compared against an in-memory one over every shape of the filter grammar,
+  including a check that the filters match enough ids to be comparing
+  something. It is created `0600`, carries a crc32c, and its header is
+  validated and its counts bounded before anything is allocated, so a length
+  field on disk cannot drive an allocation. Truncation at every length and a
+  flipped bit are refused.
 
-  It is created `0600`, carries a crc32c over its body, and its header is
-  validated and its entry count bounded before the body is read, so a length
-  field on disk cannot drive an allocation. A refused file is logged: silently
-  reading the whole log back while a cache sits there unused is the kind of
-  thing that goes unnoticed.
+  Stressed on the real corpus as well: payloads rewritten around a snapshot,
+  the store restarted, and the filter's view compared against the stored blobs.
+  `skeg_payload_index_from_disk_total` reports how many ids came from the file,
+  and reads the total minus exactly the ids rewritten after the stamp, so the
+  refusal is visible in the number rather than only asserted.
+
+  On the RSS figures: they moved in the right direction, but macOS compresses
+  idle pages and the same process reported 3 MB and 338 MB minutes apart during
+  this work. The per-vector measurements, taken in isolation in separate
+  processes, are the ones to trust.
 
 - **Quantised tier cache.** The `tq2` tier was recomputed from the source
   vectors on every open; it is now serialised to `tier.cache.bin` in the vindex
