@@ -9,6 +9,67 @@ repository.
 
 ## [Unreleased]
 
+### The full rebuild leaves the normal path
+
+The consolidate rebuilt the whole graph from scratch on every fold: measured
+O(n^1,5), 46s at 400k vectors, with the write throughput falling as 1/live-set.
+The engine now folds at a cost proportional to what changed, not to what it
+holds. Measured on real 1024-dim embeddings: steady fold slices of 18-21s per
+125k rows at 500k and 42-54s per 250k rows at 1M (flat per-vector cost across
+scale), stream/bulk recall ratio 0,995 at 500k and 0,994 at 1M, and a fold with
+nothing new to add costs 13-25ms instead of a rebuild.
+
+### Added
+
+- **Patched fold.** `ConsolidateJob` now captures the base adjacency, and the
+  fold reuses it: rows whose neighbours all survive are remapped verbatim at
+  zero distance computations, rows touching dead neighbours are re-pruned, and
+  new points are inserted with a single greedy+prune+back-edge pass. The full
+  rebuild remains as fallback, chosen by measured shape: patched only while the
+  base is at most 20% dead (the delete-patch verdict places the losing regime
+  above ~25%) and the new rows do not outnumber the live base.
+  `SKEG_PATCH_FOLD=off|force` overrides the route.
+- **Fold concurrency budget.** Heavy maintenance builds (consolidate,
+  runs-merge, delete-patch, IVF) share a process-wide budget
+  (`SKEG_FOLD_CONCURRENCY`, default 2). Explicit commands park and wait;
+  background maintenance skips and retries at the next tick, counted by
+  `MaintenanceBudgetSkips` and the `skeg_folds_waiting` gauge. The delta flush
+  is exempt: parking it froze search behind a growing flat-scanned delta,
+  which was the actual latency degradation observed, not CPU contention.
+- **Consolidate pace.** A serving store folds on a quarter of the cores; an
+  idle one uses the whole machine (`SKEG_CONSOLIDATE_THREADS` overrides).
+- **Per-kind maintenance counters.** Flush, consolidate, runs-merge,
+  delete-patch and budget skips are now counted, so a soak can prove which
+  path ran instead of guessing.
+
+### Changed
+
+- **Maintenance ladder order.** Cheap first, expensive last: flush, then
+  delete-patch, then runs-merge, then consolidate. The fold used to be checked
+  first, so whenever it was due the paths proportional to the change never got
+  a turn.
+- **The idle clause is gone.** A store that went quiet with one flush behind
+  it used to rebuild its entire base (`idle && delta + run_rows >= 4096`).
+  A quiet store needs its runs merged, which is what runs-merge is for; the
+  fold now fires only on the geometric trigger or on a heavily-dead base.
+
+### Fixed
+
+- **Delete-patch ran in its losing regime.** It had a lower tombstone bound
+  but no upper one, and fired on a base 61% dead, where the measurement says
+  it loses 3x. Past a quarter dead the ladder now routes to the full fold,
+  which also gained a heavy-dead arm: without it, nothing would ever have
+  reclaimed such a base, because the geometric trigger only watches run
+  growth.
+- **Connectivity repair scanned the whole index per stranded node.**
+  `patch_connectivity` found each stranded node's attachment point by an exact
+  scan over all rows: O(stranded x n) distances, ~0,5s per node at 460k rows,
+  and the entire cost of the ~50s per-shard folds observed on dirty history
+  with zero new writes. It now walks the graph itself (a walk from the medoid
+  can only visit reachable nodes), and logs the stranded count and repair
+  time.
+
+
 What a restart and a filtered search actually cost, found while running a
 471.918-vector corpus (HuggingFace model metadata, dim 1024, `tq2`, disk
 backend, 8 shards) as a live service. Every number below is measured on that
