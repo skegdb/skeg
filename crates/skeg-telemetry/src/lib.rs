@@ -361,10 +361,15 @@ pub enum Gauge {
     CompactionInProgress = 4,
     VindexSizeBytes = 5,
     VindexVectors = 6,
+    /// Heavy maintenance builds parked at the process-wide fold budget. A
+    /// non-zero value while latency is fine means the budget is doing its job;
+    /// a persistently high one means folds are being produced faster than the
+    /// budget lets them retire.
+    FoldsWaiting = 7,
 }
 
 impl Gauge {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     pub const ALL: [Gauge; Self::COUNT] = [
         Gauge::VlogSegmentsLive,
         Gauge::VlogSegmentsCompacting,
@@ -373,6 +378,7 @@ impl Gauge {
         Gauge::CompactionInProgress,
         Gauge::VindexSizeBytes,
         Gauge::VindexVectors,
+        Gauge::FoldsWaiting,
     ];
 
     #[inline]
@@ -385,6 +391,7 @@ impl Gauge {
             Gauge::CompactionInProgress => "skeg_compaction_in_progress",
             Gauge::VindexSizeBytes => "skeg_vindex_size_bytes",
             Gauge::VindexVectors => "skeg_vindex_vectors",
+            Gauge::FoldsWaiting => "skeg_folds_waiting",
         }
     }
 }

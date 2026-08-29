@@ -1342,6 +1342,41 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     false
 }
 
+/// Process-wide budget on concurrent HEAVY maintenance builds.
+///
+/// The per-fold thread cap does not compose: an explicit consolidate
+/// broadcasts to every shard, and eight folds at two capped threads each
+/// still took the whole machine (measured 947-977% CPU on 10 cores, searches
+/// at p50 158 / p99 534 ms for the duration). The cap protects against one
+/// fold; this protects against the broadcast, by letting at most
+/// `SKEG_FOLD_CONCURRENCY` heavy builds run at once and queueing the rest.
+///
+/// Flushes are exempt: they are frequent, cheap, and gating them behind a
+/// parked fold would stall ingest. The trade is explicit: a gated broadcast
+/// takes longer wall-clock (shards serialise), and in exchange the queries
+/// keep most of the machine. Waiting is safe here because `begin` has already
+/// snapshotted and released the vindex lock, and writes that land while a job
+/// is parked are replayed from the WAL suffix at finish.
+fn fold_budget() -> &'static tokio::sync::Semaphore {
+    static BUDGET: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let n = std::env::var("SKEG_FOLD_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(2);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
+/// Which maintenance kinds count against the fold budget.
+///
+/// Everything that rebuilds or rewrites a graph does; the flush only stacks
+/// the delta into a run and must never wait behind a fold.
+fn is_budgeted(label: &str) -> bool {
+    matches!(label, "consolidate" | "runs-merge" | "delete-patch" | "ivf")
+}
+
 /// The three phases (begin under a short lock, build off the lock, finish under
 /// a short lock), with the error propagated rather than only logged.
 ///
@@ -1371,7 +1406,16 @@ where
         }
     };
     // NO lock is held here: this is what lets reads proceed while the graph
-    // is rebuilt.
+    // is rebuilt. Heavy kinds also wait their turn at the process-wide budget,
+    // so a broadcast cannot take the machine shard by shard.
+    let _permit = if is_budgeted(label) {
+        skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
+        let p = fold_budget().acquire().await;
+        skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
+        Some(p.expect("fold budget semaphore is never closed"))
+    } else {
+        None
+    };
     let built = match tokio::task::spawn_blocking(move || build(job)).await {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => return Err(format!("{label} build failed: {e}")),
@@ -4168,6 +4212,80 @@ mod tests {
             .unwrap();
         assert_eq!(before.len(), 20, "half the vectors are even");
         assert_eq!(after.len(), before.len(), "consolidate changed what the filter matches");
+    }
+
+    /// The fold budget gates heavy builds and never gates a flush.
+    ///
+    /// This is the guard against the measured incident: an explicit
+    /// consolidate broadcasts to every shard, and eight capped folds still
+    /// took 947% of a 10-core machine. With the budget exhausted a
+    /// consolidate must park; a flush must not, because gating the ingest
+    /// path behind a parked fold would stall writes.
+    #[tokio::test]
+    async fn fold_budget_parks_heavy_builds_and_exempts_the_flush() {
+        assert!(is_budgeted("consolidate"));
+        assert!(is_budgeted("runs-merge"));
+        assert!(is_budgeted("delete-patch"));
+        assert!(!is_budgeted("flush"));
+
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-b");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0u64..(FLUSH_ROWS as u64 + 64) {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        // Exhaust the budget.
+        let held = fold_budget()
+            .acquire_many(fold_budget().available_permits() as u32)
+            .await
+            .unwrap();
+
+        // A flush must complete regardless.
+        let d = vdir.clone();
+        let ran = try_off_thread_maintenance(
+            &arc,
+            "flush",
+            |b| b.flush_begin(),
+            move |job| job.build(&d),
+            |b, built| b.flush_finish(built),
+        )
+        .await
+        .unwrap();
+        assert!(ran, "the flush must run with the budget exhausted");
+
+        // A consolidate must park until a permit frees.
+        let arc2 = arc.clone();
+        let d2 = vdir.clone();
+        let fold = tokio::spawn(async move {
+            try_off_thread_maintenance(
+                &arc2,
+                "consolidate",
+                |b| b.consolidate_begin(),
+                move |job| job.build(&d2),
+                |b, built| b.consolidate_finish(built),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !fold.is_finished(),
+            "the consolidate ran past an exhausted fold budget"
+        );
+        drop(held);
+        let ran = fold.await.unwrap().unwrap();
+        assert!(ran, "the parked consolidate must complete once a permit frees");
     }
 
     #[tokio::test]
