@@ -53,6 +53,19 @@ pub fn parse_fields(blob: &[u8]) -> Vec<(String, Value)> {
 /// if a scale bench asks for it.
 #[derive(Default)]
 pub struct PayloadIndex {
+    /// The id lists built before this process started, read back from
+    /// `payload.idx`. Immutable: nothing is ever inserted into or removed from
+    /// it. Changes since it was built live in the maps below, and `shadowed`
+    /// says which of its ids to disregard.
+    ///
+    /// This is what keeps the index off the heap. Held as `BTreeSet`s the
+    /// postings cost 178 bytes per vector on a real corpus; the same ids
+    /// delta-encoded on disk cost 12,2.
+    disk: Option<crate::payload_disk::DiskPostings>,
+    /// Ids written or deleted since `disk` was built. A shadowed id is ignored
+    /// wherever `disk` mentions it, so an overwrite never has to rewrite the
+    /// file, and a delete never has to know which postings to withdraw.
+    shadowed: std::collections::HashSet<u64>,
     by_field: BTreeMap<String, BTreeMap<Value, BTreeSet<u64>>>,
     /// What `id` currently contributes to `by_field`, kept as the canonical
     /// `key=value` text rather than as parsed pairs.
@@ -72,6 +85,9 @@ impl PayloadIndex {
     /// Indexing the same id again is how an overwrite VSET stays consistent.
     pub fn upsert(&mut self, id: u64, fields: Vec<(String, Value)>) {
         self.remove(id);
+        if self.disk.is_some() {
+            self.shadowed.insert(id);
+        }
         if fields.is_empty() {
             return;
         }
@@ -102,6 +118,9 @@ impl PayloadIndex {
 
     /// Drop all of `id`'s postings. No-op if `id` was never indexed.
     pub fn remove(&mut self, id: u64) {
+        if self.disk.is_some() {
+            self.shadowed.insert(id);
+        }
         let Some(blob) = self.by_id.remove(&id) else {
             return;
         };
@@ -139,36 +158,161 @@ impl PayloadIndex {
         self.by_id.get(&id).map(|b| b.to_vec()).unwrap_or_default()
     }
 
-    fn postings(&self, field: &str, value: &Value) -> Option<&BTreeSet<u64>> {
-        self.by_field.get(field).and_then(|vs| vs.get(value))
+    /// Build an index whose id lists come from `disk`.
+    ///
+    /// Nothing is copied out of the file: the maps here start empty and take
+    /// only what changes afterwards.
+    #[must_use]
+    pub fn from_disk(disk: crate::payload_disk::DiskPostings) -> Self {
+        Self {
+            disk: Some(disk),
+            ..Self::default()
+        }
+    }
+
+    /// Number of ids this index currently answers for.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.all_ids().len()
+    }
+
+    /// Whether this index answers for no ids.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Write the current state to `payload.idx` in `dir`, stamped with the log
+    /// position it reflects.
+    ///
+    /// The lists come from the same merge the reads use, so a file written from
+    /// an index that already had a disk part folds that part in rather than
+    /// layering another one: reopening never has to walk a chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written, synced or renamed.
+    pub fn persist(&self, dir: &std::path::Path, stamp: (u64, u64)) -> std::io::Result<()> {
+        let mut keys: BTreeMap<&str, BTreeMap<Value, ()>> = BTreeMap::new();
+        if let Some(d) = &self.disk {
+            for (f, vs) in d.directory() {
+                let e = keys.entry(f.as_str()).or_default();
+                for v in vs.keys() {
+                    e.insert(v.clone(), ());
+                }
+            }
+        }
+        for (f, vs) in &self.by_field {
+            let e = keys.entry(f.as_str()).or_default();
+            for v in vs.keys() {
+                e.insert(v.clone(), ());
+            }
+        }
+        let mut lists: Vec<(&str, Value, Vec<u64>)> = Vec::new();
+        for (f, vs) in &keys {
+            for v in vs.keys() {
+                let ids = self.postings(f, v);
+                if !ids.is_empty() {
+                    lists.push((f, v.clone(), ids));
+                }
+            }
+        }
+        let all = self.all_ids();
+        crate::payload_disk::write(
+            dir,
+            stamp,
+            &all,
+            lists.iter().map(|(f, v, ids)| (*f, v, ids.as_slice())),
+        )
+    }
+
+    /// Merge a disk id list with the in-memory one for the same key.
+    ///
+    /// Order matters only in that the result must come out sorted; the two
+    /// sources are each sorted already. A shadowed id is one the memory side
+    /// has an opinion about, so the disk side does not get a vote on it.
+    fn merge(&self, from_disk: Vec<u64>, mem: Option<&BTreeSet<u64>>) -> Vec<u64> {
+        let mut out: Vec<u64> = if self.shadowed.is_empty() {
+            from_disk
+        } else {
+            from_disk
+                .into_iter()
+                .filter(|id| !self.shadowed.contains(id))
+                .collect()
+        };
+        if let Some(m) = mem {
+            out.extend(m.iter().copied());
+        }
+        sort_dedup(out)
+    }
+
+    /// Ids for one `(field, value)`, sorted.
+    fn postings(&self, field: &str, value: &Value) -> Vec<u64> {
+        let mem = self.by_field.get(field).and_then(|vs| vs.get(value));
+        match &self.disk {
+            Some(d) => self.merge(d.postings(field, value), mem),
+            None => mem.map(|s| s.iter().copied().collect()).unwrap_or_default(),
+        }
     }
 
     /// Every id that has any value for `field` (the `EXISTS` predicate), sorted.
     fn field_ids(&self, field: &str) -> Vec<u64> {
-        let mut out = Vec::new();
+        let mut mem = Vec::new();
         if let Some(vs) = self.by_field.get(field) {
             for ids in vs.values() {
-                out.extend(ids.iter().copied());
+                mem.extend(ids.iter().copied());
             }
         }
-        sort_dedup(out)
+        match &self.disk {
+            Some(d) => {
+                let mut out: Vec<u64> = d
+                    .field_ids(field)
+                    .into_iter()
+                    .filter(|id| !self.shadowed.contains(id))
+                    .collect();
+                out.extend(mem);
+                sort_dedup(out)
+            }
+            None => sort_dedup(mem),
+        }
     }
 
     /// Ids whose `field` value lies in `[lo, hi]` (per the bounds), sorted.
     fn range_ids(&self, field: &str, lo: &Bound<Value>, hi: &Bound<Value>) -> Vec<u64> {
-        let mut out = Vec::new();
+        let mut mem = Vec::new();
         if let Some(vs) = self.by_field.get(field) {
             for (_, ids) in vs.range((lo.as_ref(), hi.as_ref())) {
-                out.extend(ids.iter().copied());
+                mem.extend(ids.iter().copied());
             }
         }
-        sort_dedup(out)
+        match &self.disk {
+            Some(d) => {
+                let mut out: Vec<u64> = d
+                    .range_ids(field, lo, hi)
+                    .into_iter()
+                    .filter(|id| !self.shadowed.contains(id))
+                    .collect();
+                out.extend(mem);
+                sort_dedup(out)
+            }
+            None => sort_dedup(mem),
+        }
     }
 
-    /// Every indexed id (the universe `NOT` complements against). Sorted, since
-    /// `by_id` is a `BTreeMap`.
-    fn all_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.by_id.keys().copied()
+    /// Every indexed id (the universe `NOT` complements against), sorted.
+    fn all_ids(&self) -> Vec<u64> {
+        let mem = self.by_id.keys().copied();
+        match &self.disk {
+            Some(d) => {
+                let mut out: Vec<u64> = d
+                    .all_ids()
+                    .filter(|id| !self.shadowed.contains(id))
+                    .collect();
+                out.extend(mem);
+                sort_dedup(out)
+            }
+            None => mem.collect(),
+        }
     }
 }
 
@@ -225,16 +369,11 @@ impl Filter {
     pub fn evaluate(&self, idx: &PayloadIndex) -> Vec<u64> {
         match self {
             // A posting is already sorted (BTreeSet iteration order).
-            Filter::Eq(f, v) => idx
-                .postings(f, v)
-                .map(|b| b.iter().copied().collect())
-                .unwrap_or_default(),
+            Filter::Eq(f, v) => idx.postings(f, v),
             Filter::In(f, vs) => {
                 let mut out = Vec::new();
                 for v in vs {
-                    if let Some(p) = idx.postings(f, v) {
-                        out.extend(p.iter().copied());
-                    }
+                    out.extend(idx.postings(f, v));
                 }
                 sort_dedup(out)
             }
@@ -255,7 +394,7 @@ impl Filter {
                 }
                 let mut acc: Vec<u64> = if positives.is_empty() {
                     // Only negations: start from the universe, then subtract.
-                    idx.all_ids().collect()
+                    idx.all_ids()
                 } else {
                     // Intersect smallest-first so the running set only shrinks.
                     let mut sets: Vec<Vec<u64>> =
@@ -287,6 +426,7 @@ impl Filter {
                 // does NOT take this path: `And` subtracts instead (see above).
                 let excluded = inner.evaluate(idx); // sorted
                 idx.all_ids()
+                    .into_iter()
                     .filter(|id| excluded.binary_search(id).is_err())
                     .collect()
             }
@@ -518,17 +658,11 @@ mod tests {
         idx.upsert(1, vec![("user".into(), kw("alice"))]);
         idx.upsert(2, vec![("user".into(), kw("alice"))]);
         idx.upsert(3, vec![("user".into(), kw("bob"))]);
-        assert_eq!(
-            idx.postings("user", &kw("alice")),
-            Some(&BTreeSet::from([1, 2]))
-        );
+        assert_eq!(idx.postings("user", &kw("alice")), vec![1, 2]);
         idx.upsert(1, vec![("user".into(), kw("carol"))]);
-        assert_eq!(
-            idx.postings("user", &kw("alice")),
-            Some(&BTreeSet::from([2]))
-        );
+        assert_eq!(idx.postings("user", &kw("alice")), vec![2]);
         idx.remove(3);
-        assert_eq!(idx.postings("user", &kw("bob")), None);
+        assert!(idx.postings("user", &kw("bob")).is_empty());
     }
 
     #[test]

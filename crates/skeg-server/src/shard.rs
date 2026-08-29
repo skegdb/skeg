@@ -582,11 +582,11 @@ enum ShardReq {
     /// shards so callers can ask any one shard.
     VindexList,
     /// Fold a disk vindex's streaming delta into its graph on this shard.
-    /// Write the vlog snapshot and a payload cache per vindex, both stamped
+    /// Write the vlog snapshot and a payload index per vindex, both stamped
     /// with the same log position. Normally the background task's job; exposed
     /// so a caller (and the tests that check the cache cannot go stale) can
     /// force one at a known point.
-    SnapshotAndPayloadCaches,
+    SnapshotAndPayloadIndexes,
     VindexConsolidate {
         name: String,
     },
@@ -794,6 +794,47 @@ async fn ensure_payload_loaded(
         return Ok(());
     }
     let ids = arc.read().backend.live_ids();
+
+    // The fast path: the index itself, read back from `payload.idx`. Only the
+    // ids the log tail touched since the file was stamped are re-read, because
+    // only those can have changed; everything else is answered straight from
+    // the file, which is why this does not put the corpus back on the heap.
+    if allow_cache
+        && let Some(rec) = vlog.recovered_from()
+        && let Some(disk) = crate::payload_disk::DiskPostings::open(vdir, rec.stamp)
+    {
+        let covered = disk.len();
+        let mut payload = PayloadIndex::from_disk(disk);
+        let mut refreshed = 0usize;
+        for id in &ids {
+            let key = payload_key(tenant, name, *id);
+            if !rec.tail_keys.contains(&key) {
+                continue;
+            }
+            refreshed += 1;
+            match vlog.get_uncached(&key).await {
+                Ok(Some(blob)) => payload.upsert(*id, parse_fields(&blob)),
+                // Written and then deleted after the stamp: the file may still
+                // list it, so say so explicitly rather than leaving it there.
+                Ok(None) => payload.remove(*id),
+                Err(e) => return Err(format!("payload index rebuild failed: {e}")),
+            }
+        }
+        let mut g = arc.write();
+        if !g.payload_loaded {
+            g.payload = payload;
+            g.payload_loaded = true;
+            skeg_telemetry::add_counter(
+                skeg_telemetry::Counter::PayloadIndexFromDisk,
+                covered as u64,
+            );
+            tracing::info!(
+                "payload index for '{name}' read from disk: {covered} ids, {refreshed} re-read from the log"
+            );
+        }
+        return Ok(());
+    }
+
     // Serial on purpose. Running the reads `buffer_unordered` looks like the
     // obvious win and measured the opposite on the same corpus: open took
     // 26,7s at concurrency 256 and 15,7s at 16, against 11,1s reading one at a
@@ -807,42 +848,18 @@ async fn ensure_payload_loaded(
     // dead value and has to come from the vlog. Both conditions must hold; a
     // filtered search served from a stale payload index drops results with no
     // error anywhere, which is far worse than a slow open.
-    let mut cached: HashMap<u64, Vec<u8>> = HashMap::new();
-    if allow_cache && let Some(rec) = vlog.recovered_from() {
-        match crate::payload_cache::read(vdir, rec.stamp, ids.len()) {
-            Some(entries) => {
-                cached.reserve(entries.len());
-                for (id, blob) in entries {
-                    if !rec.tail_keys.contains(&payload_key(tenant, name, id)) {
-                        cached.insert(id, blob);
-                    }
-                }
-            }
-            // Refusing is always safe, so this is not an error, but silently
-            // reading the whole log back while a cache file sits there unused
-            // is the kind of thing that goes unnoticed for months. Absent is
-            // normal and says nothing; present and refused is worth a line.
-            None if vdir.join(crate::payload_cache::FILE).exists() => {
-                tracing::warn!(
-                    "payload cache for '{name}' refused (stale stamp, or damaged); \
-                     rebuilding from the log"
-                );
-            }
-            None => {}
-        }
+    // Refusing the file is always safe, so this is not an error, but reading
+    // the whole log back while a payload.idx sits there unused is the kind of
+    // thing that goes unnoticed for months. Absent is normal and says nothing.
+    if allow_cache && vdir.join(crate::payload_disk::FILE).exists() {
+        tracing::warn!(
+            "payload index for '{name}' refused (stale stamp, or damaged); \
+             rebuilding from the log"
+        );
     }
-    let from_cache = cached.len();
-    skeg_telemetry::add_counter(
-        skeg_telemetry::Counter::PayloadCacheEntries,
-        from_cache as u64,
-    );
 
     let mut parsed = Vec::with_capacity(ids.len());
     for id in ids {
-        if let Some(blob) = cached.remove(&id) {
-            parsed.push((id, parse_fields(&blob)));
-            continue;
-        }
         let key = payload_key(tenant, name, id);
         // `get_uncached`: this reads every blob exactly once and keeps the
         // parsed fields in the payload index, so caching the blobs stores a
@@ -880,7 +897,7 @@ fn vindex_handles(vindexes: &RwLock<VindexSet>) -> Vec<(String, VectorEntry)> {
         .collect()
 }
 
-/// Write the vlog snapshot, then a payload cache per vindex stamped with the
+/// Write the vlog snapshot, then a payload index per vindex stamped with the
 /// position that snapshot covers.
 ///
 /// The two must carry the same stamp, which is why they are written together
@@ -891,7 +908,7 @@ fn vindex_handles(vindexes: &RwLock<VindexSet>) -> Vec<(String, VectorEntry)> {
 /// Writing the cache is best effort. It is an optimisation for the next open,
 /// so a failure is logged and the store carries on; the worst outcome is a slow
 /// warm, and the snapshot itself has already succeeded by then.
-async fn snapshot_and_payload_caches(
+async fn snapshot_and_payload_indexes(
     vlog: &VLog,
     vindexes: &RwLock<VindexSet>,
     dir: &Path,
@@ -924,24 +941,20 @@ async fn snapshot_and_payload_caches(
         if written.get(&scoped) == Some(&stamp) {
             continue;
         }
-        let blobs: Vec<(u64, Vec<u8>)> = {
+        let vdir = dir.join(format!("vindex-{scoped}"));
+        let result = {
             let g = arc.read();
             if !g.payload_loaded {
                 continue;
             }
-            g.backend
-                .live_ids()
-                .into_iter()
-                .map(|id| (id, g.payload.field_blob(id)))
-                .collect()
+            g.payload.persist(&vdir, stamp)
         };
-        let vdir = dir.join(format!("vindex-{scoped}"));
-        match crate::payload_cache::write(&vdir, stamp, &blobs) {
+        match result {
             Ok(()) => {
                 written.insert(scoped.clone(), stamp);
             }
             Err(e) => {
-                tracing::warn!("shard {shard_id}: writing payload cache for '{scoped}' failed: {e}");
+                tracing::warn!("shard {shard_id}: writing payload index for '{scoped}' failed: {e}");
             }
         }
     }
@@ -1619,7 +1632,7 @@ fn run_shard(
                         let mut written: HashMap<String, (u64, u64)> = HashMap::new();
                         loop {
                             tokio::time::sleep(SNAPSHOT_INTERVAL).await;
-                            snapshot_and_payload_caches(
+                            snapshot_and_payload_indexes(
                                 &svlog, &svindexes, &sdir, shard_id, &mut written,
                             )
                             .await;
@@ -1736,7 +1749,7 @@ fn is_mutation(req: &ShardReq) -> bool {
             | ShardReq::VindexCreate { .. }
             | ShardReq::VindexDrop { .. }
             | ShardReq::VindexConsolidate { .. }
-            | ShardReq::SnapshotAndPayloadCaches
+            | ShardReq::SnapshotAndPayloadIndexes
             | ShardReq::Vset { .. }
             | ShardReq::Vdel { .. }
     )
@@ -1769,7 +1782,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
         | ShardReq::VindexConsolidate { .. }
-        | ShardReq::SnapshotAndPayloadCaches
+        | ShardReq::SnapshotAndPayloadIndexes
         | ShardReq::Evict { .. }
         | ShardReq::IndexStats
         | ShardReq::TenantCacheBytes(_)
@@ -1969,9 +1982,9 @@ async fn process(
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             ShardResp::VindexList(rows)
         }
-        ShardReq::SnapshotAndPayloadCaches => {
+        ShardReq::SnapshotAndPayloadIndexes => {
             // Forced: no memo, so it always writes.
-            snapshot_and_payload_caches(vlog, vindexes, dir, 0, &mut HashMap::new()).await;
+            snapshot_and_payload_indexes(vlog, vindexes, dir, 0, &mut HashMap::new()).await;
             ShardResp::Done
         }
         ShardReq::VindexConsolidate { name } => {
@@ -2991,9 +3004,9 @@ impl ShardSet {
     /// Force a snapshot plus the payload caches that go with it, on every
     /// shard. Best effort per shard: failures are logged, not returned, since
     /// the result is only ever an optimisation for the next open.
-    pub async fn write_snapshot_and_payload_caches(&self) {
+    pub async fn write_snapshot_and_payload_indexes(&self) {
         let _ = self
-            .broadcast(|| ShardReq::SnapshotAndPayloadCaches)
+            .broadcast(|| ShardReq::SnapshotAndPayloadIndexes)
             .await;
     }
 
@@ -3787,7 +3800,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            shards.write_snapshot_and_payload_caches().await;
+            shards.write_snapshot_and_payload_indexes().await;
             // After the stamp: this id's payload changes, the cache still says
             // "t=old" for it.
             shards
@@ -3797,7 +3810,7 @@ mod tests {
         }
 
         let cached_before =
-            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadCacheEntries);
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexFromDisk);
         let shards =
             ShardSet::open_mode_with_workers(dir.path(), 1, false, skeg_vector::QuantKind::Int8, 1)
                 .unwrap();
@@ -3823,7 +3836,7 @@ mod tests {
         // Without this the test would also pass with the cache never read: green,
         // and proving nothing.
         assert!(
-            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadCacheEntries)
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexFromDisk)
                 - cached_before
                 >= 7,
             "the cache was never read: this test is not proving what it claims"
@@ -3907,7 +3920,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            shards.write_snapshot_and_payload_caches().await;
+            shards.write_snapshot_and_payload_indexes().await;
         }
 
         let shards = open_one(dir.path()).await;
@@ -3952,7 +3965,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            shards.write_snapshot_and_payload_caches().await;
+            shards.write_snapshot_and_payload_indexes().await;
             shards.vindex_drop("idx", 0).await.unwrap();
             shards.vindex_create("idx", 4, 0, 1).await.unwrap();
             for id in 0..4u64 {
@@ -3989,7 +4002,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            shards.write_snapshot_and_payload_caches().await;
+            shards.write_snapshot_and_payload_indexes().await;
             assert!(shards.vdel("idx", 3, 0).await.unwrap());
         }
 

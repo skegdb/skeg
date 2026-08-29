@@ -264,11 +264,11 @@ pub enum Counter {
     /// id's payload, so it belongs at open, not on a user's query: a non-zero
     /// value while serving means some search paid for it.
     PayloadIndexRebuilds = 12,
-    /// Payload entries loaded from the persisted cache instead of read back
-    /// from the log. Zero after a restart that had a cache means the cache was
-    /// refused, and the reason is worth knowing: a stamp mismatch, or a log
-    /// tail long enough that nothing in it could be trusted.
-    PayloadCacheEntries = 13,
+    /// Ids whose payload index came from `payload.idx` rather than being
+    /// rebuilt by reading the log. Zero after a restart that had the file means
+    /// it was refused, and the reason is worth knowing: a stamp mismatch, a
+    /// damaged file, or a log tail long enough that nothing in it was usable.
+    PayloadIndexFromDisk = 13,
 }
 
 impl Counter {
@@ -287,7 +287,7 @@ impl Counter {
         Counter::VlogWritebackHints,
         Counter::VlogRecoveryRecords,
         Counter::PayloadIndexRebuilds,
-        Counter::PayloadCacheEntries,
+        Counter::PayloadIndexFromDisk,
     ];
 
     #[inline]
@@ -306,7 +306,7 @@ impl Counter {
             Counter::VlogWritebackHints => "skeg_vlog_writeback_hints_total",
             Counter::VlogRecoveryRecords => "skeg_vlog_recovery_records_total",
             Counter::PayloadIndexRebuilds => "skeg_payload_index_rebuilds_total",
-            Counter::PayloadCacheEntries => "skeg_payload_cache_entries_total",
+            Counter::PayloadIndexFromDisk => "skeg_payload_index_from_disk_total",
         }
     }
 }
