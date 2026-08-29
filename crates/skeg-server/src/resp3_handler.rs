@@ -1347,7 +1347,9 @@ async fn skeg_vindex_list(shards: &ShardSet, tenant: TenantId) -> Frame {
     match shards.vindex_list().await {
         Ok(rows) => {
             let mut body = String::new();
-            for (name, dim, kind, backend, n_vectors) in rows {
+            for row in rows {
+                let (name, dim, kind, backend, n_vectors) =
+                    (row.name, row.dim, row.kind, row.backend, row.n_vectors);
                 let visible_name: &str = match prefix.as_deref() {
                     Some(p) => match name.strip_prefix(p) {
                         Some(rest) => rest,
@@ -1376,7 +1378,9 @@ async fn skeg_vindex_list(shards: &ShardSet, tenant: TenantId) -> Frame {
                     }
                 };
                 body.push_str(&format!(
-                    "name={visible_name} dim={dim} kind={kind_label} backend={backend_label} n_vectors={n_vectors}\n",
+                    "name={visible_name} dim={dim} kind={kind_label} backend={backend_label} \
+                     n_vectors={n_vectors} delta={} runs={} run_rows={} tombs={} base={}\n",
+                    row.delta, row.runs, row.run_rows, row.tombs, row.base,
                 ));
             }
             Frame::Bulk(Bytes::from(body))

@@ -115,24 +115,24 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
 
         skeg_proto::Op::VindexList => match shards.vindex_list().await {
             Ok(rows) => {
-                if frame.header.version == VERSION_V1 && rows.iter().any(|row| row.2 > 2) {
+                if frame.header.version == VERSION_V1 && rows.iter().any(|row| row.kind > 2) {
                     return Some(encode_err(
                         req_id,
                         ErrCode::InvalidRequest,
                         "native v1 cannot represent TurboQuant indexes; use RESP3 or native v2",
                     ));
                 }
+                // The binary proto's VindexInfo predates the LSM-debt fields;
+                // it keeps its wire shape and drops them.
                 let info: Vec<skeg_proto::VindexInfo> = rows
                     .into_iter()
-                    .map(
-                        |(name, dim, kind, backend, n_vectors)| skeg_proto::VindexInfo {
-                            name,
-                            dim,
-                            kind,
-                            backend,
-                            n_vectors,
-                        },
-                    )
+                    .map(|row| skeg_proto::VindexInfo {
+                        name: row.name,
+                        dim: row.dim,
+                        kind: row.kind,
+                        backend: row.backend,
+                        n_vectors: row.n_vectors,
+                    })
                     .collect();
                 Some(encode_ok_vindex_list(req_id, &info))
             }

@@ -643,6 +643,23 @@ enum ShardReq {
     },
 }
 
+/// One VINDEX row as the shards report it: identity plus the LSM debt the
+/// maintenance ladder acts on. `n_vectors`/`delta`/`run_rows`/`tombs`/`base`
+/// sum across shards; `runs` sums too (total run segments held).
+#[derive(Debug, Clone)]
+pub struct VindexRow {
+    pub name: String,
+    pub dim: u32,
+    pub kind: u8,
+    pub backend: u8,
+    pub n_vectors: u64,
+    pub delta: u64,
+    pub runs: u64,
+    pub run_rows: u64,
+    pub tombs: u64,
+    pub base: u64,
+}
+
 enum ShardResp {
     Value(Option<Bytes>),
     Done,
@@ -664,7 +681,7 @@ enum ShardResp {
     /// `(cache_bytes, cache_evictions, n_keys, cache_budget)`.
     Stats(u64, u64, u64, u64),
     /// `(name, dim, kind_wire_byte, backend_wire_byte, n_vectors)` per VINDEX.
-    VindexList(Vec<(String, u32, u8, u8, u64)>),
+    VindexList(Vec<VindexRow>),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
     /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
@@ -2152,22 +2169,27 @@ async fn process(
         }
         ShardReq::VindexList => {
             let vs = vindexes.read();
-            let mut rows: Vec<(String, u32, u8, u8, u64)> = vs
+            let mut rows: Vec<VindexRow> = vs
                 .iter()
                 .map(|(name, entry)| {
                     let vindex = entry.read();
                     let backend = &vindex.backend;
-                    (
-                        name.clone(),
-                        backend.dim() as u32,
-                        vindex.kind,
-                        backend.backend_byte(),
-                        backend.len() as u64,
-                    )
+                    VindexRow {
+                        name: name.clone(),
+                        dim: backend.dim() as u32,
+                        kind: vindex.kind,
+                        backend: backend.backend_byte(),
+                        n_vectors: backend.len() as u64,
+                        delta: backend.delta_len() as u64,
+                        runs: backend.run_count() as u64,
+                        run_rows: backend.run_rows() as u64,
+                        tombs: backend.tombstone_count() as u64,
+                        base: backend.main_len() as u64,
+                    }
                 })
                 .collect();
             // Stable order so the TUI doesn't flicker between polls.
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
             ShardResp::VindexList(rows)
         }
         ShardReq::SnapshotAndPayloadIndexes => {
@@ -3349,25 +3371,34 @@ impl ShardSet {
         Ok(freed)
     }
 
-    pub async fn vindex_list(&self) -> Result<Vec<(String, u32, u8, u8, u64)>, ShardError> {
+    pub async fn vindex_list(&self) -> Result<Vec<VindexRow>, ShardError> {
         use std::collections::BTreeMap;
-        let mut agg: BTreeMap<String, (u32, u8, u8, u64)> = BTreeMap::new();
+        let mut agg: BTreeMap<String, VindexRow> = BTreeMap::new();
         for shard in 0..self.inner.n {
             match self.call(shard, ShardReq::VindexList).await? {
                 ShardResp::VindexList(rows) => {
-                    for (name, dim, kind, backend, n_vectors) in rows {
-                        let entry = agg.entry(name).or_insert((dim, kind, backend, 0));
-                        entry.3 = entry.3.saturating_add(n_vectors);
+                    for row in rows {
+                        match agg.entry(row.name.clone()) {
+                            std::collections::btree_map::Entry::Vacant(e) => {
+                                e.insert(row);
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut e) => {
+                                let a = e.get_mut();
+                                a.n_vectors = a.n_vectors.saturating_add(row.n_vectors);
+                                a.delta = a.delta.saturating_add(row.delta);
+                                a.runs = a.runs.saturating_add(row.runs);
+                                a.run_rows = a.run_rows.saturating_add(row.run_rows);
+                                a.tombs = a.tombs.saturating_add(row.tombs);
+                                a.base = a.base.saturating_add(row.base);
+                            }
+                        }
                     }
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                 _ => return Err(ShardError::Unavailable),
             }
         }
-        Ok(agg
-            .into_iter()
-            .map(|(name, (dim, kind, backend, n))| (name, dim, kind, backend, n))
-            .collect())
+        Ok(agg.into_values().collect())
     }
 
     /// Insert a vector under `id` into `name`. Routes by `id`.
@@ -4677,7 +4708,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|(n, ..)| n)
+            .map(|row| row.name)
             .collect();
         assert!(
             !names.contains(&scope_key(VICTIM, "idx")),
