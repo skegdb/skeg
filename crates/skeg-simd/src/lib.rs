@@ -57,7 +57,7 @@ pub use distance::{
 #[cfg(target_arch = "x86_64")]
 pub use distance::{cosine_f32_avx2, dot_f32_avx2, dot_int8_avx2, hamming_binary_avx2};
 #[cfg(target_arch = "aarch64")]
-pub use distance::{cosine_f32_neon, dot_f32_neon, dot_int8_neon, hamming_binary_neon};
+pub use distance::{cosine_f32_neon, dot_f32_neon, dot_int8_neon, dot_int8_sdot, hamming_binary_neon};
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub use distance::{dot_int8_avx512, hamming_binary_avx512};
 
