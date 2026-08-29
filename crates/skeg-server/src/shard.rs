@@ -1262,7 +1262,14 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     // winning in: above roughly a quarter of the base dead, delete-patch loses
     // (0,3x at 40%), and when the runs really have grown to base size there is
     // nothing left to reuse.
-    let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN);
+    // Heavy-dead goes straight to the full fold: past roughly a quarter of
+    // the base dead, delete-patch is in its measured losing regime (0,3x at
+    // 40% in the L3 verdict), and it fired at 61% during the demo repair
+    // before this guard existed. Without this arm nothing else would ever
+    // reclaim a heavily-tombstoned base, since the geometric trigger only
+    // watches run growth.
+    let heavy_dead = base >= DELETE_PATCH_MIN_BASE && tombs * 4 > base;
+    let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN) || heavy_dead;
 
     if delta >= FLUSH_ROWS {
         let d = vdir.to_path_buf();
@@ -1277,7 +1284,10 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
         .await;
         return false;
     }
-    if base >= DELETE_PATCH_MIN_BASE && tombs >= base / DELETE_PATCH_DEAD_DIVISOR {
+    if base >= DELETE_PATCH_MIN_BASE
+        && tombs >= base / DELETE_PATCH_DEAD_DIVISOR
+        && tombs * 4 <= base
+    {
         let d = vdir.to_path_buf();
         off_thread_maintenance(
             arc,
@@ -5645,6 +5655,62 @@ mod tests {
                 - folds_before,
             0,
             "the fold ran despite the runs being a fraction of the base"
+        );
+    }
+
+    /// Past a quarter of the base dead, the tick folds instead of patching.
+    ///
+    /// Delete-patch loses in that regime (0,3x at 40% in the L3 verdict) and
+    /// during the demo repair it fired on a base 61% dead, which is how this
+    /// guard was found missing. The geometric trigger only watches run growth,
+    /// so without the heavy-dead arm nothing would ever reclaim such a base.
+    #[tokio::test]
+    async fn a_heavily_dead_base_folds_instead_of_patching() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-t");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        for id in 0u64..6_000 {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        idx.consolidate().unwrap();
+        // Kill 40% of the base: well past the crossover, squarely in the
+        // regime where patching loses.
+        for id in 0u64..2_400 {
+            idx.delete(id).unwrap();
+        }
+        idx.set_auto_flush(false);
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        let patches_before =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceDeletePatch);
+        let folds_before =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceConsolidate);
+        // The budget can make a single tick skip; retry as the shard loop does.
+        for _ in 0..50 {
+            if maintenance_tick(&arc, &vdir, 0, true).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceDeletePatch)
+                - patches_before,
+            0,
+            "delete-patch ran on a 40%-dead base, its measured losing regime"
+        );
+        assert!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceConsolidate)
+                > folds_before,
+            "nothing reclaimed the heavily-dead base"
         );
     }
 
