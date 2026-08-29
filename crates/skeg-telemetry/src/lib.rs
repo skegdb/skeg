@@ -277,10 +277,18 @@ pub enum Counter {
     /// because the tail touched them after the file was stamped. This is what
     /// a stale snapshot costs at open.
     PayloadIndexRefreshed = 14,
+    /// Maintenance operations run, by kind. Which one fires decides whether a
+    /// store scales: a fold rebuilds the whole base and costs O(live), the
+    /// other three are proportional to what changed. Without these you cannot
+    /// tell a healthy store from one folding itself to death.
+    MaintenanceFlush = 15,
+    MaintenanceConsolidate = 16,
+    MaintenanceRunsMerge = 17,
+    MaintenanceDeletePatch = 18,
 }
 
 impl Counter {
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 19;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -297,6 +305,10 @@ impl Counter {
         Counter::PayloadIndexRebuilds,
         Counter::PayloadIndexFromDisk,
         Counter::PayloadIndexRefreshed,
+        Counter::MaintenanceFlush,
+        Counter::MaintenanceConsolidate,
+        Counter::MaintenanceRunsMerge,
+        Counter::MaintenanceDeletePatch,
     ];
 
     #[inline]
@@ -317,6 +329,10 @@ impl Counter {
             Counter::PayloadIndexRebuilds => "skeg_payload_index_rebuilds_total",
             Counter::PayloadIndexFromDisk => "skeg_payload_index_from_disk_total",
             Counter::PayloadIndexRefreshed => "skeg_payload_index_refreshed_total",
+            Counter::MaintenanceFlush => "skeg_maintenance_flush_total",
+            Counter::MaintenanceConsolidate => "skeg_maintenance_consolidate_total",
+            Counter::MaintenanceRunsMerge => "skeg_maintenance_runs_merge_total",
+            Counter::MaintenanceDeletePatch => "skeg_maintenance_delete_patch_total",
         }
     }
 }

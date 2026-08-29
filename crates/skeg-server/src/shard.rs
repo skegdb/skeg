@@ -1214,13 +1214,25 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
 /// blocks), so the shard thread is free during the build.
 /// One maintenance decision for one vindex, off the request path.
 ///
-/// Priority, cheapest and most frequent first:
+/// Priority, cheapest first, and the order is the whole point:
 ///   1. flush (L0), delta past `FLUSH_ROWS`. The common case under ingest; it
 ///      keeps the flat delta scan small and builds no graph on the shard thread.
-///   2. consolidate, runs grown to about base size (geometric) or an idle
-///      cleanup. Folds runs plus delta into a fresh base and truncates the WAL.
-///   3. runs-merge (L2), runs piling up while the base is fine.
-///   4. delete-patch (L3), reclaim dead base rows.
+///   2. delete-patch (L3), dead base rows past the tombstone threshold. Reuses
+///      the surviving edges; measured 10,6x the fold at 1% dead, 4,5x at 3%.
+///   3. runs-merge (L2), runs piling up while the base is fine. O(runs), the
+///      base is never touched.
+///   4. consolidate, only when the runs have really grown to base size. Folds
+///      everything into a fresh base and truncates the WAL. This is the one
+///      that costs O(live), so it goes last.
+///
+/// The fold used to be checked second, which meant that whenever it was due the
+/// two cheap paths never got a turn. It also had an idle clause, so a store
+/// going quiet with 4096 pending rows rebuilt itself entirely; a quiet store
+/// does not need that, it needs its runs not to pile up, which is (3).
+///
+/// The fold stays for the regime the verdicts measured it winning in: above
+/// roughly a quarter of the base dead, delete-patch loses (0,3x at 40%), and
+/// once the runs have grown to base size there is nothing left to reuse.
 ///
 /// One operation per vindex per tick. Returns whether a consolidate ran, which
 /// is what tells the caller to reset this vindex's idle tracking.
@@ -1240,8 +1252,17 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             g.backend.main_len(),
         )
     };
-    let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN)
-        || (idle && delta + run_rows >= IDLE_CONSOLIDATE_MIN);
+    // Cheap first, expensive last. The fold rebuilds the whole base and costs
+    // O(live); the other three are proportional to what changed. Checking the
+    // fold first meant that whenever it was due the cheap paths never got a
+    // turn, which is why the project's own note says the delete-patch plus
+    // runs-merge cycle was never closed as a replacement for it.
+    //
+    // The fold stays as the fallback for the regime the verdicts measured it
+    // winning in: above roughly a quarter of the base dead, delete-patch loses
+    // (0,3x at 40%), and when the runs really have grown to base size there is
+    // nothing left to reuse.
+    let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN);
 
     if delta >= FLUSH_ROWS {
         let d = vdir.to_path_buf();
@@ -1256,14 +1277,38 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
         .await;
         return false;
     }
+    if base >= DELETE_PATCH_MIN_BASE && tombs >= base / DELETE_PATCH_DEAD_DIVISOR {
+        let d = vdir.to_path_buf();
+        off_thread_maintenance(
+            arc,
+            "delete-patch",
+            shard_id,
+            |b| b.delete_patch_begin(),
+            move |job| job.build(&d),
+            |b, built| b.delete_patch_finish(built),
+        )
+        .await;
+        return false;
+    }
+    if runs >= RUNS_MERGE_TRIGGER {
+        let d = vdir.to_path_buf();
+        off_thread_maintenance(
+            arc,
+            "runs-merge",
+            shard_id,
+            |b| b.merge_runs_begin(),
+            move |job| job.build(&d),
+            |b, built| b.merge_runs_finish(built),
+        )
+        .await;
+        return false;
+    }
     if consolidate_due {
         let d = vdir.to_path_buf();
         // The pace depends on WHY we are folding, and the engine knows which.
         // Triggered by quiet there is no traffic to protect and finishing
         // sooner is better; triggered by churn there are live queries and every
-        // core taken is one they do not get. It used the same share for both,
-        // holding back when nothing needed protecting and taking the machine
-        // when something did.
+        // core taken is one they do not get.
         let pace = if idle {
             skeg_vector::ConsolidatePace::Idle
         } else {
@@ -1293,31 +1338,6 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             .await;
         }
         return true;
-    }
-    if runs >= RUNS_MERGE_TRIGGER {
-        let d = vdir.to_path_buf();
-        off_thread_maintenance(
-            arc,
-            "runs-merge",
-            shard_id,
-            |b| b.merge_runs_begin(),
-            move |job| job.build(&d),
-            |b, built| b.merge_runs_finish(built),
-        )
-        .await;
-        return false;
-    }
-    if base >= DELETE_PATCH_MIN_BASE && tombs >= base / DELETE_PATCH_DEAD_DIVISOR {
-        let d = vdir.to_path_buf();
-        off_thread_maintenance(
-            arc,
-            "delete-patch",
-            shard_id,
-            |b| b.delete_patch_begin(),
-            move |job| job.build(&d),
-            |b, built| b.delete_patch_finish(built),
-        )
-        .await;
     }
     false
 }
@@ -1366,6 +1386,21 @@ where
     Ok(true)
 }
 
+/// Which counter a maintenance label belongs to.
+///
+/// Counted here, at the single point every kind passes through, rather than at
+/// four call sites that could drift apart.
+fn maintenance_counter(label: &str) -> Option<skeg_telemetry::Counter> {
+    use skeg_telemetry::Counter;
+    match label {
+        "flush" => Some(Counter::MaintenanceFlush),
+        "consolidate" => Some(Counter::MaintenanceConsolidate),
+        "runs-merge" => Some(Counter::MaintenanceRunsMerge),
+        "delete-patch" => Some(Counter::MaintenanceDeletePatch),
+        _ => None,
+    }
+}
+
 async fn off_thread_maintenance<T, B>(
     arc: &VectorEntry,
     label: &str,
@@ -1379,7 +1414,12 @@ where
     B: Send + 'static,
 {
     match try_off_thread_maintenance(arc, label, begin, build, finish).await {
-        Ok(ran) => ran,
+        Ok(ran) => {
+            if ran && let Some(c) = maintenance_counter(label) {
+                skeg_telemetry::tick_counter(c);
+            }
+            ran
+        }
         Err(e) => {
             // Automatic maintenance retries on the next tick.
             error!("shard {shard_id}: {e}");
@@ -5376,11 +5416,14 @@ mod tests {
             "flush did not drain the delta",
         );
 
-        // The flushed rows are now a run, so an idle tick consolidates and
-        // says so.
+        // The flushed rows are now a run of 4196 against an empty base, so the
+        // geometric trigger fires: run_rows >= base.max(IDLE_CONSOLIDATE_MIN).
+        // Note it is the run size that decides, not idleness; the tick is
+        // passed `idle` here only because the old chain needed it, and the
+        // assertion below holds either way.
         assert!(
             maintenance_tick(&arc, &vdir, 0, true).await,
-            "an idle tick over a full run must consolidate",
+            "a run grown past the geometric threshold must consolidate",
         );
         assert_eq!(arc.read().backend.run_count(), 0, "runs did not fold");
 
@@ -5388,6 +5431,64 @@ mod tests {
         assert!(
             !maintenance_tick(&arc, &vdir, 0, true).await,
             "a quiet tick must not report work",
+        );
+    }
+
+    /// A quiet store with a little pending work must not rebuild itself.
+    ///
+    /// The chain used to fold whenever `idle && delta + run_rows >= 4096`, so a
+    /// store that went quiet with one flush behind it rebuilt its whole base.
+    /// That is O(live) work to tidy up a run, and on a large index it is
+    /// minutes of it, triggered by nothing more than traffic stopping. A quiet
+    /// store needs its runs not to pile up, which is what runs-merge is for.
+    #[tokio::test]
+    async fn an_idle_tick_does_not_rebuild_a_base_that_dwarfs_its_runs() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-t");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        // A base far larger than what follows it, so the geometric trigger
+        // cannot fire and only the old idle clause could have.
+        for id in 0u64..20_000 {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let base = idx.main_len();
+        assert!(base >= 20_000, "base did not build: {base}");
+        idx.set_auto_flush(false);
+        // One flush worth of new rows: enough for the old clause, nowhere near
+        // the base.
+        for id in 20_000u64..(20_000 + FLUSH_ROWS as u64 + 100) {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        let folds_before =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceConsolidate);
+        // Flush first, as always.
+        assert!(!maintenance_tick(&arc, &vdir, 0, true).await);
+        // Then ticks until the store settles. None of them may fold.
+        for _ in 0..6 {
+            assert!(
+                !maintenance_tick(&arc, &vdir, 0, true).await,
+                "an idle tick folded a base {} rows against {} run rows",
+                arc.read().backend.main_len(),
+                arc.read().backend.run_rows(),
+            );
+        }
+        assert_eq!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceConsolidate)
+                - folds_before,
+            0,
+            "the fold ran despite the runs being a fraction of the base"
         );
     }
 
