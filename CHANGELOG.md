@@ -86,6 +86,21 @@ restart with a filtered query.
   recovery falls back to a full scan, which is correct and only slower, so
   downgrading is safe but gives up the faster open.
 
+- **A bulk write no longer evicts the working set.** `set_many`, the batch
+  behind MSET, wrote every value through into the hot-key cache. That is right
+  for a single SET, where reading the key back next is normal, and wrong for
+  the bulk primitive. Loading 669.405 keys into a store that was serving
+  traffic filled the 256 MB budget exactly and evicted 150.760 entries. It now
+  invalidates instead: removing rather than skipping, since a key already
+  cached would otherwise keep its old value and be served stale.
+
+- **The key index is sized from the snapshot instead of growing into it.**
+  Recovery built it with `Index::new()` and let it double its way up, so the
+  table ended up sized for the next power of two and kept the slack for the
+  life of the process. The count was known all along. Measured on 1.383.158
+  keys shaped like a real store's, 21,3 MB of actual key bytes: 149 bytes per
+  key grown against 86 pre-sized, same structure and same lookups.
+
 ### Added
 
 - **The payload index moved off the heap.** It was rebuilt at every open by
