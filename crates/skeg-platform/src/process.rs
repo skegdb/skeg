@@ -28,6 +28,7 @@ pub fn rss_bytes() -> u64 {
         let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
         // SAFETY: task_info fills `info` up to `count` natural_t words for
         // the current task; both pointers are valid for the call.
+        #[allow(deprecated)] // mach_task_self: the mach2 crate is not worth a dep for one call
         let kr = unsafe {
             libc::task_info(
                 libc::mach_task_self(),
@@ -59,7 +60,8 @@ pub fn cpu_seconds() -> f64 {
     }
     // SAFETY: rc == 0 means the struct was written.
     let ru = unsafe { ru.assume_init() };
-    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec as i32) / 1e6;
+    #[allow(clippy::cast_precision_loss)] // sub-second fields, exact in f64
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     tv(ru.ru_utime) + tv(ru.ru_stime)
 }
 

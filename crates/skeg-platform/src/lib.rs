@@ -9,6 +9,8 @@ mod cgroup;
 pub mod durability;
 pub mod file;
 pub mod lock;
+mod process;
+pub use process::{cpu_seconds, rss_bytes};
 pub mod uring;
 
 pub use affinity::{QosClass, current_thread_qos, pin_current_thread_to_performance_core};
@@ -30,10 +32,6 @@ pub use uring::{BatchReader, BlockingBatchReader, best_batch_reader};
 /// inside a container that only gets a fraction of the host. Falls back to
 /// `std::thread::available_parallelism()` when no quota is set (or on
 /// error, or on other platforms).
-#[must_use]
-pub use process::{cpu_seconds, rss_bytes};
-mod process;
-
 pub fn num_performance_cores() -> usize {
     #[cfg(target_os = "macos")]
     {

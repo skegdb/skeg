@@ -628,6 +628,21 @@ enum ShardReq {
         name: String,
         count: usize,
     },
+    /// One reshard batch: live ids after `after` whose semantic owner (by the
+    /// carried centroids) is NOT `own` - returned with vector and payload so
+    /// the set can move them. `limit` bounds the batch.
+    CollectMoves {
+        name: String,
+        centroids: Arc<crate::router::Router>,
+        own: u8,
+        after: u64,
+        limit: usize,
+        tenant: u128,
+    },
+    /// Every live id of `name` on this shard (owner-map rebuild at open).
+    LiveIds {
+        name: String,
+    },
     Vdel {
         name: String,
         id: u64,
@@ -710,6 +725,11 @@ enum ShardResp {
     VindexList(Vec<VindexRow>),
     /// Flattened row-major sample rows plus their dim.
     Sample(Vec<f32>, u32),
+    /// A reshard batch: (id, vector, payload, owner) plus the resume cursor
+    /// (`None` when the shard is exhausted).
+    Moves(Vec<(u64, Vec<f32>, Option<Bytes>, u8)>, Option<u64>),
+    /// Live ids on this shard.
+    Ids(Vec<u64>),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
     /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
@@ -2012,6 +2032,8 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::CountTenantKeys(_)
         | ShardReq::Vget { .. }
         | ShardReq::SampleVectors { .. }
+        | ShardReq::CollectMoves { .. }
+        | ShardReq::LiveIds { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
@@ -2485,6 +2507,61 @@ async fn process(
                 }
             }
         }
+        ShardReq::CollectMoves { name, centroids, own, after, limit, tenant } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => {
+                    // Read phase under the read lock; payload blobs from the
+                    // vlog after, so the lock never spans an await.
+                    let (mut batch, cursor) = {
+                        let idx = arc.read();
+                        let mut ids = idx.backend.live_ids();
+                        ids.sort_unstable();
+                        let mut out: Vec<(u64, Vec<f32>, Option<Bytes>, u8)> = Vec::new();
+                        let mut cursor = None;
+                        for &id in ids.iter().filter(|&&i| i > after) {
+                            match idx.backend.get(id) {
+                                Ok(Some(v)) => {
+                                    let owner = centroids.assign(&v) as u8;
+                                    if owner != own {
+                                        out.push((id, v, None, owner));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    return ShardResp::Err(format!("reshard read failed: {e}"));
+                                }
+                            }
+                            if out.len() >= limit {
+                                cursor = Some(id);
+                                break;
+                            }
+                        }
+                        (out, cursor)
+                    };
+                    for (id, _, payload, _) in &mut batch {
+                        let key = payload_key(tenant, &name, *id);
+                        match vlog.tenant(tenant).get(&key).await {
+                            Ok(b) => *payload = b,
+                            Err(e) => {
+                                return ShardResp::Err(format!(
+                                    "reshard payload read failed: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    ShardResp::Moves(batch, cursor)
+                }
+            }
+        }
+        ShardReq::LiveIds { name } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => ShardResp::Ids(arc.read().backend.live_ids()),
+            }
+        }
         ShardReq::Vdel { name, id, tenant } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
@@ -2676,6 +2753,11 @@ struct ShardSetInner {
     root: std::path::PathBuf,
     /// Loaded semantic routers per vindex name (scoped names included).
     routers: parking_lot::RwLock<HashMap<String, Arc<crate::router::Router>>>,
+    /// id -> owner shard, per semantically-resharded vindex. Hash placement
+    /// makes an id's shard computable; semantic placement does not, so the
+    /// set keeps the map (8B+overhead per id, rebuilt at open from the
+    /// shards' live id sets) and point ops stay O(1) instead of broadcast.
+    owners: parking_lot::RwLock<HashMap<String, ahash::AHashMap<u64, u8>>>,
 }
 
 impl Drop for ShardSetInner {
@@ -2884,6 +2966,7 @@ impl ShardSet {
                 disk_counter,
                 root: base_dir.to_path_buf(),
                 routers: parking_lot::RwLock::new(load_routers(base_dir)),
+                owners: parking_lot::RwLock::new(HashMap::new()),
             }),
         })
     }
@@ -3480,6 +3563,47 @@ impl ShardSet {
         limit: Option<u64>,
         payload: Option<Bytes>,
     ) -> Result<(), ShardError> {
+        // Semantic placement when a router exists: the vector picks its owner
+        // shard, and an overwrite whose OLD copy lives elsewhere deletes it
+        // first (vset-then-vdel order would duplicate under a same-id race;
+        // delete-then-set keeps overwrite atomic per shard and the search
+        // dedup covers the crash window either way).
+        if let Some(router) = self.router(name) {
+            self.ensure_owner_map(name).await?;
+            let owner = router.assign(&vector);
+            let old = self.inner.owners.read().get(name).and_then(|m| m.get(&id).copied());
+            if let Some(old_shard) = old
+                && usize::from(old_shard) != owner
+            {
+                self.call(usize::from(old_shard), ShardReq::Vdel {
+                    name: name.to_owned(),
+                    id,
+                    tenant,
+                })
+                .await?;
+            }
+            let req = ShardReq::Vset {
+                name: name.to_owned(),
+                id,
+                vector,
+                tenant,
+                limit,
+                payload,
+            };
+            return match self.call(owner, req).await? {
+                ShardResp::Done => {
+                    self.inner
+                        .owners
+                        .write()
+                        .entry(name.to_owned())
+                        .or_default()
+                        .insert(id, owner as u8);
+                    Ok(())
+                }
+                ShardResp::Err(e) => Err(ShardError::Storage(e)),
+                _ => Err(ShardError::Unavailable),
+            };
+        }
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
             name: name.to_owned(),
@@ -3551,7 +3675,8 @@ impl ShardSet {
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
     pub async fn vget(&self, name: &str, id: u64) -> Result<Option<Vec<f32>>, ShardError> {
-        let shard = shard_for(&id.to_le_bytes(), self.inner.n);
+        self.ensure_owner_map(name).await?;
+        let shard = self.point_shard(name, id);
         let req = ShardReq::Vget {
             name: name.to_owned(),
             id,
@@ -3633,6 +3758,116 @@ impl ShardSet {
         Ok(epoch)
     }
 
+    /// Physically re-partition `name` by its semantic router (training one
+    /// first): every live vector whose owner is another shard moves there,
+    /// vset-then-vdel so a crash duplicates and never loses (the search
+    /// merge dedups by id). Batched and cursor-resumable per shard; a move
+    /// whose id the owner map already places at its destination only deletes
+    /// the stale source copy (a concurrent post-router write won).
+    /// Returns the number of rows moved.
+    ///
+    /// # Errors
+    ///
+    /// Index missing, a shard unavailable, or a batch failing.
+    pub async fn reshard(
+        &self,
+        name: &str,
+        lambda: f32,
+        iters: usize,
+    ) -> Result<u64, ShardError> {
+        const BATCH: usize = 512;
+        self.train_router(name, lambda, iters).await?;
+        let router = self.router(name).expect("router just trained");
+        // From here every write routes semantically; the map records them.
+        let mut moved = 0u64;
+        for source in 0..self.inner.n {
+            let mut after = 0u64;
+            loop {
+                let req = ShardReq::CollectMoves {
+                    name: name.to_owned(),
+                    centroids: router.clone(),
+                    own: source as u8,
+                    after,
+                    limit: BATCH,
+                    tenant: 0,
+                };
+                let (batch, cursor) = match self.call(source, req).await? {
+                    ShardResp::Moves(b, c) => (b, c),
+                    ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                    _ => return Err(ShardError::Unavailable),
+                };
+                for (id, vector, payload, owner) in batch {
+                    let already_there = self
+                        .inner
+                        .owners
+                        .read()
+                        .get(name)
+                        .and_then(|m| m.get(&id).copied())
+                        == Some(owner);
+                    if !already_there {
+                        let req = ShardReq::Vset {
+                            name: name.to_owned(),
+                            id,
+                            vector,
+                            tenant: 0,
+                            limit: None,
+                            payload,
+                        };
+                        match self.call(usize::from(owner), req).await? {
+                            ShardResp::Done => {}
+                            ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                            _ => return Err(ShardError::Unavailable),
+                        }
+                    }
+                    self.call(source, ShardReq::Vdel {
+                        name: name.to_owned(),
+                        id,
+                        tenant: 0,
+                    })
+                    .await?;
+                    self.inner
+                        .owners
+                        .write()
+                        .entry(name.to_owned())
+                        .or_default()
+                        .insert(id, owner);
+                    moved += 1;
+                }
+                match cursor {
+                    Some(c) => after = c,
+                    None => break,
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Rebuild the id -> owner-shard map for every routed vindex by asking
+    /// each shard for its live ids. Called once after open.
+    ///
+    /// # Errors
+    ///
+    /// A shard being unavailable.
+    pub async fn rebuild_owner_maps(&self) -> Result<(), ShardError> {
+        let names: Vec<String> = self.inner.routers.read().keys().cloned().collect();
+        for name in names {
+            let mut map: ahash::AHashMap<u64, u8> = ahash::AHashMap::new();
+            for shard in 0..self.inner.n {
+                match self.call(shard, ShardReq::LiveIds { name: name.clone() }).await? {
+                    ShardResp::Ids(ids) => {
+                        for id in ids {
+                            map.insert(id, shard as u8);
+                        }
+                    }
+                    ShardResp::Err(_) => {} // shard without this vindex yet
+                    _ => return Err(ShardError::Unavailable),
+                }
+            }
+            self.inner.owners.write().insert(name, map);
+        }
+        Ok(())
+    }
+
     /// The loaded semantic router for `name`, if one has been trained.
     #[must_use]
     pub fn router(&self, name: &str) -> Option<Arc<crate::router::Router>> {
@@ -3644,15 +3879,45 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
+    /// The shard a point op for `id` addresses: the owner map for a
+    /// semantically-resharded vindex, hash otherwise (an id absent from the
+    /// map is unknown; any shard answers None, hash picks one).
+    fn point_shard(&self, name: &str, id: u64) -> usize {
+        if let Some(m) = self.inner.owners.read().get(name)
+            && let Some(&s) = m.get(&id)
+        {
+            return usize::from(s);
+        }
+        shard_for(&id.to_le_bytes(), self.inner.n)
+    }
+
+    /// A routed vindex whose owner map is missing (fresh open) rebuilds it
+    /// before the first point op resolves: correctness cannot depend on a
+    /// caller remembering an init step.
+    async fn ensure_owner_map(&self, name: &str) -> Result<(), ShardError> {
+        if self.inner.routers.read().contains_key(name)
+            && !self.inner.owners.read().contains_key(name)
+        {
+            self.rebuild_owner_maps().await?;
+        }
+        Ok(())
+    }
+
     pub async fn vdel(&self, name: &str, id: u64, tenant: u128) -> Result<bool, ShardError> {
-        let shard = shard_for(&id.to_le_bytes(), self.inner.n);
+        self.ensure_owner_map(name).await?;
+        let shard = self.point_shard(name, id);
         let req = ShardReq::Vdel {
             name: name.to_owned(),
             id,
             tenant,
         };
         match self.call(shard, req).await? {
-            ShardResp::Existed(b) => Ok(b),
+            ShardResp::Existed(b) => {
+                if b && let Some(m) = self.inner.owners.write().get_mut(name) {
+                    m.remove(&id);
+                }
+                Ok(b)
+            }
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
@@ -3728,6 +3993,12 @@ impl ShardSet {
             return Err(ShardError::Storage(e));
         }
         merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        // Dedup by id, best score first: a mid-reshard crash can leave the
+        // same id on two shards (the move is vset-then-vdel, so a crash
+        // duplicates, never loses), and boundary overlap will do it on
+        // purpose. One id, one hit.
+        let mut seen = ahash::AHashSet::new();
+        merged.retain(|&(id, _, _)| seen.insert(id));
         merged.truncate(k);
         // Shard 0 by convention: a scattered op belongs to no single shard.
         skeg_telemetry::record_op(skeg_telemetry::Op::VSearch, 0, started.elapsed());
@@ -5883,6 +6154,86 @@ mod tests {
                 > folds_before,
             "nothing reclaimed the heavily-dead base"
         );
+    }
+
+    /// A reshard moves every vector to its semantic owner, point ops keep
+    /// working through the id-owner map, and a reopen rebuilds the map.
+    #[tokio::test]
+    async fn reshard_moves_clusters_to_their_owners_and_ops_survive() {
+        let dir = TempDir::new().unwrap();
+        let open = || {
+            ShardSet::open_mode_with_workers(
+                dir.path(),
+                2,
+                false,
+                skeg_vector::QuantKind::TurboQuant { bits: 2 },
+                1,
+            )
+            .unwrap()
+        };
+        let shards = open();
+        shards.vindex_create("rs", 8, 4, 1).await.unwrap();
+        // Two orthogonal clusters, ids interleaved so hash placement mixes them.
+        let vec_for = |id: u64| {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 2) as usize] = 1.0;
+            v
+        };
+        for id in 0..400u64 {
+            shards.vset("rs", id, vec_for(id), 0, None, None).await.unwrap();
+        }
+        let moved = shards.reshard("rs", 0.25, 10).await.expect("reshard");
+        assert!(moved > 0, "an interleaved layout must move rows");
+
+        // Each shard now holds one cluster: per-shard counts are ~even and
+        // ids of the same parity live together.
+        let router = shards.router("rs").expect("router trained by reshard");
+        let owner_even = router.assign(&vec_for(0));
+        let owner_odd = router.assign(&vec_for(1));
+        assert_ne!(owner_even, owner_odd, "clusters must have distinct owners");
+
+        // Point ops after the move: get finds every id, delete works.
+        for id in [0u64, 1, 199, 398, 399] {
+            assert_eq!(
+                shards.vget("rs", id).await.unwrap().expect("live id"),
+                vec_for(id),
+                "id {id} lost or corrupted by the move"
+            );
+        }
+        assert!(shards.vdel("rs", 42, 0).await.unwrap());
+        assert!(shards.vget("rs", 42).await.unwrap().is_none());
+        // Overwrite an id with a vector of the OTHER cluster: it must follow
+        // its semantics to the other shard and stay unique.
+        shards.vset("rs", 7, vec_for(0), 0, None, None).await.unwrap();
+        assert_eq!(shards.vget("rs", 7).await.unwrap().unwrap(), vec_for(0));
+
+        // Search still finds the right cluster.
+        let hits = shards
+            .vsearch("rs", vec_for(3), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|&(id, _, _)| id % 2 == 1 || id == 7),
+            "odd-cluster query must return odd ids (or the re-homed 7)"
+        );
+        drop(shards);
+
+        // Reopen: the id-owner map rebuilds and EVERY id resolves (a weak
+        // spot-check here once passed on a 50% hash-fallback coincidence).
+        let re = open();
+        for id in 0..400u64 {
+            if id == 42 {
+                assert!(re.vget("rs", id).await.unwrap().is_none(), "delete survives");
+            } else if id == 7 {
+                assert_eq!(re.vget("rs", 7).await.unwrap().unwrap(), vec_for(0));
+            } else {
+                assert_eq!(
+                    re.vget("rs", id).await.unwrap().unwrap_or_default(),
+                    vec_for(id),
+                    "id {id} unreachable after reopen"
+                );
+            }
+        }
     }
 
     /// Training the router samples every shard, writes the sidecar, and a
