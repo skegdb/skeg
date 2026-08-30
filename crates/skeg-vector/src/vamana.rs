@@ -1831,6 +1831,11 @@ struct Segment {
     /// and the cache dies with its segment, so a fold can never leave a
     /// stale row behind. `None` under `SKEG_ENTRY_CACHE=0`.
     entry_cache: Option<std::sync::Mutex<EntrySlotCache>>,
+    /// L0 flat run: no graph was built (adjacency is empty); search scans
+    /// every row with the quantized proxy instead of walking. Exact on the
+    /// proxy, so recall >= a walk by construction. Marked by a `flat` file
+    /// in the run dir.
+    flat: bool,
 }
 
 /// Direct-mapped sketch -> seed-rows cache, 4096 slots, overwrite eviction.
@@ -1892,6 +1897,23 @@ fn new_entry_cache() -> Option<std::sync::Mutex<EntrySlotCache>> {
 /// generations' files (review P0). Indexes written before this scheme have no
 /// `CURRENT` and keep their base flat in the vindex dir; that stays readable.
 const CURRENT_FILE: &str = "CURRENT";
+
+/// Marker inside a run dir: this run is an L0 flat run (no graph).
+const FLAT_MARKER: &str = "flat";
+
+/// `SKEG_L0_FLAT_MAX=<rows>`: a flush of at most this many rows writes an L0
+/// flat run (vectors + tier, no graph build) and search scans it exactly with
+/// the quantized proxy. 0 (default) keeps the graph-per-run behaviour; the
+/// crossover comes from the bench, not from a constant.
+fn l0_flat_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SKEG_L0_FLAT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// The directory holding the LIVE base files for `dir`: `dir/gN` per the
 /// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
@@ -2204,6 +2226,7 @@ fn open_segment(
             vectors_file,
             row_cache: new_row_cache(dim),
             entry_cache: new_entry_cache(),
+            flat: bdir.join(FLAT_MARKER).exists(),
         },
         dim,
         l_search,
@@ -2705,6 +2728,28 @@ impl FlushJob {
         } = self;
         let dir = index_dir.join(format!("run-{seq}"));
         let _ = std::fs::remove_dir_all(&dir);
+        if ids.len() <= l0_flat_max() {
+            // L0 flat run: vectors + empty adjacency + marker, no graph build.
+            // The costly part of a flush IS the graph build; search scans a
+            // flat run exactly instead of walking it.
+            std::fs::create_dir_all(&dir)?;
+            let src = InMemoryVectorSource::new(vectors, dim);
+            let n = ids.len() as u32;
+            write_graph_vmn(
+                &dir.join(GRAPH_FILE),
+                n,
+                dim,
+                0,
+                MAX_R,
+                128,
+                &ids,
+                &vec![Node::new(); ids.len()],
+            )?;
+            write_vectors_bin(&dir.join(VECTORS_FILE), &src)?;
+            std::fs::write(dir.join(FLAT_MARKER), b"")?;
+            let run = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
+            return Ok(FlushBuilt { run, seq });
+        }
         let cfg = disk_build_config();
         // Always cautious: these two are O(runs) and short, and the window
         // they would open by taking the machine is not worth the seconds saved.
@@ -3921,6 +3966,23 @@ impl DiskVamanaIndex {
                 seg.nodes[id as usize].slice().iter().copied().collect()
             };
             let mut cand: Vec<(f32, VecId)> = Vec::new();
+            if seg.flat {
+                // L0 flat run: exact proxy scan of every row - no graph to
+                // walk. Downstream already handles unfiltered candidates
+                // (the navigate-all walk feeds it the same way), so admit
+                // gating is unnecessary here.
+                let mut all: Vec<(f32, VecId)> = (0..seg.main_n)
+                    .map(|r| (-(seg.quant.proxy(r as usize, &code) as f32), r))
+                    .collect();
+                let keep = list_size.min(all.len());
+                if keep < all.len() {
+                    all.select_nth_unstable_by(keep, |a, b| a.0.total_cmp(&b.0));
+                    all.truncate(keep);
+                }
+                cand.extend(all);
+                all_cand.extend(cand.iter().map(|&(d, r)| (d, seg_idx, r)));
+                continue;
+            }
             let mut walk = |seeds: &[VecId],
                             admit: Option<&dyn Fn(VecId) -> bool>,
                             early: Option<EarlyTerm>| {
@@ -6707,6 +6769,70 @@ mod tests {
             x,
             "searchable after finish"
         );
+    }
+
+    /// An L0 flat run answers searches exactly: every id flushed into a flat
+    /// run must be findable, and a reopen keeps the run flat and searchable.
+    #[test]
+    #[allow(unsafe_code)] // env knob for this test only; set before first read
+    fn l0_flat_runs_serve_and_survive_reopen() {
+        // Process-wide OnceLock knob: if another test initialised it to 0
+        // first, the flat path cannot engage in this process - skip.
+        unsafe { std::env::set_var("SKEG_L0_FLAT_MAX", "4096") };
+        if l0_flat_max() == 0 {
+            eprintln!("skipped: SKEG_L0_FLAT_MAX OnceLock already 0");
+            return;
+        }
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(400, dim, 31);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        // One flushed FLAT run (200 rows <= 4096).
+        let more = random_vectors(200, dim, 32);
+        for (i, v) in more.chunks_exact(dim).enumerate() {
+            idx.insert(1000 + i as u64, v).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 1);
+        assert!(
+            tmp.path().join("run-1").join(FLAT_MARKER).exists()
+                || std::fs::read_dir(tmp.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|e| e.path().join(FLAT_MARKER).exists()),
+            "run written without the flat marker"
+        );
+        // Every flushed id findable via the exact flat scan.
+        for probe in [0usize, 99, 199] {
+            let q = &more[probe * dim..(probe + 1) * dim];
+            let hits = idx.search(q, 5).unwrap();
+            assert!(
+                hits.iter().any(|h| h.0 == 1000 + probe as u64),
+                "id {} not found via flat run",
+                1000 + probe
+            );
+        }
+        drop(idx);
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert_eq!(re.run_count(), 1, "flat run lost at reopen");
+        for probe in [0usize, 150] {
+            let q = &more[probe * dim..(probe + 1) * dim];
+            let hits = re.search(q, 5).unwrap();
+            assert!(
+                hits.iter().any(|h| h.0 == 1000 + probe as u64),
+                "id {} lost at reopen",
+                1000 + probe
+            );
+        }
     }
 
     /// A crash mid base-swap (the new slot written but CURRENT not yet
