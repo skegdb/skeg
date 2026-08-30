@@ -24,7 +24,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use skeg_platform::advise_sequential_file;
-use skeg_simd::cosine_f32;
+use skeg_simd::{cosine_f32, dot_int8};
 use smallvec::SmallVec;
 
 use crate::ivf_router::IvfRouter;
@@ -623,6 +623,7 @@ fn build_patched_graph(
                 cfg.r,
                 cfg.l_build,
                 scratch,
+                None,
             );
         },
     );
@@ -798,20 +799,37 @@ fn insert_point_concurrent(
     r: usize,
     l_build: usize,
     scratch: &mut BuildScratch,
+    proxy: Option<&Int8WalkProxy>,
 ) {
     let p_vec = source.row(p);
     let t_walk = Instant::now();
-    greedy_search(
-        entry,
-        l_build,
-        None, // build: never early-terminate (full candidate pool for prune)
-        |id| dist(p_vec, source.row(id)),
-        |id| locked_neighbors(graph, id),
-        None, // build: no filter admission
-        &mut scratch.visited,
-        &mut scratch.seen,
-        None,
-    );
+    // The walk only steers which candidates reach the prune; with the proxy
+    // it ranks by the int8 dot, and the prune below re-scores in f32 either
+    // way, so edge quality is decided on exact distances.
+    match proxy {
+        Some(px) => greedy_search(
+            entry,
+            l_build,
+            None, // build: never early-terminate (full candidate pool for prune)
+            |id| px.dist(p, id),
+            |id| locked_neighbors(graph, id),
+            None, // build: no filter admission
+            &mut scratch.visited,
+            &mut scratch.seen,
+            None,
+        ),
+        None => greedy_search(
+            entry,
+            l_build,
+            None, // build: never early-terminate (full candidate pool for prune)
+            |id| dist(p_vec, source.row(id)),
+            |id| locked_neighbors(graph, id),
+            None, // build: no filter admission
+            &mut scratch.visited,
+            &mut scratch.seen,
+            None,
+        ),
+    };
     scratch.walk_ns += t_walk.elapsed().as_nanos() as u64;
 
     let t_prune = Instant::now();
@@ -858,6 +876,57 @@ fn insert_point_concurrent(
 /// One build pass over a random permutation of all points, run in parallel
 /// across the rayon thread pool. Inserts touch disjoint locks most of the
 /// time, so contention is low.
+/// Per-row int8 proxy for the build walk, behind `SKEG_BUILD_INT8_WALK=1`.
+///
+/// The walk only needs the cosine *ordering*, so each row is quantized to i8
+/// with a symmetric per-row scale, and the scale is folded together with the
+/// row's inverse norm into one factor: `-(dot_i8) * factor[v]` ranks rows the
+/// way `1 - cosine` does. The query side's own factor is constant across one
+/// walk and positive, so it drops out of the ordering. Only the walk uses
+/// this; the prune re-scores every candidate in f32, which is mandatory (an
+/// int8 prune measured recall 0,31 against 1,00 for f32).
+struct Int8WalkProxy {
+    data: Vec<i8>,
+    factor: Vec<f32>,
+    dim: usize,
+}
+
+impl Int8WalkProxy {
+    fn build(source: &dyn VectorSource, n: u32, dim: usize) -> Int8WalkProxy {
+        let mut data = vec![0i8; n as usize * dim];
+        let mut factor = vec![0f32; n as usize];
+        data.par_chunks_mut(dim)
+            .zip(factor.par_iter_mut())
+            .enumerate()
+            .for_each(|(v, (row_q, f))| {
+                let row = source.row(v as u32);
+                let max_abs = row.iter().fold(0f32, |m, x| m.max(x.abs()));
+                let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if max_abs == 0.0 || norm == 0.0 {
+                    return;
+                }
+                let scale = max_abs / 127.0;
+                for (q, x) in row_q.iter_mut().zip(row) {
+                    *q = (x / scale).round() as i8;
+                }
+                *f = scale / norm;
+            });
+        Int8WalkProxy { data, factor, dim }
+    }
+
+    #[inline]
+    fn dist(&self, p: VecId, v: VecId) -> f32 {
+        let pr = &self.data[p as usize * self.dim..(p as usize + 1) * self.dim];
+        let vr = &self.data[v as usize * self.dim..(v as usize + 1) * self.dim];
+        -(dot_int8(pr, vr) as f32) * self.factor[v as usize]
+    }
+}
+
+fn build_int8_walk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SKEG_BUILD_INT8_WALK").is_ok_and(|v| v == "1"))
+}
+
 #[allow(clippy::too_many_arguments)] // mirrors insert_point_concurrent's parameters
 fn run_pass_parallel(
     graph: &[Mutex<Node>],
@@ -868,6 +937,7 @@ fn run_pass_parallel(
     r: usize,
     l_build: usize,
     seed: u64,
+    proxy: Option<&Int8WalkProxy>,
 ) {
     let mut order: Vec<VecId> = (0..n).collect();
     let mut rng = StdRng::seed_from_u64(seed ^ u64::from(alpha.to_bits()));
@@ -879,7 +949,7 @@ fn run_pass_parallel(
     order.par_iter().for_each_init(
         || BuildScratch::with_capacity(cap),
         |scratch, &p| {
-            insert_point_concurrent(graph, source, &[medoid], p, alpha, r, l_build, scratch);
+            insert_point_concurrent(graph, source, &[medoid], p, alpha, r, l_build, scratch, proxy);
         },
     );
 }
@@ -1054,6 +1124,8 @@ impl VamanaIndex {
         // Both passes run in parallel across the rayon pool; the graph is a
         // Vec<Mutex<Node>> for the duration of the build, then unwrapped.
         let graph: Vec<Mutex<Node>> = plain.into_iter().map(Mutex::new).collect();
+        let proxy = build_int8_walk_enabled()
+            .then(|| Int8WalkProxy::build(metric_src, n, metric_src.dim()));
         run_pass_parallel(
             &graph,
             metric_src,
@@ -1063,6 +1135,7 @@ impl VamanaIndex {
             config.r,
             config.l_build,
             config.seed,
+            proxy.as_ref(),
         );
         run_pass_parallel(
             &graph,
@@ -1073,6 +1146,7 @@ impl VamanaIndex {
             config.r,
             config.l_build,
             config.seed.wrapping_add(1),
+            proxy.as_ref(),
         );
         let mut nodes: Vec<Node> = graph.into_iter().map(Mutex::into_inner).collect();
         patch_connectivity(&mut nodes, metric_src, n, medoid, config.r);

@@ -28,7 +28,7 @@ use skeg_simd::{
 };
 #[cfg(target_arch = "aarch64")]
 use skeg_simd::{
-    bucketize_x8_neon, cosine_f32_neon, dot_int8_neon, flip_signs_neon, fwht_f32_neon,
+    bucketize_x8_neon, cosine_f32_neon, dot_int8_neon, dot_int8_sdot, flip_signs_neon, fwht_f32_neon,
     hamming_binary_neon, tq1_masked_sum_neon, tq2_adc_i8_neon, tq4_adc_i8_neon,
 };
 
@@ -111,6 +111,12 @@ fn bench_kernels(c: &mut Criterion) {
         g.bench_function("dot_int8_neon", |x| {
             x.iter(|| dot_int8_neon(black_box(&ia), black_box(&ib)));
         });
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            g.bench_function("dot_int8_sdot", |x| {
+                // SAFETY: dotprod was checked immediately above.
+                x.iter(|| unsafe { dot_int8_sdot(black_box(&ia), black_box(&ib)) });
+            });
+        }
     }
     #[cfg(target_arch = "x86_64")]
     {

@@ -433,6 +433,58 @@ pub fn dot_int8_neon(a: &[i8], b: &[i8]) -> i32 {
     sum
 }
 
+/// Dot product of i8 slices via the `sdot` instruction (FEAT_DotProd): one
+/// instruction performs sixteen i8 multiply-accumulates into i32 lanes, where
+/// the baseline-NEON path needs three (`vmull`, two `vpadalq`). 64 i8 per
+/// iteration over 4 independent accumulators.
+///
+/// `vdotq_s32` is still unstable in `std::arch` (`stdarch_neon_dotprod`), so
+/// the instruction is emitted with inline asm; switch to the intrinsic once
+/// it stabilises.
+///
+/// # Safety
+///
+/// The current CPU must support the `dotprod` extension
+/// (`is_aarch64_feature_detected!("dotprod")`), and both slices must have the
+/// same length.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[must_use]
+pub unsafe fn dot_int8_sdot(a: &[i8], b: &[i8]) -> i32 {
+    assert_eq!(a.len(), b.len(), "dimension mismatch");
+    use std::arch::aarch64::{int8x16_t, vaddq_s32, vaddvq_s32, vdupq_n_s32, vld1q_s8};
+    use std::arch::asm;
+    let n = a.len();
+    let block = n - (n % 64);
+    let mut i = 0;
+    // SAFETY: each `vld1q_s8` reads 16 i8 at offset `i + k*16 < block <= n`,
+    // in bounds for both slices (`a.len() == b.len()`). Reads only. The asm
+    // is a single register-to-register `sdot`, no memory, no stack.
+    let mut sum = unsafe {
+        let mut acc = [vdupq_n_s32(0); 4];
+        while i < block {
+            for (k, acc_k) in acc.iter_mut().enumerate() {
+                let va: int8x16_t = vld1q_s8(a.as_ptr().add(i + k * 16));
+                let vb: int8x16_t = vld1q_s8(b.as_ptr().add(i + k * 16));
+                asm!(
+                    "sdot {acc:v}.4s, {va:v}.16b, {vb:v}.16b",
+                    acc = inout(vreg) *acc_k,
+                    va = in(vreg) va,
+                    vb = in(vreg) vb,
+                    options(pure, nomem, nostack)
+                );
+            }
+            i += 64;
+        }
+        let acc = vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3]));
+        vaddvq_s32(acc)
+    };
+    for i in i..n {
+        sum += i32::from(a[i]) * i32::from(b[i]);
+    }
+    sum
+}
+
 /// Dot product of i8 slices, AVX2. Widened i16 products are pairwise summed
 /// into i32 lanes before reduction, so every intermediate is exact.
 ///
@@ -766,6 +818,16 @@ pub fn dot_int8(a: &[i8], b: &[i8]) -> i32 {
             return unsafe { dot_int8_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Only the sdot kernel is dispatched: the baseline-NEON `vmull` path
+        // measures slower than the auto-vectorized scalar (40ns vs 23ns at
+        // dim 1024 on M-series), which is why no plain-NEON arm exists here.
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            // SAFETY: dotprod was checked immediately above.
+            return unsafe { dot_int8_sdot(a, b) };
+        }
+    }
     dot_int8_scalar(a, b)
 }
 
@@ -812,6 +874,27 @@ mod tests {
         let a = &[0xFFu8; 20];
         let b = &[0x00u8; 20];
         assert_eq!(hamming_binary(a, b), 160); // 20 bytes * 8 bits
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn dot_int8_sdot_matches_scalar_on_random_and_ragged_lengths() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as i8
+        };
+        // Ragged lengths cover the 64-wide block, its tail, and the empty case.
+        for n in [0usize, 1, 15, 63, 64, 65, 100, 512, 1000, 1024, 1536] {
+            let a: Vec<i8> = (0..n).map(|_| next()).collect();
+            let b: Vec<i8> = (0..n).map(|_| next()).collect();
+            // SAFETY: dotprod was checked at the top of the test.
+            let got = unsafe { dot_int8_sdot(&a, &b) };
+            assert_eq!(got, dot_int8_scalar(&a, &b), "length {n}");
+        }
     }
 
     #[test]
