@@ -124,6 +124,30 @@ impl IvfRouter {
     }
 
     /// Predicate-aware probe. `s` = the filter's SORTED matching ids (external =
+    /// Up to `limit` base rows from the cell nearest `query` (unit vector):
+    /// walk seeds inside the query's own semantic neighbourhood, so a NOVEL
+    /// query starts near its answers the way the entry cache starts a
+    /// repeated one. O(cells) centroid scan + O(n/cells) member walk.
+    #[must_use]
+    pub fn query_cell_seeds(&self, query: &[f32], limit: usize) -> Vec<u32> {
+        let mut best = (f32::NEG_INFINITY, 0usize);
+        for j in 0..self.n_cells {
+            let c = &self.centroids[j * self.dim..(j + 1) * self.dim];
+            let s = cosine_f32(query, c);
+            if s > best.0 {
+                best = (s, j);
+            }
+        }
+        let cell = best.1 as u32;
+        self.cell_of
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c == cell)
+            .take(limit)
+            .map(|(row, _)| row as u32)
+            .collect()
+    }
+
     /// vector rows here). Returns a shortlist ⊂ s: the `s` members that live in
     /// the query-nearest cells CONTAINING `s`, gathered until `budget` is reached.
     /// The caller proxy-scores + reranks the shortlist. Falls back to all of `s`

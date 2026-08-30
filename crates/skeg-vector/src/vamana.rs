@@ -1864,6 +1864,13 @@ fn query_sketch(q: &[f32]) -> u16 {
     key
 }
 
+/// `SKEG_IVF_SEEDS=1` seeds unfiltered walks from the query's nearest IVF
+/// cell. Off until the hop/recall gate clears it.
+fn ivf_seeds_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SKEG_IVF_SEEDS").is_ok_and(|v| v == "1"))
+}
+
 fn entry_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("SKEG_ENTRY_CACHE").is_ok_and(|v| v == "0"))
@@ -3777,6 +3784,21 @@ impl DiskVamanaIndex {
                 {
                     seed_rows.push(r);
                 }
+            }
+            // IVF cell seeds (base segment only, opt-in): a NOVEL query
+            // starts inside its own semantic cell instead of at the medoid -
+            // the complement of the entry cache, which only serves repeats.
+            // Extra seeds only add candidates.
+            if seg_idx == 0
+                && ivf_seeds_enabled()
+                && let Some(router) = &self.ivf
+            {
+                seed_rows.extend(
+                    router
+                        .query_cell_seeds(&normalized(query), 4)
+                        .into_iter()
+                        .filter(|&r| r < seg.main_n),
+                );
             }
             // Semantic entry seeds (base segment only): where similar queries
             // landed before. Extra seeds only add candidates.
