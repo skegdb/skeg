@@ -1477,7 +1477,21 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
                 "cache_bytes={} evictions={} n_keys={} budget={}",
                 s.cache_bytes, s.cache_evictions, s.n_keys, s.cache_budget,
             );
-            let body = format!("{cache_line}\n\n{}", skeg_telemetry::stats::dump_text());
+            // Self-reported process cost, Prometheus-standard names: the
+            // engine says what it uses instead of every operator deriving it
+            // from ps. CPU is cumulative; consumers take window deltas.
+            let process = format!(
+                "# TYPE process_resident_memory_bytes gauge\n\
+                 process_resident_memory_bytes {}\n\
+                 # TYPE process_cpu_seconds_total counter\n\
+                 process_cpu_seconds_total {:.3}\n",
+                skeg_platform::rss_bytes(),
+                skeg_platform::cpu_seconds(),
+            );
+            let body = format!(
+                "{cache_line}\n\n{process}\n{}",
+                skeg_telemetry::stats::dump_text()
+            );
             Frame::Bulk(Bytes::from(body))
         }
         Err(e) => shard_error(&e),

@@ -31,6 +31,9 @@ pub use uring::{BatchReader, BlockingBatchReader, best_batch_reader};
 /// `std::thread::available_parallelism()` when no quota is set (or on
 /// error, or on other platforms).
 #[must_use]
+pub use process::{cpu_seconds, rss_bytes};
+mod process;
+
 pub fn num_performance_cores() -> usize {
     #[cfg(target_os = "macos")]
     {
