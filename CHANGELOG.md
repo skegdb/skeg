@@ -75,6 +75,15 @@ nothing new to add costs 13-25ms instead of a rebuild.
 
 ### Fixed
 
+- **A restart replayed everything since the last fold into the RAM delta.**
+  `clean_stale_runs` deleted every run directory at open and recovered the
+  whole WAL: on the demo, a restart after a 218k-row growth put 900 MB back
+  into a flat-scanned delta. Flushed runs are durable graphs: `flush_finish`
+  now fsyncs the run, writes a `run.ok` marker and compacts the WAL down to
+  the current delta plus live tombstones; a reopen loads every marked run
+  and replays only the WAL suffix. Unmarked (torn) runs stay WAL-covered
+  and are deleted as before.
+
 - **Delete-patch ran in its losing regime.** It had a lower tombstone bound
   but no upper one, and fired on a base 61% dead, where the measurement says
   it loses 3x. Past a quarter dead the ladder now routes to the full fold,
