@@ -9,6 +9,26 @@ repository.
 
 ## [Unreleased]
 
+### Semantic shards (C1-C3)
+
+The owner's "galaxies" become engine machinery. `balanced_kmeans`
+(SPANN-style size penalty) gives every shard a semantic identity;
+`router-<name>.bin` persists the centroids with an epoch;
+`SKEG.VINDEX.RESHARD` physically moves every live row to its owner
+(payload included, vset-then-vdel so a crash duplicates and never
+loses, cursor-resumable, the search merge dedups by id); an id-to-owner
+map keeps point ops O(1) and rebuilds itself lazily after open.
+
+Live baptism on the demo: 386.047 rows moved in 22 minutes with the
+count exact at every check, residual debt folded in 19s. The recall
+gate then caught a real -3pt regression, root-caused to lonely queries
+in the dense per-shard graphs (top-1 perfect, tail scores -0,003..-0,028;
+NOT a boundary effect - margins identical); beam 256 restores parity
+(0,9915 vs 0,9925 hash control) and, under a 24-user storm, the
+semantic layout at beam 256 beats the old hash layout's server p99
+(20,0 vs ~28 ms) at double the load with zero errors. Routed probing
+(C4) and boundary overlap (C5) come next.
+
 ### The full rebuild leaves the normal path
 
 The consolidate rebuilt the whole graph from scratch on every fold: measured
