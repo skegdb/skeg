@@ -687,6 +687,18 @@ pub struct VindexRow {
 }
 
 /// Load every `router-<name>.bin` under the shard-set root.
+/// Default probe width for routed searches: `SKEG_PROBE` (0 = full
+/// fan-out). Ships at 0 until the probe gate clears on the live corpus.
+fn probe_default() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("SKEG_PROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn load_routers(root: &Path) -> HashMap<String, Arc<crate::router::Router>> {
     let mut out = HashMap::new();
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -3996,6 +4008,38 @@ impl ShardSet {
         want_payload: bool,
         filter: Option<Filter>,
     ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
+        self.vsearch_with_probe(
+            name,
+            query,
+            k,
+            l_search,
+            tenant,
+            want_payload,
+            filter,
+            probe_default(),
+        )
+        .await
+    }
+
+    /// [`vsearch`](Self::vsearch) with an explicit probe width. With a
+    /// semantic router and `probe > 0`, an UNFILTERED search asks only the
+    /// `probe` shards whose centroids are nearest the query - the measured
+    /// coverage ceiling at probe 2 on the real corpus is 0,9965 (M2). A
+    /// filtered search always fans out to every shard: the filter's matches
+    /// are orthogonal to semantics and can live anywhere. `probe = 0` (or no
+    /// router) keeps the full fan-out.
+    #[allow(clippy::too_many_arguments)] // vsearch's params plus the probe
+    pub async fn vsearch_with_probe(
+        &self,
+        name: &str,
+        query: Vec<f32>,
+        k: usize,
+        l_search: u32,
+        tenant: u128,
+        want_payload: bool,
+        filter: Option<Filter>,
+        probe: usize,
+    ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
         let _permit = self
             .inner
             .vsearch_admission
@@ -4010,8 +4054,28 @@ impl ShardSet {
         // The client waits for the scatter, every reply, and the merge: that
         // whole span is the search, and it is what the histogram must observe.
         let started = std::time::Instant::now();
-        let mut pending = Vec::with_capacity(self.inner.n);
-        for sender in &self.inner.senders {
+        let targets: Vec<usize> = match (&filter, probe, self.router(name)) {
+            (None, p, Some(router)) if p > 0 && p < self.inner.n => {
+                let cn = |v: &[f32]| {
+                    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                    v.iter().map(|x| x / n).collect::<Vec<f32>>()
+                };
+                let qn = cn(&query);
+                let mut sims: Vec<(f32, usize)> = (0..router.k)
+                    .map(|j| {
+                        let c = &router.centroids[j * router.dim..(j + 1) * router.dim];
+                        let s: f32 = qn.iter().zip(c).map(|(a, b)| a * b).sum();
+                        (s, j)
+                    })
+                    .collect();
+                sims.sort_by(|a, b| b.0.total_cmp(&a.0));
+                sims.into_iter().take(p).map(|(_, j)| j).collect()
+            }
+            _ => (0..self.inner.n).collect(),
+        };
+        let mut pending = Vec::with_capacity(targets.len());
+        for &shard in &targets {
+            let sender = &self.inner.senders[shard];
             let (tx, rx) = oneshot::channel();
             let req = ShardReq::Vsearch {
                 name: name.to_owned(),
@@ -6287,6 +6351,54 @@ mod tests {
                     "id {id} unreachable after reopen"
                 );
             }
+        }
+    }
+
+    /// Routed probing: with a router, an unfiltered search asks only the
+    /// top-P shards and returns the same answers as the full fan-out for
+    /// in-cluster queries; probe=0 keeps the full fan-out.
+    #[tokio::test]
+    async fn routed_probe_matches_full_fanout_for_cluster_queries() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            4,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("pr", 16, 4, 1).await.unwrap();
+        let vec_for = |id: u64| {
+            let mut v = vec![0.02f32; 16];
+            v[(id % 4) as usize] = 1.0;
+            v[(4 + id % 4) as usize] = 0.5;
+            v
+        };
+        for id in 0..800u64 {
+            shards.vset("pr", id, vec_for(id), 0, None, None).await.unwrap();
+        }
+        shards.reshard("pr", 0.25, 10).await.unwrap();
+        for probe_q in 0..4u64 {
+            let q = vec_for(probe_q);
+            let full = shards
+                .vsearch_with_probe("pr", q.clone(), 10, 0, 0, false, None, 0)
+                .await
+                .unwrap();
+            let probed = shards
+                .vsearch_with_probe("pr", q, 10, 0, 0, false, None, 2)
+                .await
+                .unwrap();
+            let ids = |v: &Vec<(u64, f32, Option<Bytes>)>| {
+                let mut s: Vec<u64> = v.iter().map(|&(id, _, _)| id).collect();
+                s.sort_unstable();
+                s
+            };
+            assert_eq!(
+                ids(&full),
+                ids(&probed),
+                "probe=2 must match full fan-out for cluster query {probe_q}"
+            );
         }
     }
 
