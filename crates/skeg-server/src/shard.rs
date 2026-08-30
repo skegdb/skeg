@@ -643,6 +643,17 @@ enum ShardReq {
     LiveIds {
         name: String,
     },
+    /// Boundary rows for the targeted overlap: live rows whose margin
+    /// between the two nearest centroids is below `tau` - returned with
+    /// vector, payload and the SECOND-nearest shard they replicate to.
+    CollectBoundary {
+        name: String,
+        centroids: Arc<crate::router::Router>,
+        after: u64,
+        limit: usize,
+        tau: f32,
+        tenant: u128,
+    },
     /// Sample of the shard's base graph for visual exploration.
     GraphSample {
         name: String,
@@ -2053,6 +2064,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::SampleVectors { .. }
         | ShardReq::CollectMoves { .. }
         | ShardReq::LiveIds { .. }
+        | ShardReq::CollectBoundary { .. }
         | ShardReq::GraphSample { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
@@ -2575,6 +2587,69 @@ async fn process(
                 }
             }
         }
+        ShardReq::CollectBoundary { name, centroids, after, limit, tau, tenant } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => {
+                    let (mut batch, cursor) = {
+                        let idx = arc.read();
+                        let mut ids = idx.backend.live_ids();
+                        ids.sort_unstable();
+                        let mut out: Vec<(u64, Vec<f32>, Option<Bytes>, u8)> = Vec::new();
+                        let mut cursor = None;
+                        for &id in ids.iter().filter(|&&i| i > after) {
+                            match idx.backend.get(id) {
+                                Ok(Some(v)) => {
+                                    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                                    let qn: Vec<f32> = v.iter().map(|x| x / n).collect();
+                                    let mut best = (f32::NEG_INFINITY, 0usize);
+                                    let mut second = (f32::NEG_INFINITY, 0usize);
+                                    for j in 0..centroids.k {
+                                        let c = &centroids.centroids
+                                            [j * centroids.dim..(j + 1) * centroids.dim];
+                                        let s: f32 =
+                                            qn.iter().zip(c).map(|(a, b)| a * b).sum();
+                                        if s > best.0 {
+                                            second = best;
+                                            best = (s, j);
+                                        } else if s > second.0 {
+                                            second = (s, j);
+                                        }
+                                    }
+                                    if best.0 - second.0 < tau {
+                                        out.push((id, v, None, second.1 as u8));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    return ShardResp::Err(format!(
+                                        "overlap read failed: {e}"
+                                    ));
+                                }
+                            }
+                            if out.len() >= limit {
+                                cursor = Some(id);
+                                break;
+                            }
+                        }
+                        (out, cursor)
+                    };
+                    for (id, _, payload, _) in &mut batch {
+                        let key = payload_key(tenant, &name, *id);
+                        match vlog.tenant(tenant).get(&key).await {
+                            Ok(b) => *payload = b,
+                            Err(e) => {
+                                return ShardResp::Err(format!(
+                                    "overlap payload read failed: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    ShardResp::Moves(batch, cursor)
+                }
+            }
+        }
         ShardReq::LiveIds { name } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
@@ -2795,7 +2870,7 @@ struct ShardSetInner {
     /// makes an id's shard computable; semantic placement does not, so the
     /// set keeps the map (8B+overhead per id, rebuilt at open from the
     /// shards' live id sets) and point ops stay O(1) instead of broadcast.
-    owners: parking_lot::RwLock<HashMap<String, ahash::AHashMap<u64, u8>>>,
+    owners: parking_lot::RwLock<HashMap<String, ahash::AHashMap<u64, (u8, Option<u8>)>>>,
 }
 
 impl Drop for ShardSetInner {
@@ -3610,15 +3685,17 @@ impl ShardSet {
             self.ensure_owner_map(name).await?;
             let owner = router.assign(&vector);
             let old = self.inner.owners.read().get(name).and_then(|m| m.get(&id).copied());
-            if let Some(old_shard) = old
-                && usize::from(old_shard) != owner
-            {
-                self.call(usize::from(old_shard), ShardReq::Vdel {
-                    name: name.to_owned(),
-                    id,
-                    tenant,
-                })
-                .await?;
+            if let Some((old_primary, old_replica)) = old {
+                for s in std::iter::once(old_primary).chain(old_replica) {
+                    if usize::from(s) != owner {
+                        self.call(usize::from(s), ShardReq::Vdel {
+                            name: name.to_owned(),
+                            id,
+                            tenant,
+                        })
+                        .await?;
+                    }
+                }
             }
             let req = ShardReq::Vset {
                 name: name.to_owned(),
@@ -3635,7 +3712,7 @@ impl ShardSet {
                         .write()
                         .entry(name.to_owned())
                         .or_default()
-                        .insert(id, owner as u8);
+                        .insert(id, (owner as u8, None));
                     Ok(())
                 }
                 ShardResp::Err(e) => Err(ShardError::Storage(e)),
@@ -3841,7 +3918,7 @@ impl ShardSet {
                         .read()
                         .get(name)
                         .and_then(|m| m.get(&id).copied())
-                        == Some(owner);
+                        .is_some_and(|(p, _)| p == owner);
                     if !already_there {
                         let req = ShardReq::Vset {
                             name: name.to_owned(),
@@ -3868,7 +3945,7 @@ impl ShardSet {
                         .write()
                         .entry(name.to_owned())
                         .or_default()
-                        .insert(id, owner);
+                        .insert(id, (owner, None));
                     moved += 1;
                 }
                 match cursor {
@@ -3877,7 +3954,89 @@ impl ShardSet {
                 }
             }
         }
+        // The loop recorded only MOVED ids; rows already on their owner never
+        // entered the map, and every consumer that trusts the map (overlap's
+        // primary check, point ops after the hash fallback stops being
+        // coincidentally right) needs the full picture.
+        self.rebuild_owner_maps().await?;
         Ok(moved)
+    }
+
+    /// Targeted 2-way overlap (C5): every live row whose margin between its
+    /// two nearest centroids is below `tau` gains a replica on the
+    /// second-nearest shard, so a probe search finds boundary rows from
+    /// either side. Idempotent (a re-run overwrites the same replicas);
+    /// deletes and overwrites remove replicas through the owner map.
+    /// Returns the number of rows replicated.
+    ///
+    /// # Errors
+    ///
+    /// Index or router missing, a shard unavailable, or a batch failing.
+    pub async fn overlap(&self, name: &str, tau: f32) -> Result<u64, ShardError> {
+        const BATCH: usize = 512;
+        let Some(router) = self.router(name) else {
+            return Err(ShardError::Storage(format!(
+                "vindex '{name}' has no semantic router; reshard first"
+            )));
+        };
+        self.ensure_owner_map(name).await?;
+        let mut replicated = 0u64;
+        for source in 0..self.inner.n {
+            let mut after = 0u64;
+            loop {
+                let req = ShardReq::CollectBoundary {
+                    name: name.to_owned(),
+                    centroids: router.clone(),
+                    after,
+                    limit: BATCH,
+                    tau,
+                    tenant: 0,
+                };
+                let (batch, cursor) = match self.call(source, req).await? {
+                    ShardResp::Moves(b, c) => (b, c),
+                    ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                    _ => return Err(ShardError::Unavailable),
+                };
+                for (id, vector, payload, second) in batch {
+                    // Only rows whose PRIMARY lives here replicate from here
+                    // (the same row seen via its replica must not re-replicate).
+                    let primary_here = self
+                        .inner
+                        .owners
+                        .read()
+                        .get(name)
+                        .and_then(|m| m.get(&id).copied())
+                        .is_some_and(|(p, _)| usize::from(p) == source);
+                    if !primary_here || usize::from(second) == source {
+                        continue;
+                    }
+                    let req = ShardReq::Vset {
+                        name: name.to_owned(),
+                        id,
+                        vector,
+                        tenant: 0,
+                        limit: None,
+                        payload,
+                    };
+                    match self.call(usize::from(second), req).await? {
+                        ShardResp::Done => {}
+                        ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                        _ => return Err(ShardError::Unavailable),
+                    }
+                    if let Some(m) = self.inner.owners.write().get_mut(name)
+                        && let Some(e) = m.get_mut(&id)
+                    {
+                        e.1 = Some(second);
+                    }
+                    replicated += 1;
+                }
+                match cursor {
+                    Some(c) => after = c,
+                    None => break,
+                }
+            }
+        }
+        Ok(replicated)
     }
 
     /// Rebuild the id -> owner-shard map for every routed vindex by asking
@@ -3889,12 +4048,19 @@ impl ShardSet {
     pub async fn rebuild_owner_maps(&self) -> Result<(), ShardError> {
         let names: Vec<String> = self.inner.routers.read().keys().cloned().collect();
         for name in names {
-            let mut map: ahash::AHashMap<u64, u8> = ahash::AHashMap::new();
+            let mut map: ahash::AHashMap<u64, (u8, Option<u8>)> = ahash::AHashMap::new();
             for shard in 0..self.inner.n {
                 match self.call(shard, ShardReq::LiveIds { name: name.clone() }).await? {
                     ShardResp::Ids(ids) => {
                         for id in ids {
-                            map.insert(id, shard as u8);
+                            // Second sighting of an id = its replica.
+                            match map.entry(id) {
+                                std::collections::hash_map::Entry::Vacant(_) => {}
+                                _ => {}
+                            }
+                            map.entry(id)
+                                .and_modify(|e| e.1 = Some(shard as u8))
+                                .or_insert((shard as u8, None));
                         }
                     }
                     ShardResp::Err(_) => {} // shard without this vindex yet
@@ -3950,7 +4116,7 @@ impl ShardSet {
     /// map is unknown; any shard answers None, hash picks one).
     fn point_shard(&self, name: &str, id: u64) -> usize {
         if let Some(m) = self.inner.owners.read().get(name)
-            && let Some(&s) = m.get(&id)
+            && let Some(&(s, _)) = m.get(&id)
         {
             return usize::from(s);
         }
@@ -3977,16 +4143,31 @@ impl ShardSet {
             id,
             tenant,
         };
-        match self.call(shard, req).await? {
-            ShardResp::Existed(b) => {
-                if b && let Some(m) = self.inner.owners.write().get_mut(name) {
-                    m.remove(&id);
-                }
-                Ok(b)
-            }
-            ShardResp::Err(e) => Err(ShardError::Storage(e)),
-            _ => Err(ShardError::Unavailable),
+        let existed = match self.call(shard, req).await? {
+            ShardResp::Existed(b) => b,
+            ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+            _ => return Err(ShardError::Unavailable),
+        };
+        // A replicated id dies everywhere: the replica must not survive as a
+        // ghost the search could resurrect.
+        let replica = self
+            .inner
+            .owners
+            .read()
+            .get(name)
+            .and_then(|m| m.get(&id).and_then(|&(_, r)| r));
+        if let Some(rep) = replica {
+            self.call(usize::from(rep), ShardReq::Vdel {
+                name: name.to_owned(),
+                id,
+                tenant,
+            })
+            .await?;
         }
+        if existed && let Some(m) = self.inner.owners.write().get_mut(name) {
+            m.remove(&id);
+        }
+        Ok(existed)
     }
 
     /// Search `name` for the `k` nearest vectors to `query`.
@@ -6352,6 +6533,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Targeted overlap: boundary rows (small margin between their two
+    /// nearest centroids) get a replica on the second shard; probe-2 search
+    /// then finds them from either side, deletes remove both copies, and an
+    /// overwrite cannot resurrect a stale replica.
+    #[tokio::test]
+    async fn targeted_overlap_replicates_boundary_rows_and_ops_stay_exact() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("ov", 8, 4, 1).await.unwrap();
+        // Two clusters plus BOUNDARY rows sitting between them.
+        let cluster = |c: usize| {
+            let mut v = vec![0.05f32; 8];
+            v[c] = 1.0;
+            v
+        };
+        let boundary = |seed: u64| {
+            let mut v = vec![0.05f32; 8];
+            v[0] = 0.72 + (seed as f32) * 1e-3;
+            v[1] = 0.70;
+            v
+        };
+        for id in 0..300u64 {
+            shards.vset("ov", id, cluster((id % 2) as usize), 0, None, None).await.unwrap();
+        }
+        for id in 300..340u64 {
+            shards.vset("ov", id, boundary(id), 0, None, None).await.unwrap();
+        }
+        shards.reshard("ov", 0.25, 10).await.unwrap();
+        // Tau comes from the trained router's own geometry: between the
+        // boundary rows' margin and the cluster cores' margin, so the test
+        // asserts SELECTIVITY instead of guessing a constant.
+        let router = shards.router("ov").expect("router");
+        let margin = |v: &[f32]| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let qn: Vec<f32> = v.iter().map(|x| x / n).collect();
+            let mut sims: Vec<f32> = (0..router.k)
+                .map(|j| {
+                    let c = &router.centroids[j * router.dim..(j + 1) * router.dim];
+                    qn.iter().zip(c).map(|(a, b)| a * b).sum()
+                })
+                .collect();
+            sims.sort_by(f32::total_cmp);
+            sims[router.k - 1] - sims[router.k - 2]
+        };
+        let m_boundary = margin(&boundary(320));
+        let m_core = margin(&cluster(0));
+        assert!(
+            m_boundary < m_core,
+            "boundary rows must sit nearer the frontier ({m_boundary} vs {m_core})"
+        );
+        let tau = (m_boundary + m_core) / 2.0;
+        let replicated = shards.overlap("ov", tau).await.expect("overlap");
+        assert!(
+            replicated >= 30 && replicated < 200,
+            "overlap at tau {tau} must catch the ~40 boundary rows, not the cores              (replicated {replicated})"
+        );
+
+        // A probe-2 search from the boundary finds boundary ids.
+        let hits = shards
+            .vsearch_with_probe("ov", boundary(320), 10, 0, 0, false, None, 1)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().filter(|&&(id, _, _)| id >= 300).count() >= 5,
+            "probe-1 from the boundary must see replicated boundary rows"
+        );
+        // No duplicate ids in results.
+        let mut ids: Vec<u64> = hits.iter().map(|&(id, _, _)| id).collect();
+        let n_before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n_before, "merge must dedup replicas");
+
+        // Delete removes BOTH copies.
+        assert!(shards.vdel("ov", 320, 0).await.unwrap());
+        assert!(shards.vget("ov", 320).await.unwrap().is_none());
+        let hits = shards
+            .vsearch_with_probe("ov", boundary(320), 10, 0, 0, false, None, 0)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|&(id, _, _)| id != 320),
+            "a deleted id must not survive as a replica ghost"
+        );
+        // Overwrite lands one logical copy (replica of the old value gone).
+        shards.vset("ov", 321, cluster(0), 0, None, None).await.unwrap();
+        assert_eq!(shards.vget("ov", 321).await.unwrap().unwrap(), cluster(0));
     }
 
     /// Routed probing: with a router, an unfiltered search asks only the

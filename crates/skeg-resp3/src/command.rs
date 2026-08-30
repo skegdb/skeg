@@ -134,6 +134,11 @@ pub enum Command {
     SkegVindexReshard {
         args: Vec<Bytes>,
     },
+    /// `SKEG.VINDEX.OVERLAP name [tau]`: replicate boundary rows (top-2
+    /// centroid margin below tau, default 0.05) onto their second shard.
+    SkegVindexOverlap {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VGRAPH name [count] [shard]`: a sample of one shard's base
     /// graph as text lines - `n <id> <degree>` then `e <from> <to>`.
     SkegVgraph {
@@ -438,6 +443,15 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVindexReshard { args })
+        }
+        "VINDEX.OVERLAP" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VINDEX.OVERLAP",
+                    want: "name [tau]",
+                });
+            }
+            Ok(Command::SkegVindexOverlap { args })
         }
         "VGRAPH" => {
             if args.is_empty() || args.len() > 3 {
