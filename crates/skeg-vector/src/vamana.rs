@@ -6817,6 +6817,80 @@ mod tests {
         );
     }
 
+    /// Price the donor reuse: same merge, donor path vs from-scratch.
+    /// Ignored (heavy): run with `cargo test -- --ignored merge_donor_speed`.
+    #[test]
+    #[ignore]
+    fn merge_donor_speedup_measured() {
+        let dim = 256;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        let big = random_vectors(20_000, dim, 51);
+        for (i, v) in big.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let built = idx.flush_begin().unwrap().unwrap().build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        let small = random_vectors(2_000, dim, 52);
+        for (i, v) in small.chunks_exact(dim).enumerate() {
+            idx.insert(100_000 + i as u64, v).unwrap();
+        }
+        let built = idx.flush_begin().unwrap().unwrap().build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+
+        let job = idx.merge_runs_begin().unwrap().unwrap();
+        assert!(job.patch.is_some());
+        // Leg B first (from-scratch): strip the patch off a clone of the state
+        // by rebuilding the job? Jobs are one-shot; run B on a second index
+        // with identical content instead.
+        let t0 = std::time::Instant::now();
+        let built = job.build(tmp.path()).unwrap();
+        let reuse = t0.elapsed();
+        idx.merge_runs_finish(built).unwrap();
+
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let mut idx2 =
+            DiskVamanaIndex::create_empty_with_tier(tmp2.path(), dim, 64, tier).unwrap();
+        idx2.set_auto_flush(false);
+        for (i, v) in big.chunks_exact(dim).enumerate() {
+            idx2.insert(i as u64, v).unwrap();
+        }
+        let built = idx2.flush_begin().unwrap().unwrap().build(tmp2.path()).unwrap();
+        idx2.flush_finish(built).unwrap();
+        for (i, v) in small.chunks_exact(dim).enumerate() {
+            idx2.insert(100_000 + i as u64, v).unwrap();
+        }
+        let built = idx2.flush_begin().unwrap().unwrap().build(tmp2.path()).unwrap();
+        idx2.flush_finish(built).unwrap();
+        let mut job2 = idx2.merge_runs_begin().unwrap().unwrap();
+        job2.patch = None;
+        job2.donor_seg = usize::MAX;
+        let t0 = std::time::Instant::now();
+        let built = job2.build(tmp2.path()).unwrap();
+        let scratch = t0.elapsed();
+        idx2.merge_runs_finish(built).unwrap();
+
+        eprintln!(
+            "merge 20k+2k dim256: reuse {:?} vs scratch {:?} ({:.2}x)",
+            reuse,
+            scratch,
+            scratch.as_secs_f64() / reuse.as_secs_f64()
+        );
+        // Both merged runs answer probes from both source runs.
+        for (which, ix) in [(1u8, &idx), (2u8, &idx2)] {
+            for probe in [0usize, 19_999] {
+                let q = &big[probe * dim..(probe + 1) * dim];
+                assert!(
+                    ix.search(q, 5).unwrap().iter().any(|h| h.0 == probe as u64),
+                    "leg {which}: donor id {probe} lost"
+                );
+            }
+        }
+    }
+
     /// A runs-merge with a dominant donor run reuses its graph: every id
     /// from BOTH runs must remain findable through the merged run.
     #[test]
