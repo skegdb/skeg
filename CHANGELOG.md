@@ -35,7 +35,10 @@ nothing new to add costs 13-25ms instead of a rebuild.
 - **Int8 walk proxy for the build** behind `SKEG_BUILD_INT8_WALK=1`:
   navigation ranks candidates by the i8 dot at a quarter of the memory
   traffic; the prune re-scores in f32 (mandatory, the int8-prune verdict
-  stands). Gate at scale pending.
+  stands). Gated at 150k real mxbai rows: fold 27,4s -> 25,0s (1,09x),
+  recall 0,9868 -> 0,9880. Real but marginal - the build is prune- and
+  back-edge-bound, not walk-bound - so the flag stays off by default;
+  the block-of-32 LUT layout is where the int8 scan win actually lives.
 
 - **Patched fold.** `ConsolidateJob` now captures the base adjacency, and the
   fold reuses it: rows whose neighbours all survive are remapped verbatim at
