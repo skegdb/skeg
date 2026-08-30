@@ -996,7 +996,7 @@ pub fn tq1_masked_dot_qi8_scalar(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
 unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
     use std::arch::aarch64::{
         int32x4_t, int8x16_t, vaddq_s32, vaddvq_s32, vandq_s8, vdupq_n_s32, vdupq_n_s8, vld1q_s8,
-        vqtbl1q_u8, vreinterpretq_s8_u8, vreinterpretq_u8_s8, vtstq_s8,
+        vld1q_u8, vqtbl1q_u8, vreinterpretq_s8_u8, vreinterpretq_u8_s8, vtstq_s8,
     };
     use std::arch::asm;
     assert_eq!(code.len(), dim / 8, "code length");
@@ -1026,7 +1026,7 @@ unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
                     let v = vld1q_s8(two.as_ptr());
                     vreinterpretq_s8_u8(vqtbl1q_u8(
                         vreinterpretq_u8_s8(v),
-                        vld1q_s8(idx.as_ptr().cast::<i8>()).into(),
+                        vld1q_u8(idx.as_ptr()),
                     ))
                 };
                 let bits01 = vandq_s8(

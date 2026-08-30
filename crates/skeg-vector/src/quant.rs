@@ -242,6 +242,12 @@ mod wire_tests {
 }
 
 /// A query vector quantized to match a [`QuantizedVectors`] set.
+fn quantize_query_i8(q: &[f32]) -> (Vec<i8>, f32) {
+    let max_abs = q.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+    (q.iter().map(|x| (x / scale).round() as i8).collect(), scale)
+}
+
 /// The 2- and 4-bit ADC run the i8-query sdot kernels by default
 /// (3.76x/3.59x at dim 1024; recall gated on 50k real mxbai embeddings:
 /// 0.9968 -> 0.9970, the query quantisation costs nothing measurable).
@@ -299,6 +305,9 @@ pub enum QueryCode {
         q_rot: Vec<f32>,
         q_sum: f32,
         qm: f32,
+        /// Query quantised to i8 + scale for the sdot masked-sum kernel
+        /// (3,57x over the f32 mask path); `None` under `SKEG_TQ_QI8=0`.
+        q_i8: Option<(Vec<i8>, f32)>,
     },
     /// TurboQuant 1-bit bit-plane query: the rotated query scalar-quantized to
     /// `b` bits and transposed into `b` bit-planes (`planes[p]` is one
@@ -1864,23 +1873,18 @@ impl QuantizedVectors {
                         let mut q_bits = vec![0u8; rotation.dim().div_ceil(8)];
                         pack_signs(&q_rot, &mut q_bits);
                         let (q_plus, q_sum, qm) = compensate(&q_rot);
+                        let q_i8 = tq_qi8_enabled().then(|| quantize_query_i8(&q_plus));
                         QueryCode::TurboQuant1Hybrid {
                             q_bits,
                             q_rot: q_plus,
                             q_sum,
                             qm,
+                            q_i8,
                         }
                     }
                     Tq1ProxyMode::Asymmetric => {
                         let (q_plus, q_sum, qm) = compensate(&q_rot);
-                        let q_i8 = (matches!(*bits, 2 | 4) && tq_qi8_enabled()).then(|| {
-                            let max_abs = q_plus.iter().fold(0f32, |m, x| m.max(x.abs()));
-                            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-                            (
-                                q_plus.iter().map(|x| (x / scale).round() as i8).collect(),
-                                scale,
-                            )
-                        });
+                        let q_i8 = tq_qi8_enabled().then(|| quantize_query_i8(&q_plus));
                         QueryCode::TurboQuant {
                             q_rot: q_plus,
                             q_sum,
@@ -2002,7 +2006,16 @@ impl QuantizedVectors {
                     },
                     // 1-bit: algebraic reduction `c * (2*masked - q_sum)`.
                     // q_sum precomputed at query time; SWAR scalar inner.
-                    1 => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),
+                    1 => match q_i8 {
+                        // masked = sum q over set bits, exact in i32; the
+                        // 2-level symmetry gives c*(2*masked - q_sum).
+                        Some((q, q_scale)) => {
+                            let masked = skeg_simd::tq1_masked_dot_qi8(code, q, q.len()) as f32
+                                * *q_scale;
+                            centroids[1] * (2.0 * masked - *q_sum)
+                        }
+                        None => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),
+                    },
                     // `build_turboquant` asserts bits in {1, 2, 4}.
                     _ => unreachable!("TurboQuant bits must be in {{1, 2, 4}}"),
                 };
@@ -2101,12 +2114,19 @@ impl QuantizedVectors {
                     ..
                 },
                 QueryCode::TurboQuant1Hybrid {
-                    q_rot, q_sum, qm, ..
+                    q_rot, q_sum, qm, q_i8, ..
                 },
             ) => {
                 assert!(row < self.n, "row out of range");
                 let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
-                let acc = tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum);
+                let acc = match q_i8 {
+                    Some((q, q_scale)) => {
+                        let masked = skeg_simd::tq1_masked_dot_qi8(code, q, q.len()) as f32
+                            * *q_scale;
+                        centroids[1] * (2.0 * masked - *q_sum)
+                    }
+                    None => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),
+                };
                 let ip = scales[row] * (acc - qm);
                 (ip.clamp(-32.0, 32.0) * TQ_PROXY_SCALE) as i32
             }
