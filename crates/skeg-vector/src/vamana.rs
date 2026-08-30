@@ -3628,6 +3628,10 @@ impl DiskVamanaIndex {
             // per query with `search_with_params`.
             (k * 8).max(64)
         };
+        if filtered {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchFiltered);
+        }
+        let phase_t0 = Instant::now();
         let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
         for (seg_idx, seg) in segs.iter().enumerate() {
             if seg.main_n == 0 {
@@ -3735,6 +3739,11 @@ impl DiskVamanaIndex {
                 all_cand.push((score, seg_idx, row));
             }
         }
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchWalkNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
+        let phase_t0 = Instant::now();
         // Global re-rank: best-by-proxy first across every segment, bounded disk
         // reads, dedup by id (a later segment can re-surface the same id).
         all_cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -3815,6 +3824,9 @@ impl DiskVamanaIndex {
                     Some(g) => {
                         let margin = c * (1.0 - g * g).max(0.0).sqrt();
                         if cos_est + margin < tau {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::RerankAdaptiveSkips,
+                            );
                             continue;
                         }
                     }
@@ -3825,6 +3837,9 @@ impl DiskVamanaIndex {
                     None => {
                         let margin = c * (1024.0 / self.dim as f32).sqrt();
                         if cos_est + margin < tau {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::RerankAdaptiveSkips,
+                            );
                             break;
                         }
                     }
@@ -3842,6 +3857,15 @@ impl DiskVamanaIndex {
             scored.push((OrderedFloat(c), id));
         }
         rerank_span.record("disk_reads", disk_reads);
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchRerankNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchRerankReads,
+            disk_reads as u64,
+        );
+        let phase_t0 = Instant::now();
 
         // Flat scan of the delta (small, in RAM). Delta entries are always live.
         for (&id, v) in &self.delta {
@@ -3857,6 +3881,10 @@ impl DiskVamanaIndex {
             }
         }
 
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchDeltaNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
         scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         scored.truncate(k);
         Ok(scored

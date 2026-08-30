@@ -294,10 +294,23 @@ pub enum Counter {
     RerankCacheHits = 20,
     /// Re-rank row read from disk (and inserted into the cache).
     RerankCacheMisses = 21,
+    /// Nanoseconds spent in the graph walks of vsearch (all segments).
+    VsearchWalkNanos = 22,
+    /// Nanoseconds spent in the bounded disk re-rank of vsearch.
+    VsearchRerankNanos = 23,
+    /// Disk rows read by the re-rank.
+    VsearchRerankReads = 24,
+    /// Nanoseconds spent flat-scanning the delta and flush staging.
+    VsearchDeltaNanos = 25,
+    /// Re-rank candidates skipped by the adaptive bound.
+    RerankAdaptiveSkips = 26,
+    /// Vsearches that carried a payload filter (the oversampled walk and the
+    /// selectivity-scaled re-rank budget).
+    VsearchFiltered = 27,
 }
 
 impl Counter {
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 28;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -321,6 +334,12 @@ impl Counter {
         Counter::MaintenanceBudgetSkips,
         Counter::RerankCacheHits,
         Counter::RerankCacheMisses,
+        Counter::VsearchWalkNanos,
+        Counter::VsearchRerankNanos,
+        Counter::VsearchRerankReads,
+        Counter::VsearchDeltaNanos,
+        Counter::RerankAdaptiveSkips,
+        Counter::VsearchFiltered,
     ];
 
     #[inline]
@@ -348,6 +367,12 @@ impl Counter {
             Counter::MaintenanceBudgetSkips => "skeg_maintenance_budget_skips_total",
             Counter::RerankCacheHits => "skeg_rerank_cache_hits_total",
             Counter::RerankCacheMisses => "skeg_rerank_cache_misses_total",
+            Counter::VsearchWalkNanos => "skeg_vsearch_walk_nanos_total",
+            Counter::VsearchRerankNanos => "skeg_vsearch_rerank_nanos_total",
+            Counter::VsearchRerankReads => "skeg_vsearch_rerank_reads_total",
+            Counter::VsearchDeltaNanos => "skeg_vsearch_delta_nanos_total",
+            Counter::RerankAdaptiveSkips => "skeg_rerank_adaptive_skips_total",
+            Counter::VsearchFiltered => "skeg_vsearch_filtered_total",
         }
     }
 }
