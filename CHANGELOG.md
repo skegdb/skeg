@@ -21,6 +21,13 @@ nothing new to add costs 13-25ms instead of a rebuild.
 
 ### Added
 
+- **`SKEG.VGET name id`** on the RESP3 surface: the stored f32 vector as
+  little-endian bytes (the encoding VSEARCH accepts), Null for unknown or
+  deleted ids, tenant-scoped like its write twin. A client never re-embeds
+  a document whose vector the index already holds: the demo's
+  similar-search dropped from ~250ms to under 4ms by fetching the anchor
+  vector instead of re-embedding its summary.
+
 - **Permute-dot ADC kernels (default).** The 2- and 4-bit TurboQuant proxy
   scored by widening every TBL-picked centroid to f32 and paying four FMAs
   per 16 dims; the query is now quantised to i8 once per search and the
