@@ -119,28 +119,24 @@ impl VisitedBitset {
     /// candidate pool for `robust_prune` after the greedy walk.
     #[must_use]
     pub fn iter(&self) -> SetBitsIter<'_> {
-        // Ascending order (callers depend on determinism): sort the dirty
-        // word list - a few hundred u32s - instead of sweeping every word.
-        let mut dirty = self.dirty.clone();
-        dirty.sort_unstable();
+        // Dense sweep. At real per-shard scales (tens of thousands of rows)
+        // the whole bitset is a few KiB, and the sparse variant's per-call
+        // clone+sort of the dirty list measured SLOWER on the build
+        // (24,0s -> 32,1s at 200k) - the sparse win only exists at ~1M rows
+        // per shard. clear() stays sparse: no ordering needed there.
         SetBitsIter {
             bits: &self.bits,
-            dirty,
-            pos: 0,
-            current_word: 0,
             word_idx: 0,
+            current_word: self.bits.first().copied().unwrap_or(0),
         }
     }
 }
 
 /// Iterator over the set indices of [`VisitedBitset`], ascending order.
-/// Walks only the dirty (non-zero) words, sorted ascending.
 pub struct SetBitsIter<'a> {
     bits: &'a [u64],
-    dirty: Vec<u32>,
-    pos: usize,
+    word_idx: usize,
     current_word: u64,
-    word_idx: u32,
 }
 
 impl Iterator for SetBitsIter<'_> {
@@ -148,16 +144,15 @@ impl Iterator for SetBitsIter<'_> {
 
     fn next(&mut self) -> Option<VecId> {
         while self.current_word == 0 {
-            if self.pos >= self.dirty.len() {
+            self.word_idx += 1;
+            if self.word_idx >= self.bits.len() {
                 return None;
             }
-            self.word_idx = self.dirty[self.pos];
-            self.pos += 1;
-            self.current_word = self.bits[self.word_idx as usize];
+            self.current_word = self.bits[self.word_idx];
         }
         let bit = self.current_word.trailing_zeros();
         self.current_word &= self.current_word - 1;
-        Some(self.word_idx * WORD_BITS as u32 + bit)
+        Some((self.word_idx * WORD_BITS + bit as usize) as VecId)
     }
 }
 
