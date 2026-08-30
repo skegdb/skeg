@@ -225,6 +225,21 @@ pub fn set_speed_enabled(enable: bool) -> Result<(), SpeedAlreadySet> {
 /// [`set_speed_enabled`]; `SKEG_SPEED` env var is a fallback for tests
 /// and ad-hoc invocations that have no Rust API access (e.g. running a
 /// bench harness against an externally built server).
+/// Stability window for the early-terminated walk: stop after this many
+/// consecutive expansions leave the top-`k` signature unchanged. The recall
+/// vs walk-time knob: 5 measured -1,4pt recall for walk/3 at 150k mxbai;
+/// wider windows trade time back for recall. `SKEG_SPEED_WINDOW` overrides.
+fn speed_window() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("SKEG_SPEED_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&w| w >= 1)
+            .unwrap_or(5)
+    })
+}
+
 fn speed_enabled() -> bool {
     *SPEED_FLAG.get_or_init(|| {
         matches!(
@@ -1274,7 +1289,7 @@ impl VamanaIndex {
         let sig_k = (k * 4).max(32).min(list_size);
         let early = speed_enabled().then_some(EarlyTerm {
             k: sig_k,
-            window: 5,
+            window: speed_window(),
         });
         let list = greedy_search(
             &[self.medoid],
@@ -3749,7 +3764,7 @@ impl DiskVamanaIndex {
             };
             let early = (!filtered && speed_enabled()).then_some(EarlyTerm {
                 k: rerank,
-                window: 5,
+                window: speed_window(),
             });
             let mut visited = VisitedBitset::new(seg.main_n as usize);
             let mut seen = VisitedBitset::new(seg.main_n as usize);
