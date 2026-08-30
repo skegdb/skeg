@@ -22,6 +22,11 @@ const WORD_BITS: usize = 64;
 pub struct VisitedBitset {
     bits: Vec<u64>,
     capacity: u32,
+    /// Word indexes that became non-zero since the last clear. A walk touches
+    /// a few hundred nodes out of up to 1M slots; clear() and iter() over the
+    /// dirty words alone turn two full-bitset sweeps per insert (~250 KiB of
+    /// scratch traffic each) into O(visited).
+    dirty: Vec<u32>,
 }
 
 impl VisitedBitset {
@@ -47,6 +52,7 @@ impl VisitedBitset {
         Self {
             bits: vec![0u64; words],
             capacity,
+            dirty: Vec::new(),
         }
     }
 
@@ -69,8 +75,12 @@ impl VisitedBitset {
         let word_idx = idx as usize / WORD_BITS;
         let bit = idx as usize % WORD_BITS;
         let mask = 1u64 << bit;
-        let was_set = (self.bits[word_idx] & mask) != 0;
-        self.bits[word_idx] |= mask;
+        let word = self.bits[word_idx];
+        if word == 0 {
+            self.dirty.push(word_idx as u32);
+        }
+        let was_set = (word & mask) != 0;
+        self.bits[word_idx] = word | mask;
         was_set
     }
 
@@ -88,7 +98,10 @@ impl VisitedBitset {
     /// the same bitset (the `BuildScratch` pattern in vamana).
     #[inline]
     pub fn clear(&mut self) {
-        self.bits.fill(0);
+        for &w in &self.dirty {
+            self.bits[w as usize] = 0;
+        }
+        self.dirty.clear();
     }
 
     /// Number of slots.
@@ -106,40 +119,45 @@ impl VisitedBitset {
     /// candidate pool for `robust_prune` after the greedy walk.
     #[must_use]
     pub fn iter(&self) -> SetBitsIter<'_> {
+        // Ascending order (callers depend on determinism): sort the dirty
+        // word list - a few hundred u32s - instead of sweeping every word.
+        let mut dirty = self.dirty.clone();
+        dirty.sort_unstable();
         SetBitsIter {
             bits: &self.bits,
+            dirty,
+            pos: 0,
+            current_word: 0,
             word_idx: 0,
-            current_word: self.bits.first().copied().unwrap_or(0),
         }
     }
 }
 
 /// Iterator over the set indices of [`VisitedBitset`], ascending order.
+/// Walks only the dirty (non-zero) words, sorted ascending.
 pub struct SetBitsIter<'a> {
     bits: &'a [u64],
-    word_idx: usize,
+    dirty: Vec<u32>,
+    pos: usize,
     current_word: u64,
+    word_idx: u32,
 }
 
 impl Iterator for SetBitsIter<'_> {
     type Item = VecId;
 
     fn next(&mut self) -> Option<VecId> {
-        // Advance to a word with a set bit. Cleared words are 0.
         while self.current_word == 0 {
-            self.word_idx += 1;
-            if self.word_idx >= self.bits.len() {
+            if self.pos >= self.dirty.len() {
                 return None;
             }
-            self.current_word = self.bits[self.word_idx];
+            self.word_idx = self.dirty[self.pos];
+            self.pos += 1;
+            self.current_word = self.bits[self.word_idx as usize];
         }
-        // Extract the lowest set bit, then clear it from `current_word`.
         let bit = self.current_word.trailing_zeros();
         self.current_word &= self.current_word - 1;
-        let word_idx_u32 = u32::try_from(self.word_idx).ok()?;
-        let base = word_idx_u32.checked_mul(WORD_BITS as u32)?;
-        let idx = base.checked_add(bit)?;
-        Some(idx)
+        Some(self.word_idx * WORD_BITS as u32 + bit)
     }
 }
 
@@ -246,6 +264,30 @@ mod tests {
         b.test_and_set(150);
         b.clear();
         assert_eq!(b.iter().count(), 0);
+    }
+
+    #[test]
+    fn reuse_across_many_clear_cycles_matches_hashset() {
+        use ahash::AHashSet;
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        // The BuildScratch pattern: one bitset, thousands of walk/clear
+        // cycles. The sparse clear must leave no stale bit behind.
+        let n: u32 = 100_000;
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut bs = VisitedBitset::new(n as usize);
+        for _ in 0..500 {
+            let mut hs: AHashSet<u32> = AHashSet::new();
+            for _ in 0..300 {
+                let idx = rng.random_range(0..n);
+                assert_eq!(bs.test_and_set(idx), !hs.insert(idx));
+            }
+            let mut want: Vec<u32> = hs.into_iter().collect();
+            want.sort_unstable();
+            let got: Vec<u32> = bs.iter().collect();
+            assert_eq!(got, want);
+            bs.clear();
+            assert_eq!(bs.iter().count(), 0);
+        }
     }
 
     #[test]
