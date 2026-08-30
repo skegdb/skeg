@@ -3218,6 +3218,12 @@ impl DiskVamanaIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchHybrid);
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchHybridScored,
+            ids.len() as u64,
+        );
+        let phase_t0 = Instant::now();
         // Per-segment query code; proxy_rescore gives the asym-quality ordering.
         let base_code = self.base.quant.quantize_query(query);
         let run_codes: Vec<_> = self
@@ -3255,12 +3261,18 @@ impl DiskVamanaIndex {
                 cand.push((p, 0, row));
             }
         }
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchHybridScoreNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
+        let phase_t0 = Instant::now();
         // Keep the top `rerank` by proxy (higher = closer), then f32-rerank them.
         let take = rerank.max(k);
         if cand.len() > take {
             cand.select_nth_unstable_by(take, |a, b| b.0.cmp(&a.0));
             cand.truncate(take);
         }
+        let rerank_rows = cand.len() as u64;
         for (_p, seg_idx, row) in cand {
             let seg = if seg_idx == 0 {
                 &self.base
@@ -3270,6 +3282,11 @@ impl DiskVamanaIndex {
             let v = self.read_vector(seg, row)?;
             scored.push((cosine_f32(query, &v), seg.ids[row as usize]));
         }
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchHybridRerankNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
+        skeg_telemetry::add_counter(skeg_telemetry::Counter::VsearchHybridReads, rerank_rows);
         scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(k);
         Ok(scored.into_iter().map(|(s, id)| (id, s)).collect())

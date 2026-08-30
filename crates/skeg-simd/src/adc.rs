@@ -947,6 +947,115 @@ pub fn tq1_masked_sum_scalar(code: &[u8], q_rot: &[f32], dim: usize) -> f32 {
     acc
 }
 
+/// [`tq1_masked_sum`] with the QUERY quantised to i8: `sum q_i8[i]` over
+/// coords whose code bit is set, exact in i32. The f32 kernel builds a
+/// full-width mask and pays f32 adds per lane; here the bit-test produces a
+/// 0/1 i8 vector that feeds `sdot` - sixteen coords per instruction. The
+/// caller applies the query scale once, like the 2-/4-bit qi8 kernels.
+///
+/// # Panics
+///
+/// Panics if `code.len() != dim / 8` or `q_i8.len() != dim`.
+#[must_use]
+pub fn tq1_masked_dot_qi8(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
+    assert_eq!(code.len(), dim / 8, "code length");
+    assert_eq!(q_i8.len(), dim, "query length");
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            // SAFETY: dotprod was checked immediately above.
+            return unsafe { tq1_masked_dot_qi8_sdot(code, q_i8, dim) };
+        }
+    }
+    tq1_masked_dot_qi8_scalar(code, q_i8, dim)
+}
+
+/// Portable scalar reference for [`tq1_masked_dot_qi8`]. Oracle in tests.
+#[must_use]
+pub fn tq1_masked_dot_qi8_scalar(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
+    let mut acc = 0i32;
+    for i in 0..dim {
+        if (code[i / 8] >> (i % 8)) & 1 == 1 {
+            acc += i32::from(q_i8[i]);
+        }
+    }
+    acc
+}
+
+/// `sdot` kernel for [`tq1_masked_dot_qi8`]: broadcast each code byte over 8
+/// i8 lanes (two bytes per 16-lane register via a zip of the selector
+/// pattern), bit-test into a 0xFF/0 mask, mask down to 0/1, one `sdot`
+/// against 16 query bytes.
+///
+/// # Safety
+///
+/// The current CPU must support the `dotprod` extension.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[must_use]
+unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
+    use std::arch::aarch64::{
+        int32x4_t, int8x16_t, vaddq_s32, vaddvq_s32, vandq_s8, vdupq_n_s32, vdupq_n_s8, vld1q_s8,
+        vqtbl1q_u8, vreinterpretq_s8_u8, vreinterpretq_u8_s8, vtstq_s8,
+    };
+    use std::arch::asm;
+    assert_eq!(code.len(), dim / 8, "code length");
+    assert_eq!(q_i8.len(), dim, "query length");
+    let block = dim - (dim % 64);
+    // SAFETY: the byte-pair table indexes select code bytes 2b and 2b+1 which
+    // exist for every 16-dim group inside `block <= dim`; q loads cover
+    // `[at, at+16) <= dim`. Reads only; the asm is a register-only sdot.
+    let mut sum = unsafe {
+        // For 16 dims we need code bytes [2g, 2g+1] broadcast 8 lanes each.
+        // Load 8 code bytes (64 dims) once, then TBL-broadcast per group.
+        let sel: int8x16_t = vld1q_s8(
+            [1i8, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128].as_ptr(),
+        );
+        let one = vdupq_n_s8(1);
+        let mut acc = [vdupq_n_s32(0); 4];
+        let mut base = 0;
+        while base < block {
+            for (k, acc_k) in acc.iter_mut().enumerate() {
+                let at = base + k * 16;
+                let b0 = i8::from_ne_bytes([code[at / 8]]);
+                let b1 = i8::from_ne_bytes([code[at / 8 + 1]]);
+                // Broadcast the two bytes over lanes 0..7 and 8..15.
+                let idx: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1];
+                let pair: int8x16_t = {
+                    let two = [b0, b1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                    let v = vld1q_s8(two.as_ptr());
+                    vreinterpretq_s8_u8(vqtbl1q_u8(
+                        vreinterpretq_u8_s8(v),
+                        vld1q_s8(idx.as_ptr().cast::<i8>()).into(),
+                    ))
+                };
+                let bits01 = vandq_s8(
+                    vreinterpretq_s8_u8(vtstq_s8(pair, sel)),
+                    one,
+                );
+                let q: int8x16_t = vld1q_s8(q_i8.as_ptr().add(at));
+                let mut a: int32x4_t = *acc_k;
+                asm!(
+                    "sdot {a:v}.4s, {m:v}.16b, {q:v}.16b",
+                    a = inout(vreg) a,
+                    m = in(vreg) bits01,
+                    q = in(vreg) q,
+                    options(pure, nomem, nostack)
+                );
+                *acc_k = a;
+            }
+            base += 64;
+        }
+        vaddvq_s32(vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3])))
+    };
+    for i in block..dim {
+        if (code[i / 8] >> (i % 8)) & 1 == 1 {
+            sum += i32::from(q_i8[i]);
+        }
+    }
+    sum
+}
+
 /// NEON kernel for [`tq1_masked_sum`]. Builds the per-lane `{0, !0}` selection
 /// mask in-register with `vtstq_u32` (broadcast the code byte, test against
 /// per-lane bit selectors) instead of gathering it from a memory table - the
@@ -1187,6 +1296,24 @@ mod qi8_tests {
             assert_eq!(
                 tq2_adc_qi8(&code, &centroids, &q, dim),
                 tq2_adc_qi8_scalar(&code, &centroids, &q, dim),
+                "dim {dim}"
+            );
+        }
+    }
+
+    #[test]
+    fn tq1_masked_dot_qi8_matches_scalar_on_random_and_ragged_dims() {
+        let mut state = 0x9216d5d98979fb1bu64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for dim in [8usize, 64, 72, 128, 512, 1024, 1536] {
+            let code: Vec<u8> = (0..dim / 8).map(|_| next()).collect();
+            let q: Vec<i8> = (0..dim).map(|_| next() as i8).collect();
+            assert_eq!(
+                tq1_masked_dot_qi8(&code, &q, dim),
+                tq1_masked_dot_qi8_scalar(&code, &q, dim),
                 "dim {dim}"
             );
         }

@@ -64,7 +64,8 @@ pub use distance::{dot_int8_avx512, hamming_binary_avx512};
 pub mod adc;
 pub use adc::{
     quantise_centroids_i8, tq1_bitplane_score, tq1_bitplane_score_scalar, tq1_masked_sum,
-    tq1_masked_sum_scalar, tq2_adc_i8, tq2_adc_qi8, tq2_adc_qi8_scalar, tq4_adc_qi8, tq2_adc_i8_scalar, tq4_adc_i8, tq4_adc_i8_scalar,
+    tq1_masked_sum_scalar, tq1_masked_dot_qi8, tq1_masked_dot_qi8_scalar, tq2_adc_i8, tq2_adc_qi8, tq2_adc_qi8_scalar,
+    tq4_adc_qi8, tq2_adc_i8_scalar, tq4_adc_i8, tq4_adc_i8_scalar,
 };
 #[cfg(target_arch = "aarch64")]
 pub use adc::{tq1_bitplane_score_neon, tq1_masked_sum_neon, tq2_adc_i8_neon, tq4_adc_i8_neon};

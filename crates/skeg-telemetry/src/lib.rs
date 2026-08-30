@@ -307,10 +307,20 @@ pub enum Counter {
     /// Vsearches that carried a payload filter (the oversampled walk and the
     /// selectivity-scaled re-rank budget).
     VsearchFiltered = 27,
+    /// Filtered/hybrid searches (score_ids path), by count.
+    VsearchHybrid = 28,
+    /// Nanoseconds spent in the hybrid path (proxy scoring of the id set).
+    VsearchHybridScoreNanos = 29,
+    /// Nanoseconds the hybrid path spent in its f32 disk re-rank.
+    VsearchHybridRerankNanos = 30,
+    /// Disk rows the hybrid path re-ranked.
+    VsearchHybridReads = 31,
+    /// Ids the hybrid path proxy-scored (the |S| or shortlist actually paid).
+    VsearchHybridScored = 32,
 }
 
 impl Counter {
-    pub const COUNT: usize = 28;
+    pub const COUNT: usize = 33;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -340,6 +350,11 @@ impl Counter {
         Counter::VsearchDeltaNanos,
         Counter::RerankAdaptiveSkips,
         Counter::VsearchFiltered,
+        Counter::VsearchHybrid,
+        Counter::VsearchHybridScoreNanos,
+        Counter::VsearchHybridRerankNanos,
+        Counter::VsearchHybridReads,
+        Counter::VsearchHybridScored,
     ];
 
     #[inline]
@@ -373,6 +388,11 @@ impl Counter {
             Counter::VsearchDeltaNanos => "skeg_vsearch_delta_nanos_total",
             Counter::RerankAdaptiveSkips => "skeg_rerank_adaptive_skips_total",
             Counter::VsearchFiltered => "skeg_vsearch_filtered_total",
+            Counter::VsearchHybrid => "skeg_vsearch_hybrid_total",
+            Counter::VsearchHybridScoreNanos => "skeg_vsearch_hybrid_score_nanos_total",
+            Counter::VsearchHybridRerankNanos => "skeg_vsearch_hybrid_rerank_nanos_total",
+            Counter::VsearchHybridReads => "skeg_vsearch_hybrid_reads_total",
+            Counter::VsearchHybridScored => "skeg_vsearch_hybrid_scored_total",
         }
     }
 }
