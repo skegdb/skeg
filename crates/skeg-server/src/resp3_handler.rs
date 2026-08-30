@@ -1140,7 +1140,7 @@ async fn skeg_vindex_reshard(args: &[Bytes], shards: &ShardSet, tenant: TenantId
         Ok(s) => s,
         Err(e) => return e,
     };
-    match shards.reshard(&scoped, 0.25, 15).await {
+    match shards.reshard(&scoped, 0.25, 15, tenant_u128(tenant)).await {
         Ok(moved) => Frame::Integer(moved as i64),
         Err(e) => shard_error(&e),
     }
@@ -1163,7 +1163,7 @@ async fn skeg_vindex_overlap(args: &[Bytes], shards: &ShardSet, tenant: TenantId
         Ok(s) => s,
         Err(e) => return e,
     };
-    match shards.overlap(&scoped, tau).await {
+    match shards.overlap(&scoped, tau, tenant_u128(tenant)).await {
         Ok(n) => Frame::Integer(n as i64),
         Err(e) => shard_error(&e),
     }

@@ -4658,16 +4658,23 @@ impl DiskVamanaIndex {
     /// Fsync every file of `run-{seq}` and write its `run.ok` marker.
     fn mark_run_durable(&self, seq: u64) -> io::Result<()> {
         let d = self.dir.join(format!("run-{seq}"));
+        // Durability order (a crash between any two steps must not leave the
+        // marker durable while a data file is not): 1) fsync each data file's
+        // contents; 2) fsync the directory so those files' entries are durable;
+        // 3) only then write + fsync run.ok; 4) fsync the directory again so
+        // the marker's entry lands last. Reversing 2 and 3 (the old order)
+        // risked a marked-but-unreadable run whose rows the WAL had already
+        // compacted away - real data loss (review finding).
         for entry in std::fs::read_dir(&d)? {
             let path = entry?.path();
             if path.is_file() {
                 File::open(&path)?.sync_all()?;
             }
         }
+        File::open(&d)?.sync_all()?;
         let marker = d.join(RUN_OK_FILE);
         std::fs::write(&marker, b"ok")?;
         File::open(&marker)?.sync_all()?;
-        // The directory entry for run.ok itself.
         File::open(&d)?.sync_all()?;
         Ok(())
     }
@@ -4686,9 +4693,16 @@ impl DiskVamanaIndex {
         let path = self.dir.join(DELTA_LOG_FILE);
         let tmp = self.dir.join("delta.log.compact");
         write_framed_wal(&tmp, &ops)?;
-        File::open(&tmp)?.sync_all()?;
+        // Open the append handle on the TEMP inode, fsync, then rename: the
+        // handle follows the inode to its new name, so there is no window
+        // where delta_log points at a renamed-over, unlinked file that would
+        // swallow later WAL appends (review finding). The old handle is
+        // dropped only once the new one is in hand.
+        let new_log = std::fs::OpenOptions::new().append(true).open(&tmp)?;
+        new_log.sync_all()?;
         std::fs::rename(&tmp, &path)?;
-        self.delta_log = std::fs::OpenOptions::new().append(true).open(&path)?;
+        File::open(&self.dir)?.sync_all()?; // the rename's directory entry
+        self.delta_log = new_log;
         self.wal_format = DeltaWalFormat::FramedV2;
         Ok(())
     }

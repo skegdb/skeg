@@ -30,7 +30,12 @@ impl Router {
     /// Panics if `x.len() != self.dim`.
     #[must_use]
     pub fn assign(&self, x: &[f32]) -> usize {
-        assert_eq!(x.len(), self.dim, "vector dim mismatch");
+        // Callers validate the dim first (a mismatch is a clean client error,
+        // never a panic under panic=abort); a mismatched vector here degrades
+        // to shard 0 rather than aborting.
+        if x.len() != self.dim {
+            return 0;
+        }
         skeg_vector::nearest_centroid(x, &self.centroids, self.k, self.dim)
     }
 

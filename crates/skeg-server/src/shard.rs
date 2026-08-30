@@ -2850,6 +2850,9 @@ async fn process(
 
 // ── ShardSet ──────────────────────────────────────────────────────────────────
 
+/// id -> (primary shard, optional replica shard) for one routed vindex.
+type OwnerMap = ahash::AHashMap<u64, (u8, Option<u8>)>;
+
 struct ShardSetInner {
     senders: Vec<Sender<ShardMsg>>,
     handles: Vec<JoinHandle<()>>,
@@ -2870,7 +2873,13 @@ struct ShardSetInner {
     /// makes an id's shard computable; semantic placement does not, so the
     /// set keeps the map (8B+overhead per id, rebuilt at open from the
     /// shards' live id sets) and point ops stay O(1) instead of broadcast.
-    owners: parking_lot::RwLock<HashMap<String, ahash::AHashMap<u64, (u8, Option<u8>)>>>,
+    owners: parking_lot::RwLock<HashMap<String, OwnerMap>>,
+    /// Per-id serialisation for routed point ops (review finding): a routed
+    /// vset/vdel is read-await-write on `owners` with shard calls between, so
+    /// concurrent ops on the SAME id could interleave into an untracked
+    /// duplicate or a wrong-shard entry. Ops on one id take its stripe; ops on
+    /// different ids run free; hash-routed vindexes never take a stripe.
+    owner_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 impl Drop for ShardSetInner {
@@ -3080,6 +3089,7 @@ impl ShardSet {
                 root: base_dir.to_path_buf(),
                 routers: parking_lot::RwLock::new(load_routers(base_dir)),
                 owners: parking_lot::RwLock::new(HashMap::new()),
+                owner_locks: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
             }),
         })
     }
@@ -3682,18 +3692,37 @@ impl ShardSet {
         // delete-then-set keeps overwrite atomic per shard and the search
         // dedup covers the crash window either way).
         if let Some(router) = self.router(name) {
+            // Serialise the whole read-delete-set-record span against a
+            // concurrent routed vset/vdel on the SAME id (review finding).
+            let _stripe = self.owner_stripe(id).lock().await;
+            // A wrong-length vector reaches the router BEFORE any shard worker
+            // validates the dim; Router::assign would assert and, under
+            // panic=abort, kill the whole process for every tenant. Reject it
+            // as a clean error here (found by the security review, C1).
+            if vector.len() != router.dim {
+                return Err(ShardError::Storage(format!(
+                    "vector has {} dims, index has {}",
+                    vector.len(),
+                    router.dim
+                )));
+            }
             self.ensure_owner_map(name).await?;
             let owner = router.assign(&vector);
             let old = self.inner.owners.read().get(name).and_then(|m| m.get(&id).copied());
             if let Some((old_primary, old_replica)) = old {
                 for s in std::iter::once(old_primary).chain(old_replica) {
                     if usize::from(s) != owner {
-                        self.call(usize::from(s), ShardReq::Vdel {
+                        match self.call(usize::from(s), ShardReq::Vdel {
                             name: name.to_owned(),
                             id,
                             tenant,
                         })
-                        .await?;
+                        .await?
+                        {
+                            ShardResp::Existed(_) => {}
+                            ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                            _ => return Err(ShardError::Unavailable),
+                        }
                     }
                 }
             }
@@ -3889,6 +3918,7 @@ impl ShardSet {
         name: &str,
         lambda: f32,
         iters: usize,
+        tenant: u128,
     ) -> Result<u64, ShardError> {
         const BATCH: usize = 512;
         self.train_router(name, lambda, iters).await?;
@@ -3904,7 +3934,7 @@ impl ShardSet {
                     own: source as u8,
                     after,
                     limit: BATCH,
-                    tenant: 0,
+                    tenant,
                 };
                 let (batch, cursor) = match self.call(source, req).await? {
                     ShardResp::Moves(b, c) => (b, c),
@@ -3924,7 +3954,7 @@ impl ShardSet {
                             name: name.to_owned(),
                             id,
                             vector,
-                            tenant: 0,
+                            tenant,
                             limit: None,
                             payload,
                         };
@@ -3934,12 +3964,19 @@ impl ShardSet {
                             _ => return Err(ShardError::Unavailable),
                         }
                     }
-                    self.call(source, ShardReq::Vdel {
+                    // Swallowing this Vdel's response would count the row moved
+                    // while its stale source copy survives (review finding).
+                    match self.call(source, ShardReq::Vdel {
                         name: name.to_owned(),
                         id,
-                        tenant: 0,
+                        tenant,
                     })
-                    .await?;
+                    .await?
+                    {
+                        ShardResp::Existed(_) => {}
+                        ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                        _ => return Err(ShardError::Unavailable),
+                    }
                     self.inner
                         .owners
                         .write()
@@ -3972,7 +4009,12 @@ impl ShardSet {
     /// # Errors
     ///
     /// Index or router missing, a shard unavailable, or a batch failing.
-    pub async fn overlap(&self, name: &str, tau: f32) -> Result<u64, ShardError> {
+    pub async fn overlap(
+        &self,
+        name: &str,
+        tau: f32,
+        tenant: u128,
+    ) -> Result<u64, ShardError> {
         const BATCH: usize = 512;
         let Some(router) = self.router(name) else {
             return Err(ShardError::Storage(format!(
@@ -3990,7 +4032,7 @@ impl ShardSet {
                     after,
                     limit: BATCH,
                     tau,
-                    tenant: 0,
+                    tenant,
                 };
                 let (batch, cursor) = match self.call(source, req).await? {
                     ShardResp::Moves(b, c) => (b, c),
@@ -4014,7 +4056,7 @@ impl ShardSet {
                         name: name.to_owned(),
                         id,
                         vector,
-                        tenant: 0,
+                        tenant,
                         limit: None,
                         payload,
                     };
@@ -4048,16 +4090,14 @@ impl ShardSet {
     pub async fn rebuild_owner_maps(&self) -> Result<(), ShardError> {
         let names: Vec<String> = self.inner.routers.read().keys().cloned().collect();
         for name in names {
-            let mut map: ahash::AHashMap<u64, (u8, Option<u8>)> = ahash::AHashMap::new();
+            let mut map: OwnerMap = ahash::AHashMap::new();
             for shard in 0..self.inner.n {
                 match self.call(shard, ShardReq::LiveIds { name: name.clone() }).await? {
                     ShardResp::Ids(ids) => {
                         for id in ids {
-                            // Second sighting of an id = its replica.
-                            match map.entry(id) {
-                                std::collections::hash_map::Entry::Vacant(_) => {}
-                                _ => {}
-                            }
+                            // First sighting is the primary, a second the
+                            // replica (lowest shard id wins primary - see the
+                            // reshard/overlap note).
                             map.entry(id)
                                 .and_modify(|e| e.1 = Some(shard as u8))
                                 .or_insert((shard as u8, None));
@@ -4111,6 +4151,11 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
+    /// The stripe serialising routed point ops on `id`.
+    fn owner_stripe(&self, id: u64) -> &tokio::sync::Mutex<()> {
+        &self.inner.owner_locks[(id % 256) as usize]
+    }
+
     /// The shard a point op for `id` addresses: the owner map for a
     /// semantically-resharded vindex, hash otherwise (an id absent from the
     /// map is unknown; any shard answers None, hash picks one).
@@ -4137,6 +4182,13 @@ impl ShardSet {
 
     pub async fn vdel(&self, name: &str, id: u64, tenant: u128) -> Result<bool, ShardError> {
         self.ensure_owner_map(name).await?;
+        // Serialise against a concurrent routed vset on the same id (review
+        // finding); a hash-routed vindex has no router so the guard is skipped.
+        let _guard = if self.router(name).is_some() {
+            Some(self.owner_stripe(id).lock().await)
+        } else {
+            None
+        };
         let shard = self.point_shard(name, id);
         let req = ShardReq::Vdel {
             name: name.to_owned(),
@@ -4157,12 +4209,19 @@ impl ShardSet {
             .get(name)
             .and_then(|m| m.get(&id).and_then(|&(_, r)| r));
         if let Some(rep) = replica {
-            self.call(usize::from(rep), ShardReq::Vdel {
+            // A failed replica delete must not report success and drop the map
+            // entry: that would leave a resurrectable ghost (review finding).
+            match self.call(usize::from(rep), ShardReq::Vdel {
                 name: name.to_owned(),
                 id,
                 tenant,
             })
-            .await?;
+            .await?
+            {
+                ShardResp::Existed(_) => {}
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
         }
         if existed && let Some(m) = self.inner.owners.write().get_mut(name) {
             m.remove(&id);
@@ -6481,7 +6540,7 @@ mod tests {
         for id in 0..400u64 {
             shards.vset("rs", id, vec_for(id), 0, None, None).await.unwrap();
         }
-        let moved = shards.reshard("rs", 0.25, 10).await.expect("reshard");
+        let moved = shards.reshard("rs", 0.25, 10, 0).await.expect("reshard");
         assert!(moved > 0, "an interleaved layout must move rows");
 
         // Each shard now holds one cluster: per-shard counts are ~even and
@@ -6535,6 +6594,65 @@ mod tests {
         }
     }
 
+    /// Concurrent routed vset+vdel on the same id leave the map and the
+    /// shards consistent: exactly one logical copy or none, never an
+    /// untracked duplicate (the race the per-id stripe closes).
+    #[tokio::test]
+    async fn concurrent_routed_ops_on_one_id_stay_consistent() {
+        let dir = TempDir::new().unwrap();
+        let shards = std::sync::Arc::new(
+            ShardSet::open_mode_with_workers(
+                dir.path(),
+                4,
+                false,
+                skeg_vector::QuantKind::TurboQuant { bits: 2 },
+                1,
+            )
+            .unwrap(),
+        );
+        shards.vindex_create("rc", 8, 4, 1).await.unwrap();
+        for id in 0..400u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 4) as usize] = 1.0;
+            shards.vset("rc", id, v, 0, None, None).await.unwrap();
+        }
+        shards.reshard("rc", 0.25, 10, 0).await.unwrap();
+
+        // Hammer id 7 with interleaved overwrite (to a different cluster) and
+        // delete from many tasks; the stripe must serialise them.
+        let mut set = tokio::task::JoinSet::new();
+        for t in 0..40u64 {
+            let s = shards.clone();
+            set.spawn(async move {
+                if t % 2 == 0 {
+                    let mut v = vec![0.05f32; 8];
+                    v[(t % 4) as usize] = 1.0;
+                    let _ = s.vset("rc", 7, v, 0, None, None).await;
+                } else {
+                    let _ = s.vdel("rc", 7, 0).await;
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+
+        // Whatever the final state, id 7 has at most one live copy across all
+        // shards, and the map agrees with the shards.
+        let mut live = Vec::new();
+        for shard in 0..4usize {
+            if let ShardResp::Vector(Some(_)) = shards
+                .call(shard, ShardReq::Vget { name: "rc".into(), id: 7 })
+                .await
+                .unwrap()
+            {
+                live.push(shard);
+            }
+        }
+        assert!(live.len() <= 1, "id 7 has {} live copies: {live:?}", live.len());
+        // vget (map-routed) agrees with the shards.
+        let via_map = shards.vget("rc", 7).await.unwrap().is_some();
+        assert_eq!(via_map, !live.is_empty(), "map disagrees with shards on id 7");
+    }
+
     /// Targeted overlap: boundary rows (small margin between their two
     /// nearest centroids) get a replica on the second shard; probe-2 search
     /// then finds them from either side, deletes remove both copies, and an
@@ -6569,7 +6687,7 @@ mod tests {
         for id in 300..340u64 {
             shards.vset("ov", id, boundary(id), 0, None, None).await.unwrap();
         }
-        shards.reshard("ov", 0.25, 10).await.unwrap();
+        shards.reshard("ov", 0.25, 10, 0).await.unwrap();
         // Tau comes from the trained router's own geometry: between the
         // boundary rows' margin and the cluster cores' margin, so the test
         // asserts SELECTIVITY instead of guessing a constant.
@@ -6593,9 +6711,9 @@ mod tests {
             "boundary rows must sit nearer the frontier ({m_boundary} vs {m_core})"
         );
         let tau = (m_boundary + m_core) / 2.0;
-        let replicated = shards.overlap("ov", tau).await.expect("overlap");
+        let replicated = shards.overlap("ov", tau, 0).await.expect("overlap");
         assert!(
-            replicated >= 30 && replicated < 200,
+            (30..200).contains(&replicated),
             "overlap at tau {tau} must catch the ~40 boundary rows, not the cores              (replicated {replicated})"
         );
 
@@ -6654,7 +6772,7 @@ mod tests {
         for id in 0..800u64 {
             shards.vset("pr", id, vec_for(id), 0, None, None).await.unwrap();
         }
-        shards.reshard("pr", 0.25, 10).await.unwrap();
+        shards.reshard("pr", 0.25, 10, 0).await.unwrap();
         for probe_q in 0..4u64 {
             let q = vec_for(probe_q);
             let full = shards
