@@ -1,7 +1,7 @@
 //! Flat-scan throughput baseline on synthetic data.
 //!
 //! Custom main (`harness = false`): prints CSV rows to stdout, one per
-//! (tier, dim, N, threading) cell. Comparison target: turbovec's
+//! (tier, dim, N, threading) cell. Comparison target: the reference implementation's
 //! verified numbers in benchmarks/results/speed_d{1536,3072}_4bit_arm_*.json
 //! (1.99 ms/q st, 0.185 ms/q mt on M3 Max at d=1536 N=100k 4-bit).
 //!

@@ -875,7 +875,7 @@ fn adc_qi8_scalar<const BITS: usize>(
 }
 
 /// `sdot` kernel for [`tq2_adc_qi8`]: TBL-decode 16 code indices to i8
-/// levels, one `sdot` against 16 query bytes - the turbovec permute-dot
+/// levels, one `sdot` against 16 query bytes - the reference permute-dot
 /// shape, single-vector form. Four independent accumulators hide the
 /// 3-cycle `sdot` latency. `vdotq_s32` is still unstable in `std::arch`,
 /// so the instruction is emitted with inline asm.

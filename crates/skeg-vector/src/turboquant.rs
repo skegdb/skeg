@@ -13,7 +13,7 @@
 //!   - Rotate query once: q' = Q * q
 //!   - Estimated <v, q> ~= scale * sum_i q'[i] * centroid[code[i]]
 //!
-//! Approximations vs the turbovec reference:
+//! Approximations vs the public reference implementation:
 //!   - Lloyd-Max levels: Gaussian N(0,1) (Joel Max 1960) scaled 1/sqrt(d-1).
 //!     For d >= 200 the Beta((d-1)/2, (d-1)/2) is very close to a Gaussian and
 //!     the relative MSE penalty is ~0.5%. Acceptable for the gate.
@@ -23,7 +23,7 @@
 //!
 //! References:
 //!   - Zandieh, Daliri, Hadian, Mirrokni (2025). TurboQuant. arXiv:2504.19874.
-//!   - Codrai (2025). turbovec. github.com/RyanCodrai/turbovec (oracle for
+//!   - the public TurboQuant reference implementation (oracle for
 //!     pipeline shape, scale-correction formula).
 //!   - Max (1960). Quantizing for Minimum Distortion. IRE Trans. Information
 //!     Theory (source of the Gaussian Lloyd-Max levels).
@@ -304,7 +304,7 @@ impl TurboQuant4 {
 /// the largest power of 2 dividing `d`) versus `O(d^2)` of the explicit
 /// Gram-Schmidt matrix. Three rounds of `D_k . FWHT_b` are composed; this
 /// is the standard fast-Johnson-Lindenstrauss construction (Lance and
-/// turbovec ship the same shape) and converges to a near-uniform
+/// the reference implementation ships the same shape) and converges to a near-uniform
 /// orthogonal transform in three rounds for the dimensions we care about
 /// (256-1024).
 ///

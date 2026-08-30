@@ -21,13 +21,13 @@
 //!   are the same for the high-nibble coord at `2*g+1`. This pre-
 //!   compute is done once per query.
 //!
-//! Why the f32 LUT instead of u8 like turbovec: the scalar reference
+//! Why the f32 LUT instead of u8 like the reference implementation: the scalar reference
 //! only needs to be a clear oracle. The NEON path will swap in a
 //! u8 LUT with periodic widen flush; that is a separate landing.
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
-/// Vectors scored in parallel per block. Matches turbovec's BLOCK
+/// Vectors scored in parallel per block. Matches the reference implementation's BLOCK
 /// constant and keeps the NEON layout aligned with 16-lane u8x16
 /// loads (two halves per block).
 pub const BLOCK: usize = 32;
@@ -257,7 +257,7 @@ pub fn tq4_block32_score_scalar(
 ///
 /// Scores 32 vectors in parallel per byte-group via two
 /// `vqtbl1q_u8` lookups (low + high nibble) per half-block, mirroring
-/// the structure of turbovec's `score_4bit_block_neon`. Accumulates
+/// the structure of the reference implementation's `score_4bit_block_neon`. Accumulates
 /// into u16 with a flush to f32 every `FLUSH_EVERY` byte-groups so
 /// the u16 lanes never overflow. Final reconstruction applies the
 /// `inv_scale` / `bias_per_group` returned by
