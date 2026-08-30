@@ -9,6 +9,17 @@ repository.
 
 ## [Unreleased]
 
+### Hardening
+
+kill -9 at the four worst moments - mid-bulk-write, mid-consolidate,
+mid-reshard, mid-overlap - all four reopen with zero acked ids lost, the
+reshard resumes to completion, and a post-crash delete leaves no replica
+ghost (bench/hardening.py in the demo repo). C4 (probe) is parked with
+its numbers: 0,9445 at probe 3 against a 0,955 bar - the dense local
+graphs' recall stacks onto routing coverage, so cell health (the graph
+doctor and usage-driven stitching) is the dependency that reopens it.
+Targeted overlap ships with tau from the measured margin distribution.
+
 ### Semantic shards (C1-C3)
 
 The owner's "galaxies" become engine machinery. `balanced_kmeans`
