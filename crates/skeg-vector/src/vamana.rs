@@ -1779,6 +1779,252 @@ struct Segment {
     row_cache: Option<std::sync::Mutex<RowSlotCache>>,
 }
 
+/// Marker written (and fsynced) inside a run directory once every file of
+/// the run is durable and the run is installed: only marked runs reopen.
+const RUN_OK_FILE: &str = "run.ok";
+
+/// Open one segment directory (the base, or a `run-N`): parse and validate
+/// `graph.vmn`, open `vectors.bin`, build or reload the quantised tier.
+/// Returns the segment plus the `(dim, l_search)` its header declares.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+fn open_segment(
+    dir: &Path,
+    tier: QuantKind,
+    mmap_tier: bool,
+    mmap_graph: bool,
+) -> io::Result<(Segment, usize, usize)> {
+        // graph.vmn
+    let graph_bytes = std::fs::read(dir.join(GRAPH_FILE))?;
+    if graph_bytes.len() < HEADER_LEN
+        || read_u32(&graph_bytes, 0) != GRAPH_MAGIC
+        || read_u32(&graph_bytes, 4) != FORMAT_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad graph.vmn header",
+        ));
+    }
+    let n = read_u32(&graph_bytes, 8);
+    let dim = read_u32(&graph_bytes, 12) as usize;
+    let medoid = read_u32(&graph_bytes, 16);
+    let l_search = read_u32(&graph_bytes, 24) as usize;
+
+    // Every field below is read straight off disk. Validate up front so a
+    // truncated or crafted file becomes a clean `InvalidData`, not an
+    // out-of-bounds slice/index panic that (panic=abort) kills the process
+    // on open or on the first search. The mmap path already checks its
+    // length; the owned path did not.
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "corrupt graph.vmn");
+    let node_len = std::mem::size_of::<Node>();
+    let need = (n as usize)
+        .checked_mul(8)
+        .and_then(|ids| {
+            (n as usize)
+                .checked_mul(node_len)
+                .and_then(|nd| ids.checked_add(nd))
+        })
+        .and_then(|body| body.checked_add(HEADER_LEN))
+        .ok_or_else(bad)?;
+    if graph_bytes.len() < need {
+        return Err(bad());
+    }
+    if n != 0 && medoid >= n {
+        return Err(bad());
+    }
+
+    let mut pos = HEADER_LEN;
+    let mut ids = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        ids.push(u64::from_le_bytes(
+            graph_bytes[pos..pos + 8]
+                .try_into()
+                .expect("8-byte window by construction"),
+        ));
+        pos += 8;
+    }
+    debug_assert_eq!(
+        node_len,
+        4 + MAX_R * 4,
+        "Node layout drifted from file format"
+    );
+    let nodes_offset = pos;
+    let nodes = if mmap_graph {
+        // Whole-file mmap, cast the Node region as `&[Node]` on access.
+        // Skip the per-Node parsing - the file IS the in-memory layout
+        // (Node is `#[repr(C)] + Pod`, little-endian u32 fields).
+        let file = skeg_platform::MappedFile::open(&dir.join(GRAPH_FILE))?;
+        // Sanity-check the mapped region covers all `n` nodes.
+        let need = nodes_offset + (n as usize) * node_len;
+        if file.len() < need {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "graph.vmn truncated: nodes region beyond file length",
+            ));
+        }
+        // Greedy walk follows arbitrary out-edges - access is random
+        // across the Node array. `MADV_RANDOM` tells the kernel to
+        // skip read-ahead for pages we won't touch. The call is a
+        // hint, so a failure (sandbox, unusual fs) is only logged.
+        if let Err(e) = file.advise_random() {
+            tracing::debug!("graph mmap MADV_RANDOM failed: {e}");
+        }
+        NodeBacking::Mapped {
+            file,
+            offset: nodes_offset,
+            count: n as usize,
+        }
+    } else {
+        let mut v = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let degree = read_u32(&graph_bytes, pos);
+            // `degree` indexes `neighbors[..degree]` (a `[u32; MAX_R]`) on
+            // every walk; a disk value > MAX_R is an out-of-range slice.
+            if degree as usize > MAX_R {
+                return Err(bad());
+            }
+            let mut neighbors = [0u32; MAX_R];
+            for (k, slot) in neighbors.iter_mut().enumerate() {
+                *slot = read_u32(&graph_bytes, pos + 4 + k * 4);
+            }
+            // Neighbor ids index `nodes[id]` / `ids[id]` during a walk.
+            if neighbors[..degree as usize].iter().any(|&nb| nb >= n) {
+                return Err(bad());
+            }
+            v.push(Node { degree, neighbors });
+            pos += node_len;
+        }
+        NodeBacking::Owned(v)
+    };
+    // `pos` is consumed by the in-RAM path; the mmap path skips ahead.
+    let _ = pos;
+
+    // vectors.bin: verify header, stream f32 to build the int8 tier.
+    let vectors_file = File::open(dir.join(VECTORS_FILE))?;
+    let mut vhdr = [0u8; HEADER_LEN];
+    vectors_file.read_exact_at(&mut vhdr, 0)?;
+    if read_u32(&vhdr, 0) != VEC_MAGIC || read_u32(&vhdr, 4) != FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad vectors.bin header",
+        ));
+    }
+    if read_u32(&vhdr, 8) != n || read_u32(&vhdr, 12) as usize != dim {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "graph.vmn and vectors.bin disagree on n/dim",
+        ));
+    }
+
+    // Build the int8 tier from unit-normalised vectors (so its dot-product
+    // proxy tracks the cosine ordering the graph was built with). The file
+    // is read in fixed chunks and quantised on the fly: peak open-path RAM
+    // is one chunk plus the int8 tier, never a transient the size of the
+    // f32 set (at 1M x 1024 that balloon was ~8 GiB and inflated serve RSS
+    // long after the buffers were freed).
+    let n_usize = n as usize;
+    let read_rows = |emit: &mut dyn FnMut(&[f32])| -> io::Result<()> {
+        let mut buf = vec![0u8; TIER_CHUNK_ROWS.min(n_usize.max(1)) * dim * 4];
+        let mut row = vec![0f32; dim];
+        let mut done = 0usize;
+        while done < n_usize {
+            let rows = TIER_CHUNK_ROWS.min(n_usize - done);
+            let span = &mut buf[..rows * dim * 4];
+            vectors_file.read_exact_at(span, HEADER_LEN as u64 + (done * dim * 4) as u64)?;
+            for chunk in span.chunks_exact(dim * 4) {
+                for (slot, c) in row.iter_mut().zip(chunk.chunks_exact(4)) {
+                    *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+                emit(&normalized(&row));
+            }
+            done += rows;
+        }
+        Ok(())
+    };
+    // Fast path: a valid cached tier skips streaming and re-quantising the
+    // whole of vectors.bin. The fingerprint ties the file to THIS index
+    // (n, dim, tier, and the source's length + mtime), because size alone
+    // would accept a cache built from different vectors of the same shape.
+    let cache_path = dir.join(TIER_CACHE_FILE);
+    let src_meta = std::fs::metadata(dir.join(VECTORS_FILE)).ok();
+    let fingerprint = |meta: Option<&std::fs::Metadata>| -> (u64, u64) {
+        match meta {
+            Some(m) => (
+                m.len(),
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos() as u64),
+            ),
+            None => (0, 0),
+        }
+    };
+    let (src_len, src_mtime) = fingerprint(src_meta.as_ref());
+    let tier_tag = tier.to_wire().unwrap_or(0);
+    let cached = if let QuantKind::TurboQuant { bits } = tier {
+        read_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime)
+            .and_then(|body| QuantizedVectors::from_tier_payload(&body, dim, bits, n_usize))
+    } else {
+        None
+    };
+
+    let mut quant = match cached {
+        Some(q) => q,
+        None => match tier {
+            QuantKind::Int8 => QuantizedVectors::build_int8_streaming(n_usize, dim, read_rows)?,
+            QuantKind::Pq { m, k } => {
+                QuantizedVectors::build_pq_streaming(n_usize, dim, m, k, read_rows)?
+            }
+            QuantKind::TurboQuant { bits } => {
+                QuantizedVectors::build_turboquant_streaming(n_usize, dim, bits, read_rows)?
+            }
+            QuantKind::F32 | QuantKind::Binary => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "disk tier supports Int8, Pq, or TurboQuant only",
+                ));
+            }
+        },
+    };
+    // Persist for the next open. Best-effort: a read-only directory or a
+    // full disk must not stop the index from opening, it only means the
+    // next open pays the rebuild again.
+    if matches!(tier, QuantKind::TurboQuant { .. })
+        && !cache_path.exists()
+        && let Some(body) = quant.tier_payload()
+    {
+        let _ = write_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime, &body);
+    }
+    // TurboQuant tier only, opt-in. Persist the codes buffer to
+    // `tier.cache.bin` and swap
+    // the in-RAM `Vec<u8>` for a `MappedFile`; the OS page cache then
+    // decides which pages stay resident. Other tiers (int8, pq) keep
+    // their `Vec<u8>` representation - the experiment runs on
+    // TurboQuant only.
+    if mmap_tier && matches!(tier, QuantKind::TurboQuant { .. }) {
+        quant.swap_turboquant_codes_to_mmap(&dir.join("tier.cache.bin"))?;
+    }
+
+    let id_to_main_row: AHashMap<u64, VecId> = ids
+        .iter()
+        .enumerate()
+        .map(|(row, &id)| (id, row as VecId))
+        .collect();
+    Ok((
+        Segment {
+            main_n: n,
+            nodes,
+            ids,
+            id_to_main_row,
+            medoid,
+            quant,
+            vectors_file,
+            row_cache: new_row_cache(dim),
+        },
+        dim,
+        l_search,
+    ))
+}
+
 /// One-probe direct-mapped row cache: slot = row % capacity, eviction is
 /// overwrite. No recency bookkeeping on purpose - the hit pattern this
 /// exists for is hub rows recurring across queries, which a direct map
@@ -2608,222 +2854,53 @@ impl DiskVamanaIndex {
         mmap_tier: bool,
         mmap_graph: bool,
     ) -> io::Result<DiskVamanaIndex> {
-        // graph.vmn
-        let graph_bytes = std::fs::read(dir.join(GRAPH_FILE))?;
-        if graph_bytes.len() < HEADER_LEN
-            || read_u32(&graph_bytes, 0) != GRAPH_MAGIC
-            || read_u32(&graph_bytes, 4) != FORMAT_VERSION
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad graph.vmn header",
-            ));
-        }
-        let n = read_u32(&graph_bytes, 8);
-        let dim = read_u32(&graph_bytes, 12) as usize;
-        let medoid = read_u32(&graph_bytes, 16);
-        let l_search = read_u32(&graph_bytes, 24) as usize;
+        let (base, dim, l_search) = open_segment(dir, tier, mmap_tier, mmap_graph)?;
 
-        // Every field below is read straight off disk. Validate up front so a
-        // truncated or crafted file becomes a clean `InvalidData`, not an
-        // out-of-bounds slice/index panic that (panic=abort) kills the process
-        // on open or on the first search. The mmap path already checks its
-        // length; the owned path did not.
-        let bad = || io::Error::new(io::ErrorKind::InvalidData, "corrupt graph.vmn");
-        let node_len = std::mem::size_of::<Node>();
-        let need = (n as usize)
-            .checked_mul(8)
-            .and_then(|ids| {
-                (n as usize)
-                    .checked_mul(node_len)
-                    .and_then(|nd| ids.checked_add(nd))
-            })
-            .and_then(|body| body.checked_add(HEADER_LEN))
-            .ok_or_else(bad)?;
-        if graph_bytes.len() < need {
-            return Err(bad());
-        }
-        if n != 0 && medoid >= n {
-            return Err(bad());
-        }
 
-        let mut pos = HEADER_LEN;
-        let mut ids = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            ids.push(u64::from_le_bytes(
-                graph_bytes[pos..pos + 8]
-                    .try_into()
-                    .expect("8-byte window by construction"),
-            ));
-            pos += 8;
+        // Reopen the durable runs. A run directory with a `run.ok` marker was
+        // fully written and fsynced before the WAL was compacted past it: it
+        // reopens as a run. One without the marker predates its own
+        // `flush_finish` (or predates markers entirely) - the WAL still
+        // covers its rows, so it is deleted and its contents come back
+        // through the replay below. This replaces the old behaviour of
+        // deleting EVERY run and replaying everything-since-the-last-fold
+        // into the delta: measured on the demo, a restart put 218k rows
+        // (900 MB) back into RAM as a flat-scanned delta.
+        let mut run_seqs: Vec<u64> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(seq) = name.strip_prefix("run-").and_then(|s| s.parse::<u64>().ok()) {
+                    if entry.path().join(RUN_OK_FILE).exists() {
+                        run_seqs.push(seq);
+                    } else {
+                        let _ = std::fs::remove_dir_all(entry.path()); // WAL-covered
+                    }
+                }
+            }
         }
-        debug_assert_eq!(
-            node_len,
-            4 + MAX_R * 4,
-            "Node layout drifted from file format"
-        );
-        let nodes_offset = pos;
-        let nodes = if mmap_graph {
-            // Whole-file mmap, cast the Node region as `&[Node]` on access.
-            // Skip the per-Node parsing - the file IS the in-memory layout
-            // (Node is `#[repr(C)] + Pod`, little-endian u32 fields).
-            let file = skeg_platform::MappedFile::open(&dir.join(GRAPH_FILE))?;
-            // Sanity-check the mapped region covers all `n` nodes.
-            let need = nodes_offset + (n as usize) * node_len;
-            if file.len() < need {
+        run_seqs.sort_unstable();
+        let mut runs: Vec<Segment> = Vec::with_capacity(run_seqs.len());
+        for &seq in &run_seqs {
+            let (seg, rdim, _) =
+                open_segment(&dir.join(format!("run-{seq}")), tier, false, false)?;
+            if rdim != dim {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "graph.vmn truncated: nodes region beyond file length",
+                    format!("run-{seq} dim {rdim} != base dim {dim}"),
                 ));
             }
-            // Greedy walk follows arbitrary out-edges - access is random
-            // across the Node array. `MADV_RANDOM` tells the kernel to
-            // skip read-ahead for pages we won't touch. The call is a
-            // hint, so a failure (sandbox, unusual fs) is only logged.
-            if let Err(e) = file.advise_random() {
-                tracing::debug!("graph mmap MADV_RANDOM failed: {e}");
-            }
-            NodeBacking::Mapped {
-                file,
-                offset: nodes_offset,
-                count: n as usize,
-            }
-        } else {
-            let mut v = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                let degree = read_u32(&graph_bytes, pos);
-                // `degree` indexes `neighbors[..degree]` (a `[u32; MAX_R]`) on
-                // every walk; a disk value > MAX_R is an out-of-range slice.
-                if degree as usize > MAX_R {
-                    return Err(bad());
-                }
-                let mut neighbors = [0u32; MAX_R];
-                for (k, slot) in neighbors.iter_mut().enumerate() {
-                    *slot = read_u32(&graph_bytes, pos + 4 + k * 4);
-                }
-                // Neighbor ids index `nodes[id]` / `ids[id]` during a walk.
-                if neighbors[..degree as usize].iter().any(|&nb| nb >= n) {
-                    return Err(bad());
-                }
-                v.push(Node { degree, neighbors });
-                pos += node_len;
-            }
-            NodeBacking::Owned(v)
-        };
-        // `pos` is consumed by the in-RAM path; the mmap path skips ahead.
-        let _ = pos;
-
-        // vectors.bin: verify header, stream f32 to build the int8 tier.
-        let vectors_file = File::open(dir.join(VECTORS_FILE))?;
-        let mut vhdr = [0u8; HEADER_LEN];
-        vectors_file.read_exact_at(&mut vhdr, 0)?;
-        if read_u32(&vhdr, 0) != VEC_MAGIC || read_u32(&vhdr, 4) != FORMAT_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad vectors.bin header",
-            ));
+            runs.push(seg);
         }
-        if read_u32(&vhdr, 8) != n || read_u32(&vhdr, 12) as usize != dim {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph.vmn and vectors.bin disagree on n/dim",
-            ));
+        let run_seq_next = run_seqs.last().map_or(0, |&s| s + 1);
+        // Live ids = the union across base and runs (a run row can shadow a
+        // base row; it is still one live id).
+        let mut live_ids: AHashSet<u64> = base.id_to_main_row.keys().copied().collect();
+        for run in &runs {
+            live_ids.extend(run.id_to_main_row.keys().copied());
         }
-
-        // Build the int8 tier from unit-normalised vectors (so its dot-product
-        // proxy tracks the cosine ordering the graph was built with). The file
-        // is read in fixed chunks and quantised on the fly: peak open-path RAM
-        // is one chunk plus the int8 tier, never a transient the size of the
-        // f32 set (at 1M x 1024 that balloon was ~8 GiB and inflated serve RSS
-        // long after the buffers were freed).
-        let n_usize = n as usize;
-        let read_rows = |emit: &mut dyn FnMut(&[f32])| -> io::Result<()> {
-            let mut buf = vec![0u8; TIER_CHUNK_ROWS.min(n_usize.max(1)) * dim * 4];
-            let mut row = vec![0f32; dim];
-            let mut done = 0usize;
-            while done < n_usize {
-                let rows = TIER_CHUNK_ROWS.min(n_usize - done);
-                let span = &mut buf[..rows * dim * 4];
-                vectors_file.read_exact_at(span, HEADER_LEN as u64 + (done * dim * 4) as u64)?;
-                for chunk in span.chunks_exact(dim * 4) {
-                    for (slot, c) in row.iter_mut().zip(chunk.chunks_exact(4)) {
-                        *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                    }
-                    emit(&normalized(&row));
-                }
-                done += rows;
-            }
-            Ok(())
-        };
-        // Fast path: a valid cached tier skips streaming and re-quantising the
-        // whole of vectors.bin. The fingerprint ties the file to THIS index
-        // (n, dim, tier, and the source's length + mtime), because size alone
-        // would accept a cache built from different vectors of the same shape.
-        let cache_path = dir.join(TIER_CACHE_FILE);
-        let src_meta = std::fs::metadata(dir.join(VECTORS_FILE)).ok();
-        let fingerprint = |meta: Option<&std::fs::Metadata>| -> (u64, u64) {
-            match meta {
-                Some(m) => (
-                    m.len(),
-                    m.modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_nanos() as u64),
-                ),
-                None => (0, 0),
-            }
-        };
-        let (src_len, src_mtime) = fingerprint(src_meta.as_ref());
-        let tier_tag = tier.to_wire().unwrap_or(0);
-        let cached = if let QuantKind::TurboQuant { bits } = tier {
-            read_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime)
-                .and_then(|body| QuantizedVectors::from_tier_payload(&body, dim, bits, n_usize))
-        } else {
-            None
-        };
-
-        let mut quant = match cached {
-            Some(q) => q,
-            None => match tier {
-                QuantKind::Int8 => QuantizedVectors::build_int8_streaming(n_usize, dim, read_rows)?,
-                QuantKind::Pq { m, k } => {
-                    QuantizedVectors::build_pq_streaming(n_usize, dim, m, k, read_rows)?
-                }
-                QuantKind::TurboQuant { bits } => {
-                    QuantizedVectors::build_turboquant_streaming(n_usize, dim, bits, read_rows)?
-                }
-                QuantKind::F32 | QuantKind::Binary => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "disk tier supports Int8, Pq, or TurboQuant only",
-                    ));
-                }
-            },
-        };
-        // Persist for the next open. Best-effort: a read-only directory or a
-        // full disk must not stop the index from opening, it only means the
-        // next open pays the rebuild again.
-        if matches!(tier, QuantKind::TurboQuant { .. })
-            && !cache_path.exists()
-            && let Some(body) = quant.tier_payload()
-        {
-            let _ = write_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime, &body);
-        }
-        // TurboQuant tier only, opt-in. Persist the codes buffer to
-        // `tier.cache.bin` and swap
-        // the in-RAM `Vec<u8>` for a `MappedFile`; the OS page cache then
-        // decides which pages stay resident. Other tiers (int8, pq) keep
-        // their `Vec<u8>` representation - the experiment runs on
-        // TurboQuant only.
-        if mmap_tier && matches!(tier, QuantKind::TurboQuant { .. }) {
-            quant.swap_turboquant_codes_to_mmap(&dir.join("tier.cache.bin"))?;
-        }
-
-        let id_to_main_row: AHashMap<u64, VecId> = ids
-            .iter()
-            .enumerate()
-            .map(|(row, &id)| (id, row as VecId))
-            .collect();
+        let live_count = live_ids.len();
+        drop(live_ids);
 
         // Replay the delta WAL: streaming inserts/deletes since the last
         // consolidation that have not yet been folded into the graph.
@@ -2838,26 +2915,17 @@ impl DiskVamanaIndex {
         let mut index = DiskVamanaIndex {
             dim,
             l_search,
-            base: Segment {
-                main_n: n,
-                nodes,
-                ids,
-                id_to_main_row,
-                medoid,
-                quant,
-                vectors_file,
-                row_cache: new_row_cache(dim),
-            },
-            runs: Vec::new(),
-            run_dirs: Vec::new(),
+            base,
+            runs,
+            run_dirs: run_seqs,
             tier,
-            run_seq: 0,
+            run_seq: run_seq_next,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             flushing: AHashMap::new(),
             auto_flush: true,
             tombstones: AHashSet::new(),
-            live_count: n as usize,
+            live_count,
             delta_log,
             wal_format,
             tq1: Box::default(),
@@ -2865,27 +2933,9 @@ impl DiskVamanaIndex {
             attr: None,
         };
         index.replay_wal_ops(wal_ops);
-        // Runs flushed before a restart are not reloaded; the WAL replay above
-        // already put their vectors back in L0, so the stale dirs are redundant
-        // (and would collide with `run-0` of this session). See the flush ADR.
-        index.clean_stale_runs();
         index.load_attr();
         index.load_ivf(); // rebuilds the zone-map if attr is present
         Ok(index)
-    }
-
-    /// Best-effort removal of leftover `run-*` directories from a prior session.
-    /// They are rebuildable from the WAL, so a failure to remove one is not
-    /// fatal to opening the index.
-    fn clean_stale_runs(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("run-") {
-                let _ = std::fs::remove_dir_all(entry.path()); // stale, rebuildable
-            }
-        }
     }
 
     /// Apply decoded WAL operations to the in-memory delta state.
@@ -4237,6 +4287,9 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if opening the merged run or deleting a dir fails.
     pub fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> io::Result<()> {
+        // The merged run replaces marked runs; it must be marked itself or a
+        // reopen would drop it AND find no WAL rows to rebuild it from.
+        self.mark_run_durable(built.merged_seq)?;
         // The merged run was already opened off-thread in build; splice it in.
         let keep_runs = self.runs.split_off(built.n_merged);
         let keep_dirs = self.run_dirs.split_off(built.n_merged);
@@ -4293,9 +4346,57 @@ impl DiskVamanaIndex {
     ///
     /// Infallible today; `io::Result` for symmetry.
     pub fn flush_finish(&mut self, built: FlushBuilt) -> io::Result<()> {
+        // Durability order matters. 1) fsync the run's files; 2) write and
+        // fsync `run.ok` - from here a reopen loads this run instead of
+        // replaying its rows; 3) install; 4) compact the WAL down to the
+        // current delta plus the live tombstones. A crash between 2 and 4
+        // leaves the run marked AND its rows still in the WAL: the replayed
+        // delta copies shadow the identical run copies, which costs RAM until
+        // the next flush and nothing else.
+        let seq = built.seq;
+        self.mark_run_durable(seq)?;
         self.runs.push(built.run);
-        self.run_dirs.push(built.seq);
+        self.run_dirs.push(seq);
         self.flushing.clear();
+        self.compact_wal()?;
+        Ok(())
+    }
+
+    /// Fsync every file of `run-{seq}` and write its `run.ok` marker.
+    fn mark_run_durable(&self, seq: u64) -> io::Result<()> {
+        let d = self.dir.join(format!("run-{seq}"));
+        for entry in std::fs::read_dir(&d)? {
+            let path = entry?.path();
+            if path.is_file() {
+                File::open(&path)?.sync_all()?;
+            }
+        }
+        let marker = d.join(RUN_OK_FILE);
+        std::fs::write(&marker, b"ok")?;
+        File::open(&marker)?.sync_all()?;
+        // The directory entry for run.ok itself.
+        File::open(&d)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Rewrite the WAL to exactly the recoverable in-RAM state: one delete per
+    /// live tombstone, one insert per delta row. Written to a temp file and
+    /// renamed, then the append handle is reopened on the new inode.
+    fn compact_wal(&mut self) -> io::Result<()> {
+        let mut ops: Vec<DeltaWalOp> = Vec::with_capacity(self.tombstones.len() + self.delta.len());
+        for &id in &self.tombstones {
+            ops.push(DeltaWalOp::Delete { id });
+        }
+        for (&id, v) in &self.delta {
+            ops.push(DeltaWalOp::Insert { id, vector: v.clone() });
+        }
+        let path = self.dir.join(DELTA_LOG_FILE);
+        let tmp = self.dir.join("delta.log.compact");
+        write_framed_wal(&tmp, &ops)?;
+        File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        self.delta_log = std::fs::OpenOptions::new().append(true).open(&path)?;
+        self.wal_format = DeltaWalFormat::FramedV2;
         Ok(())
     }
 
@@ -6198,6 +6299,64 @@ mod tests {
             x,
             "searchable after finish"
         );
+    }
+
+    /// A reopen must keep the flushed runs as runs, not replay them into the
+    /// delta.
+    ///
+    /// `clean_stale_runs` used to delete every run directory at open and
+    /// recover the whole WAL into RAM: correct, and O(everything-since-last-
+    /// fold). The demo restarted with 218k rows in the delta - 900 MB of RAM
+    /// and a flat scan on every search - because a growth's worth of runs
+    /// was thrown away and re-read. Runs are durable graphs on disk; a
+    /// reopen re-opens them and replays only the WAL suffix (the current
+    /// delta).
+    #[test]
+    fn reopen_keeps_flushed_runs_out_of_the_delta() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        let base = random_vectors(400, dim, 21);
+        for (i, v) in base.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        // Two flushed runs plus a small live delta.
+        for batch in 0..2u64 {
+            let more = random_vectors(200, dim, 22 + batch);
+            for (i, v) in more.chunks_exact(dim).enumerate() {
+                idx.insert(1000 + batch * 1000 + i as u64, v).unwrap();
+            }
+            let job = idx.flush_begin().unwrap().expect("delta to flush");
+            let built = job.build(tmp.path()).unwrap();
+            idx.flush_finish(built).unwrap();
+        }
+        let tail = random_vectors(50, dim, 30);
+        for (i, v) in tail.chunks_exact(dim).enumerate() {
+            idx.insert(5000 + i as u64, v).unwrap();
+        }
+        let live = idx.len();
+        assert_eq!(idx.run_count(), 2);
+        drop(idx);
+
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert_eq!(re.len(), live, "live set survives the reopen");
+        assert_eq!(re.run_count(), 2, "flushed runs reopened as runs");
+        assert_eq!(re.delta_len(), 50, "only the WAL suffix lands in the delta");
+        // Every id from every location is still findable.
+        for id in [0u64, 399, 1000, 1199, 2000, 2199, 5000, 5049] {
+            assert!(re.get(id).unwrap().is_some(), "id {id} lost across reopen");
+        }
+        // And a fresh insert keeps working (run_seq must not collide).
+        let mut re = re;
+        re.insert(9000, &vec![0.25f32; dim]).unwrap();
+        let job = re.flush_begin().unwrap().expect("delta to flush");
+        let built = job.build(tmp.path()).unwrap();
+        re.flush_finish(built).unwrap();
+        assert_eq!(re.run_count(), 3, "post-reopen flush adds a new run");
     }
 
     // Inserts, deletes, and re-inserts that race the off-thread flush all resolve
