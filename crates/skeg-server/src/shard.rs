@@ -622,6 +622,12 @@ enum ShardReq {
         name: String,
         id: u64,
     },
+    /// Uniform sample of up to `count` live f32 vectors from `name` on this
+    /// shard (router training input).
+    SampleVectors {
+        name: String,
+        count: usize,
+    },
     Vdel {
         name: String,
         id: u64,
@@ -660,6 +666,26 @@ pub struct VindexRow {
     pub base: u64,
 }
 
+/// Load every `router-<name>.bin` under the shard-set root.
+fn load_routers(root: &Path) -> HashMap<String, Arc<crate::router::Router>> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if let Some(name) = file.strip_prefix("router-").and_then(|s| s.strip_suffix(".bin")) {
+            match crate::router::Router::load(&entry.path()) {
+                Ok(r) => {
+                    out.insert(name.to_owned(), Arc::new(r));
+                }
+                Err(e) => tracing::warn!("router sidecar {file} unreadable, ignored: {e}"),
+            }
+        }
+    }
+    out
+}
+
 enum ShardResp {
     Value(Option<Bytes>),
     Done,
@@ -682,6 +708,8 @@ enum ShardResp {
     Stats(u64, u64, u64, u64),
     /// `(name, dim, kind_wire_byte, backend_wire_byte, n_vectors)` per VINDEX.
     VindexList(Vec<VindexRow>),
+    /// Flattened row-major sample rows plus their dim.
+    Sample(Vec<f32>, u32),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
     /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
@@ -1983,6 +2011,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::Reclaim
         | ShardReq::CountTenantKeys(_)
         | ShardReq::Vget { .. }
+        | ShardReq::SampleVectors { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
@@ -2428,6 +2457,34 @@ async fn process(
                 }
             }
         }
+        ShardReq::SampleVectors { name, count } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => {
+                    let idx = arc.read();
+                    let dim = idx.backend.dim() as u32;
+                    let ids = idx.backend.live_ids();
+                    let stride = (ids.len() / count.max(1)).max(1);
+                    let mut out = Vec::with_capacity(count.min(ids.len()) * dim as usize);
+                    let mut err = None;
+                    for id in ids.into_iter().step_by(stride).take(count) {
+                        match idx.backend.get(id) {
+                            Ok(Some(v)) => out.extend_from_slice(&v),
+                            Ok(None) => {}
+                            Err(e) => {
+                                err = Some(format!("sample read failed: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                    match err {
+                        Some(e) => ShardResp::Err(e),
+                        None => ShardResp::Sample(out, dim),
+                    }
+                }
+            }
+        }
         ShardReq::Vdel { name, id, tenant } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
@@ -2614,6 +2671,11 @@ struct ShardSetInner {
     /// Per-tenant live disk-byte counter, shared with every shard's `VLog` so
     /// the `max_disk_bytes` quota is global per tenant.
     disk_counter: skeg_core::SharedTenantDisk,
+    /// Shard-set root: sidecars that describe the SET (semantic routers)
+    /// live here, not inside a shard.
+    root: std::path::PathBuf,
+    /// Loaded semantic routers per vindex name (scoped names included).
+    routers: parking_lot::RwLock<HashMap<String, Arc<crate::router::Router>>>,
 }
 
 impl Drop for ShardSetInner {
@@ -2820,6 +2882,8 @@ impl ShardSet {
                 n: n_shards,
                 quota,
                 disk_counter,
+                root: base_dir.to_path_buf(),
+                routers: parking_lot::RwLock::new(load_routers(base_dir)),
             }),
         })
     }
@@ -3497,6 +3561,82 @@ impl ShardSet {
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
             _ => Err(ShardError::Unavailable),
         }
+    }
+
+    /// Train (or re-train) the semantic router for `name`: sample every
+    /// shard, run balanced k-means with one centroid per shard, bump the
+    /// epoch, persist the sidecar, and serve the new router immediately.
+    /// Returns the new epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is missing, a shard is unavailable, or
+    /// the sidecar cannot be written.
+    pub async fn train_router(
+        &self,
+        name: &str,
+        lambda: f32,
+        iters: usize,
+    ) -> Result<u64, ShardError> {
+        const SAMPLE_PER_SHARD: usize = 4096;
+        let mut data: Vec<f32> = Vec::new();
+        let mut dim: Option<u32> = None;
+        for shard in 0..self.inner.n {
+            let req = ShardReq::SampleVectors {
+                name: name.to_owned(),
+                count: SAMPLE_PER_SHARD,
+            };
+            match self.call(shard, req).await? {
+                ShardResp::Sample(rows, d) => {
+                    if let Some(prev) = dim
+                        && prev != d
+                    {
+                        return Err(ShardError::Storage(format!(
+                            "shard dim mismatch: {prev} vs {d}"
+                        )));
+                    }
+                    dim = Some(d);
+                    data.extend_from_slice(&rows);
+                }
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        let dim = dim.unwrap_or(0) as usize;
+        let n = data.len().checked_div(dim).unwrap_or(0);
+        if n < self.inner.n {
+            return Err(ShardError::Storage(format!(
+                "not enough live vectors to train a router: {n}"
+            )));
+        }
+        let k = self.inner.n;
+        let centroids =
+            skeg_vector::balanced_kmeans(&data, n, dim, k, lambda, iters, 0x5eed_5eed);
+        let epoch = self
+            .inner
+            .routers
+            .read()
+            .get(name)
+            .map_or(0, |r| r.epoch)
+            + 1;
+        let router = crate::router::Router {
+            k,
+            dim,
+            epoch,
+            centroids,
+        };
+        router
+            .save(&crate::router::router_path(&self.inner.root, name))
+            .map_err(|e| ShardError::Storage(format!("router save failed: {e}")))?;
+        let arc = Arc::new(router);
+        self.inner.routers.write().insert(name.to_owned(), arc);
+        Ok(epoch)
+    }
+
+    /// The loaded semantic router for `name`, if one has been trained.
+    #[must_use]
+    pub fn router(&self, name: &str) -> Option<Arc<crate::router::Router>> {
+        self.inner.routers.read().get(name).cloned()
     }
 
     /// Tombstone the vector for `id` in `name`. Routes by `id`.
@@ -5743,6 +5883,52 @@ mod tests {
                 > folds_before,
             "nothing reclaimed the heavily-dead base"
         );
+    }
+
+    /// Training the router samples every shard, writes the sidecar, and a
+    /// reopened shard set serves the same centroids (same epoch, bit-exact).
+    #[tokio::test]
+    async fn router_training_writes_a_sidecar_that_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("rt", 8, 4, 1).await.unwrap();
+        // Two clear clusters so the trained centroids are meaningful.
+        for id in 0..200u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 2) as usize] = 1.0;
+            shards.vset("rt", id, v, 0, None, None).await.unwrap();
+        }
+        let epoch = shards.train_router("rt", 0.25, 10).await.expect("training");
+        assert!(epoch >= 1);
+        let r1 = shards.router("rt").expect("router loaded after training");
+        assert_eq!(r1.k, 2, "one centroid per shard");
+        assert_eq!(r1.dim, 8);
+        drop(shards);
+
+        let re = ShardSet::open_mode_with_workers(
+            dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        let r2 = re.router("rt").expect("router reloaded at open");
+        assert_eq!(r2.epoch, r1.epoch);
+        assert_eq!(r2.centroids, r1.centroids, "centroids must reload bit-exact");
+        // The two natural clusters land on different owners.
+        let mut a = vec![0.05f32; 8];
+        a[0] = 1.0;
+        let mut b = vec![0.05f32; 8];
+        b[1] = 1.0;
+        assert_ne!(r2.assign(&a), r2.assign(&b), "distinct clusters share an owner");
     }
 
     /// VGET returns the stored vector for a live id across every location

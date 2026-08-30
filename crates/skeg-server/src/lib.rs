@@ -15,6 +15,7 @@ pub mod payload;
 pub mod payload_disk;
 pub mod quota;
 pub mod resp3_handler;
+pub mod router;
 pub mod shard;
 pub mod tenant;
 #[cfg(feature = "tracing-otlp")]
