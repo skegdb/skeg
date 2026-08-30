@@ -75,6 +75,17 @@ nothing new to add costs 13-25ms instead of a rebuild.
 
 ### Fixed
 
+- **Filtered scans paid four hash probes per id.** The phase decomposition
+  under storm caught the hybrid route (58% of shard calls on the demo)
+  scoring 12,3k ids at 212ns each against a 40ns kernel. In the folded
+  steady state the loop now does one base lookup per id: scoring per call
+  2,60 -> 1,85ms, re-rank 0,57 -> 0,23ms under the same storm. The
+  scan-vs-IVF crossover re-measured on current kernels at the demo's
+  regime: the exact scan wins the tail (the compiled threshold was right;
+  `SKEG_HYBRID_SCAN_MAX` exists to re-measure as kernels move). The
+  remaining 151ns/id is the per-id hash walk - the block-32 layout's
+  target number.
+
 - **A restart replayed everything since the last fold into the RAM delta.**
   `clean_stale_runs` deleted every run directory at open and recovered the
   whole WAL: on the demo, a restart after a 218k-row growth put 900 MB back
