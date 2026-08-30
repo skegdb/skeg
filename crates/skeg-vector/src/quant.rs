@@ -2119,6 +2119,17 @@ impl QuantizedVectors {
     /// TurboQuant set. Derived from `(dim, bits)`; observability for the
     /// auto-selection (e.g. logging which proxy a vindex picked at create).
     #[must_use]
+    /// `Some(bits)` when this tier is TurboQuant 2- or 4-bit: the tiers whose
+    /// proxy is a cosine estimate times `TQ_PROXY_SCALE`, which is what makes
+    /// an adaptive re-rank bound comparable to exact cosines.
+    #[must_use]
+    pub fn turboquant_cos_scaled_bits(&self) -> Option<u8> {
+        match &self.repr {
+            QuantRepr::TurboQuant { bits, .. } if matches!(*bits, 2 | 4) => Some(*bits),
+            _ => None,
+        }
+    }
+
     pub fn tq1_proxy_mode(&self) -> Option<Tq1ProxyMode> {
         match &self.repr {
             QuantRepr::TurboQuant { bits: 1, .. } => Some(tq1_proxy_mode_for(self.dim, 1)),

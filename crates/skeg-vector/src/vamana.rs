@@ -450,6 +450,34 @@ fn adaptive_rr() -> Option<f32> {
     })
 }
 
+/// Adaptive re-rank for the 2-/4-bit TurboQuant tiers, whose proxy is a
+/// cosine estimate: a candidate whose estimate plus this flat margin cannot
+/// reach the current k-th exact cosine stops the disk reads (best-first
+/// order, so neither can the rest). Unlike tq1 there is no per-vector
+/// reconstruction quality, so the margin is flat and conservative.
+/// OFF by default: A/B under a 12-user storm on the 441k demo measured it
+/// neutral (server p99 27,97 vs 28,24 ms) - the re-rank row cache and the
+/// page cache already absorb the reads it would skip. It stays as an opt-in
+/// (`SKEG_TQ24_ADAPTIVE_RR=1`) for regimes where re-rank reads actually
+/// miss: cold opens, indexes far beyond RAM. `SKEG_ADAPTIVE_MARGIN`
+/// overrides the margin (shared with the tq1 path); the toy sweep at 150k
+/// said 0,02 buys p50 -27% warm for -0,1pt recall, 0,05 is recall-safer.
+fn adaptive_rr_tq24() -> Option<f32> {
+    static M: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        matches!(
+            std::env::var("SKEG_TQ24_ADAPTIVE_RR").ok().as_deref(),
+            Some("on" | "1" | "true")
+        )
+        .then(|| {
+            std::env::var("SKEG_ADAPTIVE_MARGIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.05f32)
+        })
+    })
+}
+
 /// Diagnostic: rank by the quantized proxy alone, no f32 rerank (blog-comparable).
 fn no_rerank() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3726,9 +3754,17 @@ impl DiskVamanaIndex {
         // (bit-plane / asym / hybrid-rescore). Popcount is Hamming, and int8/PQ/
         // tq2/tq4 report no tq1 mode - for those the bound would compare a
         // wrong-scale estimate to the k-th cosine and skip every candidate.
-        let adaptive = adaptive_rr().filter(
-            |_| matches!(self.base.quant.tq1_proxy_mode(), Some(m) if m != Tq1ProxyMode::Popcount),
-        );
+        // tq1 asym family: per-vector reconstruction-quality bound (opt-in).
+        // tq2/tq4: cosine-scaled proxy with a flat conservative margin
+        // (default on). Other tiers report neither and never skip.
+        let adaptive = if matches!(self.base.quant.tq1_proxy_mode(), Some(m) if m != Tq1ProxyMode::Popcount)
+        {
+            adaptive_rr()
+        } else if self.base.quant.turboquant_cos_scaled_bits().is_some() {
+            adaptive_rr_tq24()
+        } else {
+            None
+        };
         let mut topk: std::collections::BinaryHeap<std::cmp::Reverse<OrderedFloat<f32>>> =
             std::collections::BinaryHeap::new();
         for (pscore, seg_idx, row) in all_cand {
@@ -3766,11 +3802,32 @@ impl DiskVamanaIndex {
                 // reconstruction quality (1/scale). Good code => tight => stop
                 // sooner; poor code => loose => keep reading. pscore = -(proxy i32).
                 let cos_est = -pscore / 1.0e7;
-                let g = seg.quant.tq1_recon_g(row as usize).unwrap_or(0.0);
-                let margin = c * (1.0 - g * g).max(0.0).sqrt();
+                // tq1 asym: per-vector bound from the code's reconstruction
+                // quality. tq2/tq4 (no g): flat margin normalised by
+                // sqrt(1024/dim) - the ADC estimate's noise scales like
+                // 1/sqrt(dim), so one margin value holds across dimensions
+                // (calibrated at dim 1024; at dim 16 it widens 8x and the
+                // skip goes quiet instead of eating recall).
                 let tau = topk.peek().map(|r| r.0.0).unwrap_or(f32::MIN);
-                if cos_est + margin < tau {
-                    continue; // provably can't enter top-k; skip its disk read
+                match seg.quant.tq1_recon_g(row as usize) {
+                    // Per-vector bound: a poor code further down may still
+                    // pass, so only this candidate is skipped.
+                    Some(g) => {
+                        let margin = c * (1.0 - g * g).max(0.0).sqrt();
+                        if cos_est + margin < tau {
+                            continue;
+                        }
+                    }
+                    // Flat margin (tq2/tq4), normalised by sqrt(1024/dim):
+                    // candidates arrive best-proxy-first, so once one fails
+                    // the bound every later one fails it too - stop, don't
+                    // wander the rest of the pool.
+                    None => {
+                        let margin = c * (1024.0 / self.dim as f32).sqrt();
+                        if cos_est + margin < tau {
+                            break;
+                        }
+                    }
                 }
             }
             let v = self.read_vector(seg, row)?;
