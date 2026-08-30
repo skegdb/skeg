@@ -2583,6 +2583,12 @@ pub struct RunMergeJob {
     merged_seq: u64,
     n_merged: usize,
     old_dirs: Vec<u64>,
+    /// Reuse route: the largest non-flat run donates its graph (adjacency
+    /// copy + medoid); only the other runs' rows get inserted. `None` falls
+    /// back to the from-scratch build (no worthy donor).
+    patch: Option<PatchBase>,
+    /// Which run index in `survivors` is the donor (its rows keep their edges).
+    donor_seg: usize,
 }
 
 /// Output of [`RunMergeJob::build`]: the merged run already OPENED off-thread
@@ -2613,11 +2619,16 @@ impl RunMergeJob {
             merged_seq,
             n_merged,
             old_dirs,
+            patch,
+            donor_seg,
         } = self;
         let dir = index_dir.join(format!("run-{merged_seq}"));
         let _ = std::fs::remove_dir_all(&dir);
         // Read survivor vectors OFF-THREAD from the duped run fds.
         let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
+        // Per merged row: the donor-run row it came from (keeps its edges), or
+        // u32::MAX (inserted fresh). Same contract as the patched consolidate.
+        let mut base_origin: Vec<u32> = Vec::with_capacity(survivors.len());
         let mut buf = vec![0u8; dim * 4];
         for (seg, row) in survivors {
             let off = HEADER_LEN as u64 + u64::from(row) * dim as u64 * 4;
@@ -2626,15 +2637,22 @@ impl RunMergeJob {
                 buf.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
             );
+            base_origin.push(if seg == donor_seg { row } else { u32::MAX });
         }
         let cfg = disk_build_config();
         // Always cautious: these two are O(runs) and short, and the window
         // they would open by taking the machine is not worth the seconds saved.
+        let build = move || match patch {
+            // Edge repair on the patched route stays on f32 (int8 pruning
+            // scored 0.31 recall on real data - the standing constraint).
+            Some(pb) => build_patched_graph(pb, vectors, ids, &base_origin, dim, &cfg),
+            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+        };
         let rebuilt = match consolidate_thread_cap(ConsolidatePace::Serving)
             .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
         {
-            Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
-            None => build_disk_graph(tier, vectors, ids, dim, &cfg),
+            Some(pool) => pool.install(build),
+            None => build(),
         };
         rebuilt.save(&dir)?;
         // Open the merged run HERE (off-thread): the quant-tier build for the
@@ -4708,6 +4726,32 @@ impl DiskVamanaIndex {
         for ri in 0..n_merged {
             seg_files.push(self.runs[ri].vectors_file.try_clone()?);
         }
+        // Reuse route (the patched consolidate's idea applied to runs): the
+        // LARGEST non-flat run donates its graph; only the other runs' rows
+        // are inserted. Worth it only when the donor carries the majority of
+        // the survivors - below that the remap bookkeeping is pure overhead.
+        let mut donor_seg = usize::MAX;
+        let mut donor_live = 0usize;
+        let mut per_run_live = vec![0usize; n_merged];
+        for &(ri, _) in &survivors {
+            per_run_live[ri] += 1;
+        }
+        for ri in 0..n_merged {
+            if !self.runs[ri].flat && per_run_live[ri] > donor_live {
+                donor_live = per_run_live[ri];
+                donor_seg = ri;
+            }
+        }
+        let patch = if donor_seg != usize::MAX && donor_live * 2 >= survivors.len() {
+            let donor = &self.runs[donor_seg];
+            Some(PatchBase {
+                adj: (0..donor.main_n as usize).map(|r| donor.nodes[r]).collect(),
+                medoid: donor.medoid,
+            })
+        } else {
+            donor_seg = usize::MAX;
+            None
+        };
         let old_dirs = self.run_dirs[..n_merged].to_vec();
         let merged_seq = self.run_seq;
         self.run_seq += 1;
@@ -4720,6 +4764,8 @@ impl DiskVamanaIndex {
             merged_seq,
             n_merged,
             old_dirs,
+            patch,
+            donor_seg,
         }))
     }
 
@@ -6769,6 +6815,53 @@ mod tests {
             x,
             "searchable after finish"
         );
+    }
+
+    /// A runs-merge with a dominant donor run reuses its graph: every id
+    /// from BOTH runs must remain findable through the merged run.
+    #[test]
+    fn runs_merge_donor_reuse_keeps_every_id_findable() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        // Donor run: 1200 rows (majority). Second run: 300.
+        let big = random_vectors(1200, dim, 41);
+        for (i, v) in big.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("flush 1");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        let small = random_vectors(300, dim, 42);
+        for (i, v) in small.chunks_exact(dim).enumerate() {
+            idx.insert(10_000 + i as u64, v).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("flush 2");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 2);
+        let job = idx.merge_runs_begin().unwrap().expect("merge job");
+        assert!(job.patch.is_some(), "donor path must engage (1200 of 1500)");
+        let built = job.build(tmp.path()).unwrap();
+        idx.merge_runs_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 1);
+        for probe in [0usize, 600, 1199] {
+            let q = &big[probe * dim..(probe + 1) * dim];
+            let hits = idx.search(q, 5).unwrap();
+            assert!(hits.iter().any(|h| h.0 == probe as u64), "donor id {probe} lost");
+        }
+        for probe in [0usize, 299] {
+            let q = &small[probe * dim..(probe + 1) * dim];
+            let hits = idx.search(q, 5).unwrap();
+            assert!(
+                hits.iter().any(|h| h.0 == 10_000 + probe as u64),
+                "inserted id {} lost",
+                10_000 + probe
+            );
+        }
     }
 
     /// An L0 flat run answers searches exactly: every id flushed into a flat
