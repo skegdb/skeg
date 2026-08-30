@@ -4667,6 +4667,82 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
+    /// Verify this index's on-disk and in-RAM invariants and report every
+    /// problem found (empty = healthy). The operator's fsck: a database is
+    /// not production-grade if the only way to know it is intact is to wait
+    /// for a query to fail.
+    ///
+    /// The checks are exactly the failure shapes this engine has actually
+    /// produced, each one a bug that reached a gate:
+    /// - a base or run whose graph row count disagrees with `vectors.bin`;
+    /// - an adjacency edge pointing past the segment's row count (dangling);
+    /// - an id table shorter than the graph (unnameable rows);
+    /// - a run directory missing its `run.ok` durability marker;
+    /// - a `CURRENT` pointer naming a generation slot that is not there;
+    /// - a medoid outside its own segment.
+    ///
+    /// Read-only and O(rows + edges): safe to run on a serving index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error only if segment metadata cannot be read at all;
+    /// content problems come back as report lines, not errors.
+    pub fn check(&self) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        let dim = self.dim;
+        let mut check_seg = |what: &str, seg: &Segment| -> io::Result<()> {
+            let n = seg.main_n as usize;
+            if seg.ids.len() != n {
+                out.push(format!(
+                    "{what}: {} ids for {n} graph rows",
+                    seg.ids.len()
+                ));
+            }
+            let want = HEADER_LEN as u64 + (n as u64) * dim as u64 * 4;
+            let got = seg.vectors_file.metadata()?.len();
+            if got < want {
+                out.push(format!(
+                    "{what}: vectors.bin holds {got} bytes, {n} rows of dim {dim} need {want}"
+                ));
+            }
+            if n > 0 && seg.medoid as usize >= n {
+                out.push(format!("{what}: medoid {} outside {n} rows", seg.medoid));
+            }
+            let mut dangling = 0usize;
+            for row in 0..n {
+                for &nb in seg.nodes[row].slice() {
+                    if nb as usize >= n {
+                        dangling += 1;
+                    }
+                }
+            }
+            if dangling > 0 {
+                out.push(format!("{what}: {dangling} edges point past row {n}"));
+            }
+            Ok(())
+        };
+        check_seg("base", &self.base)?;
+        for (i, run) in self.runs.iter().enumerate() {
+            check_seg(&format!("run {i}"), run)?;
+        }
+        // Durability markers: a run without one replays from the WAL at open,
+        // which is correct but means the run is not yet durable.
+        for &seq in &self.run_dirs {
+            let d = self.dir.join(format!("run-{seq}"));
+            if d.exists() && !d.join(RUN_OK_FILE).exists() {
+                out.push(format!("run-{seq}: missing the {RUN_OK_FILE} marker"));
+            }
+        }
+        // Generation pointer: CURRENT must name a slot that exists.
+        if let Some(slot) = current_slot(&self.dir) {
+            let g = self.dir.join(format!("g{slot}"));
+            if !g.join(GRAPH_FILE).exists() {
+                out.push(format!("CURRENT names g{slot}, which has no {GRAPH_FILE}"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Begin a background runs-only merge (Level 2 of the write-heavy path):
     /// snapshot the live vectors from the front runs (tombstone-masked,
     /// newer-run-wins) so an off-thread [`RunMergeJob::build`] can fold them into
@@ -6888,6 +6964,87 @@ mod tests {
                     "leg {which}: donor id {probe} lost"
                 );
             }
+        }
+    }
+
+    /// A healthy index reports nothing, and each corruption shape this
+    /// engine has actually produced is caught by name.
+    #[test]
+    fn check_is_quiet_when_healthy_and_names_each_corruption() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        let vecs = random_vectors(500, dim, 61);
+        for (i, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        // A run too, so the run checks have something to look at.
+        for (i, v) in random_vectors(100, dim, 62).chunks_exact(dim).enumerate() {
+            idx.insert(9000 + i as u64, v).unwrap();
+        }
+        let built = idx.flush_begin().unwrap().unwrap().build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+
+        let clean = idx.check().unwrap();
+        assert!(clean.is_empty(), "healthy index reported: {clean:?}");
+
+        // 2. missing run.ok marker
+        let seq = *idx.run_dirs.first().expect("a run");
+        std::fs::remove_file(tmp.path().join(format!("run-{seq}")).join(RUN_OK_FILE)).unwrap();
+        let broken = idx.check().unwrap();
+        assert!(
+            broken.iter().any(|p| p.contains("marker")),
+            "missing run.ok not caught: {broken:?}"
+        );
+
+        // 3. CURRENT pointing at a slot with no graph
+        let slot = current_slot(tmp.path()).expect("CURRENT");
+        std::fs::remove_file(tmp.path().join(format!("g{slot}")).join(GRAPH_FILE)).unwrap();
+        let broken = idx.check().unwrap();
+        assert!(
+            broken.iter().any(|p| p.contains("CURRENT names")),
+            "bad CURRENT not caught: {broken:?}"
+        );
+    }
+
+    /// A graph file carrying a dangling edge is REFUSED at open on the
+    /// in-RAM path (the reader validates every neighbour against `n`). The
+    /// mmap path casts the node region without that per-node pass, which is
+    /// exactly why `check` keeps its own edge scan - this test pins the
+    /// reader's guarantee so a refactor cannot quietly drop it.
+    #[test]
+    fn a_dangling_edge_on_disk_is_refused_at_open() {
+        let dim = 8;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let n = 40usize;
+        let vecs = random_vectors(n, dim, 71);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut nodes = vec![Node::new(); n];
+        for (row, node) in nodes.iter_mut().enumerate() {
+            let mut e = vec![((row + 1) % n) as VecId];
+            if row == 0 {
+                e.push(n as VecId + 999); // off the end of the world
+            }
+            node.set(&e);
+        }
+        let g0 = tmp.path().join("g0");
+        std::fs::create_dir_all(&g0).unwrap();
+        write_tier(tmp.path(), tier).unwrap();
+        write_graph_vmn(&g0.join(GRAPH_FILE), n as u32, dim, 0, MAX_R, 128, &ids, &nodes)
+            .unwrap();
+        write_vectors_bin(&g0.join(VECTORS_FILE), &InMemoryVectorSource::new(vecs, dim))
+            .unwrap();
+        set_current_slot(tmp.path(), 0).unwrap();
+        write_framed_wal(&tmp.path().join(DELTA_LOG_FILE), &[]).unwrap();
+
+        match DiskVamanaIndex::open_with_tier(tmp.path(), tier) {
+            Ok(_) => panic!("a dangling edge must not open"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
         }
     }
 

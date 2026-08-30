@@ -446,6 +446,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
         Command::SkegVindexDrop { .. } => CommandKind::VindexDrop,
         Command::SkegVindexConsolidate { .. } => CommandKind::VindexConsolidate,
         Command::SkegVindexList => CommandKind::VindexList,
+        Command::SkegCheck { .. } => CommandKind::VindexList,
         // A tenant erasing its own subject's keys is a KV write; the two
         // cross-tenant / store-wide ops are admin.
         Command::SkegSubjectErase { .. } => CommandKind::KvWrite,
@@ -663,6 +664,7 @@ async fn dispatch_command(
         Command::SkegWhoami => skeg_whoami(*tenant, tenant_backend.is_some()),
         Command::SkegAuth { args } => skeg_auth(&args),
         Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
+        Command::SkegCheck { args } => skeg_check(args.as_slice(), shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
         Command::SkegVindexConsolidate { args } => {
@@ -1131,6 +1133,24 @@ async fn skeg_vget(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
 
 /// `SKEG.VINDEX.RESHARD name`: train the router, move every row to its
 /// semantic owner. Returns the number of rows moved.
+/// `SKEG.CHECK <index>` - the operator's fsck. Returns one line per problem
+/// found, or a single `OK` line when the index is healthy. Read-only.
+async fn skeg_check(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    let name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let scoped = match scope_vindex_or_reject(tenant, name) {
+        Ok(s) => s,
+        Err(f) => return f,
+    };
+    match shards.check(&scoped).await {
+        Ok(problems) if problems.is_empty() => Frame::Bulk(Bytes::from("OK\n")),
+        Ok(problems) => Frame::Bulk(Bytes::from(problems.join("\n") + "\n")),
+        Err(e) => shard_error(&e),
+    }
+}
+
 async fn skeg_vindex_reshard(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
     let raw_name = match parse_utf8_arg(&args[0], "name") {
         Ok(s) => s,

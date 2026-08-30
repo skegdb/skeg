@@ -9,6 +9,21 @@ repository.
 
 ## [Unreleased]
 
+### SKEG.CHECK
+
+The operator's fsck. `SKEG.CHECK <index>` reports every integrity problem
+found across the shards, or `OK` when the index is healthy; an unknown
+index is an error, not a clean bill of health. Read-only and O(rows +
+edges), safe on a serving index.
+
+What it checks is exactly the failure shapes this engine has produced:
+ids/graph/vectors.bin row-count disagreement, edges pointing past a
+segment's rows (the mmap reader skips the per-node validation the in-RAM
+reader does), a medoid outside its segment, a run directory missing its
+run.ok durability marker, a CURRENT pointer naming an absent generation
+slot, and - for a resharded index - a router whose dim or centroid count
+disagrees with the index, or an owner map naming a shard out of range.
+
 ### Hardening
 
 kill -9 at the four worst moments - mid-bulk-write, mid-consolidate,

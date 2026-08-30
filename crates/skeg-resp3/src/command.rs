@@ -100,6 +100,8 @@ pub enum Command {
     // ── SKEG.* vector namespace ─────────────────────────────────────
     /// `SKEG.VINDEX.LIST` - enumerate vindexes for the calling tenant.
     SkegVindexList,
+    /// `SKEG.CHECK <index>` - integrity report for one index.
+    SkegCheck { args: Vec<Bytes> },
     /// `SKEG.VINDEX.CREATE name dim [kind] backend`. The parser checks
     /// arity (3 or 4 args; 3 omits `kind` and takes the server default)
     /// and forwards the raw bytes; inner argument
@@ -338,6 +340,14 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
         // Args preserved for forward-compat with the placeholder
         // `SKEG.AUTH is reserved` handler.
         "AUTH" => Ok(Command::SkegAuth { args }),
+        "CHECK" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongArity {
+                    command: "SKEG.CHECK",
+                });
+            }
+            Ok(Command::SkegCheck { args })
+        }
         "VINDEX.LIST" => {
             if !args.is_empty() {
                 return Err(CommandError::WrongArity {

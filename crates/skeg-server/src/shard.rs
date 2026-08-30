@@ -588,6 +588,8 @@ enum ShardReq {
     /// Enumerate VINDEXes known to this shard. Replicated across all
     /// shards so callers can ask any one shard.
     VindexList,
+    /// Integrity report for one vindex (the operator's fsck).
+    VindexCheck { name: String },
     /// Fold a disk vindex's streaming delta into its graph on this shard.
     /// Write the vlog snapshot and a payload index per vindex, both stamped
     /// with the same log position. Normally the background task's job; exposed
@@ -740,6 +742,8 @@ enum ShardResp {
     },
     /// Live key count for a tenant on the answering shard.
     Count(u64),
+    /// Integrity problems found; empty = healthy.
+    Problems(Vec<String>),
     /// New value length after an APPEND.
     Len(u64),
     /// Dead bytes physically reclaimed on the answering shard.
@@ -2071,6 +2075,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::GraphSample { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
+        | ShardReq::VindexCheck { .. }
         | ShardReq::VindexDrop { .. }
         | ShardReq::VindexConsolidate { .. }
         | ShardReq::SnapshotAndPayloadIndexes
@@ -2261,6 +2266,22 @@ async fn process(
                     ShardResp::Done
                 }
                 Err(e) => ShardResp::Err(e),
+            }
+        }
+        ShardReq::VindexCheck { name } => {
+            let vs = vindexes.read();
+            let Some(entry) = vs.get(&name) else {
+                return ShardResp::Problems(Vec::new());
+            };
+            let vindex = entry.read();
+            match &vindex.backend {
+                VectorBackend::Disk(idx) => match idx.check() {
+                    Ok(p) => ShardResp::Problems(p),
+                    Err(e) => ShardResp::Err(format!("check failed: {e}")),
+                },
+                // A flat index holds no graph, runs or generation slots:
+                // there is nothing on disk for a check to disagree with.
+                VectorBackend::Flat(_) => ShardResp::Problems(Vec::new()),
             }
         }
         ShardReq::VindexList => {
@@ -3525,6 +3546,76 @@ impl ShardSet {
         let _ = self
             .broadcast(|| ShardReq::SnapshotAndPayloadIndexes)
             .await;
+    }
+
+    /// Integrity report for `name` across every shard, plus the coordinator's
+    /// own cross-checks (owner map vs the shards that actually hold the rows).
+    /// Empty = healthy. Read-only; safe on a serving index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is invalid or a shard is unavailable.
+    pub async fn check(&self, name: &str) -> Result<Vec<String>, ShardError> {
+        validate_vindex_name(name)?;
+        // An fsck that answers "healthy" for an index that does not exist is
+        // a trap: say so instead.
+        let known = match self.call(0, ShardReq::VindexList).await? {
+            ShardResp::VindexList(rows) => rows.iter().any(|r| r.name == name),
+            _ => false,
+        };
+        if !known {
+            return Err(ShardError::Storage(format!("no such vindex '{name}'")));
+        }
+        let mut out = Vec::new();
+        for shard in 0..self.inner.n {
+            let req = ShardReq::VindexCheck {
+                name: name.to_owned(),
+            };
+            match self.call(shard, req).await? {
+                ShardResp::Problems(p) => {
+                    out.extend(p.into_iter().map(|line| format!("shard {shard}: {line}")));
+                }
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        // Coordinator-side: a routed vindex's owner map must name shards that
+        // are in range, and its router's dim must match the index. Both have
+        // bitten before, so both are checked, not assumed.
+        if let Some(router) = self.router(name) {
+            let dim = match self.call(0, ShardReq::VindexList).await? {
+                ShardResp::VindexList(rows) => rows
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map_or(0, |r| r.dim as usize),
+                _ => 0,
+            };
+            if dim != 0 && router.dim != dim {
+                out.push(format!(
+                    "router dim {} does not match index dim {dim}",
+                    router.dim
+                ));
+            }
+            if router.k > self.inner.n {
+                out.push(format!(
+                    "router has {} centroids for {} shards",
+                    router.k, self.inner.n
+                ));
+            }
+            if let Some(map) = self.inner.owners.read().get(name) {
+                let bad = map
+                    .values()
+                    .filter(|(p, r)| {
+                        usize::from(*p) >= self.inner.n
+                            || r.is_some_and(|s| usize::from(s) >= self.inner.n)
+                    })
+                    .count();
+                if bad > 0 {
+                    out.push(format!("owner map: {bad} entries name a shard out of range"));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Consolidate a VINDEX on every shard.
@@ -6852,6 +6943,38 @@ mod tests {
                 "probe=2 must match full fan-out for cluster query {probe_q}"
             );
         }
+    }
+
+    /// A healthy index checks clean through the coordinator, including the
+    /// routed cross-checks; a missing index is not an error (nothing to
+    /// disagree with) and an unknown one reports nothing rather than lying.
+    #[tokio::test]
+    async fn check_reports_clean_on_a_healthy_routed_index() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("ck", 8, 4, 1).await.unwrap();
+        for id in 0..300u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 2) as usize] = 1.0;
+            shards.vset("ck", id, v, 0, None, None).await.unwrap();
+        }
+        let clean = shards.check("ck").await.unwrap();
+        assert!(clean.is_empty(), "healthy index reported: {clean:?}");
+
+        // After a reshard the router cross-checks run too.
+        shards.reshard("ck", 0.25, 10, 0).await.unwrap();
+        let after = shards.check("ck").await.unwrap();
+        assert!(after.is_empty(), "resharded index reported: {after:?}");
+
+        // An unknown index is an error, not a clean bill of health.
+        assert!(shards.check("nope").await.is_err(), "unknown index reported healthy");
     }
 
     /// Dropping a resharded vindex removes its router sidecar, its in-RAM
