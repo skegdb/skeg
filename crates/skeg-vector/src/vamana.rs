@@ -3830,13 +3830,14 @@ impl DiskVamanaIndex {
         skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchInner);
         let phase_t0 = Instant::now();
         let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
+        // One normalize per search, not one per segment plus one for the IVF
+        // seeds (dim-sized alloc + sqrt each).
+        let qn = normalized(query);
         for (seg_idx, seg) in segs.iter().enumerate() {
             if seg.main_n == 0 {
                 continue;
             }
-            let code = seg
-                .quant
-                .quantize_query_with_mode(&normalized(query), tq1_mode);
+            let code = seg.quant.quantize_query_with_mode(&qn, tq1_mode);
             // The base (segment 0) carries the deep beam. Runs are small and only
             // feed the global re-rank, so they walk a shallow list - this keeps
             // query latency flat as runs accumulate, instead of paying a full
@@ -3883,7 +3884,7 @@ impl DiskVamanaIndex {
             {
                 seed_rows.extend(
                     router
-                        .query_cell_seeds(&normalized(query), 4)
+                        .query_cell_seeds(&qn, 4)
                         .into_iter()
                         .filter(|&r| r < seg.main_n),
                 );
