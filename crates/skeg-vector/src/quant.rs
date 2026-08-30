@@ -254,7 +254,18 @@ fn quantize_query_i8(q: &[f32]) -> (Vec<i8>, f32) {
 /// `SKEG_TQ_QI8=0` restores the f32 widening kernels.
 fn tq_qi8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("SKEG_TQ_QI8").is_ok_and(|v| v == "0"))
+    *ON.get_or_init(|| {
+        // The i8-query kernels exist as NEON sdot only. On any other arch the
+        // dispatch would land on the scalar i32 loop and LOSE to the measured
+        // AVX2/AVX-512 f32 kernels, so the i8 query is not even built there:
+        // x86 keeps its own proven path until it grows a VNNI/maddubs kernel
+        // (tracked; needs an x86 box in the measurement loop first).
+        #[cfg(target_arch = "aarch64")]
+        let arch_ok = std::arch::is_aarch64_feature_detected!("dotprod");
+        #[cfg(not(target_arch = "aarch64"))]
+        let arch_ok = false;
+        arch_ok && !std::env::var("SKEG_TQ_QI8").is_ok_and(|v| v == "0")
+    })
 }
 
 #[derive(Debug, Clone)]
