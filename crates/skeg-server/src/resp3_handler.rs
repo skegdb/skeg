@@ -433,7 +433,9 @@ fn command_kind(cmd: &Command) -> CommandKind {
         | Command::Decr { .. }
         | Command::IncrBy { .. }
         | Command::DecrBy { .. } => CommandKind::KvWrite,
-        Command::SkegVsearch { .. } | Command::SkegVget { .. } => CommandKind::VectorRead,
+        Command::SkegVsearch { .. } | Command::SkegVget { .. } | Command::SkegVgraph { .. } => {
+            CommandKind::VectorRead
+        }
         Command::SkegVset { .. } | Command::SkegVmset { .. } | Command::SkegVdel { .. } => {
             CommandKind::VectorWrite
         }
@@ -483,6 +485,7 @@ fn is_pipelineable(cmd: &Command) -> bool {
             | Command::SkegVsearch { .. }
             | Command::SkegVdel { .. }
             | Command::SkegVget { .. }
+            | Command::SkegVgraph { .. }
             | Command::Ping(_)
             | Command::Echo(_)
     )
@@ -516,6 +519,7 @@ async fn exec_pipelined(
         Command::SkegVsearch { args } => skeg_vsearch(&args, &shards, tenant).await,
         Command::SkegVdel { args } => skeg_vdel(&args, &shards, tenant).await,
         Command::SkegVget { args } => skeg_vget(&args, &shards, tenant).await,
+        Command::SkegVgraph { args } => skeg_vgraph(&args, &shards, tenant).await,
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
         // Unreachable: the connection loop only routes `is_pipelineable` commands
@@ -663,6 +667,7 @@ async fn dispatch_command(
         Command::SkegVmset { args } => skeg_vmset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegVget { args } => skeg_vget(&args, shards, *tenant).await,
+        Command::SkegVgraph { args } => skeg_vgraph(&args, shards, *tenant).await,
         Command::SkegSubjectErase { args } => skeg_subject_erase(&args, shards, *tenant).await,
         Command::SkegTenantErase { args } => {
             skeg_tenant_erase(&args, shards, *tenant, tenant_backend).await
@@ -1113,6 +1118,47 @@ async fn skeg_vget(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
             Frame::Bulk(bytes.into())
         }
         Ok(None) => Frame::Null,
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.VGRAPH name [count] [shard]`: text lines `n <id> <degree>` then
+/// `e <from> <to>` - a one-hop sample of one shard's base graph, sized for a
+/// force-directed view (default 120 seeds, shard 0).
+async fn skeg_vgraph(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let count = match args.get(1) {
+        Some(b) => match parse_u64_arg(b, "count") {
+            Ok(v) => (v as usize).clamp(1, 2048),
+            Err(e) => return e,
+        },
+        None => 120,
+    };
+    let shard = match args.get(2) {
+        Some(b) => match parse_u64_arg(b, "shard") {
+            Ok(v) => v as usize,
+            Err(e) => return e,
+        },
+        None => 0,
+    };
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match shards.graph_sample(&scoped, shard, count).await {
+        Ok((nodes, edges)) => {
+            let mut body = String::new();
+            for (id, deg) in nodes {
+                body.push_str(&format!("n {id} {deg}\n"));
+            }
+            for (a, b) in edges {
+                body.push_str(&format!("e {a} {b}\n"));
+            }
+            Frame::Bulk(Bytes::from(body))
+        }
         Err(e) => shard_error(&e),
     }
 }

@@ -643,6 +643,11 @@ enum ShardReq {
     LiveIds {
         name: String,
     },
+    /// Sample of the shard's base graph for visual exploration.
+    GraphSample {
+        name: String,
+        count: usize,
+    },
     Vdel {
         name: String,
         id: u64,
@@ -730,6 +735,8 @@ enum ShardResp {
     Moves(Vec<(u64, Vec<f32>, Option<Bytes>, u8)>, Option<u64>),
     /// Live ids on this shard.
     Ids(Vec<u64>),
+    /// Graph sample: (id, degree) nodes and (from, to) edges.
+    Graph(Vec<(u64, u32)>, Vec<(u64, u64)>),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
     /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
@@ -2034,6 +2041,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::SampleVectors { .. }
         | ShardReq::CollectMoves { .. }
         | ShardReq::LiveIds { .. }
+        | ShardReq::GraphSample { .. }
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexDrop { .. }
@@ -2560,6 +2568,24 @@ async fn process(
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => ShardResp::Ids(arc.read().backend.live_ids()),
+            }
+        }
+        ShardReq::GraphSample { name, count } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => {
+                    let idx = arc.read();
+                    match &idx.backend {
+                        VectorBackend::Disk(i) => {
+                            let (nodes, edges) = i.graph_sample(count);
+                            ShardResp::Graph(nodes, edges)
+                        }
+                        VectorBackend::Flat(_) => {
+                            ShardResp::Err("flat backend has no graph".into())
+                        }
+                    }
+                }
             }
         }
         ShardReq::Vdel { name, id, tenant } => {
@@ -3866,6 +3892,34 @@ impl ShardSet {
             self.inner.owners.write().insert(name, map);
         }
         Ok(())
+    }
+
+    /// Sample the base graph of one shard of `name` for visual exploration.
+    ///
+    /// # Errors
+    ///
+    /// Index missing, flat backend, shard out of range or unavailable.
+    pub async fn graph_sample(
+        &self,
+        name: &str,
+        shard: usize,
+        count: usize,
+    ) -> Result<(Vec<(u64, u32)>, Vec<(u64, u64)>), ShardError> {
+        if shard >= self.inner.n {
+            return Err(ShardError::Storage(format!(
+                "shard {shard} out of range (0..{})",
+                self.inner.n
+            )));
+        }
+        let req = ShardReq::GraphSample {
+            name: name.to_owned(),
+            count,
+        };
+        match self.call(shard, req).await? {
+            ShardResp::Graph(n, e) => Ok((n, e)),
+            ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            _ => Err(ShardError::Unavailable),
+        }
     }
 
     /// The loaded semantic router for `name`, if one has been trained.

@@ -4026,6 +4026,38 @@ impl DiskVamanaIndex {
             .collect())
     }
 
+    /// A uniform sample of the base graph for visual exploration: up to
+    /// `count` seed rows (stride-picked) plus their out-neighbours, as
+    /// `(id, degree)` nodes and `(from_id, to_id)` edges. Read-only, RAM
+    /// only (adjacency + ids), no distances.
+    #[must_use]
+    pub fn graph_sample(&self, count: usize) -> (Vec<(u64, u32)>, Vec<(u64, u64)>) {
+        let n = self.base.main_n as usize;
+        if n == 0 || count == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let stride = (n / count.max(1)).max(1);
+        let mut rows: Vec<u32> = (0..n).step_by(stride).take(count).map(|r| r as u32).collect();
+        let mut in_sample: AHashSet<u32> = rows.iter().copied().collect();
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        // Neighbours of seeds join the node set (one hop), so the picture
+        // shows real structure instead of isolated dots.
+        let seeds: Vec<u32> = rows.clone();
+        for &r in &seeds {
+            for &nb in self.base.nodes[r as usize].slice() {
+                if in_sample.insert(nb) {
+                    rows.push(nb);
+                }
+                edges.push((self.base.ids[r as usize], self.base.ids[nb as usize]));
+            }
+        }
+        let nodes = rows
+            .into_iter()
+            .map(|r| (self.base.ids[r as usize], self.base.nodes[r as usize].degree))
+            .collect();
+        (nodes, edges)
+    }
+
     /// Run the main-graph greedy walk for `query` and return the ordered
     /// sequence of graph node rows it expands - the on-disk access pattern a
     /// paged graph store would see. For cache-locality analysis (the gate

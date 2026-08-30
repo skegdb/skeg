@@ -129,6 +129,11 @@ pub enum Command {
         args: Vec<Bytes>,
     },
     /// `SKEG.VDEL name id`. Arity 2.
+    /// `SKEG.VGRAPH name [count] [shard]`: a sample of one shard's base
+    /// graph as text lines - `n <id> <degree>` then `e <from> <to>`.
+    SkegVgraph {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VGET name id`: the stored f32 vector for a live id, as
     /// little-endian bytes (the same encoding VSEARCH accepts), or Null.
     SkegVget {
@@ -419,6 +424,15 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVdel { args })
+        }
+        "VGRAPH" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VGRAPH",
+                    want: "name [count] [shard]",
+                });
+            }
+            Ok(Command::SkegVgraph { args })
         }
         "VGET" => {
             if args.len() != 2 {
