@@ -4036,19 +4036,40 @@ impl DiskVamanaIndex {
         if n == 0 || count == 0 {
             return (Vec::new(), Vec::new());
         }
-        let stride = (n / count.max(1)).max(1);
-        let mut rows: Vec<u32> = (0..n).step_by(stride).take(count).map(|r| r as u32).collect();
-        let mut in_sample: AHashSet<u32> = rows.iter().copied().collect();
-        let mut edges: Vec<(u64, u64)> = Vec::new();
-        // Neighbours of seeds join the node set (one hop), so the picture
-        // shows real structure instead of isolated dots.
-        let seeds: Vec<u32> = rows.clone();
-        for &r in &seeds {
+        // CONNECTED patches instead of scattered stars: a stride sample with
+        // one hop kept ~0.1% of edges (both endpoints rarely sampled) and drew
+        // dust. A few seeds per call expand breadth-first until the budget is
+        // spent, so the local edge structure comes out whole.
+        let n_seeds = (count / 40).clamp(2, 16);
+        let stride = (n / n_seeds).max(1);
+        let mut rows: Vec<u32> = Vec::with_capacity(count);
+        let mut in_sample: AHashSet<u32> = AHashSet::new();
+        let mut queue: std::collections::VecDeque<u32> = (0..n)
+            .step_by(stride)
+            .take(n_seeds)
+            .map(|r| r as u32)
+            .collect();
+        for &s in &queue {
+            in_sample.insert(s);
+        }
+        while let Some(r) = queue.pop_front() {
+            rows.push(r);
+            if rows.len() + queue.len() >= count {
+                continue; // drain what is queued, expand no further
+            }
             for &nb in self.base.nodes[r as usize].slice() {
                 if in_sample.insert(nb) {
-                    rows.push(nb);
+                    queue.push_back(nb);
                 }
-                edges.push((self.base.ids[r as usize], self.base.ids[nb as usize]));
+            }
+        }
+        rows.extend(queue);
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        for &r in &rows {
+            for &nb in self.base.nodes[r as usize].slice() {
+                if in_sample.contains(&nb) {
+                    edges.push((self.base.ids[r as usize], self.base.ids[nb as usize]));
+                }
             }
         }
         let nodes = rows
