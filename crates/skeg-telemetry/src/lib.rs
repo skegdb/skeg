@@ -317,10 +317,14 @@ pub enum Counter {
     VsearchHybridReads = 31,
     /// Ids the hybrid path proxy-scored (the |S| or shortlist actually paid).
     VsearchHybridScored = 32,
+    /// Walk seeded from the semantic entry cache (query-sketch hit).
+    EntryCacheHits = 33,
+    /// Entry-cache lookups that found no sketch match.
+    EntryCacheMisses = 34,
 }
 
 impl Counter {
-    pub const COUNT: usize = 33;
+    pub const COUNT: usize = 35;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -355,6 +359,8 @@ impl Counter {
         Counter::VsearchHybridRerankNanos,
         Counter::VsearchHybridReads,
         Counter::VsearchHybridScored,
+        Counter::EntryCacheHits,
+        Counter::EntryCacheMisses,
     ];
 
     #[inline]
@@ -393,6 +399,8 @@ impl Counter {
             Counter::VsearchHybridRerankNanos => "skeg_vsearch_hybrid_rerank_nanos_total",
             Counter::VsearchHybridReads => "skeg_vsearch_hybrid_reads_total",
             Counter::VsearchHybridScored => "skeg_vsearch_hybrid_scored_total",
+            Counter::EntryCacheHits => "skeg_entry_cache_hits_total",
+            Counter::EntryCacheMisses => "skeg_entry_cache_misses_total",
         }
     }
 }

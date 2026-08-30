@@ -1805,6 +1805,57 @@ struct Segment {
     /// wholesale - so the cache dies with its segment and can never serve a
     /// stale row. `None` when the budget is zero.
     row_cache: Option<std::sync::Mutex<RowSlotCache>>,
+    /// Semantic entry cache: query sketch -> the base rows where similar
+    /// queries landed, used as extra walk seeds so a repeated or similar
+    /// query starts near its answer instead of at the medoid. Extra seeds
+    /// only ADD candidates, so recall cannot drop; rows are segment-local
+    /// and the cache dies with its segment, so a fold can never leave a
+    /// stale row behind. `None` under `SKEG_ENTRY_CACHE=0`.
+    entry_cache: Option<std::sync::Mutex<EntrySlotCache>>,
+}
+
+/// Direct-mapped sketch -> seed-rows cache, 4096 slots, overwrite eviction.
+struct EntrySlotCache {
+    slots: Vec<Option<(u16, SmallVec<[VecId; 8]>)>>,
+}
+
+impl EntrySlotCache {
+    fn new() -> EntrySlotCache {
+        EntrySlotCache { slots: vec![None; 4096] }
+    }
+
+    fn get(&self, sketch: u16) -> Option<SmallVec<[VecId; 8]>> {
+        match &self.slots[sketch as usize % self.slots.len()] {
+            Some((s, rows)) if *s == sketch => Some(rows.clone()),
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, sketch: u16, rows: SmallVec<[VecId; 8]>) {
+        let n = self.slots.len();
+        self.slots[sketch as usize % n] = Some((sketch, rows));
+    }
+}
+
+/// 16-bit sign sketch of a query, dimension-agnostic: every coordinate's
+/// sign folds (xor) into one of 16 bits, so two queries share a slot only
+/// when their broad sign structure matches. Identical queries always
+/// collide into the same slot; near-duplicates usually do.
+fn query_sketch(q: &[f32]) -> u16 {
+    let mut key = 0u16;
+    for (i, &x) in q.iter().enumerate() {
+        key ^= u16::from(x > 0.0) << (i & 15);
+    }
+    key
+}
+
+fn entry_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SKEG_ENTRY_CACHE").is_ok_and(|v| v == "0"))
+}
+
+fn new_entry_cache() -> Option<std::sync::Mutex<EntrySlotCache>> {
+    entry_cache_enabled().then(|| std::sync::Mutex::new(EntrySlotCache::new()))
 }
 
 /// Marker written (and fsynced) inside a run directory once every file of
@@ -2047,6 +2098,7 @@ fn open_segment(
             quant,
             vectors_file,
             row_cache: new_row_cache(dim),
+            entry_cache: new_entry_cache(),
         },
         dim,
         l_search,
@@ -3664,6 +3716,7 @@ impl DiskVamanaIndex {
         if filtered {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchFiltered);
         }
+        let sketch = query_sketch(query);
         let phase_t0 = Instant::now();
         let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
         for (seg_idx, seg) in segs.iter().enumerate() {
@@ -3707,6 +3760,21 @@ impl DiskVamanaIndex {
                     && !self.tombstones.contains(&id)
                 {
                     seed_rows.push(r);
+                }
+            }
+            // Semantic entry seeds (base segment only): where similar queries
+            // landed before. Extra seeds only add candidates.
+            if seg_idx == 0
+                && let Some(cache) = &seg.entry_cache
+            {
+                match cache.lock().expect("entry cache poisoned").get(sketch) {
+                    Some(rows) => {
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::EntryCacheHits);
+                        seed_rows.extend(rows.iter().copied().filter(|&r| r < seg.main_n));
+                    }
+                    None => skeg_telemetry::tick_counter(
+                        skeg_telemetry::Counter::EntryCacheMisses,
+                    ),
                 }
             }
             // Prototype nav: exact f32 (read from disk) steers the walk when
@@ -3920,6 +3988,18 @@ impl DiskVamanaIndex {
         );
         scored.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         scored.truncate(k);
+        // Remember where this query landed: its base-row winners become the
+        // walk seeds of the next query with the same sketch.
+        if let Some(cache) = &self.base.entry_cache {
+            let rows: SmallVec<[VecId; 8]> = scored
+                .iter()
+                .filter_map(|&(_, id)| self.base.id_to_main_row.get(&id).copied())
+                .take(8)
+                .collect();
+            if !rows.is_empty() {
+                cache.lock().expect("entry cache poisoned").put(sketch, rows);
+            }
+        }
         Ok(scored
             .into_iter()
             .map(|(s, id)| (id, s.into_inner()))
@@ -6428,6 +6508,42 @@ mod tests {
             idx.search(qv, 1).unwrap()[0].0,
             x,
             "searchable after finish"
+        );
+    }
+
+    /// A repeated query must hit the semantic entry cache and return the
+    /// same results it returned cold.
+    #[test]
+    fn entry_cache_seeds_repeat_queries_without_changing_results() {
+        let dim = 32;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            tmp.path(),
+            dim,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        for (i, v) in random_vectors(3000, dim, 77).chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        if !entry_cache_enabled() {
+            return; // the suite also runs with SKEG_ENTRY_CACHE=0
+        }
+        let q: Vec<f32> = random_vectors(1, dim, 78);
+        let hits0 =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::EntryCacheHits);
+        let cold = idx.search(&q, 10).unwrap();
+        let warm = idx.search(&q, 10).unwrap();
+        assert_eq!(
+            cold.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            warm.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            "seeded results differ from cold results"
+        );
+        assert!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::EntryCacheHits) > hits0,
+            "the repeat query never hit the entry cache"
         );
     }
 
