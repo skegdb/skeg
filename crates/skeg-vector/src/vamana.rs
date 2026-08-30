@@ -3235,30 +3235,46 @@ impl DiskVamanaIndex {
         // RAM already, so they go straight to the finalist list.
         let mut cand: Vec<(i32, usize, VecId)> = Vec::new();
         let mut scored: Vec<(f32, u64)> = Vec::new();
-        let mut seen: AHashSet<u64> = AHashSet::new();
-        for &id in ids {
-            if self.tombstones.contains(&id) || !seen.insert(id) {
-                continue;
+        // Fast path for the folded steady state (no tombstones, no delta, no
+        // runs - exactly where a big filtered scan lands after consolidate):
+        // one hash lookup per id instead of four. The id set comes from
+        // Filter::evaluate sorted and unique, so the dedup set is only needed
+        // when newer locations could shadow (measured 212ns/id on the demo
+        // storm against a 40ns scoring kernel - the loop, not the math).
+        if self.tombstones.is_empty() && self.delta.is_empty() && self.runs.is_empty() {
+            cand.reserve(ids.len());
+            for &id in ids {
+                if let Some(&row) = self.base.id_to_main_row.get(&id) {
+                    let p = self.base.quant.proxy_rescore(row as usize, &base_code);
+                    cand.push((p, 0, row));
+                }
             }
-            if let Some(v) = self.delta.get(&id) {
-                scored.push((cosine_f32(query, v), id));
-                continue;
-            }
-            // Newest run wins, then base (matches consolidate precedence).
-            if let Some((ri, &row)) = self
-                .runs
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(ri, r)| r.id_to_main_row.get(&id).map(|row| (ri, row)))
-            {
-                let p = self.runs[ri]
-                    .quant
-                    .proxy_rescore(row as usize, &run_codes[ri]);
-                cand.push((p, ri + 1, row));
-            } else if let Some(&row) = self.base.id_to_main_row.get(&id) {
-                let p = self.base.quant.proxy_rescore(row as usize, &base_code);
-                cand.push((p, 0, row));
+        } else {
+            let mut seen: AHashSet<u64> = AHashSet::new();
+            for &id in ids {
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                if let Some(v) = self.delta.get(&id) {
+                    scored.push((cosine_f32(query, v), id));
+                    continue;
+                }
+                // Newest run wins, then base (consolidate precedence).
+                if let Some((ri, &row)) = self
+                    .runs
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(ri, r)| r.id_to_main_row.get(&id).map(|row| (ri, row)))
+                {
+                    let p = self.runs[ri]
+                        .quant
+                        .proxy_rescore(row as usize, &run_codes[ri]);
+                    cand.push((p, ri + 1, row));
+                } else if let Some(&row) = self.base.id_to_main_row.get(&id) {
+                    let p = self.base.quant.proxy_rescore(row as usize, &base_code);
+                    cand.push((p, 0, row));
+                }
             }
         }
         skeg_telemetry::add_counter(
@@ -4749,17 +4765,29 @@ impl DiskVamanaIndex {
         k: usize,
         rerank: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
-        /// Below this many matches, an exact scan of `s` is cheaper than the IVF
-        /// route (measured: at 5k, qscan 0.9ms vs routed 1.9ms; the route wins
-        /// from ~10k up, where qscan goes O(|S|)).
-        const SCAN_MAX: usize = 12_288;
+        /// Below this many matches, an exact scan of `s` is cheaper than the
+        /// IVF route. The compiled default was measured BEFORE the sdot
+        /// kernels made scanning 3,6x cheaper, and the demo's default filter
+        /// lands at ~12,3k ids per shard - exactly on this edge, so the
+        /// router never engaged and every filtered query paid the full scan.
+        /// `SKEG_HYBRID_SCAN_MAX` overrides while the crossover is
+        /// re-measured on current kernels.
+        fn scan_max() -> usize {
+            static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("SKEG_HYBRID_SCAN_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(12_288)
+            })
+        }
         /// Candidate budget the router narrows `s` down to before scoring.
         const SHORTLIST: usize = 4_096;
         if k == 0 || s.is_empty() {
             return Ok(Vec::new());
         }
         match &self.ivf {
-            Some(router) if s.len() > SCAN_MAX => {
+            Some(router) if s.len() > scan_max() => {
                 // Map external ids -> base rows (skip ids not in the base: delta
                 // ids fall through to a direct scan of the whole `s`).
                 let s_rows: Vec<u64> = s
