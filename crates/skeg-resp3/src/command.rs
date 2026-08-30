@@ -129,6 +129,11 @@ pub enum Command {
         args: Vec<Bytes>,
     },
     /// `SKEG.VDEL name id`. Arity 2.
+    /// `SKEG.VINDEX.RESHARD name`: train the semantic router and physically
+    /// re-partition the vindex by it. Explicit admin op; returns rows moved.
+    SkegVindexReshard {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VGRAPH name [count] [shard]`: a sample of one shard's base
     /// graph as text lines - `n <id> <degree>` then `e <from> <to>`.
     SkegVgraph {
@@ -424,6 +429,15 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVdel { args })
+        }
+        "VINDEX.RESHARD" => {
+            if args.len() != 1 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VINDEX.RESHARD",
+                    want: "name",
+                });
+            }
+            Ok(Command::SkegVindexReshard { args })
         }
         "VGRAPH" => {
             if args.is_empty() || args.len() > 3 {

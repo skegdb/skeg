@@ -440,6 +440,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
             CommandKind::VectorWrite
         }
         Command::SkegVindexCreate { .. } => CommandKind::VindexCreate,
+        Command::SkegVindexReshard { .. } => CommandKind::VectorWrite,
         Command::SkegVindexDrop { .. } => CommandKind::VindexDrop,
         Command::SkegVindexConsolidate { .. } => CommandKind::VindexConsolidate,
         Command::SkegVindexList => CommandKind::VindexList,
@@ -520,6 +521,7 @@ async fn exec_pipelined(
         Command::SkegVdel { args } => skeg_vdel(&args, &shards, tenant).await,
         Command::SkegVget { args } => skeg_vget(&args, &shards, tenant).await,
         Command::SkegVgraph { args } => skeg_vgraph(&args, &shards, tenant).await,
+        Command::SkegVindexReshard { args } => skeg_vindex_reshard(&args, &shards, tenant).await,
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
         // Unreachable: the connection loop only routes `is_pipelineable` commands
@@ -668,6 +670,7 @@ async fn dispatch_command(
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
         Command::SkegVget { args } => skeg_vget(&args, shards, *tenant).await,
         Command::SkegVgraph { args } => skeg_vgraph(&args, shards, *tenant).await,
+        Command::SkegVindexReshard { args } => skeg_vindex_reshard(&args, shards, *tenant).await,
         Command::SkegSubjectErase { args } => skeg_subject_erase(&args, shards, *tenant).await,
         Command::SkegTenantErase { args } => {
             skeg_tenant_erase(&args, shards, *tenant, tenant_backend).await
@@ -1118,6 +1121,23 @@ async fn skeg_vget(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
             Frame::Bulk(bytes.into())
         }
         Ok(None) => Frame::Null,
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.VINDEX.RESHARD name`: train the router, move every row to its
+/// semantic owner. Returns the number of rows moved.
+async fn skeg_vindex_reshard(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match shards.reshard(&scoped, 0.25, 15).await {
+        Ok(moved) => Frame::Integer(moved as i64),
         Err(e) => shard_error(&e),
     }
 }
