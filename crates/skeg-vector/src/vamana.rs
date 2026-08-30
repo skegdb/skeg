@@ -1316,6 +1316,10 @@ impl VamanaIndex {
     /// Returns an I/O error if the directory or files cannot be written.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        // Write into the live base slot (or dir itself for the legacy flat
+        // layout), so `save` and `open` agree on where the base lives.
+        let dir = &base_dir(dir);
+        std::fs::create_dir_all(dir)?;
         write_graph_vmn(
             &dir.join(GRAPH_FILE),
             self.n,
@@ -1880,6 +1884,82 @@ fn new_entry_cache() -> Option<std::sync::Mutex<EntrySlotCache>> {
     entry_cache_enabled().then(|| std::sync::Mutex::new(EntrySlotCache::new()))
 }
 
+/// The base of a vindex (`graph.vmn` + `vectors.bin` + `tier.cache.bin`) lives
+/// in a generation slot `g0`/`g1`, and a single `CURRENT` pointer file names
+/// the live slot. A consolidate builds the new base in the OTHER slot, fsyncs
+/// it, then flips `CURRENT` with one atomic rename - so a crash mid-swap
+/// leaves the old base whole under the old pointer, never a torn mix of two
+/// generations' files (review P0). Indexes written before this scheme have no
+/// `CURRENT` and keep their base flat in the vindex dir; that stays readable.
+const CURRENT_FILE: &str = "CURRENT";
+
+/// The directory holding the LIVE base files for `dir`: `dir/gN` per the
+/// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
+fn base_dir(dir: &Path) -> std::path::PathBuf {
+    match std::fs::read_to_string(dir.join(CURRENT_FILE)) {
+        Ok(s) => dir.join(format!("g{}", s.trim())),
+        Err(_) => dir.to_path_buf(),
+    }
+}
+
+/// The current live slot (`Some(0|1)`), or `None` for a legacy flat layout.
+fn current_slot(dir: &Path) -> Option<u8> {
+    std::fs::read_to_string(dir.join(CURRENT_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Atomically point `CURRENT` at `slot`: write a temp file, fsync it, rename
+/// over `CURRENT`, fsync the directory so the rename is durable.
+fn set_current_slot(dir: &Path, slot: u8) -> io::Result<()> {
+    let tmp = dir.join("CURRENT.tmp");
+    std::fs::write(&tmp, slot.to_string())?;
+    File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, dir.join(CURRENT_FILE))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Install `built_tmp` (a directory holding the new base files) as the live
+/// base for `dir`, atomically: fsync its files, rename it into the inactive
+/// slot, flip `CURRENT`, then remove the old slot (or the legacy flat files).
+/// The caller's already-open fds into `built_tmp` follow the inode across the
+/// rename.
+fn install_base_generation(dir: &Path, built_tmp: &Path) -> io::Result<()> {
+    // Durability: every file in the new base must be on disk before it can
+    // become live.
+    for entry in std::fs::read_dir(built_tmp)? {
+        let path = entry?.path();
+        if path.is_file() {
+            File::open(&path)?.sync_all()?;
+        }
+    }
+    let old = current_slot(dir);
+    let next = match old {
+        Some(0) => 1u8,
+        _ => 0u8,
+    };
+    let slot_dir = dir.join(format!("g{next}"));
+    let _ = std::fs::remove_dir_all(&slot_dir); // a torn prior attempt, if any
+    std::fs::rename(built_tmp, &slot_dir)?;
+    File::open(dir)?.sync_all()?;
+    set_current_slot(dir, next)?;
+    // Reclaim the superseded generation. A crash before this leaves a dead
+    // slot the next install overwrites; never the live one.
+    match old {
+        Some(s) => {
+            let _ = std::fs::remove_dir_all(dir.join(format!("g{s}")));
+        }
+        None => {
+            // Legacy flat files are now dead - the pointer names g{next}.
+            let _ = std::fs::remove_file(dir.join(GRAPH_FILE));
+            let _ = std::fs::remove_file(dir.join(VECTORS_FILE));
+            let _ = std::fs::remove_file(dir.join(TIER_CACHE_FILE));
+        }
+    }
+    Ok(())
+}
+
 /// Marker written (and fsynced) inside a run directory once every file of
 /// the run is durable and the run is installed: only marked runs reopen.
 const RUN_OK_FILE: &str = "run.ok";
@@ -1895,7 +1975,10 @@ fn open_segment(
     mmap_graph: bool,
 ) -> io::Result<(Segment, usize, usize)> {
         // graph.vmn
-    let graph_bytes = std::fs::read(dir.join(GRAPH_FILE))?;
+    // The live base files live in dir's current generation slot (or dir
+    // itself for a legacy flat layout).
+    let bdir = base_dir(dir);
+    let graph_bytes = std::fs::read(bdir.join(GRAPH_FILE))?;
     if graph_bytes.len() < HEADER_LEN
         || read_u32(&graph_bytes, 0) != GRAPH_MAGIC
         || read_u32(&graph_bytes, 4) != FORMAT_VERSION
@@ -1953,7 +2036,7 @@ fn open_segment(
         // Whole-file mmap, cast the Node region as `&[Node]` on access.
         // Skip the per-Node parsing - the file IS the in-memory layout
         // (Node is `#[repr(C)] + Pod`, little-endian u32 fields).
-        let file = skeg_platform::MappedFile::open(&dir.join(GRAPH_FILE))?;
+        let file = skeg_platform::MappedFile::open(&bdir.join(GRAPH_FILE))?;
         // Sanity-check the mapped region covers all `n` nodes.
         let need = nodes_offset + (n as usize) * node_len;
         if file.len() < need {
@@ -2000,7 +2083,7 @@ fn open_segment(
     let _ = pos;
 
     // vectors.bin: verify header, stream f32 to build the int8 tier.
-    let vectors_file = File::open(dir.join(VECTORS_FILE))?;
+    let vectors_file = File::open(bdir.join(VECTORS_FILE))?;
     let mut vhdr = [0u8; HEADER_LEN];
     vectors_file.read_exact_at(&mut vhdr, 0)?;
     if read_u32(&vhdr, 0) != VEC_MAGIC || read_u32(&vhdr, 4) != FORMAT_VERSION {
@@ -2045,8 +2128,8 @@ fn open_segment(
     // whole of vectors.bin. The fingerprint ties the file to THIS index
     // (n, dim, tier, and the source's length + mtime), because size alone
     // would accept a cache built from different vectors of the same shape.
-    let cache_path = dir.join(TIER_CACHE_FILE);
-    let src_meta = std::fs::metadata(dir.join(VECTORS_FILE)).ok();
+    let cache_path = bdir.join(TIER_CACHE_FILE);
+    let src_meta = std::fs::metadata(bdir.join(VECTORS_FILE)).ok();
     let fingerprint = |meta: Option<&std::fs::Metadata>| -> (u64, u64) {
         match meta {
             Some(m) => (
@@ -2102,7 +2185,7 @@ fn open_segment(
     // their `Vec<u8>` representation - the experiment runs on
     // TurboQuant only.
     if mmap_tier && matches!(tier, QuantKind::TurboQuant { .. }) {
-        quant.swap_turboquant_codes_to_mmap(&dir.join("tier.cache.bin"))?;
+        quant.swap_turboquant_codes_to_mmap(&bdir.join(TIER_CACHE_FILE))?;
     }
 
     let id_to_main_row: AHashMap<u64, VecId> = ids
@@ -3112,11 +3195,16 @@ impl DiskVamanaIndex {
         );
         std::fs::create_dir_all(dir)?;
         write_tier(dir, tier)?;
-        write_graph_vmn(&dir.join(GRAPH_FILE), 0, dim, 0, MAX_R, l_search, &[], &[])?;
+        // The base starts in generation slot g0; CURRENT points at it. A
+        // consolidate later builds g1 and flips the pointer atomically.
+        let g0 = dir.join("g0");
+        std::fs::create_dir_all(&g0)?;
+        write_graph_vmn(&g0.join(GRAPH_FILE), 0, dim, 0, MAX_R, l_search, &[], &[])?;
         write_vectors_bin(
-            &dir.join(VECTORS_FILE),
+            &g0.join(VECTORS_FILE),
             &InMemoryVectorSource::new(Vec::new(), dim),
         )?;
+        set_current_slot(dir, 0)?;
         write_framed_wal(&dir.join(DELTA_LOG_FILE), &[])?;
         DiskVamanaIndex::open(dir)
     }
@@ -4467,9 +4555,11 @@ impl DiskVamanaIndex {
         let suffix_ops = decode_wal_payload(self.wal_format, &suffix, self.dim)?;
         // Swap in the built base, drop every run dir (pre-begin runs are folded
         // into the new base; post-begin runs replay from the WAL suffix).
-        std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
-        std::fs::rename(built.tmp.join(VECTORS_FILE), dir.join(VECTORS_FILE))?;
-        let _ = std::fs::remove_dir_all(&built.tmp);
+        // Atomic base swap: the whole new generation (graph + vectors + tier
+        // cache) is installed under one CURRENT flip - never a torn mix of
+        // old and new files (review P0). built.base's fds follow the inodes
+        // across the rename.
+        install_base_generation(&dir, &built.tmp)?;
         self.run_seq = built.run_seq_high.max(self.run_seq);
         self.discard_runs()?;
         // Re-encode the post-begin suffix as V2.
@@ -4781,9 +4871,7 @@ impl DiskVamanaIndex {
         let new_base = built.base;
         // The patch reordered base rows: drop the stale router sidecar.
         let _ = std::fs::remove_file(dir.join(IVF_FILE));
-        std::fs::rename(built.tmp.join(GRAPH_FILE), dir.join(GRAPH_FILE))?;
-        std::fs::rename(built.tmp.join(VECTORS_FILE), dir.join(VECTORS_FILE))?;
-        let _ = std::fs::remove_dir_all(&built.tmp);
+        install_base_generation(&dir, &built.tmp)?;
         self.base = new_base;
         self.ivf = None;
         // Drop tombstones that no longer cover anything (their only copy was a
@@ -6618,6 +6706,41 @@ mod tests {
             x,
             "searchable after finish"
         );
+    }
+
+    /// A crash mid base-swap (the new slot written but CURRENT not yet
+    /// flipped) leaves the OLD generation live and intact - the torn-swap
+    /// window the generation pointer closes.
+    #[test]
+    fn a_crash_before_the_pointer_flip_keeps_the_old_base() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx =
+            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let vecs = random_vectors(300, dim, 55);
+        for (id, v) in vecs.chunks_exact(dim).enumerate() {
+            idx.insert(id as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let base_before = idx.main_len();
+        assert!(base_before >= 300);
+        drop(idx);
+
+        // Simulate a crash mid-swap: a half-built inactive slot exists, but
+        // CURRENT still names the live one. `install`'s "remove a torn prior
+        // attempt" clause and the untouched pointer must ignore it.
+        let live = current_slot(tmp.path()).expect("CURRENT written");
+        let dead = if live == 0 { 1u8 } else { 0u8 };
+        let dead_dir = tmp.path().join(format!("g{dead}"));
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        std::fs::write(dead_dir.join(GRAPH_FILE), b"garbage").unwrap();
+
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert_eq!(re.main_len(), base_before, "reopen must serve the old base");
+        for id in [0u64, 150, 299] {
+            assert!(re.get(id).unwrap().is_some(), "id {id} lost across the torn swap");
+        }
     }
 
     /// A repeated query must hit the semantic entry cache and return the
