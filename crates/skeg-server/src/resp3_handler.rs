@@ -433,7 +433,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
         | Command::Decr { .. }
         | Command::IncrBy { .. }
         | Command::DecrBy { .. } => CommandKind::KvWrite,
-        Command::SkegVsearch { .. } => CommandKind::VectorRead,
+        Command::SkegVsearch { .. } | Command::SkegVget { .. } => CommandKind::VectorRead,
         Command::SkegVset { .. } | Command::SkegVmset { .. } | Command::SkegVdel { .. } => {
             CommandKind::VectorWrite
         }
@@ -482,6 +482,7 @@ fn is_pipelineable(cmd: &Command) -> bool {
             | Command::SkegVmset { .. }
             | Command::SkegVsearch { .. }
             | Command::SkegVdel { .. }
+            | Command::SkegVget { .. }
             | Command::Ping(_)
             | Command::Echo(_)
     )
@@ -514,6 +515,7 @@ async fn exec_pipelined(
         Command::SkegVmset { args } => skeg_vmset(&args, &shards, tenant, be).await,
         Command::SkegVsearch { args } => skeg_vsearch(&args, &shards, tenant).await,
         Command::SkegVdel { args } => skeg_vdel(&args, &shards, tenant).await,
+        Command::SkegVget { args } => skeg_vget(&args, &shards, tenant).await,
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
         // Unreachable: the connection loop only routes `is_pipelineable` commands
@@ -660,6 +662,7 @@ async fn dispatch_command(
         Command::SkegVset { args } => skeg_vset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVmset { args } => skeg_vmset(&args, shards, *tenant, tenant_backend).await,
         Command::SkegVdel { args } => skeg_vdel(&args, shards, *tenant).await,
+        Command::SkegVget { args } => skeg_vget(&args, shards, *tenant).await,
         Command::SkegSubjectErase { args } => skeg_subject_erase(&args, shards, *tenant).await,
         Command::SkegTenantErase { args } => {
             skeg_tenant_erase(&args, shards, *tenant, tenant_backend).await
@@ -1078,6 +1081,38 @@ async fn skeg_vdel(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
     match shards.vdel(&scoped, id, tenant_u128(tenant)).await {
         Ok(true) => Frame::Integer(1),
         Ok(false) => Frame::Integer(0),
+        Err(e) => shard_error(&e),
+    }
+}
+
+/// `SKEG.VGET name id`: the stored f32 vector, little-endian bytes, or Null.
+/// The read twin of VSET: what went in comes back bit-exact, so a client
+/// never re-embeds a document whose vector the index already holds.
+async fn skeg_vget(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    if args.len() != 2 {
+        return Frame::Error("ERR wrong number of arguments for 'SKEG.VGET'; want name id".into());
+    }
+    let raw_name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let id = match parse_u64_arg(&args[1], "id") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let scoped = match scope_vindex_or_reject(tenant, raw_name) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match shards.vget(&scoped, id).await {
+        Ok(Some(v)) => {
+            let mut bytes = Vec::with_capacity(v.len() * 4);
+            for x in v {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+            Frame::Bulk(bytes.into())
+        }
+        Ok(None) => Frame::Null,
         Err(e) => shard_error(&e),
     }
 }

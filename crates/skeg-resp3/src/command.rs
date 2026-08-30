@@ -129,6 +129,11 @@ pub enum Command {
         args: Vec<Bytes>,
     },
     /// `SKEG.VDEL name id`. Arity 2.
+    /// `SKEG.VGET name id`: the stored f32 vector for a live id, as
+    /// little-endian bytes (the same encoding VSEARCH accepts), or Null.
+    SkegVget {
+        args: Vec<Bytes>,
+    },
     SkegVdel {
         args: Vec<Bytes>,
     },
@@ -414,6 +419,15 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
                 });
             }
             Ok(Command::SkegVdel { args })
+        }
+        "VGET" => {
+            if args.len() != 2 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VGET",
+                    want: "name id",
+                });
+            }
+            Ok(Command::SkegVget { args })
         }
         "VSEARCH" => {
             // `name k l_search vector` plus optional trailing `WITHPAYLOAD`

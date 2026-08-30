@@ -5745,6 +5745,35 @@ mod tests {
         );
     }
 
+    /// VGET returns the stored vector for a live id across every location
+    /// (delta, run, base), and nothing for a deleted or unknown id.
+    #[tokio::test]
+    async fn vget_returns_the_stored_vector_and_respects_deletes() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("vg", 8, 4, 1).await.unwrap();
+        let v: Vec<f32> = (0..8).map(|i| i as f32 / 10.0).collect();
+        shards.vset("vg", 7, v.clone(), 0, None, None).await.unwrap();
+        let got = shards.vget("vg", 7).await.unwrap().expect("id 7 stored");
+        assert_eq!(got, v, "roundtrip must be bit-exact");
+        assert!(
+            shards.vget("vg", 8).await.unwrap().is_none(),
+            "unknown id must be None"
+        );
+        shards.vdel("vg", 7, 0).await.unwrap();
+        assert!(
+            shards.vget("vg", 7).await.unwrap().is_none(),
+            "deleted id must be None"
+        );
+    }
+
     #[tokio::test]
     async fn off_thread_maintenance_runs_merge_and_delete_patch() {
         let dir = TempDir::new().unwrap();
