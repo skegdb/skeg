@@ -46,6 +46,8 @@ pub enum ParseError {
     NestingTooDeep(usize),
     #[error("bulk too large: {0}")]
     BulkTooLarge(usize),
+    #[error("protocol violation: {0}")]
+    Protocol(&'static str),
     #[error("invalid boolean payload: {0:?}")]
     InvalidBoolean(Vec<u8>),
     #[error("invalid double: {0}")]
@@ -153,12 +155,13 @@ fn parse_bulk(body: &[u8]) -> ParseResult {
     if body.len() < end + 2 {
         return Ok(None);
     }
-    // Trailing CRLF is mandatory per the spec. Treat the absence as
-    // "incomplete" rather than malformed; the parser does not currently
-    // distinguish a truncated stream from a corrupt one for the trailing
-    // bytes, and treating both as incomplete is safe.
+    // We HAVE end+2 bytes; if they are not the mandatory trailing CRLF the
+    // frame is corrupt, not incomplete. Returning Ok(None) here let a bad
+    // stream sit in the connection buffer and grow to the memory ceiling
+    // (review P0) - a protocol violation must be an error so the connection
+    // is dropped.
     if &body[end..end + 2] != b"\r\n" {
-        return Ok(None);
+        return Err(ParseError::Protocol("bulk string missing trailing CRLF"));
     }
     Ok(Some((
         Frame::Bulk(Bytes::copy_from_slice(&body[start..end])),

@@ -1231,7 +1231,10 @@ fn read_registry(dir: &Path) -> Vec<RegistryEntry> {
         return Vec::new();
     }
     let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(count);
+    // A corrupt count must not drive a huge reservation (review P1): every
+    // entry is at least a 2-byte length prefix, so it cannot exceed
+    // bytes.len()/2. The loop still bounds-checks each entry.
+    let mut out = Vec::with_capacity(count.min(bytes.len() / 2));
     pos += 4;
     for _ in 0..count {
         if pos + 2 > bytes.len() {
@@ -2113,7 +2116,17 @@ async fn drop_vindex(
     drop(arc);
     quota.sub(tenant, fragment);
     if was_disk {
-        let _ = std::fs::remove_dir_all(dir.join(format!("vindex-{name}")));
+        // A failed directory removal must not let DROP report success: the
+        // index would reappear at the next open (review P1). NotFound is fine
+        // (already gone / never flushed).
+        let vdir = dir.join(format!("vindex-{name}"));
+        match std::fs::remove_dir_all(&vdir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("vindex dir {} not removed: {e}", vdir.display()));
+            }
+        }
         persist_registry(dir, vindexes);
     }
     // Drop the index's payload blobs. Without this a recreated index reusing
@@ -3473,7 +3486,30 @@ impl ShardSet {
             name: name.clone(),
             tenant,
         })
-        .await
+        .await?;
+        // The semantic router is derived state that outlives the shards it
+        // describes: without this, recreating the same name inherits stale
+        // centroids and an owner map for gone data (review P0). Drop the
+        // sidecar and the in-RAM state, propagating a sidecar-removal error.
+        self.drop_router_state(&name)?;
+        Ok(())
+    }
+
+    /// Remove a vindex's semantic-router sidecar and its in-RAM router + owner
+    /// map. Idempotent (absent sidecar is fine). A failed removal of a present
+    /// sidecar is an error - a dropped index must not leave routing behind.
+    fn drop_router_state(&self, name: &str) -> Result<(), ShardError> {
+        self.inner.routers.write().remove(name);
+        self.inner.owners.write().remove(name);
+        let path = crate::router::router_path(&self.inner.root, name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ShardError::Storage(format!(
+                "router sidecar {} not removed: {e}",
+                path.display()
+            ))),
+        }
     }
 
     /// Consolidate a disk vindex on every shard: fold each shard's streaming
@@ -3566,6 +3602,21 @@ impl ShardSet {
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                 _ => return Err(ShardError::Unavailable),
             }
+        }
+        // Erasure must remove derived routers too, or centroids trained on the
+        // erased vectors survive on disk (review P0). Scoped names are
+        // `{tenant}::name`; drop every router under this tenant's prefix.
+        let prefix = format!("{tenant}::");
+        let scoped: Vec<String> = self
+            .inner
+            .routers
+            .read()
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for name in scoped {
+            self.drop_router_state(&name)?;
         }
         Ok((vindexes, keys))
     }
@@ -3694,7 +3745,7 @@ impl ShardSet {
         if let Some(router) = self.router(name) {
             // Serialise the whole read-delete-set-record span against a
             // concurrent routed vset/vdel on the SAME id (review finding).
-            let _stripe = self.owner_stripe(id).lock().await;
+            let _stripe = self.owner_stripe(name, id).lock().await;
             // A wrong-length vector reaches the router BEFORE any shard worker
             // validates the dim; Router::assign would assert and, under
             // panic=abort, kill the whole process for every tenant. Reject it
@@ -4151,9 +4202,16 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
-    /// The stripe serialising routed point ops on `id`.
-    fn owner_stripe(&self, id: u64) -> &tokio::sync::Mutex<()> {
-        &self.inner.owner_locks[(id % 256) as usize]
+    /// The stripe serialising routed point ops on `(name, id)`. Hashing the
+    /// index name in too keeps equal ids across different indexes - and
+    /// adversarial id distributions - from serialising on the same stripe
+    /// (review P2).
+    fn owner_stripe(&self, name: &str, id: u64) -> &tokio::sync::Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut h);
+        id.hash(&mut h);
+        &self.inner.owner_locks[(h.finish() % self.inner.owner_locks.len() as u64) as usize]
     }
 
     /// The shard a point op for `id` addresses: the owner map for a
@@ -4185,7 +4243,7 @@ impl ShardSet {
         // Serialise against a concurrent routed vset on the same id (review
         // finding); a hash-routed vindex has no router so the guard is skipped.
         let _guard = if self.router(name).is_some() {
-            Some(self.owner_stripe(id).lock().await)
+            Some(self.owner_stripe(name, id).lock().await)
         } else {
             None
         };
@@ -4264,7 +4322,7 @@ impl ShardSet {
     /// [`vsearch`](Self::vsearch) with an explicit probe width. With a
     /// semantic router and `probe > 0`, an UNFILTERED search asks only the
     /// `probe` shards whose centroids are nearest the query - the measured
-    /// coverage ceiling at probe 2 on the real corpus is 0,9965 (M2). A
+    /// coverage ceiling at probe 2 on the real corpus is 0,9965. A
     /// filtered search always fans out to every shard: the filter's matches
     /// are orthogonal to semantics and can live anywhere. `probe = 0` (or no
     /// router) keeps the full fan-out.
@@ -6794,6 +6852,43 @@ mod tests {
                 "probe=2 must match full fan-out for cluster query {probe_q}"
             );
         }
+    }
+
+    /// Dropping a resharded vindex removes its router sidecar, its in-RAM
+    /// router and owner map; recreating the same name starts routing-free.
+    #[tokio::test]
+    async fn drop_clears_the_semantic_router() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            2,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("dr", 8, 4, 1).await.unwrap();
+        for id in 0..200u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 2) as usize] = 1.0;
+            shards.vset("dr", id, v, 0, None, None).await.unwrap();
+        }
+        shards.reshard("dr", 0.25, 10, 0).await.unwrap();
+        assert!(shards.router("dr").is_some());
+        let sidecar = crate::router::router_path(dir.path(), "dr");
+        assert!(sidecar.exists(), "sidecar written");
+
+        shards.vindex_drop("dr", 0).await.unwrap();
+        assert!(shards.router("dr").is_none(), "router still loaded after drop");
+        assert!(!sidecar.exists(), "sidecar survived the drop");
+        assert!(
+            shards.inner.owners.read().get("dr").is_none(),
+            "owner map survived the drop"
+        );
+
+        // Recreate the same name: no inherited routing.
+        shards.vindex_create("dr", 8, 4, 1).await.unwrap();
+        assert!(shards.router("dr").is_none(), "recreated index inherited a router");
     }
 
     /// Training the router samples every shard, writes the sidecar, and a

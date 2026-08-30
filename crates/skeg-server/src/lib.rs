@@ -275,12 +275,26 @@ impl Server {
             tenant = tenant_backend.is_some(),
             "server listening (RESP3)"
         );
+        // Bound concurrent connections: each can buffer up to the frame
+        // ceiling, so an unbounded accept loop is a memory-DoS surface
+        // (review P0). SKEG_MAX_CONNECTIONS caps it; a permit is held for the
+        // connection's lifetime.
+        let max_conns = std::env::var("SKEG_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1024);
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_conns));
         loop {
             let (stream, _) = listener.accept().await?;
+            // Acquire before spawning; if the pool is exhausted the accept
+            // loop parks here rather than piling up unbounded tasks.
+            let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
             tune_socket(&stream);
             let shards = shards.clone();
             let backend = tenant_backend.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 handle_connection_resp3(stream, shards, backend).await;
             });
         }
