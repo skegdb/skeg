@@ -32,13 +32,14 @@ nothing new to add costs 13-25ms instead of a rebuild.
   (the baseline-NEON `vmull` kernel measures slower than the
   auto-vectorized scalar and stays undispatched); the 100k-vector flat
   scan drops 23,8%.
-- **Int8 walk proxy for the build** behind `SKEG_BUILD_INT8_WALK=1`:
-  navigation ranks candidates by the i8 dot at a quarter of the memory
-  traffic; the prune re-scores in f32 (mandatory, the int8-prune verdict
-  stands). Gated at 150k real mxbai rows: fold 27,4s -> 25,0s (1,09x),
-  recall 0,9868 -> 0,9880. Real but marginal - the build is prune- and
-  back-edge-bound, not walk-bound - so the flag stays off by default;
-  the block-of-32 LUT layout is where the int8 scan win actually lives.
+- **Int8 walk proxy for the build** (default on; `SKEG_BUILD_INT8_WALK=0`
+  restores the f32 walk): navigation ranks candidates by the i8 dot on the
+  sdot kernel at a quarter of the memory traffic; the prune re-scores in
+  f32 (mandatory, the int8-prune verdict stands). Gated at 150k real mxbai
+  rows: fold 28,3s -> 14,9s (1,90x), recall 0,9878 -> 0,9880. An earlier
+  1,09x verdict was invalid - measured on a binary that lacked the flag,
+  i.e. two identical runs; the re-measure on the merged binary is the
+  number that stands.
 
 - **Patched fold.** `ConsolidateJob` now captures the base adjacency, and the
   fold reuses it: rows whose neighbours all survive are remapped verbatim at

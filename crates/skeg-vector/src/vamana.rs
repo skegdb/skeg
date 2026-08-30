@@ -922,9 +922,14 @@ impl Int8WalkProxy {
     }
 }
 
+/// The int8 build walk is the default: gated at 150k real mxbai rows, fold
+/// 28,3s -> 14,9s (1,90x) with recall 0,9878 -> 0,9880. (An earlier "1,09x"
+/// verdict was measured on a binary that lacked the flag entirely - two
+/// identical runs and their noise.) `SKEG_BUILD_INT8_WALK=0` restores the
+/// f32 walk.
 fn build_int8_walk_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SKEG_BUILD_INT8_WALK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("SKEG_BUILD_INT8_WALK").is_ok_and(|v| v == "0"))
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors insert_point_concurrent's parameters
