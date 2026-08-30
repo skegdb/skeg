@@ -3717,6 +3717,7 @@ impl DiskVamanaIndex {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchFiltered);
         }
         let sketch = query_sketch(query);
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchInner);
         let phase_t0 = Instant::now();
         let mut all_cand: Vec<(f32, usize, VecId)> = Vec::new();
         for (seg_idx, seg) in segs.iter().enumerate() {
@@ -3830,6 +3831,10 @@ impl DiskVamanaIndex {
             // budget below. Re-score the survivors with the asymmetric proxy
             // (in-RAM, no disk) so the reads land on the best candidates. Other
             // modes keep the walk's proxy value at zero extra cost.
+            skeg_telemetry::add_counter(
+                skeg_telemetry::Counter::VsearchWalkHops,
+                visited.count_set() as u64,
+            );
             let hybrid = code.is_tq1_hybrid();
             for (proxy, row) in cand {
                 let score = if hybrid {

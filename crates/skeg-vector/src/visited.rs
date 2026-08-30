@@ -25,6 +25,14 @@ pub struct VisitedBitset {
 }
 
 impl VisitedBitset {
+    /// Number of set bits: after a walk, the nodes it expanded. One popcount
+    /// per word, outside any hot loop.
+    #[must_use]
+    pub fn count_set(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+
     /// Create a bitset with `n` slots. Allocation: `n/64` `u64` words, all
     /// zeroed.
     ///

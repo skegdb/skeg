@@ -321,10 +321,16 @@ pub enum Counter {
     EntryCacheHits = 33,
     /// Entry-cache lookups that found no sketch match.
     EntryCacheMisses = 34,
+    /// Graph nodes expanded by search walks (sum; divide by VsearchInner for
+    /// the average hops a query pays to reach its answers).
+    VsearchWalkHops = 35,
+    /// Searches that took the graph-walk route (the denominator for
+    /// per-search walk averages; the hybrid route has its own counters).
+    VsearchInner = 36,
 }
 
 impl Counter {
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 37;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -361,6 +367,8 @@ impl Counter {
         Counter::VsearchHybridScored,
         Counter::EntryCacheHits,
         Counter::EntryCacheMisses,
+        Counter::VsearchWalkHops,
+        Counter::VsearchInner,
     ];
 
     #[inline]
@@ -401,6 +409,8 @@ impl Counter {
             Counter::VsearchHybridScored => "skeg_vsearch_hybrid_scored_total",
             Counter::EntryCacheHits => "skeg_entry_cache_hits_total",
             Counter::EntryCacheMisses => "skeg_entry_cache_misses_total",
+            Counter::VsearchWalkHops => "skeg_vsearch_walk_hops_total",
+            Counter::VsearchInner => "skeg_vsearch_inner_total",
         }
     }
 }
