@@ -1936,7 +1936,7 @@ const CURRENT_FILE: &str = "CURRENT";
 /// Marker inside a run dir: this run is an L0 flat run (no graph).
 const FLAT_MARKER: &str = "flat";
 
-/// Fraction of the LIVE set sitting in run segments at which SEARCH stops
+/// Run-debt ratio at which SEARCH stops
 /// trusting the short beam on them and scans them exactly on the proxy.
 ///
 /// Runs are walked with a deliberately short beam so latency stays flat as
@@ -1948,10 +1948,15 @@ const FLAT_MARKER: &str = "flat";
 /// The trigger is MASS, not count. A count cannot see the case that matters:
 /// one merged run holding 40k of 60k live rows is a single run - "healthy" by
 /// any count - with two thirds of the corpus behind a beam of 40. Above this
-/// share, run segments switch to a full proxy scan: exact with respect to the
+/// ratio, run segments switch to a full proxy scan: exact with respect to the
 /// proxy (the re-rank keeps its own budget), which removes precisely the
 /// misses the beam was causing, and pays in latency instead of in recall.
-const RUN_MASS_FALLBACK: f32 = 0.25;
+///
+/// NOTE what the ratio is and is not: run rows include stale, shadowed and
+/// tombstoned copies, so it measures PHYSICAL run debt and can exceed 1.0.
+/// It is deliberately a conservative signal - it fires early when the runs
+/// carry garbage - and it is NOT the live fraction sitting in runs.
+const RUN_DEBT_FALLBACK: f32 = 0.25;
 
 /// `SKEG_L0_FLAT_MAX=<rows>`: a flush of at most this many rows writes an L0
 /// flat run (vectors + tier, no graph build) and search scans it exactly with
@@ -4125,7 +4130,7 @@ impl DiskVamanaIndex {
             // Once the runs hold a large SHARE of the live set, a graphed run
             // is scanned, not walked: maintenance is behind and the short beam
             // is losing rows that the index really holds.
-            let debt_fallback = seg_idx > 0 && self.run_mass() >= RUN_MASS_FALLBACK;
+            let debt_fallback = seg_idx > 0 && self.run_debt_ratio() >= RUN_DEBT_FALLBACK;
             if debt_fallback {
                 skeg_telemetry::tick_counter(skeg_telemetry::Counter::RunScanFallback);
             }
@@ -4812,18 +4817,25 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
-    /// Share of the live set that sits in run segments (0.0 when there are
-    /// none). The number that decides whether the short beam on runs is still
-    /// a safe assumption - a run COUNT cannot, because one merged run can
-    /// hold most of the index.
+    /// Rows held by run segments divided by the live count: the run debt
+    /// ratio. Decides whether the short beam on runs is still a safe
+    /// assumption - a run COUNT cannot, because one merged run can hold most
+    /// of the index.
+    ///
+    /// Run rows include stale, shadowed and tombstoned copies, so this is
+    /// PHYSICAL debt and may exceed 1.0. That makes it conservative by
+    /// construction (it fires early when runs carry garbage) and means it is
+    /// not the live fraction - do not read it as one.
     #[must_use]
-    pub fn run_mass(&self) -> f32 {
+    pub fn run_debt_ratio(&self) -> f32 {
         let run_rows: usize = self.runs.iter().map(|r| r.main_n as usize).sum();
         if run_rows == 0 {
             return 0.0;
         }
         let live = self.live_count.max(1);
-        (run_rows as f32 / live as f32).min(1.0)
+        // NOT clamped to 1.0: debt above the live count is real information,
+        // and hiding it would make the worst case look like the boundary.
+        run_rows as f32 / live as f32
     }
 
     /// Rows in the largest single run: a merge can cut the COUNT while

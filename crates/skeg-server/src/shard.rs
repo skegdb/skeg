@@ -3773,6 +3773,44 @@ impl ShardSet {
             .await;
     }
 
+    /// Per-SHARD LSM state for one vindex, one line per shard.
+    ///
+    /// `VINDEX.LIST` sums across shards, and that sum has already cost real
+    /// time: "33 runs" read as a crisis when it was four per shard - under
+    /// every per-shard threshold in the engine - and the fix aimed at it
+    /// could not fire. Aggregates hide exactly the quantity the thresholds
+    /// are written against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is invalid or a shard is unavailable.
+    pub async fn vindex_per_shard(&self, name: &str) -> Result<Vec<String>, ShardError> {
+        validate_vindex_name(name)?;
+        let mut out = Vec::new();
+        for shard in 0..self.inner.n {
+            let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await? else {
+                return Err(ShardError::Unavailable);
+            };
+            let Some(r) = rows.iter().find(|r| r.name == name) else {
+                out.push(format!("shard={shard} absent=1"));
+                continue;
+            };
+            let live = r.n_vectors.max(1);
+            out.push(format!(
+                "shard={shard} live={} base={} delta={} runs={} run_rows={} tombs={} \
+                 run_debt_ratio={:.3}",
+                r.n_vectors,
+                r.base,
+                r.delta,
+                r.runs,
+                r.run_rows,
+                r.tombs,
+                r.run_rows as f32 / live as f32,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Operational health, per vindex: is maintenance keeping up?
     ///
     /// Deliberately separate from [`check`](Self::check), which certifies
@@ -3781,10 +3819,13 @@ impl ShardSet {
     /// 0.9925 to 0.7180 because the live set migrated into run segments. An
     /// operator needs to see that coming, and no integrity check ever will.
     ///
-    /// Graded on MASS, not on run count: one merged run holding most of the
-    /// index is a single run - healthy by any count - with the majority of
-    /// the corpus behind a short beam. `run_mass` is the share of live rows
-    /// sitting in runs.
+    /// Graded on run DEBT, not on run count: one merged run holding most of
+    /// the index is a single run - healthy by any count - with the majority
+    /// of the corpus behind a short beam.
+    ///
+    /// `run_debt_ratio` is run rows over live rows. Run rows include stale,
+    /// shadowed and tombstoned copies, so it is physical debt and can exceed
+    /// 1.0; it is a conservative signal, not the live fraction.
     ///
     /// # Errors
     ///
@@ -3793,7 +3834,7 @@ impl ShardSet {
         validate_vindex_name(name)?;
         let mut out = Vec::new();
         let (mut worst_runs, mut worst_shard) = (0usize, 0usize);
-        let (mut worst_mass, mut worst_mass_shard) = (0.0f32, 0usize);
+        let (mut worst_debt, mut worst_debt_shard) = (0.0f32, 0usize);
         let (mut tot_runs, mut tot_delta, mut tot_run_rows, mut tot_live) = (0u64, 0u64, 0u64, 0u64);
         let mut max_run_rows = 0u64;
         let mut present: Vec<usize> = Vec::new();
@@ -3811,10 +3852,10 @@ impl ShardSet {
                 worst_shard = shard;
             }
             let live = row.n_vectors.max(1);
-            let mass = row.run_rows as f32 / live as f32;
-            if mass > worst_mass {
-                worst_mass = mass;
-                worst_mass_shard = shard;
+            let debt = row.run_rows as f32 / live as f32;
+            if debt > worst_debt {
+                worst_debt = debt;
+                worst_debt_shard = shard;
             }
             max_run_rows = max_run_rows.max(row.run_rows);
             tot_runs += row.runs;
@@ -3828,9 +3869,9 @@ impl ShardSet {
         if present.is_empty() {
             return Err(ShardError::Storage(format!("no such vindex '{name}'")));
         }
-        let state = if worst_mass >= 0.25 {
+        let state = if worst_debt >= 0.25 {
             "CRITICAL"
-        } else if worst_mass >= 0.10 || worst_runs >= 4 {
+        } else if worst_debt >= 0.10 || worst_runs >= 4 {
             "DEGRADED"
         } else {
             "OK"
@@ -3843,7 +3884,7 @@ impl ShardSet {
                 self.inner.n
             ));
         }
-        out.push(format!("run_mass {worst_mass:.3} shard {worst_mass_shard}"));
+        out.push(format!("run_debt_ratio {worst_debt:.3} shard {worst_debt_shard}"));
         out.push(format!("worst_runs {worst_runs} shard {worst_shard}"));
         out.push(format!("max_run_rows {max_run_rows}"));
         out.push(format!("runs_total {tot_runs}"));
@@ -3868,7 +3909,7 @@ impl ShardSet {
             "reason {}",
             match state {
                 "CRITICAL" =>
-                    "a quarter or more of the live rows sit in run segments: search scans them instead of walking, and maintenance is behind",
+                    "run debt is a quarter of the live count or more: search scans run segments instead of walking them, and maintenance is behind",
                 "DEGRADED" => "runs are accumulating: a merge is due",
                 _ => "maintenance is keeping up",
             }

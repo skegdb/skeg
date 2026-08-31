@@ -449,6 +449,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
         Command::SkegCheck { .. } => CommandKind::VindexList,
         Command::SkegVowner { .. } => CommandKind::VindexList,
         Command::SkegHealth { .. } => CommandKind::VindexList,
+        Command::SkegVindexShards { .. } => CommandKind::VindexList,
         // A tenant erasing its own subject's keys is a KV write; the two
         // cross-tenant / store-wide ops are admin.
         Command::SkegSubjectErase { .. } => CommandKind::KvWrite,
@@ -669,6 +670,7 @@ async fn dispatch_command(
         Command::SkegCheck { args } => skeg_check(args.as_slice(), shards, *tenant).await,
         Command::SkegVowner { args } => skeg_vowner(args.as_slice(), shards, *tenant).await,
         Command::SkegHealth { args } => skeg_health(args.as_slice(), shards, *tenant).await,
+        Command::SkegVindexShards { args } => skeg_vindex_shards(args.as_slice(), shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
         Command::SkegVindexConsolidate { args } => {
@@ -1137,6 +1139,24 @@ async fn skeg_vget(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
 
 /// `SKEG.VINDEX.RESHARD name`: train the router, move every row to its
 /// semantic owner. Returns the number of rows moved.
+/// `SKEG.VINDEX.SHARDS <index>` - per-shard LSM state. LIST sums across
+/// shards, and thresholds are written per shard: reading the sum against a
+/// per-shard threshold is how a real fix aimed at the wrong number.
+async fn skeg_vindex_shards(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    let name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let scoped = match scope_vindex_or_reject(tenant, name) {
+        Ok(s) => s,
+        Err(f) => return f,
+    };
+    match shards.vindex_per_shard(&scoped).await {
+        Ok(lines) => Frame::Bulk(Bytes::from(lines.join("\n") + "\n")),
+        Err(e) => shard_error(&e),
+    }
+}
+
 /// `SKEG.HEALTH <index>` - is maintenance keeping up? Separate from CHECK,
 /// which certifies integrity: an index can be perfectly intact and losing
 /// recall because runs are piling up faster than they merge.
