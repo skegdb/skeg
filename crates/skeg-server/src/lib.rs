@@ -11,6 +11,7 @@
 //! via [`Server::with_tenant_backend`].
 
 pub mod handler;
+pub mod layout_manifest;
 pub mod payload;
 pub mod payload_disk;
 pub mod quota;
@@ -216,8 +217,12 @@ impl Server {
             // No `.max(1)`: an empty directory is not a one-shard
             // replica. A layout that cannot be established is a refusal
             // to start, not a guess.
-            let n = ShardSet::discover_shard_count(data_dir)?.get();
-            tracing::info!("serve mode: {n} shard(s) discovered on disk");
+            let layout = crate::layout_manifest::LayoutManifest::open_or_migrate(
+                data_dir,
+                crate::layout_manifest::OpenMode::ReadOnly,
+            )?;
+            let n = layout.shard_count().get();
+            tracing::info!("serve mode: {n} shard(s) declared by the store");
             ShardSet::open_mode_full_mmap(data_dir, n, true, tier, workers, mmap_tier, mmap_graph)?
         };
         let listener = TcpListener::bind(addr).await?;

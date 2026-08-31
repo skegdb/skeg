@@ -3192,76 +3192,6 @@ pub struct ShardSet {
 }
 
 impl ShardSet {
-    /// Open `n_shards` read-write shards, each storing into
-    /// How many shards this directory was WRITTEN with, or an error.
-    ///
-    /// Opening with the wrong count is silent and total: a set written with
-    /// eight shards, opened with one, serves exactly the rows that landed in
-    /// shard 0 - an eighth of the index - and answers every query with
-    /// complete confidence. Read-only serve mode hardcoded 1 and did exactly
-    /// that.
-    ///
-    /// So this is FAIL-CLOSED. A replica that cannot establish the layout
-    /// must refuse to start, not guess and serve a fraction:
-    /// - no `shard-N` directory at all -> `NotFound` (an empty directory is
-    ///   not a one-shard replica, and treating it as one is how "healthy"
-    ///   gets printed over nothing);
-    /// - a gap in the numbering (`shard-0`, `shard-2`) -> `InvalidData`.
-    ///   Deducing "the highest id plus one" here would serve around a hole,
-    ///   which is the very failure this function exists to prevent.
-    ///
-    /// A persistent manifest carrying a version and the shard count is the
-    /// real answer; this scan is the migration path for sets written before
-    /// one exists.
-    ///
-    /// # Errors
-    ///
-    /// `NotFound` when no shard directory exists, `InvalidData` when the
-    /// numbering is not contiguous from zero.
-    pub fn discover_shard_count(base_dir: &Path) -> std::io::Result<NonZeroUsize> {
-        let mut ids: Vec<usize> = Vec::new();
-        for e in std::fs::read_dir(base_dir)? {
-            // NOT `.flatten()`: swallowing an unreadable entry lets discovery
-            // conclude the layout simply HAS fewer shards, which is the exact
-            // failure this function exists to refuse. An I/O error is a
-            // refusal to start.
-            let e = e?;
-            let name = e.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some(rest) = name.strip_prefix("shard-")
-                && let Ok(id) = rest.parse::<usize>()
-                && e.path().is_dir()
-            {
-                ids.push(id);
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        let Some(&highest) = ids.last() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "no shard-N directory under {}: refusing to serve an \
-                     unknown layout",
-                    base_dir.display()
-                ),
-            ));
-        };
-        if ids.len() != highest + 1 || ids[0] != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "shard directories under {} are not contiguous from 0 \
-                     (found {:?}): refusing to serve around a hole",
-                    base_dir.display(),
-                    ids
-                ),
-            ));
-        }
-        NonZeroUsize::new(highest + 1)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no shards"))
-    }
-
     /// `base_dir/shard-{id}/`.
     ///
     /// # Errors
@@ -3369,6 +3299,23 @@ impl ShardSet {
         mmap_graph: bool,
     ) -> std::io::Result<Self> {
         assert!(n_shards >= 1, "n_shards must be >= 1");
+        // The store declares its own shape, and this is the ONE place that
+        // asks. A caller's `n_shards` is a request, not an authority: if the
+        // manifest disagrees, or the directories disagree with the manifest,
+        // the open refuses instead of picking a winner. Read-only opens never
+        // write - serve mode runs over copies an operator may have mounted
+        // read-only, and over stores older than the manifest itself.
+        let mode = if read_only {
+            crate::layout_manifest::OpenMode::ReadOnly
+        } else {
+            crate::layout_manifest::OpenMode::ReadWrite {
+                requested_shards: NonZeroUsize::new(n_shards)
+                    .expect("n_shards >= 1 asserted above"),
+            }
+        };
+        let n_shards = crate::layout_manifest::LayoutManifest::open_or_migrate(base_dir, mode)?
+            .shard_count()
+            .get();
         let mut senders = Vec::with_capacity(n_shards);
         let mut handles = Vec::with_capacity(n_shards);
         // Readiness barrier: each shard reports its startup outcome once recovery
@@ -7216,14 +7163,18 @@ mod tests {
                 shards.vset("sd", id, v, 0, None, None).await.unwrap();
             }
         }
+        let layout = crate::layout_manifest::LayoutManifest::open_or_migrate(
+            dir.path(),
+            crate::layout_manifest::OpenMode::ReadOnly,
+        )
+        .unwrap();
         assert_eq!(
-            ShardSet::discover_shard_count(dir.path()).unwrap().get(),
+            layout.shard_count().get(),
             8,
-            "an eight-shard set must be discovered as eight"
+            "an eight-shard set must report eight shards"
         );
-        // Reopening with the discovered count sees every row; the old
-        // hardcoded 1 would see roughly an eighth of them.
-        let n = ShardSet::discover_shard_count(dir.path()).unwrap().get();
+        // Reopening sees every row; the old hardcoded 1 would see an eighth.
+        let n = layout.shard_count().get();
         let re = ShardSet::open_mode_with_workers(
             dir.path(),
             n,
@@ -7240,9 +7191,18 @@ mod tests {
             .sum();
         assert_eq!(total, 800, "reopen lost rows: saw {total} of 800");
         // Fail-closed: an absent or holed layout is an ERROR, never a guess.
-        assert!(ShardSet::discover_shard_count(&dir.path().join("nope")).is_err());
+        assert!(
+            crate::layout_manifest::LayoutManifest::open_or_migrate(
+                &dir.path().join("nope"),
+                crate::layout_manifest::OpenMode::ReadOnly,
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(dir.path().join("shard-3")).unwrap();
-        let holed = ShardSet::discover_shard_count(dir.path());
+        let holed = crate::layout_manifest::LayoutManifest::open_or_migrate(
+            dir.path(),
+            crate::layout_manifest::OpenMode::ReadOnly,
+        );
         assert!(
             holed.is_err(),
             "a gap in the numbering must not be served around"

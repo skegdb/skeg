@@ -9,6 +9,39 @@ repository.
 
 ## [Unreleased]
 
+### The on-disk layout is declared, not deduced
+
+A store now carries a `LAYOUT` file at its root stating what it is: format
+version, shard count, store identity, and the feature flags its files were
+written with. Every server constructor asks that file and nothing else, so
+there is exactly ONE place that decides how many shards a store has.
+
+Before, the count was inferred by scanning for `shard-N` directories. The
+scan was made fail-closed after serve mode was found opening one shard of an
+eight-shard store - 597 rows of 5,000, recall 0.115, no error and no warning
+- but a refusal still leaves the reader deducing something the writer knew
+and never wrote down.
+
+Every ambiguity is now a startup error: a failed checksum, a format version
+this build does not read, a feature flag it cannot honour, a shard count that
+disagrees with the caller, or a manifest that disagrees with the directories
+beside it. The file is a fixed 44 bytes with a CRC32C over its body, checked
+before any field is believed - the version of a corrupt file is itself
+corrupt. A longer file is rejected rather than read as a prefix, so a future
+writer's extra data can never be silently ignored by an older reader.
+
+Deliberately absent: base generations and router epochs. Those advance per
+vindex many times a minute and already have their own atomic per-vindex
+files; putting them here would turn one rarely-written file into a contended
+one, and recreate the rule-in-two-places shape behind every P0 this engine
+has had.
+
+Stores written before this existed still open. A writable open adopts a
+manifest once, keeping the fail-closed rules; a read-only open reads the
+layout and changes nothing on disk, because serve mode runs over copies an
+operator may have mounted read-only. Directory scanning survives only as
+that one-way migration.
+
 ### A point read could return a stale vector (P0)
 
 `DiskVamanaIndex::get` checked the BASE before the RUNS, under a comment
