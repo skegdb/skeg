@@ -57,15 +57,17 @@ pub use distance::{
 #[cfg(target_arch = "x86_64")]
 pub use distance::{cosine_f32_avx2, dot_f32_avx2, dot_int8_avx2, hamming_binary_avx2};
 #[cfg(target_arch = "aarch64")]
-pub use distance::{cosine_f32_neon, dot_f32_neon, dot_int8_neon, dot_int8_sdot, hamming_binary_neon};
+pub use distance::{
+    cosine_f32_neon, dot_f32_neon, dot_int8_neon, dot_int8_sdot, hamming_binary_neon,
+};
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub use distance::{dot_int8_avx512, hamming_binary_avx512};
 
 pub mod adc;
 pub use adc::{
-    quantise_centroids_i8, tq1_bitplane_score, tq1_bitplane_score_scalar, tq1_masked_sum,
-    tq1_masked_sum_scalar, tq1_masked_dot_qi8, tq1_masked_dot_qi8_scalar, tq2_adc_i8, tq2_adc_qi8, tq2_adc_qi8_scalar,
-    tq4_adc_qi8, tq2_adc_i8_scalar, tq4_adc_i8, tq4_adc_i8_scalar,
+    quantise_centroids_i8, tq1_bitplane_score, tq1_bitplane_score_scalar, tq1_masked_dot_qi8,
+    tq1_masked_dot_qi8_scalar, tq1_masked_sum, tq1_masked_sum_scalar, tq2_adc_i8,
+    tq2_adc_i8_scalar, tq2_adc_qi8, tq2_adc_qi8_scalar, tq4_adc_i8, tq4_adc_i8_scalar, tq4_adc_qi8,
 };
 #[cfg(target_arch = "aarch64")]
 pub use adc::{tq1_bitplane_score_neon, tq1_masked_sum_neon, tq2_adc_i8_neon, tq4_adc_i8_neon};

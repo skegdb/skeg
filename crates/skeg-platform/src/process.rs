@@ -165,13 +165,19 @@ mod tests {
     fn raising_never_lowers_the_limit() {
         let (before, _) = fd_limit();
         let after = raise_fd_limit(1);
-        assert!(after >= before, "raise_fd_limit(1) lowered {before} to {after}");
+        assert!(
+            after >= before,
+            "raise_fd_limit(1) lowered {before} to {after}"
+        );
     }
 
     #[test]
     fn rss_and_cpu_report_plausible_numbers() {
         let rss = rss_bytes();
-        assert!(rss > 1 << 20, "a running test process holds > 1MB, got {rss}");
+        assert!(
+            rss > 1 << 20,
+            "a running test process holds > 1MB, got {rss}"
+        );
         let c0 = cpu_seconds();
         // Burn a little CPU; the counter must be monotone non-decreasing.
         let mut x = 0u64;

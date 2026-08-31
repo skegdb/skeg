@@ -78,19 +78,17 @@ pub type Directory = BTreeMap<String, BTreeMap<Value, Span>>;
 /// # Errors
 ///
 /// Returns an error if the file cannot be written, synced or renamed.
-pub fn write<'a, I>(
-    dir: &Path,
-    stamp: (u64, u64),
-    all_ids: &[u64],
-    lists: I,
-) -> std::io::Result<()>
+pub fn write<'a, I>(dir: &Path, stamp: (u64, u64), all_ids: &[u64], lists: I) -> std::io::Result<()>
 where
     I: Iterator<Item = (&'a str, &'a Value, &'a [u64])>,
 {
     let mut postings: Vec<u8> = Vec::new();
     let mut directory: Directory = BTreeMap::new();
     for (field, value, ids) in lists {
-        debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "id list must be sorted");
+        debug_assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "id list must be sorted"
+        );
         let off = u32::try_from(postings.len())
             .map_err(|_| std::io::Error::other("payload index postings exceed 4 GiB"))?;
         put_varint(ids.len() as u64, &mut postings);
@@ -184,7 +182,8 @@ impl DiskPostings {
         let mut f = std::fs::File::open(dir.join(FILE)).ok()?;
         let mut head = [0u8; HEADER];
         f.read_exact(&mut head).ok()?;
-        let u32_at = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+        let u32_at =
+            |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
         let u64_at = |o: usize| {
             let mut b = [0u8; 8];
             b.copy_from_slice(&head[o..o + 8]);
@@ -200,7 +199,8 @@ impl DiskPostings {
         let dir_len = usize::try_from(u64_at(32)).ok()?;
         let expected_crc = u32_at(40);
 
-        let body_len = usize::try_from(f.metadata().ok()?.len().checked_sub(HEADER as u64)?).ok()?;
+        let body_len =
+            usize::try_from(f.metadata().ok()?.len().checked_sub(HEADER as u64)?).ok()?;
         let mut body = Vec::new();
         body.try_reserve_exact(body_len).ok()?;
         f.read_to_end(&mut body).ok()?;

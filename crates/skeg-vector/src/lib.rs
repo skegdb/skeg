@@ -30,8 +30,8 @@ mod turboquant;
 mod vamana;
 mod visited;
 
-pub use flat::FlatIndex;
 pub use balance::{balanced_kmeans, nearest_centroid};
+pub use flat::FlatIndex;
 pub use ivf_router::IvfRouter;
 pub use quant::{
     QuantKind, QuantizedVectors, QueryCode, TQ1_HYBRID_MIN_DIM, Tq1ProxyMode, tq1_proxy_mode_for,
@@ -41,8 +41,7 @@ pub use tq1_control::{SHADOW_EVERY, Tq1ProxyController};
 pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
 pub use vamana::{
     ConsolidateBuilt, ConsolidateJob, ConsolidatePace, DeletePatchBuilt, DeletePatchJob,
-    DiskVamanaIndex,
-    FlushBuilt, FlushJob, IvfBuilt, IvfJob, RunMergeBuilt, RunMergeJob, VamanaConfig, VamanaIndex,
-    build_phase_times_ns, reset_build_phase_times, set_speed_enabled,
+    DiskVamanaIndex, FlushBuilt, FlushJob, IvfBuilt, IvfJob, RunMergeBuilt, RunMergeJob,
+    VamanaConfig, VamanaIndex, build_phase_times_ns, reset_build_phase_times, set_speed_enabled,
 };
 pub use visited::VisitedBitset;

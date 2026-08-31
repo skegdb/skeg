@@ -755,7 +755,11 @@ impl Tq1Aniso {
         &self.center
     }
     pub(crate) fn from_parts(shift: Vec<f32>, inv_scale: Vec<f32>, center: Vec<f32>) -> Self {
-        Self { shift, inv_scale, center }
+        Self {
+            shift,
+            inv_scale,
+            center,
+        }
     }
 
     #[must_use]
@@ -1492,7 +1496,14 @@ impl QuantizedVectors {
     /// cached (they are cheaper to rebuild, and int8/pq carry different state).
     #[must_use]
     pub fn tier_payload(&self) -> Option<Vec<u8>> {
-        let QuantRepr::TurboQuant { codes, scales, aniso, bits, .. } = &self.repr else {
+        let QuantRepr::TurboQuant {
+            codes,
+            scales,
+            aniso,
+            bits,
+            ..
+        } = &self.repr
+        else {
             return None;
         };
         let c = codes.as_slice();
@@ -1548,7 +1559,11 @@ impl QuantizedVectors {
             let e = p.checked_add(bytes)?;
             let src = buf.get(*p..e)?;
             *p = e;
-            Some(src.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+            Some(
+                src.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
         };
         let scales = take_f32s(&mut p)?;
         if scales.len() != n {
@@ -1984,7 +1999,12 @@ impl QuantizedVectors {
                     code_bytes,
                     ..
                 },
-                QueryCode::TurboQuant { q_rot, q_sum, qm, q_i8 },
+                QueryCode::TurboQuant {
+                    q_rot,
+                    q_sum,
+                    qm,
+                    q_i8,
+                },
             ) => {
                 // Asymmetric inner product: for each coord, multiply the
                 // rotated query coord by the Lloyd-Max centroid keyed by the
@@ -2021,8 +2041,8 @@ impl QuantizedVectors {
                         // masked = sum q over set bits, exact in i32; the
                         // 2-level symmetry gives c*(2*masked - q_sum).
                         Some((q, q_scale)) => {
-                            let masked = skeg_simd::tq1_masked_dot_qi8(code, q, q.len()) as f32
-                                * *q_scale;
+                            let masked =
+                                skeg_simd::tq1_masked_dot_qi8(code, q, q.len()) as f32 * *q_scale;
                             centroids[1] * (2.0 * masked - *q_sum)
                         }
                         None => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),
@@ -2125,15 +2145,19 @@ impl QuantizedVectors {
                     ..
                 },
                 QueryCode::TurboQuant1Hybrid {
-                    q_rot, q_sum, qm, q_i8, ..
+                    q_rot,
+                    q_sum,
+                    qm,
+                    q_i8,
+                    ..
                 },
             ) => {
                 assert!(row < self.n, "row out of range");
                 let code = &codes.as_slice()[row * code_bytes..(row + 1) * code_bytes];
                 let acc = match q_i8 {
                     Some((q, q_scale)) => {
-                        let masked = skeg_simd::tq1_masked_dot_qi8(code, q, q.len()) as f32
-                            * *q_scale;
+                        let masked =
+                            skeg_simd::tq1_masked_dot_qi8(code, q, q.len()) as f32 * *q_scale;
                         centroids[1] * (2.0 * masked - *q_sum)
                     }
                     None => tq1_adc_swar(code, centroids, q_rot, q_rot.len(), *q_sum),

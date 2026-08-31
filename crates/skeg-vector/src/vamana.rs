@@ -599,13 +599,12 @@ fn build_patched_graph(
             remap[orow as usize] = new_row as u32;
         }
     }
-    let medoid = if (patch.medoid as usize) < remap.len()
-        && remap[patch.medoid as usize] != u32::MAX
-    {
-        remap[patch.medoid as usize]
-    } else {
-        approximate_medoid(&src, n_new, cfg.medoid_sample, cfg.seed)
-    };
+    let medoid =
+        if (patch.medoid as usize) < remap.len() && remap[patch.medoid as usize] != u32::MAX {
+            remap[patch.medoid as usize]
+        } else {
+            approximate_medoid(&src, n_new, cfg.medoid_sample, cfg.seed)
+        };
 
     // Surviving base rows first: verbatim remap, or bridge+re-prune where a
     // neighbour died. Each row writes only its own node, so this is a plain
@@ -1004,7 +1003,17 @@ fn run_pass_parallel(
     order.par_iter().for_each_init(
         || BuildScratch::with_capacity(cap),
         |scratch, &p| {
-            insert_point_concurrent(graph, source, &[medoid], p, alpha, r, l_build, scratch, proxy);
+            insert_point_concurrent(
+                graph,
+                source,
+                &[medoid],
+                p,
+                alpha,
+                r,
+                l_build,
+                scratch,
+                proxy,
+            );
         },
     );
 }
@@ -1852,7 +1861,9 @@ struct EntrySlotCache {
 
 impl EntrySlotCache {
     fn new() -> EntrySlotCache {
-        EntrySlotCache { slots: vec![None; 4096] }
+        EntrySlotCache {
+            slots: vec![None; 4096],
+        }
     }
 
     fn get(&self, sketch: u16) -> Option<SmallVec<[VecId; 8]>> {
@@ -2053,7 +2064,7 @@ fn open_segment(
     mmap_tier: bool,
     mmap_graph: bool,
 ) -> io::Result<(Segment, usize, usize)> {
-        // graph.vmn
+    // graph.vmn
     // The live base files live in dir's current generation slot (or dir
     // itself for a legacy flat layout).
     let bdir = base_dir(dir);
@@ -2323,7 +2334,9 @@ impl RowSlotCache {
     fn new(budget_bytes: usize, dim: usize) -> RowSlotCache {
         let per_row = dim * 4 + std::mem::size_of::<Option<(VecId, Vec<f32>)>>();
         let n = (budget_bytes / per_row).max(16);
-        RowSlotCache { slots: vec![None; n] }
+        RowSlotCache {
+            slots: vec![None; n],
+        }
     }
 
     fn get(&self, row: VecId) -> Option<Vec<f32>> {
@@ -3181,7 +3194,6 @@ impl DiskVamanaIndex {
     ) -> io::Result<DiskVamanaIndex> {
         let (base, dim, l_search) = open_segment(dir, tier, mmap_tier, mmap_graph)?;
 
-
         // Reopen the durable runs. A run directory with a `run.ok` marker was
         // fully written and fsynced before the WAL was compacted past it: it
         // reopens as a run. One without the marker predates its own
@@ -3195,7 +3207,10 @@ impl DiskVamanaIndex {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(seq) = name.strip_prefix("run-").and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(seq) = name
+                    .strip_prefix("run-")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     if entry.path().join(RUN_OK_FILE).exists() {
                         run_seqs.push(seq);
                     } else {
@@ -3207,8 +3222,7 @@ impl DiskVamanaIndex {
         run_seqs.sort_unstable();
         let mut runs: Vec<Segment> = Vec::with_capacity(run_seqs.len());
         for &seq in &run_seqs {
-            let (seg, rdim, _) =
-                open_segment(&dir.join(format!("run-{seq}")), tier, false, false)?;
+            let (seg, rdim, _) = open_segment(&dir.join(format!("run-{seq}")), tier, false, false)?;
             if rdim != dim {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -4105,9 +4119,7 @@ impl DiskVamanaIndex {
                         skeg_telemetry::tick_counter(skeg_telemetry::Counter::EntryCacheHits);
                         seed_rows.extend(rows.iter().copied().filter(|&r| r < seg.main_n));
                     }
-                    None => skeg_telemetry::tick_counter(
-                        skeg_telemetry::Counter::EntryCacheMisses,
-                    ),
+                    None => skeg_telemetry::tick_counter(skeg_telemetry::Counter::EntryCacheMisses),
                 }
             }
             // Prototype nav: exact f32 (read from disk) steers the walk when
@@ -4358,7 +4370,10 @@ impl DiskVamanaIndex {
                 .take(8)
                 .collect();
             if !rows.is_empty() {
-                cache.lock().expect("entry cache poisoned").put(sketch, rows);
+                cache
+                    .lock()
+                    .expect("entry cache poisoned")
+                    .put(sketch, rows);
             }
         }
         Ok(scored
@@ -4415,7 +4430,12 @@ impl DiskVamanaIndex {
         }
         let nodes = rows
             .into_iter()
-            .map(|r| (self.base.ids[r as usize], self.base.nodes[r as usize].degree))
+            .map(|r| {
+                (
+                    self.base.ids[r as usize],
+                    self.base.nodes[r as usize].degree,
+                )
+            })
             .collect();
         (nodes, edges)
     }
@@ -4843,7 +4863,11 @@ impl DiskVamanaIndex {
     /// not.
     #[must_use]
     pub fn max_run_rows(&self) -> usize {
-        self.runs.iter().map(|r| r.main_n as usize).max().unwrap_or(0)
+        self.runs
+            .iter()
+            .map(|r| r.main_n as usize)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Verify this index's on-disk and in-RAM invariants and report every
@@ -4872,10 +4896,7 @@ impl DiskVamanaIndex {
         let mut check_seg = |what: &str, seg: &Segment| -> io::Result<()> {
             let n = seg.main_n as usize;
             if seg.ids.len() != n {
-                out.push(format!(
-                    "{what}: {} ids for {n} graph rows",
-                    seg.ids.len()
-                ));
+                out.push(format!("{what}: {} ids for {n} graph rows", seg.ids.len()));
             }
             let want = HEADER_LEN as u64 + (n as u64) * dim as u64 * 4;
             let got = seg.vectors_file.metadata()?.len();
@@ -5142,7 +5163,10 @@ impl DiskVamanaIndex {
             ops.push(DeltaWalOp::Delete { id });
         }
         for (&id, v) in &self.delta {
-            ops.push(DeltaWalOp::Insert { id, vector: v.clone() });
+            ops.push(DeltaWalOp::Insert {
+                id,
+                vector: v.clone(),
+            });
         }
         let path = self.dir.join(DELTA_LOG_FILE);
         let tmp = self.dir.join("delta.log.compact");
@@ -7109,20 +7133,29 @@ mod tests {
         let dim = 256;
         let tier = QuantKind::TurboQuant { bits: 2 };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         idx.set_auto_flush(false);
         let big = random_vectors(20_000, dim, 51);
         for (i, v) in big.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        let built = idx.flush_begin().unwrap().unwrap().build(tmp.path()).unwrap();
+        let built = idx
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp.path())
+            .unwrap();
         idx.flush_finish(built).unwrap();
         let small = random_vectors(2_000, dim, 52);
         for (i, v) in small.chunks_exact(dim).enumerate() {
             idx.insert(100_000 + i as u64, v).unwrap();
         }
-        let built = idx.flush_begin().unwrap().unwrap().build(tmp.path()).unwrap();
+        let built = idx
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp.path())
+            .unwrap();
         idx.flush_finish(built).unwrap();
 
         let job = idx.merge_runs_begin().unwrap().unwrap();
@@ -7136,18 +7169,27 @@ mod tests {
         idx.merge_runs_finish(built).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
-        let mut idx2 =
-            DiskVamanaIndex::create_empty_with_tier(tmp2.path(), dim, 64, tier).unwrap();
+        let mut idx2 = DiskVamanaIndex::create_empty_with_tier(tmp2.path(), dim, 64, tier).unwrap();
         idx2.set_auto_flush(false);
         for (i, v) in big.chunks_exact(dim).enumerate() {
             idx2.insert(i as u64, v).unwrap();
         }
-        let built = idx2.flush_begin().unwrap().unwrap().build(tmp2.path()).unwrap();
+        let built = idx2
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp2.path())
+            .unwrap();
         idx2.flush_finish(built).unwrap();
         for (i, v) in small.chunks_exact(dim).enumerate() {
             idx2.insert(100_000 + i as u64, v).unwrap();
         }
-        let built = idx2.flush_begin().unwrap().unwrap().build(tmp2.path()).unwrap();
+        let built = idx2
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp2.path())
+            .unwrap();
         idx2.flush_finish(built).unwrap();
         let mut job2 = idx2.merge_runs_begin().unwrap().unwrap();
         job2.patch = None;
@@ -7182,8 +7224,7 @@ mod tests {
         let dim = 16;
         let tier = QuantKind::TurboQuant { bits: 2 };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         idx.set_auto_flush(false);
         let vecs = random_vectors(500, dim, 61);
         for (i, v) in vecs.chunks_exact(dim).enumerate() {
@@ -7194,7 +7235,12 @@ mod tests {
         for (i, v) in random_vectors(100, dim, 62).chunks_exact(dim).enumerate() {
             idx.insert(9000 + i as u64, v).unwrap();
         }
-        let built = idx.flush_begin().unwrap().unwrap().build(tmp.path()).unwrap();
+        let built = idx
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp.path())
+            .unwrap();
         idx.flush_finish(built).unwrap();
 
         let clean = idx.check().unwrap();
@@ -7239,10 +7285,22 @@ mod tests {
         let g0 = tmp.path().join("g0");
         std::fs::create_dir_all(&g0).unwrap();
         write_tier(tmp.path(), tier).unwrap();
-        write_graph_vmn(&g0.join(GRAPH_FILE), n as u32, dim, 0, MAX_R, 128, &ids, &nodes)
-            .unwrap();
-        write_vectors_bin(&g0.join(VECTORS_FILE), &InMemoryVectorSource::new(vecs, dim))
-            .unwrap();
+        write_graph_vmn(
+            &g0.join(GRAPH_FILE),
+            n as u32,
+            dim,
+            0,
+            MAX_R,
+            128,
+            &ids,
+            &nodes,
+        )
+        .unwrap();
+        write_vectors_bin(
+            &g0.join(VECTORS_FILE),
+            &InMemoryVectorSource::new(vecs, dim),
+        )
+        .unwrap();
         set_current_slot(tmp.path(), 0).unwrap();
         write_framed_wal(&tmp.path().join(DELTA_LOG_FILE), &[]).unwrap();
         // Patch a degree straight into the file when asked: no writer API
@@ -7311,10 +7369,22 @@ mod tests {
         let g0 = tmp.path().join("g0");
         std::fs::create_dir_all(&g0).unwrap();
         write_tier(tmp.path(), tier).unwrap();
-        write_graph_vmn(&g0.join(GRAPH_FILE), n as u32, dim, 0, MAX_R, 128, &ids, &nodes)
-            .unwrap();
-        write_vectors_bin(&g0.join(VECTORS_FILE), &InMemoryVectorSource::new(vecs, dim))
-            .unwrap();
+        write_graph_vmn(
+            &g0.join(GRAPH_FILE),
+            n as u32,
+            dim,
+            0,
+            MAX_R,
+            128,
+            &ids,
+            &nodes,
+        )
+        .unwrap();
+        write_vectors_bin(
+            &g0.join(VECTORS_FILE),
+            &InMemoryVectorSource::new(vecs, dim),
+        )
+        .unwrap();
         set_current_slot(tmp.path(), 0).unwrap();
         write_framed_wal(&tmp.path().join(DELTA_LOG_FILE), &[]).unwrap();
 
@@ -7331,8 +7401,7 @@ mod tests {
         let dim = 16;
         let tier = QuantKind::TurboQuant { bits: 2 };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         idx.set_auto_flush(false);
         // Donor run: 1200 rows (majority). Second run: 300.
         let big = random_vectors(1200, dim, 41);
@@ -7358,7 +7427,10 @@ mod tests {
         for probe in [0usize, 600, 1199] {
             let q = &big[probe * dim..(probe + 1) * dim];
             let hits = idx.search(q, 5).unwrap();
-            assert!(hits.iter().any(|h| h.0 == probe as u64), "donor id {probe} lost");
+            assert!(
+                hits.iter().any(|h| h.0 == probe as u64),
+                "donor id {probe} lost"
+            );
         }
         for probe in [0usize, 299] {
             let q = &small[probe * dim..(probe + 1) * dim];
@@ -7386,8 +7458,7 @@ mod tests {
         let dim = 16;
         let tier = QuantKind::TurboQuant { bits: 2 };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         idx.set_auto_flush(false);
         let base = random_vectors(400, dim, 31);
         for (i, v) in base.chunks_exact(dim).enumerate() {
@@ -7443,8 +7514,7 @@ mod tests {
         let dim = 16;
         let tier = QuantKind::TurboQuant { bits: 2 };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         let vecs = random_vectors(300, dim, 55);
         for (id, v) in vecs.chunks_exact(dim).enumerate() {
             idx.insert(id as u64, v).unwrap();
@@ -7466,7 +7536,10 @@ mod tests {
         let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
         assert_eq!(re.main_len(), base_before, "reopen must serve the old base");
         for id in [0u64, 150, 299] {
-            assert!(re.get(id).unwrap().is_some(), "id {id} lost across the torn swap");
+            assert!(
+                re.get(id).unwrap().is_some(),
+                "id {id} lost across the torn swap"
+            );
         }
     }
 
@@ -7491,8 +7564,7 @@ mod tests {
             return; // the suite also runs with SKEG_ENTRY_CACHE=0
         }
         let q: Vec<f32> = random_vectors(1, dim, 78);
-        let hits0 =
-            skeg_telemetry::counter_value(skeg_telemetry::Counter::EntryCacheHits);
+        let hits0 = skeg_telemetry::counter_value(skeg_telemetry::Counter::EntryCacheHits);
         let cold = idx.search(&q, 10).unwrap();
         let warm = idx.search(&q, 10).unwrap();
         assert_eq!(
@@ -7521,8 +7593,7 @@ mod tests {
         let dim = 16;
         let tmp = tempfile::TempDir::new().unwrap();
         let tier = QuantKind::TurboQuant { bits: 2 };
-        let mut idx =
-            DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         idx.set_auto_flush(false);
         let base = random_vectors(400, dim, 21);
         for (i, v) in base.chunks_exact(dim).enumerate() {

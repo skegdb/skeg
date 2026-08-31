@@ -893,7 +893,7 @@ unsafe fn adc_qi8_sdot<const BITS: usize>(
     dim: usize,
 ) -> i32 {
     use std::arch::aarch64::{
-        int32x4_t, int8x16_t, vaddq_s32, vaddvq_s32, vdupq_n_s32, vld1q_s8, vqtbl1q_s8,
+        int8x16_t, int32x4_t, vaddq_s32, vaddvq_s32, vdupq_n_s32, vld1q_s8, vqtbl1q_s8,
     };
     use std::arch::asm;
     assert_eq!(code.len(), dim * BITS / 8, "code length");
@@ -924,7 +924,10 @@ unsafe fn adc_qi8_sdot<const BITS: usize>(
             }
             base += 64;
         }
-        vaddvq_s32(vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3])))
+        vaddvq_s32(vaddq_s32(
+            vaddq_s32(acc[0], acc[1]),
+            vaddq_s32(acc[2], acc[3]),
+        ))
     };
     for i in block..dim {
         sum += i32::from(q_i8[i]) * i32::from(centroids_i8[code_index::<BITS>(code, i)]);
@@ -995,7 +998,7 @@ pub fn tq1_masked_dot_qi8_scalar(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
 #[must_use]
 unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
     use std::arch::aarch64::{
-        int32x4_t, int8x16_t, vaddq_s32, vaddvq_s32, vandq_s8, vdupq_n_s32, vdupq_n_s8, vld1q_s8,
+        int8x16_t, int32x4_t, vaddq_s32, vaddvq_s32, vandq_s8, vdupq_n_s8, vdupq_n_s32, vld1q_s8,
         vld1q_u8, vqtbl1q_u8, vreinterpretq_s8_u8, vreinterpretq_u8_s8, vtstq_s8,
     };
     use std::arch::asm;
@@ -1008,9 +1011,8 @@ unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
     let mut sum = unsafe {
         // For 16 dims we need code bytes [2g, 2g+1] broadcast 8 lanes each.
         // Load 8 code bytes (64 dims) once, then TBL-broadcast per group.
-        let sel: int8x16_t = vld1q_s8(
-            [1i8, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128].as_ptr(),
-        );
+        let sel: int8x16_t =
+            vld1q_s8([1i8, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128].as_ptr());
         let one = vdupq_n_s8(1);
         let mut acc = [vdupq_n_s32(0); 4];
         let mut base = 0;
@@ -1024,15 +1026,9 @@ unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
                 let pair: int8x16_t = {
                     let two = [b0, b1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
                     let v = vld1q_s8(two.as_ptr());
-                    vreinterpretq_s8_u8(vqtbl1q_u8(
-                        vreinterpretq_u8_s8(v),
-                        vld1q_u8(idx.as_ptr()),
-                    ))
+                    vreinterpretq_s8_u8(vqtbl1q_u8(vreinterpretq_u8_s8(v), vld1q_u8(idx.as_ptr())))
                 };
-                let bits01 = vandq_s8(
-                    vreinterpretq_s8_u8(vtstq_s8(pair, sel)),
-                    one,
-                );
+                let bits01 = vandq_s8(vreinterpretq_s8_u8(vtstq_s8(pair, sel)), one);
                 let q: int8x16_t = vld1q_s8(q_i8.as_ptr().add(at));
                 let mut a: int32x4_t = *acc_k;
                 asm!(
@@ -1046,7 +1042,10 @@ unsafe fn tq1_masked_dot_qi8_sdot(code: &[u8], q_i8: &[i8], dim: usize) -> i32 {
             }
             base += 64;
         }
-        vaddvq_s32(vaddq_s32(vaddq_s32(acc[0], acc[1]), vaddq_s32(acc[2], acc[3])))
+        vaddvq_s32(vaddq_s32(
+            vaddq_s32(acc[0], acc[1]),
+            vaddq_s32(acc[2], acc[3]),
+        ))
     };
     for i in block..dim {
         if (code[i / 8] >> (i % 8)) & 1 == 1 {
@@ -1284,7 +1283,9 @@ mod qi8_tests {
     fn tq2_qi8_sdot_matches_scalar_on_random_and_ragged_dims() {
         let mut state = 0x243f6a8885a308d3u64;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u8
         };
         let centroids: [i8; 16] =
@@ -1305,7 +1306,9 @@ mod qi8_tests {
     fn tq1_masked_dot_qi8_matches_scalar_on_random_and_ragged_dims() {
         let mut state = 0x9216d5d98979fb1bu64;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u8
         };
         for dim in [8usize, 64, 72, 128, 512, 1024, 1536] {
@@ -1323,7 +1326,9 @@ mod qi8_tests {
     fn tq4_qi8_sdot_matches_scalar_on_random_and_ragged_dims() {
         let mut state = 0x452821e638d01377u64;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u8
         };
         let centroids: [i8; 16] = std::array::from_fn(|i| (i as i8 - 8) * 15);
@@ -1352,7 +1357,9 @@ mod qi8_tests {
             std::array::from_fn(|i| if i < 4 { [-90i8, -30, 30, 90][i] } else { 0 });
         let dim = 1024;
         let code: Vec<u8> = (0..dim / 4).map(|i| (i * 37 % 256) as u8).collect();
-        let q_i8: Vec<i8> = (0..dim).map(|i| ((i * 13 % 255) as i16 - 127) as i8).collect();
+        let q_i8: Vec<i8> = (0..dim)
+            .map(|i| ((i * 13 % 255) as i16 - 127) as i8)
+            .collect();
         let q_f32: Vec<f32> = q_i8.iter().map(|&x| f32::from(x)).collect();
         let exact = tq2_adc_qi8(&code, &centroids, &q_i8, dim) as f32;
         let viaf32 = tq2_adc_i8(&code, &centroids, 1.0, &q_f32, dim);

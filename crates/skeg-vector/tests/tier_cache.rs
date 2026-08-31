@@ -119,12 +119,19 @@ fn cache_from_a_different_index_is_rejected() {
         .save(b.path())
         .unwrap();
     // Plant a's cache into b.
-    std::fs::copy(a.path().join("tier.cache.bin"), b.path().join("tier.cache.bin")).unwrap();
+    std::fs::copy(
+        a.path().join("tier.cache.bin"),
+        b.path().join("tier.cache.bin"),
+    )
+    .unwrap();
 
     let idx = open(b.path());
     // Rebuilt from b's own vectors: a self-query must find itself.
     let hits = idx.search_with_l(&v[0..DIM], 1, 64).unwrap();
-    assert_eq!(hits[0].0, 0, "a foreign cache must be rejected, not trusted");
+    assert_eq!(
+        hits[0].0, 0,
+        "a foreign cache must be rejected, not trusted"
+    );
 }
 
 #[test]
@@ -147,7 +154,11 @@ fn truncated_cache_falls_back_to_rebuild() {
 fn garbage_cache_does_not_panic() {
     let tmp = tempfile::TempDir::new().unwrap();
     build(tmp.path());
-    std::fs::write(tmp.path().join("tier.cache.bin"), b"not a tier cache at all").unwrap();
+    std::fs::write(
+        tmp.path().join("tier.cache.bin"),
+        b"not a tier cache at all",
+    )
+    .unwrap();
     let idx = open(tmp.path());
     assert_eq!(idx.len(), N);
 }

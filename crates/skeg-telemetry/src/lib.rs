@@ -337,10 +337,13 @@ pub enum Counter {
     /// Run segments scanned instead of walked because the run count is over
     /// the ceiling: the visible symptom of maintenance falling behind.
     RunScanFallback = 39,
+    /// Maintenance jobs that ran and failed. Previously indistinguishable
+    /// from "nothing to do", which hid real failures from every signal.
+    MaintenanceFailures = 40,
 }
 
 impl Counter {
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 41;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -382,6 +385,7 @@ impl Counter {
         Counter::VsearchHybridMapNanos,
         Counter::VsearchHybridRouteNanos,
         Counter::RunScanFallback,
+        Counter::MaintenanceFailures,
     ];
 
     #[inline]
@@ -427,6 +431,7 @@ impl Counter {
             Counter::VsearchHybridMapNanos => "skeg_vsearch_hybrid_map_nanos_total",
             Counter::VsearchHybridRouteNanos => "skeg_vsearch_hybrid_route_nanos_total",
             Counter::RunScanFallback => "skeg_run_scan_fallback_total",
+            Counter::MaintenanceFailures => "skeg_maintenance_failures_total",
         }
     }
 }

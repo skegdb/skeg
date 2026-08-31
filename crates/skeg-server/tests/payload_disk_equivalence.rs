@@ -6,7 +6,7 @@
 //! "the disk path works" but "the two are indistinguishable", checked over a
 //! generated corpus and every shape the filter grammar has.
 
-use skeg_server::payload::{parse_filter, PayloadIndex, parse_fields};
+use skeg_server::payload::{PayloadIndex, parse_fields, parse_filter};
 use skeg_server::payload_disk::DiskPostings;
 
 /// Deterministic pseudo-random: reproducible failures beat lucky passes.
@@ -24,7 +24,11 @@ impl Rng {
 }
 
 const LICS: [&str; 4] = ["mit", "apache-2.0", "bsd-3-clause", "gpl-3.0"];
-const TASKS: [&str; 3] = ["text-generation", "automatic-speech-recognition", "text-to-image"];
+const TASKS: [&str; 3] = [
+    "text-generation",
+    "automatic-speech-recognition",
+    "text-to-image",
+];
 
 fn payload(rng: &mut Rng, id: u64) -> String {
     let mut s = format!(
@@ -80,7 +84,13 @@ fn compare(mem: &PayloadIndex, disk: &PayloadIndex, label: &str) {
         let filter = parse_filter(f).expect("filtro valido");
         let a = filter.evaluate(mem);
         let b = filter.evaluate(disk);
-        assert_eq!(a, b, "{label}: `{f}` differs (memory {} ids, disk {} ids)", a.len(), b.len());
+        assert_eq!(
+            a,
+            b,
+            "{label}: `{f}` differs (memory {} ids, disk {} ids)",
+            a.len(),
+            b.len()
+        );
         matched += a.len();
     }
     // Without this, two indexes that both answer nothing would pass every
@@ -97,7 +107,9 @@ fn a_disk_backed_index_answers_exactly_like_one_in_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mem, _) = build(3000, 0x5EED);
     mem.persist(tmp.path(), (7, 4096)).unwrap();
-    let disk = PayloadIndex::from_disk(DiskPostings::open(tmp.path(), (7, 4096)).expect("il file deve aprirsi"));
+    let disk = PayloadIndex::from_disk(
+        DiskPostings::open(tmp.path(), (7, 4096)).expect("il file deve aprirsi"),
+    );
     assert_eq!(disk.len(), mem.len(), "the two must cover the same ids");
     compare(&mem, &disk, "fresh");
 }
@@ -107,8 +119,9 @@ fn writes_after_the_file_was_built_are_visible_and_shadow_it() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut mem, _) = build(2000, 0xC0FFEE);
     mem.persist(tmp.path(), (1, 1)).unwrap();
-    let mut disk =
-        PayloadIndex::from_disk(DiskPostings::open(tmp.path(), (1, 1)).expect("il file deve aprirsi"));
+    let mut disk = PayloadIndex::from_disk(
+        DiskPostings::open(tmp.path(), (1, 1)).expect("il file deve aprirsi"),
+    );
 
     // The same churn applied to both: overwrites, deletes, and new ids.
     let mut rng = Rng(0xABCD);
@@ -128,7 +141,11 @@ fn writes_after_the_file_was_built_are_visible_and_shadow_it() {
         mem.upsert(id, parse_fields(p.as_bytes()));
         disk.upsert(id, parse_fields(p.as_bytes()));
     }
-    assert_eq!(disk.len(), mem.len(), "the two must still cover the same ids");
+    assert_eq!(
+        disk.len(),
+        mem.len(),
+        "the two must still cover the same ids"
+    );
     compare(&mem, &disk, "after churn");
 }
 
@@ -137,8 +154,9 @@ fn persisting_again_folds_the_previous_file_in_rather_than_chaining() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut mem, _) = build(1500, 0x1234);
     mem.persist(tmp.path(), (1, 1)).unwrap();
-    let mut disk =
-        PayloadIndex::from_disk(DiskPostings::open(tmp.path(), (1, 1)).expect("il file deve aprirsi"));
+    let mut disk = PayloadIndex::from_disk(
+        DiskPostings::open(tmp.path(), (1, 1)).expect("il file deve aprirsi"),
+    );
 
     let mut rng = Rng(0x9999);
     for _ in 0..300 {
@@ -149,8 +167,9 @@ fn persisting_again_folds_the_previous_file_in_rather_than_chaining() {
     }
     // Second generation, written from an index that already had a disk part.
     disk.persist(tmp.path(), (2, 2)).unwrap();
-    let reloaded =
-        PayloadIndex::from_disk(DiskPostings::open(tmp.path(), (2, 2)).expect("il file deve aprirsi"));
+    let reloaded = PayloadIndex::from_disk(
+        DiskPostings::open(tmp.path(), (2, 2)).expect("il file deve aprirsi"),
+    );
     assert_eq!(reloaded.len(), mem.len());
     compare(&mem, &reloaded, "second generation");
 }

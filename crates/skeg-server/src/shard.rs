@@ -10,9 +10,9 @@
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread::JoinHandle;
@@ -62,7 +62,6 @@ const FLUSH_ROWS: usize = 4096;
 /// waiting for a full consolidate. Fires regardless of idle - it is cheap and
 /// takes only two short locks around an off-thread build.
 const RUNS_MERGE_TRIGGER: usize = 4;
-
 
 /// Reclaim dead base rows in place (delete-patch, O(deleted)) once tombstones
 /// reach base/this (~6%): frequent enough to stay in delete-patch's cheap
@@ -315,6 +314,15 @@ impl VectorBackend {
         match self {
             VectorBackend::Flat(_) => 0,
             VectorBackend::Disk(i) => i.run_rows(),
+        }
+    }
+
+    /// Rows in the LARGEST single run, not their sum: a merge can cut both
+    /// the count and the sum while leaving one enormous segment behind.
+    fn max_run_rows(&self) -> usize {
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.max_run_rows(),
         }
     }
 
@@ -608,12 +616,16 @@ enum ShardReq {
     /// shards so callers can ask any one shard.
     VindexList,
     /// Integrity report for one vindex (the operator's fsck).
-    VindexCheck { name: String },
+    VindexCheck {
+        name: String,
+    },
     /// Does this vindex still want an IVF router? Contract probe: the only
     /// caller is the test that pins "an explicit consolidate leaves the
     /// index in the same state the maintenance ladder would".
     #[cfg_attr(not(test), allow(dead_code))]
-    WantsIvf { name: String },
+    WantsIvf {
+        name: String,
+    },
     /// Fold a disk vindex's streaming delta into its graph on this shard.
     /// Write the vlog snapshot and a payload index per vindex, both stamped
     /// with the same log position. Normally the background task's job; exposed
@@ -719,6 +731,10 @@ pub struct VindexRow {
     pub delta: u64,
     pub runs: u64,
     pub run_rows: u64,
+    /// Rows in the LARGEST single run. Distinct from `run_rows`, which is
+    /// their sum: a merge can cut the count and the sum while leaving one
+    /// enormous segment behind, and only this number shows it.
+    pub max_run_rows: u64,
     pub tombs: u64,
     pub base: u64,
 }
@@ -743,7 +759,10 @@ fn load_routers(root: &Path) -> HashMap<String, Arc<crate::router::Router>> {
     };
     for entry in entries.flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
-        if let Some(name) = file.strip_prefix("router-").and_then(|s| s.strip_suffix(".bin")) {
+        if let Some(name) = file
+            .strip_prefix("router-")
+            .and_then(|s| s.strip_suffix(".bin"))
+        {
             match crate::router::Router::load(&entry.path()) {
                 Ok(r) => {
                     out.insert(name.to_owned(), Arc::new(r));
@@ -1096,7 +1115,9 @@ async fn snapshot_and_payload_indexes(
                 written.insert(scoped.clone(), stamp);
             }
             Err(e) => {
-                tracing::warn!("shard {shard_id}: writing payload index for '{scoped}' failed: {e}");
+                tracing::warn!(
+                    "shard {shard_id}: writing payload index for '{scoped}' failed: {e}"
+                );
             }
         }
     }
@@ -1434,12 +1455,12 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             |b, built| b.merge_runs_finish(built),
         )
         .await;
-        // Only a merge that actually RAN consumes the tick. A busy fold
-        // budget must not stop the flush: that would trade the starvation
-        // this clause removes for the one below it, and the delta - already
-        // over its threshold - would grow without bound while the merge waits
-        // for a permit it may not get for minutes.
-        if outcome != MaintenanceOutcome::BudgetBusy {
+        // Only a merge that actually RAN consumes the tick - now true, since
+        // a failure is no longer disguised as NotNeeded. A busy budget or a
+        // failed merge must not stop the flush: that would trade the
+        // starvation this clause removes for the one below it, and the delta
+        // - already over its threshold - would grow without bound.
+        if outcome == MaintenanceOutcome::Ran || outcome == MaintenanceOutcome::NotNeeded {
             arc.read().flush_streak.store(0, Ordering::Relaxed);
             return false;
         }
@@ -1588,9 +1609,15 @@ enum MaintenanceOutcome {
     Ran,
     /// The backend had nothing to do.
     NotNeeded,
-    /// The process-wide fold budget was taken; retry next tick. The caller
-    /// MUST consider running a cheaper rung instead of returning.
+    /// The process-wide fold budget, or this vindex's heavy gate, was taken;
+    /// retry next tick. The caller MUST consider running a cheaper rung
+    /// instead of returning.
     BudgetBusy,
+    /// The job ran and FAILED. Distinct from `NotNeeded`, which used to
+    /// swallow it: a failed merge reported as "nothing to do" hides a real
+    /// problem from every signal above it, and made the anti-starvation
+    /// comment ("only a merge that actually ran consumes the tick") untrue.
+    Failed,
 }
 
 async fn try_off_thread_maintenance<T, B>(
@@ -1654,9 +1681,7 @@ where
             match fold_budget().try_acquire() {
                 Ok(p) => Some(p),
                 Err(_) => {
-                    skeg_telemetry::tick_counter(
-                        skeg_telemetry::Counter::MaintenanceBudgetSkips,
-                    );
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceBudgetSkips);
                     return Ok(MaintenanceOutcome::BudgetBusy);
                 }
             }
@@ -1735,9 +1760,11 @@ where
             outcome
         }
         Err(e) => {
-            // Automatic maintenance retries on the next tick.
+            // Automatic maintenance retries on the next tick - but the caller
+            // is told it FAILED, not that there was nothing to do.
             error!("shard {shard_id}: {e}");
-            MaintenanceOutcome::NotNeeded
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceFailures);
+            MaintenanceOutcome::Failed
         }
     }
 }
@@ -2053,7 +2080,11 @@ fn run_shard(
                         loop {
                             tokio::time::sleep(SNAPSHOT_INTERVAL).await;
                             snapshot_and_payload_indexes(
-                                &svlog, &svindexes, &sdir, shard_id, &mut written,
+                                &svlog,
+                                &svindexes,
+                                &sdir,
+                                shard_id,
+                                &mut written,
                             )
                             .await;
                         }
@@ -2438,6 +2469,7 @@ async fn process(
                         delta: backend.delta_len() as u64,
                         runs: backend.run_count() as u64,
                         run_rows: backend.run_rows() as u64,
+                        max_run_rows: backend.max_run_rows() as u64,
                         tombs: backend.tombstone_count() as u64,
                         base: backend.main_len() as u64,
                     }
@@ -2733,7 +2765,14 @@ async fn process(
                 }
             }
         }
-        ShardReq::CollectMoves { name, centroids, own, after, limit, tenant } => {
+        ShardReq::CollectMoves {
+            name,
+            centroids,
+            own,
+            after,
+            limit,
+            tenant,
+        } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
@@ -2771,9 +2810,7 @@ async fn process(
                         match vlog.tenant(tenant).get(&key).await {
                             Ok(b) => *payload = b,
                             Err(e) => {
-                                return ShardResp::Err(format!(
-                                    "reshard payload read failed: {e}"
-                                ));
+                                return ShardResp::Err(format!("reshard payload read failed: {e}"));
                             }
                         }
                     }
@@ -2781,7 +2818,14 @@ async fn process(
                 }
             }
         }
-        ShardReq::CollectBoundary { name, centroids, after, limit, tau, tenant } => {
+        ShardReq::CollectBoundary {
+            name,
+            centroids,
+            after,
+            limit,
+            tau,
+            tenant,
+        } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
@@ -2802,8 +2846,7 @@ async fn process(
                                     for j in 0..centroids.k {
                                         let c = &centroids.centroids
                                             [j * centroids.dim..(j + 1) * centroids.dim];
-                                        let s: f32 =
-                                            qn.iter().zip(c).map(|(a, b)| a * b).sum();
+                                        let s: f32 = qn.iter().zip(c).map(|(a, b)| a * b).sum();
                                         if s > best.0 {
                                             second = best;
                                             best = (s, j);
@@ -2817,9 +2860,7 @@ async fn process(
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
-                                    return ShardResp::Err(format!(
-                                        "overlap read failed: {e}"
-                                    ));
+                                    return ShardResp::Err(format!("overlap read failed: {e}"));
                                 }
                             }
                             if out.len() >= limit {
@@ -2834,9 +2875,7 @@ async fn process(
                         match vlog.tenant(tenant).get(&key).await {
                             Ok(b) => *payload = b,
                             Err(e) => {
-                                return ShardResp::Err(format!(
-                                    "overlap payload read failed: {e}"
-                                ));
+                                return ShardResp::Err(format!("overlap payload read failed: {e}"));
                             }
                         }
                     }
@@ -3121,7 +3160,12 @@ impl ShardSet {
     /// numbering is not contiguous from zero.
     pub fn discover_shard_count(base_dir: &Path) -> std::io::Result<NonZeroUsize> {
         let mut ids: Vec<usize> = Vec::new();
-        for e in std::fs::read_dir(base_dir)?.flatten() {
+        for e in std::fs::read_dir(base_dir)? {
+            // NOT `.flatten()`: swallowing an unreadable entry lets discovery
+            // conclude the layout simply HAS fewer shards, which is the exact
+            // failure this function exists to refuse. An I/O error is a
+            // refusal to start.
+            let e = e?;
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
             if let Some(rest) = name.strip_prefix("shard-")
@@ -3154,9 +3198,8 @@ impl ShardSet {
                 ),
             ));
         }
-        NonZeroUsize::new(highest + 1).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no shards")
-        })
+        NonZeroUsize::new(highest + 1)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no shards"))
     }
 
     /// `base_dir/shard-{id}/`.
@@ -3768,9 +3811,7 @@ impl ShardSet {
     /// shard. Best effort per shard: failures are logged, not returned, since
     /// the result is only ever an optimisation for the next open.
     pub async fn write_snapshot_and_payload_indexes(&self) {
-        let _ = self
-            .broadcast(|| ShardReq::SnapshotAndPayloadIndexes)
-            .await;
+        let _ = self.broadcast(|| ShardReq::SnapshotAndPayloadIndexes).await;
     }
 
     /// Per-SHARD LSM state for one vindex, one line per shard.
@@ -3835,7 +3876,8 @@ impl ShardSet {
         let mut out = Vec::new();
         let (mut worst_runs, mut worst_shard) = (0usize, 0usize);
         let (mut worst_debt, mut worst_debt_shard) = (0.0f32, 0usize);
-        let (mut tot_runs, mut tot_delta, mut tot_run_rows, mut tot_live) = (0u64, 0u64, 0u64, 0u64);
+        let (mut tot_runs, mut tot_delta, mut tot_run_rows, mut tot_live) =
+            (0u64, 0u64, 0u64, 0u64);
         let mut max_run_rows = 0u64;
         let mut present: Vec<usize> = Vec::new();
         for shard in 0..self.inner.n {
@@ -3857,7 +3899,7 @@ impl ShardSet {
                 worst_debt = debt;
                 worst_debt_shard = shard;
             }
-            max_run_rows = max_run_rows.max(row.run_rows);
+            max_run_rows = max_run_rows.max(row.max_run_rows);
             tot_runs += row.runs;
             tot_delta += row.delta;
             tot_run_rows += row.run_rows;
@@ -3869,7 +3911,14 @@ impl ShardSet {
         if present.is_empty() {
             return Err(ShardError::Storage(format!("no such vindex '{name}'")));
         }
-        let state = if worst_debt >= 0.25 {
+        // ONE ordered state, worst-wins: MISSING > PARTIAL > CRITICAL >
+        // DEGRADED > OK. Reporting OK and then adding a PARTIAL line below it
+        // is the false green this command exists to prevent - a monitor reads
+        // `state` and nothing else.
+        let partial = present.len() != self.inner.n;
+        let state = if partial {
+            "PARTIAL"
+        } else if worst_debt >= 0.25 {
             "CRITICAL"
         } else if worst_debt >= 0.10 || worst_runs >= 4 {
             "DEGRADED"
@@ -3877,14 +3926,16 @@ impl ShardSet {
             "OK"
         };
         out.push(format!("state {state}"));
-        if present.len() != self.inner.n {
+        if partial {
             out.push(format!(
-                "PARTIAL present on {} of {} shards",
+                "present_on {} of {} shards",
                 present.len(),
                 self.inner.n
             ));
         }
-        out.push(format!("run_debt_ratio {worst_debt:.3} shard {worst_debt_shard}"));
+        out.push(format!(
+            "run_debt_ratio {worst_debt:.3} shard {worst_debt_shard}"
+        ));
         out.push(format!("worst_runs {worst_runs} shard {worst_shard}"));
         out.push(format!("max_run_rows {max_run_rows}"));
         out.push(format!("runs_total {tot_runs}"));
@@ -3906,8 +3957,14 @@ impl ShardSet {
             skeg_telemetry::counter_value(skeg_telemetry::Counter::RunScanFallback)
         ));
         out.push(format!(
+            "process_maintenance_failures_total {}",
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceFailures)
+        ));
+        out.push(format!(
             "reason {}",
             match state {
+                "PARTIAL" =>
+                    "the index is missing on at least one shard: part of the corpus cannot be searched at all",
                 "CRITICAL" =>
                     "run debt is a quarter of the live count or more: search scans run segments instead of walking them, and maintenance is behind",
                 "DEGRADED" => "runs are accumulating: a merge is due",
@@ -3927,7 +3984,11 @@ impl ShardSet {
     /// # Errors
     ///
     /// Returns an error if the name is invalid or a shard is unavailable.
-    pub async fn owners_of(&self, name: &str, ids: &[u64]) -> Result<Vec<(u8, Option<u8>)>, ShardError> {
+    pub async fn owners_of(
+        &self,
+        name: &str,
+        ids: &[u64],
+    ) -> Result<Vec<(u8, Option<u8>)>, ShardError> {
         validate_vindex_name(name)?;
         self.ensure_owner_map(name).await?;
         let map = self.inner.owners.read();
@@ -4022,7 +4083,9 @@ impl ShardSet {
                     })
                     .count();
                 if bad > 0 {
-                    out.push(format!("owner map: {bad} entries name a shard out of range"));
+                    out.push(format!(
+                        "owner map: {bad} entries name a shard out of range"
+                    ));
                 }
             }
         }
@@ -4210,6 +4273,8 @@ impl ShardSet {
                                 a.n_vectors = a.n_vectors.saturating_add(row.n_vectors);
                                 a.delta = a.delta.saturating_add(row.delta);
                                 a.runs = a.runs.saturating_add(row.runs);
+                                // The largest run is a MAX across shards, never a sum.
+                                a.max_run_rows = a.max_run_rows.max(row.max_run_rows);
                                 a.run_rows = a.run_rows.saturating_add(row.run_rows);
                                 a.tombs = a.tombs.saturating_add(row.tombs);
                                 a.base = a.base.saturating_add(row.base);
@@ -4261,16 +4326,25 @@ impl ShardSet {
             }
             self.ensure_owner_map(name).await?;
             let owner = router.assign(&vector);
-            let old = self.inner.owners.read().get(name).and_then(|m| m.get(&id).copied());
+            let old = self
+                .inner
+                .owners
+                .read()
+                .get(name)
+                .and_then(|m| m.get(&id).copied());
             if let Some((old_primary, old_replica)) = old {
                 for s in std::iter::once(old_primary).chain(old_replica) {
                     if usize::from(s) != owner {
-                        match self.call(usize::from(s), ShardReq::Vdel {
-                            name: name.to_owned(),
-                            id,
-                            tenant,
-                        })
-                        .await?
+                        match self
+                            .call(
+                                usize::from(s),
+                                ShardReq::Vdel {
+                                    name: name.to_owned(),
+                                    id,
+                                    tenant,
+                                },
+                            )
+                            .await?
                         {
                             ShardResp::Existed(_) => {}
                             ShardResp::Err(e) => return Err(ShardError::Storage(e)),
@@ -4432,15 +4506,8 @@ impl ShardSet {
             )));
         }
         let k = self.inner.n;
-        let centroids =
-            skeg_vector::balanced_kmeans(&data, n, dim, k, lambda, iters, 0x5eed_5eed);
-        let epoch = self
-            .inner
-            .routers
-            .read()
-            .get(name)
-            .map_or(0, |r| r.epoch)
-            + 1;
+        let centroids = skeg_vector::balanced_kmeans(&data, n, dim, k, lambda, iters, 0x5eed_5eed);
+        let epoch = self.inner.routers.read().get(name).map_or(0, |r| r.epoch) + 1;
         let router = crate::router::Router {
             k,
             dim,
@@ -4519,12 +4586,16 @@ impl ShardSet {
                     }
                     // Swallowing this Vdel's response would count the row moved
                     // while its stale source copy survives (review finding).
-                    match self.call(source, ShardReq::Vdel {
-                        name: name.to_owned(),
-                        id,
-                        tenant,
-                    })
-                    .await?
+                    match self
+                        .call(
+                            source,
+                            ShardReq::Vdel {
+                                name: name.to_owned(),
+                                id,
+                                tenant,
+                            },
+                        )
+                        .await?
                     {
                         ShardResp::Existed(_) => {}
                         ShardResp::Err(e) => return Err(ShardError::Storage(e)),
@@ -4562,12 +4633,7 @@ impl ShardSet {
     /// # Errors
     ///
     /// Index or router missing, a shard unavailable, or a batch failing.
-    pub async fn overlap(
-        &self,
-        name: &str,
-        tau: f32,
-        tenant: u128,
-    ) -> Result<u64, ShardError> {
+    pub async fn overlap(&self, name: &str, tau: f32, tenant: u128) -> Result<u64, ShardError> {
         const BATCH: usize = 512;
         let Some(router) = self.router(name) else {
             return Err(ShardError::Storage(format!(
@@ -4645,7 +4711,10 @@ impl ShardSet {
         for name in names {
             let mut map: OwnerMap = ahash::AHashMap::new();
             for shard in 0..self.inner.n {
-                match self.call(shard, ShardReq::LiveIds { name: name.clone() }).await? {
+                match self
+                    .call(shard, ShardReq::LiveIds { name: name.clone() })
+                    .await?
+                {
                     ShardResp::Ids(ids) => {
                         for id in ids {
                             // First sighting is the primary, a second the
@@ -4771,12 +4840,16 @@ impl ShardSet {
         if let Some(rep) = replica {
             // A failed replica delete must not report success and drop the map
             // entry: that would leave a resurrectable ghost (review finding).
-            match self.call(usize::from(rep), ShardReq::Vdel {
-                name: name.to_owned(),
-                id,
-                tenant,
-            })
-            .await?
+            match self
+                .call(
+                    usize::from(rep),
+                    ShardReq::Vdel {
+                        name: name.to_owned(),
+                        id,
+                        tenant,
+                    },
+                )
+                .await?
             {
                 ShardResp::Existed(_) => {}
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
@@ -5309,10 +5382,21 @@ mod tests {
                 .unwrap();
         let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexRebuilds);
         let hits = shards
-            .vsearch("idx", vec![1.0; 4], 4, 32, 0, false, Some(crate::payload::parse_filter("n EXISTS").unwrap()))
+            .vsearch(
+                "idx",
+                vec![1.0; 4],
+                4,
+                32,
+                0,
+                false,
+                Some(crate::payload::parse_filter("n EXISTS").unwrap()),
+            )
             .await
             .unwrap();
-        assert!(!hits.is_empty(), "the filter must find the reloaded payloads");
+        assert!(
+            !hits.is_empty(),
+            "the filter must find the reloaded payloads"
+        );
         assert_eq!(
             skeg_telemetry::counter_value(skeg_telemetry::Counter::PayloadIndexRebuilds) - before,
             0,
@@ -5345,7 +5429,14 @@ mod tests {
             shards.vindex_create("idx", 4, 0, 1).await.unwrap();
             for id in 0..8u64 {
                 shards
-                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("t=old")))
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        0,
+                        None,
+                        Some(Bytes::from("t=old")),
+                    )
                     .await
                     .unwrap();
             }
@@ -5364,13 +5455,27 @@ mod tests {
             ShardSet::open_mode_with_workers(dir.path(), 1, false, skeg_vector::QuantKind::Int8, 1)
                 .unwrap();
         let old = shards
-            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false,
-                     Some(crate::payload::parse_filter("t = old").unwrap()))
+            .vsearch(
+                "idx",
+                vec![1.0; 4],
+                8,
+                32,
+                0,
+                false,
+                Some(crate::payload::parse_filter("t = old").unwrap()),
+            )
             .await
             .unwrap();
         let new = shards
-            .vsearch("idx", vec![1.0; 4], 8, 32, 0, false,
-                     Some(crate::payload::parse_filter("t = new").unwrap()))
+            .vsearch(
+                "idx",
+                vec![1.0; 4],
+                8,
+                32,
+                0,
+                false,
+                Some(crate::payload::parse_filter("t = new").unwrap()),
+            )
             .await
             .unwrap();
         assert!(
@@ -5416,8 +5521,14 @@ mod tests {
             shards.vindex_create(&scoped, 4, 0, 1).await.unwrap();
             for id in 0..6u64 {
                 shards
-                    .vset(&scoped, id, vec![id as f32 + 1.0; 4], T, None,
-                          Some(Bytes::from("lic=mit")))
+                    .vset(
+                        &scoped,
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        T,
+                        None,
+                        Some(Bytes::from("lic=mit")),
+                    )
                     .await
                     .unwrap();
             }
@@ -5427,8 +5538,15 @@ mod tests {
             ShardSet::open_mode_with_workers(dir.path(), 1, false, skeg_vector::QuantKind::Int8, 1)
                 .unwrap();
         let hits = shards
-            .vsearch(&scoped, vec![1.0; 4], 6, 32, T, false,
-                     Some(crate::payload::parse_filter("lic = mit").unwrap()))
+            .vsearch(
+                &scoped,
+                vec![1.0; 4],
+                6,
+                32,
+                T,
+                false,
+                Some(crate::payload::parse_filter("lic = mit").unwrap()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5465,7 +5583,14 @@ mod tests {
             shards.vindex_create("idx", 4, 0, 1).await.unwrap();
             for id in 0..6u64 {
                 shards
-                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("t=old")))
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        0,
+                        None,
+                        Some(Bytes::from("t=old")),
+                    )
                     .await
                     .unwrap();
             }
@@ -5496,7 +5621,10 @@ mod tests {
             .vsearch("idx", vec![1.0; 4], 6, 32, 0, false, filt("t = old"))
             .await
             .unwrap();
-        assert!(!old.iter().any(|(id, _, _)| *id == 2), "id 2 came back as t=old");
+        assert!(
+            !old.iter().any(|(id, _, _)| *id == 2),
+            "id 2 came back as t=old"
+        );
         assert_eq!(old.len(), 5);
     }
 
@@ -5510,7 +5638,14 @@ mod tests {
             shards.vindex_create("idx", 4, 0, 1).await.unwrap();
             for id in 0..4u64 {
                 shards
-                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("gen=one")))
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        0,
+                        None,
+                        Some(Bytes::from("gen=one")),
+                    )
                     .await
                     .unwrap();
             }
@@ -5519,7 +5654,14 @@ mod tests {
             shards.vindex_create("idx", 4, 0, 1).await.unwrap();
             for id in 0..4u64 {
                 shards
-                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("gen=two")))
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        0,
+                        None,
+                        Some(Bytes::from("gen=two")),
+                    )
                     .await
                     .unwrap();
             }
@@ -5534,7 +5676,11 @@ mod tests {
             .vsearch("idx", vec![1.0; 4], 8, 32, 0, false, filt("gen = two"))
             .await
             .unwrap();
-        assert!(one.is_empty(), "the dropped generation came back: {} hits", one.len());
+        assert!(
+            one.is_empty(),
+            "the dropped generation came back: {} hits",
+            one.len()
+        );
         assert_eq!(two.len(), 4, "the live generation is incomplete");
     }
 
@@ -5547,7 +5693,14 @@ mod tests {
             shards.vindex_create("idx", 4, 0, 1).await.unwrap();
             for id in 0..5u64 {
                 shards
-                    .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from("k=v")))
+                    .vset(
+                        "idx",
+                        id,
+                        vec![id as f32 + 1.0; 4],
+                        0,
+                        None,
+                        Some(Bytes::from("k=v")),
+                    )
                     .await
                     .unwrap();
             }
@@ -5560,7 +5713,10 @@ mod tests {
             .vsearch("idx", vec![1.0; 4], 8, 32, 0, false, filt("k = v"))
             .await
             .unwrap();
-        assert!(!hits.iter().any(|(id, _, _)| *id == 3), "the deleted id came back");
+        assert!(
+            !hits.iter().any(|(id, _, _)| *id == 3),
+            "the deleted id came back"
+        );
         assert_eq!(hits.len(), 4);
     }
 
@@ -5573,7 +5729,10 @@ mod tests {
         let shards = open_one(dir.path()).await;
         shards.set(b"a", b"1", Durability::Kernel).await.unwrap();
         shards.set(b"b", b"2", Durability::Kernel).await.unwrap();
-        assert_eq!(shards.get(b"a").await.unwrap().as_deref(), Some(b"1".as_slice()));
+        assert_eq!(
+            shards.get(b"a").await.unwrap().as_deref(),
+            Some(b"1".as_slice())
+        );
         shards.set(b"a", b"3", Durability::Kernel).await.unwrap();
         assert_eq!(
             shards.get(b"a").await.unwrap().as_deref(),
@@ -5581,8 +5740,15 @@ mod tests {
             "an overwrite must be visible through the cache"
         );
         assert!(shards.del(b"a", Durability::Kernel).await.unwrap());
-        assert_eq!(shards.get(b"a").await.unwrap(), None, "a deleted key must stay deleted");
-        assert_eq!(shards.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(
+            shards.get(b"a").await.unwrap(),
+            None,
+            "a deleted key must stay deleted"
+        );
+        assert_eq!(
+            shards.get(b"b").await.unwrap().as_deref(),
+            Some(b"2".as_slice())
+        );
         assert_eq!(shards.get(b"missing").await.unwrap(), None);
     }
 
@@ -5596,7 +5762,14 @@ mod tests {
         for id in 0..40u64 {
             let tag = if id % 2 == 0 { "p=even" } else { "p=odd" };
             shards
-                .vset("idx", id, vec![id as f32 + 1.0; 4], 0, None, Some(Bytes::from(tag)))
+                .vset(
+                    "idx",
+                    id,
+                    vec![id as f32 + 1.0; 4],
+                    0,
+                    None,
+                    Some(Bytes::from(tag)),
+                )
                 .await
                 .unwrap();
         }
@@ -5610,7 +5783,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.len(), 20, "half the vectors are even");
-        assert_eq!(after.len(), before.len(), "consolidate changed what the filter matches");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "consolidate changed what the filter matches"
+        );
     }
 
     /// The fold budget gates heavy builds and never gates a flush.
@@ -5663,7 +5840,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(ran, MaintenanceOutcome::Ran, "the flush must run with the budget exhausted");
+        assert_eq!(
+            ran,
+            MaintenanceOutcome::Ran,
+            "the flush must run with the budget exhausted"
+        );
 
         // A consolidate must park until a permit frees.
         let arc2 = arc.clone();
@@ -5686,7 +5867,11 @@ mod tests {
         );
         drop(held);
         let ran = fold.await.unwrap().unwrap();
-        assert_eq!(ran, MaintenanceOutcome::Ran, "the parked consolidate must complete once a permit frees");
+        assert_eq!(
+            ran,
+            MaintenanceOutcome::Ran,
+            "the parked consolidate must complete once a permit frees"
+        );
     }
 
     #[tokio::test]
@@ -6855,7 +7040,10 @@ mod tests {
         shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // disk
         // Enough vectors that the rebuild is measurably slower than a search.
         for id in 0u64..4000 {
-            shards.vset("idx", id, tvec(id + 1), 0, None, None).await.unwrap();
+            shards
+                .vset("idx", id, tvec(id + 1), 0, None, None)
+                .await
+                .unwrap();
         }
 
         let reader = {
@@ -6864,7 +7052,9 @@ mod tests {
                 let mut worst = std::time::Duration::ZERO;
                 for i in 0..40u64 {
                     let t = std::time::Instant::now();
-                    s.vsearch("idx", tvec(i * 7 + 1), 5, 0, 0, false, None).await.unwrap();
+                    s.vsearch("idx", tvec(i * 7 + 1), 5, 0, 0, false, None)
+                        .await
+                        .unwrap();
                     worst = worst.max(t.elapsed());
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
@@ -6884,7 +7074,10 @@ mod tests {
         );
 
         // and the result must stay correct
-        let hits = shards.vsearch("idx", tvec(90), 5, 0, 0, false, None).await.unwrap();
+        let hits = shards
+            .vsearch("idx", tvec(90), 5, 0, 0, false, None)
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, 89, "nearest neighbour still found");
     }
 
@@ -6938,13 +7131,20 @@ mod tests {
         )
         .unwrap();
         let rows = re.vindex_list().await.unwrap();
-        let total: u64 = rows.iter().filter(|r| r.name == "sd").map(|r| r.n_vectors).sum();
+        let total: u64 = rows
+            .iter()
+            .filter(|r| r.name == "sd")
+            .map(|r| r.n_vectors)
+            .sum();
         assert_eq!(total, 800, "reopen lost rows: saw {total} of 800");
         // Fail-closed: an absent or holed layout is an ERROR, never a guess.
         assert!(ShardSet::discover_shard_count(&dir.path().join("nope")).is_err());
         std::fs::remove_dir_all(dir.path().join("shard-3")).unwrap();
         let holed = ShardSet::discover_shard_count(dir.path());
-        assert!(holed.is_err(), "a gap in the numbering must not be served around");
+        assert!(
+            holed.is_err(),
+            "a gap in the numbering must not be served around"
+        );
     }
 
     /// Two heavy jobs must not run on the same vindex at once. The engine's
@@ -7116,7 +7316,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(folded, "a run grown past the geometric threshold must consolidate");
+        assert!(
+            folded,
+            "a run grown past the geometric threshold must consolidate"
+        );
         assert_eq!(arc.read().backend.run_count(), 0, "runs did not fold");
 
         // Nothing left to do: quiet tick, no consolidate reported.
@@ -7264,7 +7467,10 @@ mod tests {
             v
         };
         for id in 0..400u64 {
-            shards.vset("rs", id, vec_for(id), 0, None, None).await.unwrap();
+            shards
+                .vset("rs", id, vec_for(id), 0, None, None)
+                .await
+                .unwrap();
         }
         let moved = shards.reshard("rs", 0.25, 10, 0).await.expect("reshard");
         assert!(moved > 0, "an interleaved layout must move rows");
@@ -7288,7 +7494,10 @@ mod tests {
         assert!(shards.vget("rs", 42).await.unwrap().is_none());
         // Overwrite an id with a vector of the OTHER cluster: it must follow
         // its semantics to the other shard and stay unique.
-        shards.vset("rs", 7, vec_for(0), 0, None, None).await.unwrap();
+        shards
+            .vset("rs", 7, vec_for(0), 0, None, None)
+            .await
+            .unwrap();
         assert_eq!(shards.vget("rs", 7).await.unwrap().unwrap(), vec_for(0));
 
         // Search still finds the right cluster.
@@ -7307,7 +7516,10 @@ mod tests {
         let re = open();
         for id in 0..400u64 {
             if id == 42 {
-                assert!(re.vget("rs", id).await.unwrap().is_none(), "delete survives");
+                assert!(
+                    re.vget("rs", id).await.unwrap().is_none(),
+                    "delete survives"
+                );
             } else if id == 7 {
                 assert_eq!(re.vget("rs", 7).await.unwrap().unwrap(), vec_for(0));
             } else {
@@ -7366,17 +7578,31 @@ mod tests {
         let mut live = Vec::new();
         for shard in 0..4usize {
             if let ShardResp::Vector(Some(_)) = shards
-                .call(shard, ShardReq::Vget { name: "rc".into(), id: 7 })
+                .call(
+                    shard,
+                    ShardReq::Vget {
+                        name: "rc".into(),
+                        id: 7,
+                    },
+                )
                 .await
                 .unwrap()
             {
                 live.push(shard);
             }
         }
-        assert!(live.len() <= 1, "id 7 has {} live copies: {live:?}", live.len());
+        assert!(
+            live.len() <= 1,
+            "id 7 has {} live copies: {live:?}",
+            live.len()
+        );
         // vget (map-routed) agrees with the shards.
         let via_map = shards.vget("rc", 7).await.unwrap().is_some();
-        assert_eq!(via_map, !live.is_empty(), "map disagrees with shards on id 7");
+        assert_eq!(
+            via_map,
+            !live.is_empty(),
+            "map disagrees with shards on id 7"
+        );
     }
 
     /// Targeted overlap: boundary rows (small margin between their two
@@ -7408,10 +7634,16 @@ mod tests {
             v
         };
         for id in 0..300u64 {
-            shards.vset("ov", id, cluster((id % 2) as usize), 0, None, None).await.unwrap();
+            shards
+                .vset("ov", id, cluster((id % 2) as usize), 0, None, None)
+                .await
+                .unwrap();
         }
         for id in 300..340u64 {
-            shards.vset("ov", id, boundary(id), 0, None, None).await.unwrap();
+            shards
+                .vset("ov", id, boundary(id), 0, None, None)
+                .await
+                .unwrap();
         }
         shards.reshard("ov", 0.25, 10, 0).await.unwrap();
         // Tau comes from the trained router's own geometry: between the
@@ -7470,7 +7702,10 @@ mod tests {
             "a deleted id must not survive as a replica ghost"
         );
         // Overwrite lands one logical copy (replica of the old value gone).
-        shards.vset("ov", 321, cluster(0), 0, None, None).await.unwrap();
+        shards
+            .vset("ov", 321, cluster(0), 0, None, None)
+            .await
+            .unwrap();
         assert_eq!(shards.vget("ov", 321).await.unwrap().unwrap(), cluster(0));
     }
 
@@ -7496,7 +7731,10 @@ mod tests {
             v
         };
         for id in 0..800u64 {
-            shards.vset("pr", id, vec_for(id), 0, None, None).await.unwrap();
+            shards
+                .vset("pr", id, vec_for(id), 0, None, None)
+                .await
+                .unwrap();
         }
         shards.reshard("pr", 0.25, 10, 0).await.unwrap();
         for probe_q in 0..4u64 {
@@ -7548,7 +7786,10 @@ mod tests {
             shards.vset("iv", id, v, 0, None, None).await.unwrap();
         }
         shards.vindex_consolidate("iv").await.unwrap();
-        let wants = match shards.call(0, ShardReq::WantsIvf { name: "iv".into() }).await {
+        let wants = match shards
+            .call(0, ShardReq::WantsIvf { name: "iv".into() })
+            .await
+        {
             Ok(ShardResp::Count(n)) => n == 1,
             _ => false,
         };
@@ -7588,11 +7829,62 @@ mod tests {
         shards.reshard("ow", 0.25, 10, 0).await.unwrap();
         let after = shards.owners_of("ow", &probe).await.unwrap();
         assert_eq!(after.len(), probe.len());
-        assert!(after.iter().all(|&(p, r)| (p as usize) < 4
-            && r.is_none_or(|s| (s as usize) < 4)));
+        assert!(
+            after
+                .iter()
+                .all(|&(p, r)| (p as usize) < 4 && r.is_none_or(|s| (s as usize) < 4))
+        );
         // The whole point: a semantic reshard MOVES rows, so the placement a
         // benchmark reports must change with it.
         assert_ne!(before, after, "reshard left every id on its hash shard");
+    }
+
+    /// HEALTH must never print OK over an index that is missing on some
+    /// shards. A monitor reads `state` and nothing else, so an OK with a
+    /// caveat below it is the false green this command exists to prevent.
+    #[tokio::test]
+    async fn health_state_is_partial_when_the_index_is_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            4,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("hp", 8, 4, 1).await.unwrap();
+        for id in 0..200u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 4) as usize] = 1.0;
+            shards.vset("hp", id, v, 0, None, None).await.unwrap();
+        }
+        let ok = shards.health("hp").await.unwrap();
+        assert!(
+            ok.iter().any(|l| l == "state OK"),
+            "a complete quiet index should read OK: {ok:?}"
+        );
+
+        // Drop the index on ONE shard only, as a partial failure would.
+        shards
+            .call(
+                2,
+                ShardReq::VindexDrop {
+                    name: "hp".into(),
+                    tenant: 0,
+                },
+            )
+            .await
+            .expect("drop on one shard");
+        let partial = shards.health("hp").await.unwrap();
+        assert!(
+            partial.iter().any(|l| l == "state PARTIAL"),
+            "an index missing on a shard must not read OK: {partial:?}"
+        );
+        assert!(
+            partial.iter().any(|l| l.starts_with("present_on 3 of 4")),
+            "the report must say where it is missing: {partial:?}"
+        );
     }
 
     /// A healthy index checks clean through the coordinator, including the
@@ -7624,7 +7916,10 @@ mod tests {
         assert!(after.is_empty(), "resharded index reported: {after:?}");
 
         // An unknown index is an error, not a clean bill of health.
-        assert!(shards.check("nope").await.is_err(), "unknown index reported healthy");
+        assert!(
+            shards.check("nope").await.is_err(),
+            "unknown index reported healthy"
+        );
     }
 
     /// Dropping a resharded vindex removes its router sidecar, its in-RAM
@@ -7652,7 +7947,10 @@ mod tests {
         assert!(sidecar.exists(), "sidecar written");
 
         shards.vindex_drop("dr", 0).await.unwrap();
-        assert!(shards.router("dr").is_none(), "router still loaded after drop");
+        assert!(
+            shards.router("dr").is_none(),
+            "router still loaded after drop"
+        );
         assert!(!sidecar.exists(), "sidecar survived the drop");
         assert!(
             shards.inner.owners.read().get("dr").is_none(),
@@ -7661,7 +7959,10 @@ mod tests {
 
         // Recreate the same name: no inherited routing.
         shards.vindex_create("dr", 8, 4, 1).await.unwrap();
-        assert!(shards.router("dr").is_none(), "recreated index inherited a router");
+        assert!(
+            shards.router("dr").is_none(),
+            "recreated index inherited a router"
+        );
     }
 
     /// Training the router samples every shard, writes the sidecar, and a
@@ -7701,13 +8002,20 @@ mod tests {
         .unwrap();
         let r2 = re.router("rt").expect("router reloaded at open");
         assert_eq!(r2.epoch, r1.epoch);
-        assert_eq!(r2.centroids, r1.centroids, "centroids must reload bit-exact");
+        assert_eq!(
+            r2.centroids, r1.centroids,
+            "centroids must reload bit-exact"
+        );
         // The two natural clusters land on different owners.
         let mut a = vec![0.05f32; 8];
         a[0] = 1.0;
         let mut b = vec![0.05f32; 8];
         b[1] = 1.0;
-        assert_ne!(r2.assign(&a), r2.assign(&b), "distinct clusters share an owner");
+        assert_ne!(
+            r2.assign(&a),
+            r2.assign(&b),
+            "distinct clusters share an owner"
+        );
     }
 
     /// VGET returns the stored vector for a live id across every location
@@ -7725,7 +8033,10 @@ mod tests {
         .unwrap();
         shards.vindex_create("vg", 8, 4, 1).await.unwrap();
         let v: Vec<f32> = (0..8).map(|i| i as f32 / 10.0).collect();
-        shards.vset("vg", 7, v.clone(), 0, None, None).await.unwrap();
+        shards
+            .vset("vg", 7, v.clone(), 0, None, None)
+            .await
+            .unwrap();
         let got = shards.vget("vg", 7).await.unwrap().expect("id 7 stored");
         assert_eq!(got, v, "roundtrip must be bit-exact");
         assert!(

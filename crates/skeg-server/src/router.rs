@@ -84,7 +84,11 @@ impl Router {
         let dim = u32_at(12) as usize;
         let epoch = u64::from_le_bytes(b[16..24].try_into().expect("8 bytes"));
         let need = 24usize
-            .checked_add(k.checked_mul(dim).and_then(|n| n.checked_mul(4)).ok_or_else(bad)?)
+            .checked_add(
+                k.checked_mul(dim)
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or_else(bad)?,
+            )
             .and_then(|n| n.checked_add(4))
             .ok_or_else(bad)?;
         if b.len() != need || k == 0 || dim == 0 {
@@ -98,7 +102,12 @@ impl Router {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        Ok(Router { k, dim, epoch, centroids })
+        Ok(Router {
+            k,
+            dim,
+            epoch,
+            centroids,
+        })
     }
 }
 

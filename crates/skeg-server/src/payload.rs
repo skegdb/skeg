@@ -777,15 +777,20 @@ mod blob_roundtrip_tests {
             b"k=-42 neg=-0 big=9223372036854775807",
             b"single=x",
             b"",
-            b"no_equals_token dl=5",       // the parser skips the bare token
-            b"=novalue dl=5",              // and an empty key
+            b"no_equals_token dl=5", // the parser skips the bare token
+            b"=novalue dl=5",        // and an empty key
         ];
         for blob in cases {
             let mut idx = PayloadIndex::default();
             let fields = parse_fields(blob);
             idx.upsert(1, fields.clone());
             let again = parse_fields(&idx.field_blob(1));
-            assert_eq!(again, fields, "blob {:?} did not round trip", String::from_utf8_lossy(blob));
+            assert_eq!(
+                again,
+                fields,
+                "blob {:?} did not round trip",
+                String::from_utf8_lossy(blob)
+            );
         }
     }
 
@@ -799,6 +804,10 @@ mod blob_roundtrip_tests {
         let back = parse_fields(&idx.field_blob(1));
         assert_eq!(back[0], ("n".into(), Value::Int(7)));
         assert_eq!(back[1], ("s".into(), Value::Keyword("seven".into())));
-        assert_eq!(back[2], ("z".into(), Value::Int(7)), "leading zeros parse as the number");
+        assert_eq!(
+            back[2],
+            ("z".into(), Value::Int(7)),
+            "leading zeros parse as the number"
+        );
     }
 }

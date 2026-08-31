@@ -13,14 +13,24 @@ fn rss_kb() -> u64 {
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
         .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
 }
 
 fn main() {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1_383_158);
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_383_158);
     let presized = std::env::var("PRESIZED").is_ok();
     let base = rss_kb();
-    let mut idx = if presized { Index::with_capacity(n) } else { Index::new() };
+    let mut idx = if presized {
+        Index::with_capacity(n)
+    } else {
+        Index::new()
+    };
     let mut key_bytes = 0usize;
     for i in 0..n {
         let key: Vec<u8> = match i % 4 {
@@ -38,7 +48,13 @@ fn main() {
         key_bytes += key.len();
         idx.set(
             key,
-            IndexEntry { fingerprint: i as u32, segment_id: 0, _pad: 0, offset: i as u32, size: 128 },
+            IndexEntry {
+                fingerprint: i as u32,
+                segment_id: 0,
+                _pad: 0,
+                offset: i as u32,
+                size: 128,
+            },
         );
     }
     let used = (rss_kb() - base) as f64;

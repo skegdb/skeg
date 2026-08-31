@@ -121,8 +121,9 @@ mod tests {
         let mut data = Vec::new();
         for (c, &m) in masses.iter().enumerate() {
             for _ in 0..m {
-                let mut v: Vec<f32> =
-                    (0..dim).map(|_| rng.random_range(-spread..spread)).collect();
+                let mut v: Vec<f32> = (0..dim)
+                    .map(|_| rng.random_range(-spread..spread))
+                    .collect();
                 v[c] += 1.0;
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 for x in &mut v {

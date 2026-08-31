@@ -37,7 +37,6 @@ impl VisitedBitset {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-
     /// Create a bitset with `n` slots. Allocation: `n/64` `u64` words, all
     /// zeroed.
     ///

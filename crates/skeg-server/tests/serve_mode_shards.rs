@@ -33,7 +33,10 @@ async fn write_sharded(dir: &std::path::Path) {
     let shards = ShardSet::open_mode_with_workers(dir, SHARDS, false, TIER, 1).unwrap();
     shards.vindex_create("sv", DIM, 4, 1).await.unwrap();
     for id in 0..ROWS {
-        shards.vset("sv", id, vec_for(id), 0, None, None).await.unwrap();
+        shards
+            .vset("sv", id, vec_for(id), 0, None, None)
+            .await
+            .unwrap();
     }
     shards.write_snapshot_and_payload_indexes().await;
 }
@@ -54,23 +57,20 @@ async fn serve_mode_opens_every_shard_it_was_written_with() {
     write_sharded(dir.path()).await;
 
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port()));
-    let server = Server::bind_serve_full_mmap(
-        &addr.to_string(),
-        dir.path(),
-        TIER,
-        1,
-        false,
-        false,
-    )
-    .await
-    .expect("serve mode must open an eight-shard set");
+    let server = Server::bind_serve_full_mmap(&addr.to_string(), dir.path(), TIER, 1, false, false)
+        .await
+        .expect("serve mode must open an eight-shard set");
 
     let rows = server
         .shards()
         .vindex_list()
         .await
         .expect("list through the serve path");
-    let seen: u64 = rows.iter().filter(|r| r.name == "sv").map(|r| r.n_vectors).sum();
+    let seen: u64 = rows
+        .iter()
+        .filter(|r| r.name == "sv")
+        .map(|r| r.n_vectors)
+        .sum();
     assert_eq!(
         seen, ROWS,
         "serve mode saw {seen} of {ROWS} rows: it opened the wrong number of shards"

@@ -670,7 +670,9 @@ async fn dispatch_command(
         Command::SkegCheck { args } => skeg_check(args.as_slice(), shards, *tenant).await,
         Command::SkegVowner { args } => skeg_vowner(args.as_slice(), shards, *tenant).await,
         Command::SkegHealth { args } => skeg_health(args.as_slice(), shards, *tenant).await,
-        Command::SkegVindexShards { args } => skeg_vindex_shards(args.as_slice(), shards, *tenant).await,
+        Command::SkegVindexShards { args } => {
+            skeg_vindex_shards(args.as_slice(), shards, *tenant).await
+        }
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
         Command::SkegVindexConsolidate { args } => {
@@ -1190,7 +1192,10 @@ async fn skeg_vowner(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Fra
     };
     let mut ids = Vec::with_capacity(args.len() - 1);
     for a in &args[1..] {
-        match std::str::from_utf8(a).ok().and_then(|s| s.parse::<u64>().ok()) {
+        match std::str::from_utf8(a)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             Some(v) => ids.push(v),
             None => return Frame::Error("ERR id must be an unsigned integer".into()),
         }
@@ -1250,7 +1255,10 @@ async fn skeg_vindex_overlap(args: &[Bytes], shards: &ShardSet, tenant: TenantId
         Err(e) => return e,
     };
     let tau = match args.get(1) {
-        Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse::<f32>().ok()) {
+        Some(b) => match std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
             Some(v) if v > 0.0 => v,
             _ => return Frame::Error("ERR tau must be a positive number".into()),
         },

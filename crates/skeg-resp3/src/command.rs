@@ -101,13 +101,21 @@ pub enum Command {
     /// `SKEG.VINDEX.LIST` - enumerate vindexes for the calling tenant.
     SkegVindexList,
     /// `SKEG.CHECK <index>` - integrity report for one index.
-    SkegCheck { args: Vec<Bytes> },
+    SkegCheck {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VOWNER <index> <id> [id...]` - which shard holds each id.
-    SkegVowner { args: Vec<Bytes> },
+    SkegVowner {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.HEALTH <index>` - operational health (is maintenance keeping up?).
-    SkegHealth { args: Vec<Bytes> },
+    SkegHealth {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VINDEX.SHARDS <index>` - per-shard LSM state (LIST sums it away).
-    SkegVindexShards { args: Vec<Bytes> },
+    SkegVindexShards {
+        args: Vec<Bytes>,
+    },
     /// `SKEG.VINDEX.CREATE name dim [kind] backend`. The parser checks
     /// arity (3 or 4 args; 3 omits `kind` and takes the server default)
     /// and forwards the raw bytes; inner argument

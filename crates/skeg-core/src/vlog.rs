@@ -261,8 +261,13 @@ impl VLog {
     ///
     /// Returns an error on IO failure.
     pub async fn open_with_max_segment(dir: &Path, max_seg_size: u64) -> Result<Self> {
-        Self::open_shared_mode(dir, max_seg_size, Arc::new(Mutex::new(AHashMap::new())), false)
-            .await
+        Self::open_shared_mode(
+            dir,
+            max_seg_size,
+            Arc::new(Mutex::new(AHashMap::new())),
+            false,
+        )
+        .await
     }
 
     /// Open the store READ-ONLY: a shared advisory lock (many readers coexist,
@@ -382,7 +387,8 @@ impl VLog {
                 // real records and silently drop keys, so it is clamped to the
                 // file length: worse case we rescan, never under-scan.
                 let start = if id == snap.hwm {
-                    snap.hwm_offset.min(segment_path(dir, id).metadata().map_or(0, |m| m.len()))
+                    snap.hwm_offset
+                        .min(segment_path(dir, id).metadata().map_or(0, |m| m.len()))
                 } else {
                     0
                 };
@@ -919,9 +925,11 @@ impl VLog {
                 .collect()
         };
         let dir = self.inner.dir.clone();
-        tokio::task::spawn_blocking(move || snapshot::write(&dir, hwm, hwm_offset, max_ts, &entries))
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+        tokio::task::spawn_blocking(move || {
+            snapshot::write(&dir, hwm, hwm_offset, max_ts, &entries)
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
         // Returned so a caller can stamp its own derived state with the exact
         // position this snapshot covers, which is what makes that state
         // reusable at the next open.
@@ -1660,7 +1668,9 @@ mod tests {
             "the writer opened while readers hold the shared lock"
         );
         drop((r1, r2));
-        VLog::open(dir.path()).await.expect("writer reopens after readers close");
+        VLog::open(dir.path())
+            .await
+            .expect("writer reopens after readers close");
     }
 
     #[tokio::test]
@@ -1668,7 +1678,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v = VLog::open(dir.path()).await.unwrap();
         for i in 0..300u32 {
-            v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel).await.unwrap();
+            v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                .await
+                .unwrap();
         }
         v.write_snapshot().await.unwrap();
         let snap = crate::snapshot::read(dir.path()).expect("snapshot written");
@@ -1686,12 +1698,16 @@ mod tests {
         {
             let v = VLog::open(dir.path()).await.unwrap();
             for i in 0..300u32 {
-                v.set(format!("k{i}").as_bytes(), b"v1", Durability::Kernel).await.unwrap();
+                v.set(format!("k{i}").as_bytes(), b"v1", Durability::Kernel)
+                    .await
+                    .unwrap();
             }
             v.write_snapshot().await.unwrap();
             // after the snapshot: new keys AND an overwrite, which must win
             for i in 300..400u32 {
-                v.set(format!("k{i}").as_bytes(), b"v1", Durability::Kernel).await.unwrap();
+                v.set(format!("k{i}").as_bytes(), b"v1", Durability::Kernel)
+                    .await
+                    .unwrap();
             }
             v.set(b"k7", b"v2", Durability::Kernel).await.unwrap();
             v.flush().await.unwrap();
@@ -1718,7 +1734,9 @@ mod tests {
         {
             let v = VLog::open(dir.path()).await.unwrap();
             for i in 0..200u32 {
-                v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel).await.unwrap();
+                v.set(format!("k{i}").as_bytes(), b"v", Durability::Kernel)
+                    .await
+                    .unwrap();
             }
             v.write_snapshot().await.unwrap();
             v.flush().await.unwrap();
@@ -2551,7 +2569,11 @@ mod tests {
 
         for i in 1..8u32 {
             let got = v.get_uncached(format!("k{i}").as_bytes()).await.unwrap();
-            assert_eq!(got.as_deref(), Some(b"v".as_slice()), "the scan must still read values");
+            assert_eq!(
+                got.as_deref(),
+                Some(b"v".as_slice()),
+                "the scan must still read values"
+            );
         }
         assert_eq!(
             v.disk_reads() - after_hot,
@@ -2561,8 +2583,15 @@ mod tests {
 
         // Re-reading a scanned key still costs a disk read: it was never cached.
         let before = v.disk_reads();
-        assert_eq!(v.get_uncached(b"k1").await.unwrap().as_deref(), Some(b"v".as_slice()));
-        assert_eq!(v.disk_reads() - before, 1, "the scan must leave nothing behind");
+        assert_eq!(
+            v.get_uncached(b"k1").await.unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
+        assert_eq!(
+            v.disk_reads() - before,
+            1,
+            "the scan must leave nothing behind"
+        );
 
         // The key that was hot before the scan is still cached.
         let before = v.disk_reads();
@@ -2587,16 +2616,22 @@ mod tests {
 
         // A hot key, read so it is cached, then overwritten by a batch.
         v.set(b"hot", b"old", Durability::Kernel).await.unwrap();
-        assert_eq!(v.get(b"hot").await.unwrap().as_deref(), Some(b"old".as_slice()));
+        assert_eq!(
+            v.get(b"hot").await.unwrap().as_deref(),
+            Some(b"old".as_slice())
+        );
         let reads_before = v.disk_reads();
-        assert_eq!(v.get(b"hot").await.unwrap().as_deref(), Some(b"old".as_slice()));
-        assert_eq!(v.disk_reads(), reads_before, "the key must be cached to start with");
+        assert_eq!(
+            v.get(b"hot").await.unwrap().as_deref(),
+            Some(b"old".as_slice())
+        );
+        assert_eq!(
+            v.disk_reads(),
+            reads_before,
+            "the key must be cached to start with"
+        );
 
-        let pairs: Vec<(&[u8], &[u8])> = vec![
-            (b"hot", b"new"),
-            (b"bulk1", b"a"),
-            (b"bulk2", b"b"),
-        ];
+        let pairs: Vec<(&[u8], &[u8])> = vec![(b"hot", b"new"), (b"bulk1", b"a"), (b"bulk2", b"b")];
         v.set_many(&pairs, Durability::Kernel).await.unwrap();
 
         // Correctness first: the overwrite must be what a reader sees.
@@ -2608,7 +2643,10 @@ mod tests {
 
         // And the batch must not have left its own keys behind.
         let before = v.disk_reads();
-        assert_eq!(v.get_uncached(b"bulk2").await.unwrap().as_deref(), Some(b"b".as_slice()));
+        assert_eq!(
+            v.get_uncached(b"bulk2").await.unwrap().as_deref(),
+            Some(b"b".as_slice())
+        );
         assert_eq!(
             v.disk_reads() - before,
             1,
