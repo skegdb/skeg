@@ -3851,16 +3851,15 @@ impl DiskVamanaIndex {
         // lied, which is why nothing caught it for so long. Measured: 3,534 of
         // 60,000 rows stale on a settled index that held one run.
         //
-        // Runs are appended, so the last is the newest: iterate in reverse.
-        for run in self.runs.iter().rev() {
-            if let Some(&row) = run.id_to_main_row.get(&id) {
-                return Ok(Some(self.read_vector(run, row)?));
-            }
+        // Through `newest_location`, not a second copy of the walk. Both of
+        // these were fixed on the same day, independently, and immediately
+        // stated the same rule in two places again - which is how they came to
+        // disagree in the first place.
+        match self.newest_location(id) {
+            Some((0, row)) => Ok(Some(self.read_vector(&self.base, row)?)),
+            Some((seg, row)) => Ok(Some(self.read_vector(&self.runs[seg - 1], row)?)),
+            None => Ok(None),
         }
-        if let Some(&row) = self.base.id_to_main_row.get(&id) {
-            return Ok(Some(self.read_vector(&self.base, row)?));
-        }
-        Ok(None)
     }
 
     /// Where the NEWEST copy of `id` lives: `(segment index, row)` with 0 =
@@ -4723,6 +4722,45 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// Returns an I/O error if rebuilding, re-saving, or re-opening fails.
+    /// Append the live rows of the PERSISTED layers to `out`: runs
+    /// newest-first, then the base, skipping tombstoned ids and anything a
+    /// newer layer has already claimed through `seen`.
+    ///
+    /// This is the LSM precedence rule for the on-disk layers, and it exists
+    /// once. It used to be written out identically in both `consolidate` and
+    /// `consolidate_begin` - the same fifteen lines, byte for byte. Every P0
+    /// this engine has had was a rule stated twice with one copy wrong, twice
+    /// over this exact rule, so the fold paths do not get to keep their own
+    /// copies of it.
+    ///
+    /// `seen` is threaded in rather than created here because the caller has
+    /// already claimed the newer layers (delta, and any in-flight flush
+    /// staging) into it. That ordering IS the precedence.
+    fn append_persisted_survivors(
+        &self,
+        seen: &mut AHashSet<u64>,
+        out: &mut Vec<(u64, usize, u32)>,
+    ) {
+        // Runs are appended, so the last is the newest: iterate in reverse.
+        // Segment numbering matches `segs`: 0 is the base, 1.. are the runs.
+        for (ri, run) in self.runs.iter().enumerate().rev() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                out.push((id, ri + 1, row));
+            }
+        }
+        for row in 0..self.base.main_n {
+            let id = self.base.ids[row as usize];
+            if self.tombstones.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            out.push((id, 0, row));
+        }
+    }
+
     pub fn consolidate(&mut self) -> io::Result<()> {
         let dim = self.dim;
         // Collect the surviving (id, location) refs only - ~24 B each, not the
@@ -4751,22 +4789,7 @@ impl DiskVamanaIndex {
                 survivors.push((id, Self::LOC_FLUSHING, 0));
             }
         }
-        for (ri, run) in self.runs.iter().enumerate().rev() {
-            for row in 0..run.main_n {
-                let id = run.ids[row as usize];
-                if self.tombstones.contains(&id) || !seen.insert(id) {
-                    continue;
-                }
-                survivors.push((id, ri + 1, row));
-            }
-        }
-        for row in 0..self.base.main_n {
-            let id = self.base.ids[row as usize];
-            if self.tombstones.contains(&id) || !seen.insert(id) {
-                continue;
-            }
-            survivors.push((id, 0, row));
-        }
+        self.append_persisted_survivors(&mut seen, &mut survivors);
         if survivors.is_empty() {
             return Ok(());
         }
@@ -4856,22 +4879,7 @@ impl DiskVamanaIndex {
         }
         // Base/runs, newest run first; delta already shadows via `seen`.
         let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
-        for (ri, run) in self.runs.iter().enumerate().rev() {
-            for row in 0..run.main_n {
-                let id = run.ids[row as usize];
-                if self.tombstones.contains(&id) || !seen.insert(id) {
-                    continue;
-                }
-                survivors.push((id, ri + 1, row));
-            }
-        }
-        for row in 0..self.base.main_n {
-            let id = self.base.ids[row as usize];
-            if self.tombstones.contains(&id) || !seen.insert(id) {
-                continue;
-            }
-            survivors.push((id, 0, row));
-        }
+        self.append_persisted_survivors(&mut seen, &mut survivors);
         if survivors.is_empty() && delta_ids.is_empty() {
             return Ok(None);
         }

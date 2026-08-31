@@ -1420,6 +1420,119 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     maintenance_tick_at(arc, vdir, shard_id, idle, FLUSH_ROWS).await
 }
 
+/// The LSM state one tick decides from, read once under one lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LsmState {
+    delta: usize,
+    runs: usize,
+    run_rows: usize,
+    tombs: usize,
+    base: usize,
+    /// Consecutive ticks a due merge has lost to the flush.
+    flush_streak: u64,
+}
+
+/// One rung of the maintenance ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rung {
+    RunsMerge,
+    Flush,
+    DeletePatch,
+    Consolidate,
+}
+
+impl LsmState {
+    /// Count OR mass. The count alone left a single fat dirty run untouched
+    /// forever - one run is not "four runs" however much garbage it holds. A
+    /// lone run is only OFFERED; whether it is dirty enough to rewrite is
+    /// decided in `merge_runs_begin`, from the survivor set, where the number
+    /// is exact.
+    fn merge_due(&self) -> bool {
+        self.runs >= RUNS_MERGE_TRIGGER || (self.runs >= 1 && self.tombs > 0)
+    }
+
+    /// Past roughly a quarter of the base dead, delete-patch is in its
+    /// measured losing regime (0.3x at 40%), so a heavy-dead base goes
+    /// straight to the full fold. Without this arm nothing would ever reclaim
+    /// a heavily-tombstoned base: the geometric trigger only watches runs.
+    fn heavy_dead(&self) -> bool {
+        self.base >= DELETE_PATCH_MIN_BASE && self.tombs * 4 > self.base
+    }
+
+    fn consolidate_due(&self) -> bool {
+        self.run_rows >= self.base.max(IDLE_CONSOLIDATE_MIN) || self.heavy_dead()
+    }
+
+    fn delete_patch_due(&self) -> bool {
+        self.base >= DELETE_PATCH_MIN_BASE
+            && self.tombs >= self.base / DELETE_PATCH_DEAD_DIVISOR
+            && self.tombs * 4 <= self.base
+    }
+}
+
+/// The rungs due this tick, in the order to attempt them. PURE: no I/O, no
+/// lock, no clock.
+///
+/// Separated from the doing for two reasons, both paid for.
+///
+/// The decision is what the tests care about, and testing it through real
+/// maintenance walks ONE trajectory through the state space at the cost of a
+/// graph build per step. Against a function the space itself can be swept.
+///
+/// And a list cannot repeat itself by accident. The ladder used to reach
+/// `runs-merge` from two places: once as the anti-starvation attempt, and
+/// again further down where `runs >= RUNS_MERGE_TRIGGER` was still true. The
+/// second was reachable ONLY as a duplicate - `runs >= RUNS_MERGE_TRIGGER`
+/// implies `merge_due`, and getting past the flush rung requires `!flush_due`,
+/// which is exactly when the first attempt already fired. So it re-ran an
+/// operation that had just declined, and that refusal costs a full survivor
+/// set - one hash insert per row of every run - under the write lock.
+///
+/// Cheap first, expensive last. The fold rebuilds the whole base and costs
+/// O(live); the other three are proportional to what changed. Checking the
+/// fold first meant that whenever it was due the cheap paths never got a turn,
+/// which is why the project's own note says the delete-patch plus runs-merge
+/// cycle was never closed as a replacement for it.
+fn ladder_plan(s: &LsmState, flush_rows: usize) -> Vec<Rung> {
+    let mut plan = Vec::with_capacity(2);
+    let flush_due = s.delta >= flush_rows;
+    let merge_due = s.merge_due();
+
+    // Flush and merge ALTERNATE when both are due.
+    //
+    // Every rung ends the tick, so a permanently hot rung starves every rung
+    // below it. Under sustained write churn the delta is ALWAYS over the flush
+    // threshold, so the tick took the flush branch forever - and each flush
+    // adds a run. Measured on the churn gate: runs climbed 0 -> 33 over ten
+    // turnovers and never merged, recall falling 0.9925 -> 0.7180 as more of
+    // the live set moved into run graphs, which the walk searches with a short
+    // beam. The store stayed correct throughout (0/120 stale) - starvation,
+    // not corruption.
+    //
+    // A ceiling alone was NOT enough, and the measurement said so: run counts
+    // an operator reads are SUMMED across shards, so the "33 runs" were four
+    // per shard - under any per-shard ceiling worth having, and already at the
+    // ordinary merge trigger. The rung was due every tick and lost every tick.
+    //
+    // So the flush still wins normally, but it cannot win TWICE in a row while
+    // a merge is due. Under sustained churn that gives the merge every other
+    // tick, which keeps the count flat, and needs no threshold guessed right.
+    let starved = s.flush_streak >= 1;
+    if merge_due && (!flush_due || starved) {
+        plan.push(Rung::RunsMerge);
+    }
+    if flush_due {
+        plan.push(Rung::Flush);
+    }
+    if s.delete_patch_due() {
+        plan.push(Rung::DeletePatch);
+    }
+    if s.consolidate_due() {
+        plan.push(Rung::Consolidate);
+    }
+    plan
+}
+
 /// The tick with the flush threshold as a parameter.
 ///
 /// The invariant worth protecting here is the LADDER'S CHOICE, not the work
@@ -1434,175 +1547,112 @@ async fn maintenance_tick_at(
     idle: bool,
     flush_rows: usize,
 ) -> bool {
-    let (delta, runs, run_rows, tombs, base) = {
+    let state = {
         let g = arc.read();
-        (
-            g.backend.delta_len(),
-            g.backend.run_count(),
-            g.backend.run_rows(),
-            g.backend.tombstone_count(),
-            g.backend.main_len(),
-        )
+        LsmState {
+            delta: g.backend.delta_len(),
+            runs: g.backend.run_count(),
+            run_rows: g.backend.run_rows(),
+            tombs: g.backend.tombstone_count(),
+            base: g.backend.main_len(),
+            flush_streak: g.flush_streak.load(Ordering::Relaxed),
+        }
     };
-    // Cheap first, expensive last. The fold rebuilds the whole base and costs
-    // O(live); the other three are proportional to what changed. Checking the
-    // fold first meant that whenever it was due the cheap paths never got a
-    // turn, which is why the project's own note says the delete-patch plus
-    // runs-merge cycle was never closed as a replacement for it.
-    //
-    // The fold stays as the fallback for the regime the verdicts measured it
-    // winning in: above roughly a quarter of the base dead, delete-patch loses
-    // (0,3x at 40%), and when the runs really have grown to base size there is
-    // nothing left to reuse.
-    // Heavy-dead goes straight to the full fold: past roughly a quarter of
-    // the base dead, delete-patch is in its measured losing regime (0,3x at
-    // 40% in the L3 verdict), and it fired at 61% during the demo repair
-    // before this guard existed. Without this arm nothing else would ever
-    // reclaim a heavily-tombstoned base, since the geometric trigger only
-    // watches run growth.
-    let heavy_dead = base >= DELETE_PATCH_MIN_BASE && tombs * 4 > base;
-    let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN) || heavy_dead;
+    let merge_due = state.merge_due();
 
-    // Flush and merge ALTERNATE when both are due.
-    //
-    // Every rung of this ladder ends in `return`, so a rung that is
-    // permanently hot starves every rung below it. Under sustained write
-    // churn the delta is ALWAYS over the flush threshold, so the tick took
-    // the flush branch forever - and each flush adds a run. Measured on the
-    // churn gate: runs climbed 0 -> 33 over ten turnovers and never merged,
-    // and recall fell from 0.9925 to 0.7180 as more of the live set moved
-    // into run graphs, which the walk deliberately searches with a short
-    // beam. The store stayed correct throughout (0/120 stale reads) - this
-    // is starvation, not corruption.
-    //
-    // A ceiling alone was NOT enough, and the measurement said so: the run
-    // counts an operator reads are SUMMED across shards, so the "33 runs"
-    // that wrecked recall were four per shard - under any per-shard ceiling
-    // worth having, and already at the ordinary merge trigger. The rung was
-    // due every single tick and lost every single tick.
-    //
-    // So: the flush still wins the tick normally (cheapest rung, and it
-    // bounds the RAM delta), but it cannot win TWICE in a row while a merge
-    // is due. Under sustained churn that gives the merge every other tick,
-    // which is enough to keep the count flat - and it needs no threshold to
-    // be guessed correctly.
-    let flush_due = delta >= flush_rows;
-    // Count OR mass. The count alone left a single fat dirty run untouched
-    // forever - measured at rest, three times the live count in runs with no
-    // merge ever firing again, because one run is not "four runs" however
-    // much garbage it holds. A lone run is only OFFERED here; whether it is
-    // dirty enough to rewrite is decided in `merge_runs_begin`, from the
-    // survivor set, where the number is exact.
-    let merge_due = runs >= RUNS_MERGE_TRIGGER || (runs >= 1 && tombs > 0);
-    let starved = arc.read().flush_streak.load(Ordering::Relaxed) >= 1;
-    if merge_due && (!flush_due || starved) {
+    for rung in ladder_plan(&state, flush_rows) {
         let d = vdir.to_path_buf();
-        let outcome = off_thread_maintenance(
-            arc,
-            "runs-merge",
-            shard_id,
-            |b| b.merge_runs_begin(),
-            move |job| job.build(&d),
-            |b, built| b.merge_runs_finish(built),
-        )
-        .await;
-        // ONLY a merge that actually ran consumes the tick.
-        //
-        // `NotNeeded` here means the exact check said there is nothing worth
-        // rewriting - a clean run offered by a coarse trigger - and treating
-        // that as work done left a run past the consolidate threshold sitting
-        // there tick after tick, because the ladder returned before reaching
-        // the rung that would have folded it. `BudgetBusy` and `Failed` must
-        // not stop the flush either: that would trade the starvation this
-        // clause removes for the one below it.
-        if outcome == MaintenanceOutcome::Ran {
-            arc.read().flush_streak.store(0, Ordering::Relaxed);
-            return false;
+        match rung {
+            Rung::RunsMerge => {
+                let outcome = off_thread_maintenance(
+                    arc,
+                    "runs-merge",
+                    shard_id,
+                    |b| b.merge_runs_begin(),
+                    move |job| job.build(&d),
+                    |b, built| b.merge_runs_finish(built),
+                )
+                .await;
+                // ONLY a merge that actually ran consumes the tick.
+                //
+                // `NotNeeded` means the exact check said there is nothing worth
+                // rewriting - a clean run offered by a coarse trigger - and
+                // treating that as work done left a run past the consolidate
+                // threshold sitting there tick after tick. `BudgetBusy` and
+                // `Failed` must not stop the flush either: that would trade the
+                // starvation this removes for the one below it.
+                if outcome == MaintenanceOutcome::Ran {
+                    arc.read().flush_streak.store(0, Ordering::Relaxed);
+                    return false;
+                }
+            }
+            Rung::Flush => {
+                off_thread_maintenance(
+                    arc,
+                    "flush",
+                    shard_id,
+                    |b| b.flush_begin(),
+                    move |job| job.build(&d),
+                    |b, built| b.flush_finish(built),
+                )
+                .await;
+                if merge_due {
+                    arc.read().flush_streak.fetch_add(1, Ordering::Relaxed);
+                }
+                return false;
+            }
+            Rung::DeletePatch => {
+                off_thread_maintenance(
+                    arc,
+                    "delete-patch",
+                    shard_id,
+                    |b| b.delete_patch_begin(),
+                    move |job| job.build(&d),
+                    |b, built| b.delete_patch_finish(built),
+                )
+                .await;
+                return false;
+            }
+            Rung::Consolidate => {
+                // The pace depends on WHY we are folding, and the engine knows
+                // which. Triggered by quiet there is no traffic to protect and
+                // finishing sooner is better; triggered by churn there are live
+                // queries and every core taken is one they do not get.
+                let pace = if idle {
+                    skeg_vector::ConsolidatePace::Idle
+                } else {
+                    skeg_vector::ConsolidatePace::Serving
+                };
+                let ran = off_thread_maintenance(
+                    arc,
+                    "consolidate",
+                    shard_id,
+                    |b| b.consolidate_begin(),
+                    move |job| job.build_with_threads(&d, pace),
+                    |b, built| b.consolidate_finish(built),
+                )
+                .await;
+                if ran == MaintenanceOutcome::Ran && arc.read().backend.wants_ivf() {
+                    // Base changed: rebuild the IVF router off the request path
+                    // AND off the write lock. `begin` dups the fd, `build` runs
+                    // k-means off-thread, `finish` swaps under a short lock.
+                    off_thread_maintenance(
+                        arc,
+                        "ivf",
+                        shard_id,
+                        |b| b.ivf_begin(),
+                        |job| job.build(),
+                        |b, built| b.ivf_finish(built),
+                    )
+                    .await;
+                }
+                // `Ran`, not `true`: with the fold budget a due consolidate can
+                // skip its tick, and reporting it as done would reset the
+                // caller's idle tracking over work that never happened. The
+                // retry is the next tick.
+                return ran == MaintenanceOutcome::Ran;
+            }
         }
-    }
-    if flush_due {
-        let d = vdir.to_path_buf();
-        off_thread_maintenance(
-            arc,
-            "flush",
-            shard_id,
-            |b| b.flush_begin(),
-            move |job| job.build(&d),
-            |b, built| b.flush_finish(built),
-        )
-        .await;
-        if merge_due {
-            arc.read().flush_streak.fetch_add(1, Ordering::Relaxed);
-        }
-        return false;
-    }
-    if base >= DELETE_PATCH_MIN_BASE
-        && tombs >= base / DELETE_PATCH_DEAD_DIVISOR
-        && tombs * 4 <= base
-    {
-        let d = vdir.to_path_buf();
-        off_thread_maintenance(
-            arc,
-            "delete-patch",
-            shard_id,
-            |b| b.delete_patch_begin(),
-            move |job| job.build(&d),
-            |b, built| b.delete_patch_finish(built),
-        )
-        .await;
-        return false;
-    }
-    if runs >= RUNS_MERGE_TRIGGER {
-        let d = vdir.to_path_buf();
-        off_thread_maintenance(
-            arc,
-            "runs-merge",
-            shard_id,
-            |b| b.merge_runs_begin(),
-            move |job| job.build(&d),
-            |b, built| b.merge_runs_finish(built),
-        )
-        .await;
-        return false;
-    }
-    if consolidate_due {
-        let d = vdir.to_path_buf();
-        // The pace depends on WHY we are folding, and the engine knows which.
-        // Triggered by quiet there is no traffic to protect and finishing
-        // sooner is better; triggered by churn there are live queries and every
-        // core taken is one they do not get.
-        let pace = if idle {
-            skeg_vector::ConsolidatePace::Idle
-        } else {
-            skeg_vector::ConsolidatePace::Serving
-        };
-        let ran = off_thread_maintenance(
-            arc,
-            "consolidate",
-            shard_id,
-            |b| b.consolidate_begin(),
-            move |job| job.build_with_threads(&d, pace),
-            |b, built| b.consolidate_finish(built),
-        )
-        .await;
-        if ran == MaintenanceOutcome::Ran && arc.read().backend.wants_ivf() {
-            // Base changed: rebuild the IVF router off the request path AND off
-            // the write lock. `begin` dups the fd, `build` runs k-means
-            // off-thread, `finish` swaps under a short lock.
-            off_thread_maintenance(
-                arc,
-                "ivf",
-                shard_id,
-                |b| b.ivf_begin(),
-                |job| job.build(),
-                |b, built| b.ivf_finish(built),
-            )
-            .await;
-        }
-        // `Ran`, not `true`: with the fold budget a due consolidate can skip
-        // its tick, and reporting it as done would reset the caller's idle
-        // tracking over work that never happened. The retry is the next tick.
-        return ran == MaintenanceOutcome::Ran;
     }
     false
 }
@@ -7281,6 +7331,152 @@ mod tests {
             "the flush queued behind a heavy job it is meant to coexist with"
         );
         drop(held);
+    }
+
+    // ---- the ladder's decision, as a decision ----
+    //
+    // What matters about the ladder is WHICH rung it picks and in what order,
+    // not the work the rung then schedules. Driving real maintenance to assert
+    // that took half an hour before the threshold became an argument, and even
+    // now it walks one trajectory through the state space. `ladder_plan` is
+    // pure, so the space itself can be covered.
+
+    fn st(delta: usize, runs: usize, run_rows: usize, tombs: usize, base: usize) -> LsmState {
+        LsmState {
+            delta,
+            runs,
+            run_rows,
+            tombs,
+            base,
+            flush_streak: 0,
+        }
+    }
+
+    #[test]
+    fn a_quiet_index_schedules_nothing() {
+        assert!(ladder_plan(&st(0, 0, 0, 0, 10_000), 4096).is_empty());
+    }
+
+    #[test]
+    fn a_full_delta_flushes() {
+        assert_eq!(
+            ladder_plan(&st(5000, 0, 0, 0, 10_000), 4096),
+            vec![Rung::Flush]
+        );
+    }
+
+    #[test]
+    fn the_flush_wins_the_tick_when_both_are_due() {
+        // The flush is the cheapest rung and it bounds the RAM delta, so it
+        // goes first - once.
+        let plan = ladder_plan(&st(5000, 4, 4000, 0, 10_000), 4096);
+        assert_eq!(plan.first(), Some(&Rung::Flush));
+    }
+
+    #[test]
+    fn the_merge_goes_first_once_the_flush_has_already_won_a_tick() {
+        // The anti-starvation rule: a permanently hot flush cannot hold the
+        // tick forever while runs pile up. Measured cost of getting this
+        // wrong: 0 -> 33 runs over ten turnovers, recall 0.9925 -> 0.7180.
+        let mut s = st(5000, 4, 4000, 0, 10_000);
+        s.flush_streak = 1;
+        assert_eq!(ladder_plan(&s, 4096).first(), Some(&Rung::RunsMerge));
+    }
+
+    #[test]
+    fn a_declined_merge_falls_through_to_the_flush() {
+        // `NotNeeded` means the exact check found nothing worth rewriting.
+        // The tick must not be consumed by a refusal - the flush is still due.
+        let mut s = st(5000, 4, 4000, 0, 10_000);
+        s.flush_streak = 1;
+        assert_eq!(ladder_plan(&s, 4096), vec![Rung::RunsMerge, Rung::Flush]);
+    }
+
+    #[test]
+    fn the_merge_is_never_planned_twice() {
+        // It used to be. With a due merge and a quiet delta the ladder tried
+        // the merge, took the refusal, fell past a flush that was not due, and
+        // reached a SECOND runs-merge rung where `runs >= RUNS_MERGE_TRIGGER`
+        // was still true - attempting the identical operation for the identical
+        // refusal. That refusal is not cheap: `merge_runs_begin` builds the
+        // whole survivor set, one hash insert per row of every run, before it
+        // can decide there is nothing to do, holding the write lock readers
+        // contend for.
+        //
+        // Swept, not spot-checked: no reachable state may plan it twice.
+        for delta in [0, 100, 4095, 4096, 100_000] {
+            for runs in 0..8 {
+                for tombs in [0, 1, 5000, 60_000] {
+                    for base in [0, 4096, 100_000] {
+                        for streak in [0u64, 1, 7] {
+                            let mut s = st(delta, runs, runs * 4096, tombs, base);
+                            s.flush_streak = streak;
+                            let plan = ladder_plan(&s, 4096);
+                            let n = plan.iter().filter(|r| **r == Rung::RunsMerge).count();
+                            assert!(n <= 1, "{s:?} plans {n} merges: {plan:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_plan_is_free_of_repeats() {
+        // The same argument as above, for every rung: a plan is an ordered set
+        // of things to try, and trying one twice in a tick is always waste.
+        for delta in [0, 4096, 50_000] {
+            for runs in 0..6 {
+                for tombs in [0, 100, 30_000, 90_000] {
+                    for base in [0, 4096, 100_000] {
+                        let s = st(delta, runs, runs * 4096, tombs, base);
+                        let plan = ladder_plan(&s, 4096);
+                        let mut seen = plan.clone();
+                        seen.sort_by_key(|r| format!("{r:?}"));
+                        seen.dedup();
+                        assert_eq!(seen.len(), plan.len(), "{s:?} repeats a rung: {plan:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_heavily_tombstoned_base_goes_to_the_fold_not_the_patch() {
+        // Past roughly a quarter dead, delete-patch is in its measured losing
+        // regime (0.3x at 40%). It fired at 61% during the demo repair before
+        // this guard existed.
+        let s = st(0, 0, 0, 70_000, 100_000);
+        let plan = ladder_plan(&s, 4096);
+        assert!(plan.contains(&Rung::Consolidate), "{plan:?}");
+        assert!(!plan.contains(&Rung::DeletePatch), "{plan:?}");
+    }
+
+    #[test]
+    fn a_lightly_tombstoned_base_takes_the_patch() {
+        // The regime where reuse wins - the L3 verdict measured 10.6x at 1%
+        // dead and 4.5x at 3%, and the trigger sits at base/16 (6.25%), well
+        // inside it, with the 25% ceiling above.
+        //
+        // Both edges pinned, because the first version of this test asserted
+        // the patch at 6% and failed: 6% is BELOW the trigger, not above it.
+        assert_eq!(
+            ladder_plan(&st(0, 0, 0, 10_000, 100_000), 4096),
+            vec![Rung::DeletePatch]
+        );
+        assert!(
+            ladder_plan(&st(0, 0, 0, 6_000, 100_000), 4096).is_empty(),
+            "6% dead is under the base/16 trigger: nothing is due"
+        );
+    }
+
+    #[test]
+    fn a_lone_dirty_run_is_still_offered_to_the_merge() {
+        // Count OR mass: one run is not "four runs" however much garbage it
+        // holds, and a lone fat dirty run sat untouched forever. Whether it is
+        // dirty enough to rewrite is decided from the survivor set, not here.
+        let s = st(0, 1, 4096, 10, 100_000);
+        assert_eq!(ladder_plan(&s, 4096).first(), Some(&Rung::RunsMerge));
     }
 
     /// Sustained writes must not starve the runs-merge. Every rung of the
