@@ -11,16 +11,17 @@
 //! that disagrees with it is a startup error, and the scan survives only as a
 //! one-way migration for stores written before this file existed.
 
-use skeg_server::layout_manifest::{LayoutManifest, OpenMode};
-use std::num::NonZeroUsize;
+use skeg_server::layout_manifest::{LayoutManifest, MAX_SHARDS, OpenMode, ShardCount};
 
-fn nz(n: usize) -> NonZeroUsize {
-    NonZeroUsize::new(n).unwrap()
+/// A checked count for the test's own use. Panics on a bad one, which is what
+/// a test wants: a fixture that cannot be built is a broken test, not a case.
+fn sc(n: usize) -> ShardCount {
+    ShardCount::checked(n, "test").unwrap()
 }
 
 fn rw(n: usize) -> OpenMode {
     OpenMode::ReadWrite {
-        requested_shards: nz(n),
+        requested_shards: sc(n),
     }
 }
 
@@ -35,7 +36,7 @@ fn legacy_store(root: &std::path::Path, shards: usize) {
 fn a_new_store_declares_its_layout() {
     let dir = tempfile::TempDir::new().unwrap();
     let m = LayoutManifest::open_or_migrate(dir.path(), rw(8)).unwrap();
-    assert_eq!(m.shard_count(), nz(8));
+    assert_eq!(m.shard_count(), sc(8));
     assert!(
         dir.path().join("LAYOUT").exists(),
         "the manifest must be on disk before any shard is written"
@@ -153,7 +154,7 @@ fn a_legacy_store_migrates_once_when_writable() {
     let dir = tempfile::TempDir::new().unwrap();
     legacy_store(dir.path(), 8);
     let m = LayoutManifest::open_or_migrate(dir.path(), rw(8)).unwrap();
-    assert_eq!(m.shard_count(), nz(8));
+    assert_eq!(m.shard_count(), sc(8));
     assert!(
         dir.path().join("LAYOUT").exists(),
         "a writable legacy store adopts a manifest"
@@ -170,7 +171,7 @@ fn a_legacy_store_is_readable_without_being_written_to() {
     let dir = tempfile::TempDir::new().unwrap();
     legacy_store(dir.path(), 8);
     let m = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly).unwrap();
-    assert_eq!(m.shard_count(), nz(8));
+    assert_eq!(m.shard_count(), sc(8));
     assert!(
         !dir.path().join("LAYOUT").exists(),
         "a read-only open must leave the store exactly as it found it"
@@ -249,5 +250,123 @@ fn unknown_feature_flags_refuse_to_open() {
     bytes[40..44].copy_from_slice(&sum.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+// ---- what the parser must survive ----
+//
+// `LAYOUT` is bytes on disk, and bytes on disk are not trusted input just
+// because this process wrote them last time. A restored backup, a shared
+// volume, a corrupt sector, an operator with a hex editor: the parser is the
+// boundary, and its job is to refuse rather than to cope.
+//
+// The checksum is NOT a defence against any of this. It detects accidental
+// corruption; anyone who can write the file can recompute it, which is
+// exactly what these tests do.
+
+#[test]
+fn an_enormous_manifest_is_refused_without_reading_it_all() {
+    // `std::fs::read` allocates the whole file BEFORE anything can check its
+    // length. A 512 MiB LAYOUT is a 512 MiB allocation at startup, and the
+    // file is 44 bytes by construction - there is never a reason to hold more
+    // than that in memory.
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(2)).unwrap();
+    let path = dir.path().join("LAYOUT");
+    let big = vec![0u8; 512 * 1024 * 1024];
+    std::fs::write(&path, &big).unwrap();
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn an_absurd_shard_count_is_refused() {
+    // The count is a u32 read from the file and handed to a loop that spawns
+    // one OS THREAD per shard. Four billion of them is not a layout, it is a
+    // fork bomb with a checksum. Re-signed here, because a valid checksum is
+    // exactly what an attacker with write access produces.
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(2)).unwrap();
+    let path = dir.path().join("LAYOUT");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    let sum = crc32c::crc32c(&bytes[..40]);
+    bytes[40..44].copy_from_slice(&sum.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("a four-billion-shard layout must not be honoured");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("4294967295"),
+        "the refusal must name the count it rejected, got: {err}"
+    );
+}
+
+#[test]
+fn a_legacy_scan_cannot_be_talked_into_an_absurd_count() {
+    // The migration path reaches the same loop. A directory named for a huge
+    // index is refused by the contiguity rule, but the bound is asserted here
+    // too so the two paths cannot drift apart - which is how every P0 in this
+    // engine happened.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("shard-0")).unwrap();
+    std::fs::create_dir_all(dir.path().join("shard-4294967294")).unwrap();
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_shard_count_at_the_bound_is_still_accepted() {
+    // The bound must be a bound, not a fence around the useful range. This
+    // pins that a legitimate large deployment is not refused by it.
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(2)).unwrap();
+    let path = dir.path().join("LAYOUT");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[12..16].copy_from_slice(&(MAX_SHARDS as u32).to_le_bytes());
+    let sum = crc32c::crc32c(&bytes[..40]);
+    bytes[40..44].copy_from_slice(&sum.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let m = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly).unwrap();
+    assert_eq!(m.shard_count().get(), MAX_SHARDS);
+}
+
+#[test]
+fn a_layout_that_is_a_directory_is_an_error_not_a_migration() {
+    // The absent-manifest branch is reached on NotFound. Any other I/O error
+    // must propagate: treating "cannot read this" as "there is nothing here"
+    // is how a store gets silently re-migrated on top of itself.
+    let dir = tempfile::TempDir::new().unwrap();
+    legacy_store(dir.path(), 2);
+    std::fs::create_dir(dir.path().join("LAYOUT")).unwrap();
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("an unreadable LAYOUT is not an absent one");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn a_caller_asking_for_an_absurd_count_is_refused_too() {
+    // The bound is not about untrusted FILES, it is about what reaches the
+    // loop that spawns one OS thread and one channel per shard. A caller's
+    // number reaches the same loop, so it goes through the same check - and
+    // the type makes that structural rather than remembered.
+    let dir = tempfile::TempDir::new().unwrap();
+    let Err(err) = skeg_server::shard::ShardSet::open(dir.path(), MAX_SHARDS + 1) else {
+        panic!("a caller must not be able to ask for more than the bound");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn zero_shards_from_a_caller_is_an_error_not_a_panic() {
+    // This used to be `assert!(n_shards >= 1)`: a panic, and under
+    // `panic = "abort"` a dead process, for what is an ordinary bad argument.
+    let dir = tempfile::TempDir::new().unwrap();
+    let Err(err) = skeg_server::shard::ShardSet::open(dir.path(), 0) else {
+        panic!("zero shards is not a store");
+    };
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }

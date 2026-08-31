@@ -10,7 +10,6 @@
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3298,19 +3297,25 @@ impl ShardSet {
         mmap_tier: bool,
         mmap_graph: bool,
     ) -> std::io::Result<Self> {
-        assert!(n_shards >= 1, "n_shards must be >= 1");
         // The store declares its own shape, and this is the ONE place that
         // asks. A caller's `n_shards` is a request, not an authority: if the
         // manifest disagrees, or the directories disagree with the manifest,
         // the open refuses instead of picking a winner. Read-only opens never
         // write - serve mode runs over copies an operator may have mounted
         // read-only, and over stores older than the manifest itself.
+        //
+        // The request goes through the same bound as the file does. It reaches
+        // the same loop below - one OS thread and one channel per shard - so a
+        // caller asking for ten million is refused for the same reason a file
+        // declaring ten million is, and by the same code.
         let mode = if read_only {
             crate::layout_manifest::OpenMode::ReadOnly
         } else {
             crate::layout_manifest::OpenMode::ReadWrite {
-                requested_shards: NonZeroUsize::new(n_shards)
-                    .expect("n_shards >= 1 asserted above"),
+                requested_shards: crate::layout_manifest::ShardCount::checked(
+                    n_shards,
+                    "this open",
+                )?,
             }
         };
         let n_shards = crate::layout_manifest::LayoutManifest::open_or_migrate(base_dir, mode)?

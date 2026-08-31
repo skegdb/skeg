@@ -37,11 +37,28 @@ const ENCODED_LEN: usize = BODY_LEN + 4;
 /// No flags are defined yet. Any bit set is a store this build cannot honour.
 const KNOWN_FLAGS: u64 = 0;
 
+/// The largest shard count this build will act on.
+///
+/// Not a capacity estimate - a bound on what a FILE is allowed to make the
+/// process do. The count is a `u32` read off disk and handed to a loop that
+/// spawns one OS thread and one channel per shard; four billion of those is
+/// not a layout, it is a fork bomb with a valid checksum. And the checksum is
+/// no defence: anyone who can write the file can recompute it.
+///
+/// 4096 is far above any real deployment (the production workload runs 8) and
+/// far below anything that hurts.
+pub const MAX_SHARDS: usize = 4096;
+
+/// The manifest is a fixed 44 bytes. Reading more than a little over that is
+/// pointless, and reading the whole file first - which `std::fs::read` does -
+/// makes the size of an allocation at startup a property of a file on disk.
+const MAX_READ: u64 = 4096;
+
 /// What the store declares about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutManifest {
     format_version: u32,
-    shard_count: NonZeroUsize,
+    shard_count: ShardCount,
     store_uuid: [u8; 16],
     feature_flags: u64,
 }
@@ -52,7 +69,7 @@ pub struct LayoutManifest {
 pub enum OpenMode {
     /// The caller will write. A legacy store adopts a manifest; the requested
     /// count must match what is already there.
-    ReadWrite { requested_shards: NonZeroUsize },
+    ReadWrite { requested_shards: ShardCount },
     /// The caller will not write, and neither will this. Serve mode runs over
     /// copies an operator may have mounted read-only.
     ReadOnly,
@@ -62,8 +79,58 @@ fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+/// Read at most [`MAX_READ`] bytes, so the file cannot dictate the size of
+/// the allocation. A file larger than that is refused by the exact-length
+/// check downstream, which is where "not a manifest" belongs.
+fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    use io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(ENCODED_LEN);
+    // +1: reading one past the expected length is what lets the exact-length
+    // check below tell "44 bytes" from "44 bytes and then some".
+    f.take(MAX_READ).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// A shard count that has been checked: non-zero, and within [`MAX_SHARDS`].
+///
+/// A newtype rather than a `NonZeroUsize`, because the bound is the part that
+/// gets forgotten. This module briefly shipped with the check applied on the
+/// legacy scan and NOT on the manifest decode - one construction site out of
+/// two, exactly the rule-in-two-places shape behind every P0 in this engine.
+/// The value cannot be built except through [`ShardCount::checked`], so
+/// forgetting it is a compile error rather than something review has to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShardCount(NonZeroUsize);
+
+impl ShardCount {
+    /// The only constructor. `whence` names the source in the refusal, since
+    /// "declares 4294967295 shards" is only actionable with the file beside it.
+    pub fn checked(n: usize, whence: &str) -> io::Result<Self> {
+        let nz = NonZeroUsize::new(n)
+            .ok_or_else(|| invalid(format!("{whence} declares zero shards")))?;
+        if n > MAX_SHARDS {
+            return Err(invalid(format!(
+                "{whence} declares {n} shards, above the {MAX_SHARDS} this \
+                 build will act on: refusing to spawn a thread per shard for it"
+            )));
+        }
+        Ok(Self(nz))
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for ShardCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl LayoutManifest {
-    pub fn shard_count(&self) -> NonZeroUsize {
+    pub fn shard_count(&self) -> ShardCount {
         self.shard_count
     }
 
@@ -90,7 +157,7 @@ impl LayoutManifest {
     ///   entry as an absent shard.
     pub fn open_or_migrate(root: &Path, mode: OpenMode) -> io::Result<Self> {
         let path = root.join(FILE);
-        match std::fs::read(&path) {
+        match read_bounded(&path) {
             Ok(bytes) => {
                 let m = Self::decode(&bytes, root)?;
                 m.check_directories(root)?;
@@ -239,8 +306,7 @@ impl LayoutManifest {
             )));
         }
         let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let shard_count = NonZeroUsize::new(count as usize)
-            .ok_or_else(|| invalid(format!("{} declares zero shards", where_.display())))?;
+        let shard_count = ShardCount::checked(count as usize, &where_.display().to_string())?;
         let feature_flags = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
         if feature_flags & !KNOWN_FLAGS != 0 {
             return Err(invalid(format!(
@@ -290,7 +356,7 @@ fn fresh_uuid() -> io::Result<[u8; 16]> {
 /// Kept private. It is a migration, not an API - every server constructor goes
 /// through [`LayoutManifest::open_or_migrate`], so there is exactly one place
 /// that decides how many shards a store has.
-fn scan_shard_count(root: &Path) -> io::Result<NonZeroUsize> {
+fn scan_shard_count(root: &Path) -> io::Result<ShardCount> {
     let mut ids: Vec<usize> = Vec::new();
     for e in std::fs::read_dir(root)? {
         // NOT `.flatten()`: swallowing an unreadable entry lets discovery
@@ -325,6 +391,5 @@ fn scan_shard_count(root: &Path) -> io::Result<NonZeroUsize> {
             root.display()
         )));
     }
-    NonZeroUsize::new(highest + 1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no shards"))
+    ShardCount::checked(highest + 1, &root.display().to_string())
 }
