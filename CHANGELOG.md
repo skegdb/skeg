@@ -9,6 +9,28 @@ repository.
 
 ## [Unreleased]
 
+### A point read could return a stale vector (P0)
+
+`DiskVamanaIndex::get` checked the BASE before the RUNS, under a comment
+claiming the opposite ("newest run wins on a shadowed id"). A run holds a
+freshly flushed delta and is therefore NEWER than the base, so any id
+present in both read back at its old value: an acknowledged overwrite
+stayed invisible to point lookups (SKEG.VGET, and anything built on it)
+until a consolidate happened to fold that run into the base.
+
+Search was never affected - `score_ids_quantized` walks runs newest-first
+and falls back to the base - so recall stayed high while point reads
+lied. That divergence is why it survived: every recall gate passed.
+
+Measured on a settled 60,000-row index holding one run: 3,534 rows
+(5.9%) returned the previous generation. With runs and delta at zero, the
+count was zero - which is why a bench that consolidated between rounds
+could never see it.
+
+Precedence is now delta -> flush staging -> runs newest-first -> base.
+Pinned by a test that fails against the old order with the diagnosis in
+its message (cosine 0.255 to the new vector, 1.000 to the old one).
+
 ### Read-only serve mode served a fraction of the index (P0)
 
 `bind_serve*` opened the shard set with a hardcoded count of 1. A set

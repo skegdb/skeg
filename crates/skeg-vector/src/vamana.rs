@@ -3752,14 +3752,28 @@ impl DiskVamanaIndex {
         if let Some(v) = self.flushing.get(&id) {
             return Ok(Some(v.clone()));
         }
-        if let Some(&row) = self.base.id_to_main_row.get(&id) {
-            return Ok(Some(self.read_vector(&self.base, row)?));
-        }
-        // Newest run wins on a shadowed id; runs are searched after the base.
-        for run in &self.runs {
+        // LSM precedence, newest layer first: delta, then the in-flight flush
+        // staging (both above), then the RUNS newest-first, and only then the
+        // base.
+        //
+        // This used to check the base BEFORE the runs, with a comment claiming
+        // the opposite ("newest run wins"). A run holds a freshly flushed
+        // delta, so it is NEWER than the base: any id present in both read
+        // back at its OLD value, and an acknowledged write stayed invisible to
+        // point lookups until a consolidate happened to fold that run into the
+        // base. Search was never affected - `score_ids_quantized` walks runs
+        // newest-first and then the base - so recall stayed high while VGET
+        // lied, which is why nothing caught it for so long. Measured: 3,534 of
+        // 60,000 rows stale on a settled index that held one run.
+        //
+        // Runs are appended, so the last is the newest: iterate in reverse.
+        for run in self.runs.iter().rev() {
             if let Some(&row) = run.id_to_main_row.get(&id) {
                 return Ok(Some(self.read_vector(run, row)?));
             }
+        }
+        if let Some(&row) = self.base.id_to_main_row.get(&id) {
+            return Ok(Some(self.read_vector(&self.base, row)?));
         }
         Ok(None)
     }
@@ -7343,6 +7357,64 @@ mod tests {
         assert_eq!(node.slice().len(), MAX_R, "slice must clamp to MAX_R");
         node.degree = u32::MAX;
         assert_eq!(node.slice().len(), MAX_R);
+    }
+
+    /// A point lookup must return the NEWEST version of a row, and a run is
+    /// newer than the base. `get` checked the base first - with a comment
+    /// claiming the opposite - so an acknowledged overwrite stayed invisible
+    /// to VGET until a consolidate folded its run into the base. Search was
+    /// unaffected (it walks runs newest-first), so recall stayed high while
+    /// point reads returned stale vectors: 3,534 of 60,000 on a settled
+    /// index holding a single run.
+    #[test]
+    fn a_point_read_prefers_the_run_over_the_older_base() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+
+        // Generation one, folded into the base.
+        let old = random_vectors(300, dim, 91);
+        for (i, v) in old.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+        assert_eq!(
+            idx.run_count(),
+            0,
+            "setup: everything should be in the base"
+        );
+
+        // Generation two: overwrite every id, then flush into a RUN (not a
+        // consolidate). Base and run now both hold every id; the run is newer.
+        let new = random_vectors(300, dim, 92);
+        for (i, v) in new.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(
+            idx.run_count(),
+            1,
+            "setup: the overwrite must live in a run"
+        );
+        assert_eq!(idx.delta_len(), 0, "setup: the delta must be drained");
+
+        for probe in [0usize, 7, 150, 299] {
+            let got = idx.get(probe as u64).unwrap().expect("row present");
+            let want = &new[probe * dim..(probe + 1) * dim];
+            let stale = &old[probe * dim..(probe + 1) * dim];
+            let cos = |a: &[f32], b: &[f32]| cosine_f32(a, b);
+            assert!(
+                cos(&got, want) > 0.999,
+                "id {probe}: point read returned the pre-flush vector \
+                 (cos to new {:.3}, to old {:.3})",
+                cos(&got, want),
+                cos(&got, stale)
+            );
+        }
     }
 
     /// A graph file carrying a dangling edge is REFUSED at open on the
