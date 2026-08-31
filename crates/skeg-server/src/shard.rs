@@ -326,6 +326,14 @@ impl VectorBackend {
         }
     }
 
+    /// `(physical, live, garbage)` rows in the runs.
+    fn run_contents(&self) -> (usize, usize, usize) {
+        match self {
+            VectorBackend::Flat(_) => (0, 0, 0),
+            VectorBackend::Disk(i) => i.run_contents(),
+        }
+    }
+
     /// Run debt over live rows, from the engine that owns the definition.
     fn run_debt_ratio(&self) -> f32 {
         match self {
@@ -747,7 +755,15 @@ pub struct VindexRow {
     /// definition. Every P0 found today had the same shape - one rule
     /// implemented in two places, one of them wrong - so this number is not
     /// recomputed by its readers.
+    ///
+    /// AMPLIFICATION, not garbage: a run holding exactly the live set scores
+    /// 1.0, and so does one of the same size holding nothing but corpses.
+    /// Use `run_live`/`run_dead` to tell those apart.
     pub run_debt_ratio: f32,
+    /// Run rows that are still the newest live copy of their id.
+    pub run_live: u64,
+    /// Run rows a vacuum could reclaim: dead, tombstoned or superseded.
+    pub run_dead: u64,
     pub tombs: u64,
     pub base: u64,
 }
@@ -1458,10 +1474,10 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     // Count OR mass. The count alone left a single fat dirty run untouched
     // forever - measured at rest, three times the live count in runs with no
     // merge ever firing again, because one run is not "four runs" however
-    // much garbage it holds.
-    let debt = arc.read().backend.run_debt_ratio();
-    let merge_due =
-        runs >= RUNS_MERGE_TRIGGER || (runs >= 1 && debt >= skeg_vector::run_vacuum_debt());
+    // much garbage it holds. A lone run is only OFFERED here; whether it is
+    // dirty enough to rewrite is decided in `merge_runs_begin`, from the
+    // survivor set, where the number is exact.
+    let merge_due = runs >= RUNS_MERGE_TRIGGER || (runs >= 1 && tombs > 0);
     let starved = arc.read().flush_streak.load(Ordering::Relaxed) >= 1;
     if merge_due && (!flush_due || starved) {
         let d = vdir.to_path_buf();
@@ -1474,12 +1490,16 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             |b, built| b.merge_runs_finish(built),
         )
         .await;
-        // Only a merge that actually RAN consumes the tick - now true, since
-        // a failure is no longer disguised as NotNeeded. A busy budget or a
-        // failed merge must not stop the flush: that would trade the
-        // starvation this clause removes for the one below it, and the delta
-        // - already over its threshold - would grow without bound.
-        if outcome == MaintenanceOutcome::Ran || outcome == MaintenanceOutcome::NotNeeded {
+        // ONLY a merge that actually ran consumes the tick.
+        //
+        // `NotNeeded` here means the exact check said there is nothing worth
+        // rewriting - a clean run offered by a coarse trigger - and treating
+        // that as work done left a run past the consolidate threshold sitting
+        // there tick after tick, because the ladder returned before reaching
+        // the rung that would have folded it. `BudgetBusy` and `Failed` must
+        // not stop the flush either: that would trade the starvation this
+        // clause removes for the one below it.
+        if outcome == MaintenanceOutcome::Ran {
             arc.read().flush_streak.store(0, Ordering::Relaxed);
             return false;
         }
@@ -2479,6 +2499,7 @@ async fn process(
                 .map(|(name, entry)| {
                     let vindex = entry.read();
                     let backend = &vindex.backend;
+                    let (_, run_live, run_dead) = backend.run_contents();
                     VindexRow {
                         name: name.clone(),
                         dim: backend.dim() as u32,
@@ -2490,6 +2511,8 @@ async fn process(
                         run_rows: backend.run_rows() as u64,
                         max_run_rows: backend.max_run_rows() as u64,
                         run_debt_ratio: backend.run_debt_ratio(),
+                        run_live: run_live as u64,
+                        run_dead: run_dead as u64,
                         tombs: backend.tombstone_count() as u64,
                         base: backend.main_len() as u64,
                     }
@@ -3858,15 +3881,23 @@ impl ShardSet {
             };
             out.push(format!(
                 "shard={shard} live={} base={} delta={} runs={} run_rows={} \
-                 max_run_rows={} tombs={} run_debt_ratio={:.3}",
+                 run_live={} run_dead={} max_run_rows={} tombs={} \
+                 run_debt_ratio={:.3} run_garbage_ratio={:.3}",
                 r.n_vectors,
                 r.base,
                 r.delta,
                 r.runs,
                 r.run_rows,
+                r.run_live,
+                r.run_dead,
                 r.max_run_rows,
                 r.tombs,
                 r.run_debt_ratio,
+                if r.run_rows == 0 {
+                    0.0
+                } else {
+                    r.run_dead as f32 / r.run_rows as f32
+                },
             ));
         }
         Ok(out)
@@ -3898,6 +3929,7 @@ impl ShardSet {
         let (mut worst_debt, mut worst_debt_shard) = (0.0f32, 0usize);
         let (mut tot_runs, mut tot_delta, mut tot_run_rows, mut tot_live) =
             (0u64, 0u64, 0u64, 0u64);
+        let (mut tot_live_rows, mut tot_dead) = (0u64, 0u64);
         let mut max_run_rows = 0u64;
         let mut present: Vec<usize> = Vec::new();
         for shard in 0..self.inner.n {
@@ -3923,6 +3955,8 @@ impl ShardSet {
             tot_delta += row.delta;
             tot_run_rows += row.run_rows;
             tot_live += row.n_vectors;
+            tot_live_rows += row.run_live;
+            tot_dead += row.run_dead;
         }
         // An index absent everywhere is not healthy - it is missing. Saying
         // OK over nothing is exactly the class of lie this command exists to
@@ -3955,6 +3989,19 @@ impl ShardSet {
         out.push(format!(
             "run_debt_ratio {worst_debt:.3} shard {worst_debt_shard}"
         ));
+        // The number that says whether the debt is WASTE or simply the live
+        // set living in a run: amplification cannot tell those apart, and
+        // reading it as if it could shipped an infinite rewrite loop today.
+        out.push(format!(
+            "run_garbage_ratio {:.3}",
+            if tot_run_rows == 0 {
+                0.0
+            } else {
+                tot_dead as f32 / tot_run_rows as f32
+            }
+        ));
+        out.push(format!("run_live_total {tot_live_rows}"));
+        out.push(format!("run_dead_total {tot_dead}"));
         out.push(format!("worst_runs {worst_runs} shard {worst_shard}"));
         out.push(format!("max_run_rows {max_run_rows}"));
         out.push(format!("runs_total {tot_runs}"));
@@ -4296,6 +4343,8 @@ impl ShardSet {
                                 a.max_run_rows = a.max_run_rows.max(row.max_run_rows);
                                 // Worst shard, never an average: a threshold is per shard.
                                 a.run_debt_ratio = a.run_debt_ratio.max(row.run_debt_ratio);
+                                a.run_live = a.run_live.saturating_add(row.run_live);
+                                a.run_dead = a.run_dead.saturating_add(row.run_dead);
                                 a.run_rows = a.run_rows.saturating_add(row.run_rows);
                                 a.tombs = a.tombs.saturating_add(row.tombs);
                                 a.base = a.base.saturating_add(row.base);
@@ -7243,7 +7292,13 @@ mod tests {
     /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
     /// from 0.9925 to 0.7180 as the live set moved into short-beam run
     /// graphs.
+    /// Ignored: 32 minutes, because it drives REAL maintenance through 20
+    /// rounds of writes past the flush threshold. A half-hour test in the
+    /// default suite is skipped by everyone and protects nothing; run it with
+    /// `cargo test -p skeg-server -- --ignored starve`. The churn gate covers
+    /// the same ground continuously, on the production shape.
     #[tokio::test]
+    #[ignore]
     async fn sustained_writes_do_not_starve_the_runs_merge() {
         let dir = TempDir::new().unwrap();
         let vdir = dir.path().join("vindex-t");

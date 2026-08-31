@@ -4881,6 +4881,44 @@ impl DiskVamanaIndex {
         Ok(())
     }
 
+    /// What the runs are actually holding: `(physical, live, garbage)`.
+    ///
+    /// A run row is LIVE when it is that id's newest copy and the id is not
+    /// tombstoned or shadowed by the delta / flush staging; everything else
+    /// is garbage that a vacuum can reclaim. Published because the ratio next
+    /// to it cannot answer the question people ask of it: a run holding
+    /// exactly the live set and a run of the same size holding nothing but
+    /// corpses both score 1.0 on `run_debt_ratio`, and only these three
+    /// numbers tell them apart. Confusing the two shipped an infinite rewrite
+    /// loop earlier today.
+    ///
+    /// O(run rows) with a hash lookup each: for a report or a maintenance
+    /// decision, not for a query.
+    #[must_use]
+    pub fn run_contents(&self) -> (usize, usize, usize) {
+        let physical: usize = self.runs.iter().map(|r| r.main_n as usize).sum();
+        if physical == 0 {
+            return (0, 0, 0);
+        }
+        let mut live = 0usize;
+        for (ri, run) in self.runs.iter().enumerate() {
+            for row in 0..run.main_n {
+                let id = run.ids[row as usize];
+                if self.tombstones.contains(&id)
+                    || self.delta.contains_key(&id)
+                    || self.flushing.contains_key(&id)
+                {
+                    continue;
+                }
+                // Newest copy, or a superseded one still on disk.
+                if self.newest_location(id) == Some((ri + 1, row)) {
+                    live += 1;
+                }
+            }
+        }
+        (physical, live, physical - live)
+    }
+
     /// Rows held by run segments divided by the live count: the run debt
     /// ratio. Decides whether the short beam on runs is still a safe
     /// assumption - a run COUNT cannot, because one merged run can hold most
