@@ -3460,6 +3460,64 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// I/O error if a re-rank read from `vectors.bin` fails.
+    /// Score base rows the caller already holds, skipping the external-id
+    /// round trip. The IVF route hands back ROWS, which the old path turned
+    /// into ids only for `score_ids_quantized` to hash them back into rows:
+    /// measured at 163ns per row against a ~40ns scoring kernel, that hash
+    /// was the single biggest term in filtered search.
+    ///
+    /// Only valid in the folded steady state (no tombstones, delta or runs) -
+    /// the caller checks, because outside it a base row can be shadowed by a
+    /// newer copy and only the id path knows that.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a re-rank read fails.
+    fn score_base_rows_quantized(
+        &self,
+        query: &[f32],
+        rows: &[VecId],
+        k: usize,
+        rerank: usize,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchHybrid);
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchHybridScored,
+            rows.len() as u64,
+        );
+        let phase_t0 = Instant::now();
+        let base_code = self.base.quant.quantize_query(query);
+        let mut cand: Vec<(i32, VecId)> = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let p = self.base.quant.proxy_rescore(row as usize, &base_code);
+            cand.push((p, row));
+        }
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchHybridScoreNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
+        let phase_t0 = Instant::now();
+        let take = rerank.max(k);
+        if cand.len() > take {
+            cand.select_nth_unstable_by(take, |a, b| b.0.cmp(&a.0));
+            cand.truncate(take);
+        }
+        let rerank_rows = cand.len() as u64;
+        let mut scored: Vec<(f32, u64)> = Vec::with_capacity(cand.len());
+        for (_p, row) in cand {
+            let v = self.read_vector(&self.base, row)?;
+            scored.push((cosine_f32(query, &v), self.base.ids[row as usize]));
+        }
+        skeg_telemetry::add_counter(
+            skeg_telemetry::Counter::VsearchHybridRerankNanos,
+            phase_t0.elapsed().as_nanos() as u64,
+        );
+        skeg_telemetry::add_counter(skeg_telemetry::Counter::VsearchHybridReads, rerank_rows);
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(s, id)| (id, s)).collect())
+    }
+
     pub fn score_ids_quantized(
         &self,
         query: &[f32],
@@ -5279,10 +5337,18 @@ impl DiskVamanaIndex {
             Some(router) if s.len() > scan_max() => {
                 // Map external ids -> base rows (skip ids not in the base: delta
                 // ids fall through to a direct scan of the whole `s`).
+                // Timed: this pass and the routing below are O(|S|) and the
+                // router cuts neither, which is what the end-to-end numbers
+                // could not separate.
+                let t_map = Instant::now();
                 let s_rows: Vec<u64> = s
                     .iter()
                     .filter_map(|id| self.base.id_to_main_row.get(id).map(|&r| u64::from(r)))
                     .collect();
+                skeg_telemetry::add_counter(
+                    skeg_telemetry::Counter::VsearchHybridMapNanos,
+                    t_map.elapsed().as_nanos() as u64,
+                );
                 if s_rows.len() < s.len() {
                     // Some matches are outside the base (delta): can't route them
                     // reliably, so scan all of `s` exactly.
@@ -5296,7 +5362,28 @@ impl DiskVamanaIndex {
                 // score_ids_quantized). Self-heals at the next consolidate, which
                 // folds runs/delta and rebuilds the router.
                 let q = normalized(query);
+                let t_route = Instant::now();
                 let short_rows = router.probe(&q, &s_rows, SHORTLIST.max(rerank));
+                skeg_telemetry::add_counter(
+                    skeg_telemetry::Counter::VsearchHybridRouteNanos,
+                    t_route.elapsed().as_nanos() as u64,
+                );
+                // In the folded steady state score the rows straight: the
+                // row -> id -> hash -> row round trip cost more than the
+                // kernel it fed.
+                if self.tombstones.is_empty() && self.delta.is_empty() && self.runs.is_empty() {
+                    #[allow(clippy::cast_possible_truncation)] // rows come from base, < u32::MAX
+                    let mut rows: Vec<VecId> = short_rows.iter().map(|&r| r as VecId).collect();
+                    // Ascending row order before scoring. The probe gathers by
+                    // cell, which scrambles rows; the codes array is 256 B per
+                    // row at dim 1024, so a scrambled 10k-row pass is 10k
+                    // random walks through 12 MB. Scoring measured 147ns/row
+                    // against a 40ns kernel - the cost is the memory walk, not
+                    // the arithmetic, and a sort is the cheapest way to ask
+                    // for it back.
+                    rows.sort_unstable();
+                    return self.score_base_rows_quantized(query, &rows, k, rerank);
+                }
                 let shortlist: Vec<u64> = short_rows
                     .iter()
                     .map(|&r| self.base.ids[r as usize])

@@ -327,10 +327,17 @@ pub enum Counter {
     /// Searches that took the graph-walk route (the denominator for
     /// per-search walk averages; the hybrid route has its own counters).
     VsearchInner = 36,
+    /// Filtered search, phase 1: turning the match set into base rows
+    /// (external id -> row lookup). O(|S|) and invisible until now - the IVF
+    /// router cuts scoring and rerank, never this.
+    VsearchHybridMapNanos = 37,
+    /// Filtered search, phase 2: the IVF router bucketing the rows it was
+    /// handed and picking the shortlist. Also O(|S|).
+    VsearchHybridRouteNanos = 38,
 }
 
 impl Counter {
-    pub const COUNT: usize = 37;
+    pub const COUNT: usize = 39;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -369,6 +376,8 @@ impl Counter {
         Counter::EntryCacheMisses,
         Counter::VsearchWalkHops,
         Counter::VsearchInner,
+        Counter::VsearchHybridMapNanos,
+        Counter::VsearchHybridRouteNanos,
     ];
 
     #[inline]
@@ -411,6 +420,8 @@ impl Counter {
             Counter::EntryCacheMisses => "skeg_entry_cache_misses_total",
             Counter::VsearchWalkHops => "skeg_vsearch_walk_hops_total",
             Counter::VsearchInner => "skeg_vsearch_inner_total",
+            Counter::VsearchHybridMapNanos => "skeg_vsearch_hybrid_map_nanos_total",
+            Counter::VsearchHybridRouteNanos => "skeg_vsearch_hybrid_route_nanos_total",
         }
     }
 }
