@@ -326,6 +326,14 @@ impl VectorBackend {
         }
     }
 
+    /// Run debt over live rows, from the engine that owns the definition.
+    fn run_debt_ratio(&self) -> f32 {
+        match self {
+            VectorBackend::Flat(_) => 0.0,
+            VectorBackend::Disk(i) => i.run_debt_ratio(),
+        }
+    }
+
     /// Flush (L0): snapshot the delta into a run off-thread. `None` if empty /
     /// already flushing / flat.
     fn flush_begin(&mut self) -> std::io::Result<Option<FlushJob>> {
@@ -735,6 +743,11 @@ pub struct VindexRow {
     /// their sum: a merge can cut the count and the sum while leaving one
     /// enormous segment behind, and only this number shows it.
     pub max_run_rows: u64,
+    /// Run rows over live rows, computed ONCE by the engine that owns the
+    /// definition. Every P0 found today had the same shape - one rule
+    /// implemented in two places, one of them wrong - so this number is not
+    /// recomputed by its readers.
+    pub run_debt_ratio: f32,
     pub tombs: u64,
     pub base: u64,
 }
@@ -2470,6 +2483,7 @@ async fn process(
                         runs: backend.run_count() as u64,
                         run_rows: backend.run_rows() as u64,
                         max_run_rows: backend.max_run_rows() as u64,
+                        run_debt_ratio: backend.run_debt_ratio(),
                         tombs: backend.tombstone_count() as u64,
                         base: backend.main_len() as u64,
                     }
@@ -3836,17 +3850,17 @@ impl ShardSet {
                 out.push(format!("shard={shard} absent=1"));
                 continue;
             };
-            let live = r.n_vectors.max(1);
             out.push(format!(
-                "shard={shard} live={} base={} delta={} runs={} run_rows={} tombs={} \
-                 run_debt_ratio={:.3}",
+                "shard={shard} live={} base={} delta={} runs={} run_rows={} \
+                 max_run_rows={} tombs={} run_debt_ratio={:.3}",
                 r.n_vectors,
                 r.base,
                 r.delta,
                 r.runs,
                 r.run_rows,
+                r.max_run_rows,
                 r.tombs,
-                r.run_rows as f32 / live as f32,
+                r.run_debt_ratio,
             ));
         }
         Ok(out)
@@ -3894,7 +3908,7 @@ impl ShardSet {
                 worst_shard = shard;
             }
             let live = row.n_vectors.max(1);
-            let debt = row.run_rows as f32 / live as f32;
+            let debt = row.run_debt_ratio;
             if debt > worst_debt {
                 worst_debt = debt;
                 worst_debt_shard = shard;
@@ -4275,6 +4289,8 @@ impl ShardSet {
                                 a.runs = a.runs.saturating_add(row.runs);
                                 // The largest run is a MAX across shards, never a sum.
                                 a.max_run_rows = a.max_run_rows.max(row.max_run_rows);
+                                // Worst shard, never an average: a threshold is per shard.
+                                a.run_debt_ratio = a.run_debt_ratio.max(row.run_debt_ratio);
                                 a.run_rows = a.run_rows.saturating_add(row.run_rows);
                                 a.tombs = a.tombs.saturating_add(row.tombs);
                                 a.base = a.base.saturating_add(row.base);

@@ -1847,11 +1847,6 @@ struct Segment {
     /// and the cache dies with its segment, so a fold can never leave a
     /// stale row behind. `None` under `SKEG_ENTRY_CACHE=0`.
     entry_cache: Option<std::sync::Mutex<EntrySlotCache>>,
-    /// L0 flat run: no graph was built (adjacency is empty); search scans
-    /// every row with the quantized proxy instead of walking. Exact on the
-    /// proxy, so recall >= a walk by construction. Marked by a `flat` file
-    /// in the run dir.
-    flat: bool,
 }
 
 /// Direct-mapped sketch -> seed-rows cache, 4096 slots, overwrite eviction.
@@ -1891,16 +1886,8 @@ fn query_sketch(q: &[f32]) -> u16 {
     key
 }
 
-/// `SKEG_IVF_SEEDS=1` seeds unfiltered walks from the query's nearest IVF
-/// cell. Off until the hop/recall gate clears it.
-fn ivf_seeds_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SKEG_IVF_SEEDS").is_ok_and(|v| v == "1"))
-}
-
-/// `SKEG_RERANK_MULT=<n>`: the per-shard f32 re-rank budget as a multiple of
-/// `k` (default 8). Exists so the budget can be re-gated with the shard
-/// fan-out in the picture - see the caveat at the default.
+/// `SKEG_RERANK_FLOOR=<rows>`: the per-shard f32 re-rank budget never drops
+/// below this. Guards small `k`, where `k * mult` alone would be tiny.
 fn rerank_floor() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1912,9 +1899,15 @@ fn rerank_floor() -> usize {
     })
 }
 
-/// `SKEG_RERANK_MULT=<n>`: see [`rerank_floor`] for the other half. Measured
-/// 2026-08-31: at k=10 the FLOOR binds, not the multiplier - k*4 and k*8 both
-/// land on the same per-shard budget and the same recall (0,9843 / 0,9840).
+/// `SKEG_RERANK_MULT=<n>`: the per-shard f32 re-rank budget as a multiple of
+/// `k` (default 8).
+///
+/// Kept as a knob, NOT as a tuning suggestion: measured on the real
+/// semantically-resharded corpus, dropping it to 2 costs 3.1 points of
+/// recall, because the reshard concentrates a query's top-k into one or two
+/// shards and a per-shard budget then starves the shard holding the answers.
+/// On a uniformly-placed synthetic corpus the same change measured -0.0002,
+/// which is exactly why the knob exists: to re-gate on the shape at hand.
 fn rerank_mult() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1944,9 +1937,6 @@ fn new_entry_cache() -> Option<std::sync::Mutex<EntrySlotCache>> {
 /// `CURRENT` and keep their base flat in the vindex dir; that stays readable.
 const CURRENT_FILE: &str = "CURRENT";
 
-/// Marker inside a run dir: this run is an L0 flat run (no graph).
-const FLAT_MARKER: &str = "flat";
-
 /// Run-debt ratio at which SEARCH stops
 /// trusting the short beam on them and scans them exactly on the proxy.
 ///
@@ -1968,20 +1958,6 @@ const FLAT_MARKER: &str = "flat";
 /// It is deliberately a conservative signal - it fires early when the runs
 /// carry garbage - and it is NOT the live fraction sitting in runs.
 const RUN_DEBT_FALLBACK: f32 = 0.25;
-
-/// `SKEG_L0_FLAT_MAX=<rows>`: a flush of at most this many rows writes an L0
-/// flat run (vectors + tier, no graph build) and search scans it exactly with
-/// the quantized proxy. 0 (default) keeps the graph-per-run behaviour; the
-/// crossover comes from the bench, not from a constant.
-fn l0_flat_max() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("SKEG_L0_FLAT_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
 
 /// The directory holding the LIVE base files for `dir`: `dir/gN` per the
 /// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
@@ -2314,7 +2290,6 @@ fn open_segment(
             vectors_file,
             row_cache: new_row_cache(dim),
             entry_cache: new_entry_cache(),
-            flat: bdir.join(FLAT_MARKER).exists(),
         },
         dim,
         l_search,
@@ -2836,28 +2811,6 @@ impl FlushJob {
         } = self;
         let dir = index_dir.join(format!("run-{seq}"));
         let _ = std::fs::remove_dir_all(&dir);
-        if ids.len() <= l0_flat_max() {
-            // L0 flat run: vectors + empty adjacency + marker, no graph build.
-            // The costly part of a flush IS the graph build; search scans a
-            // flat run exactly instead of walking it.
-            std::fs::create_dir_all(&dir)?;
-            let src = InMemoryVectorSource::new(vectors, dim);
-            let n = ids.len() as u32;
-            write_graph_vmn(
-                &dir.join(GRAPH_FILE),
-                n,
-                dim,
-                0,
-                MAX_R,
-                128,
-                &ids,
-                &vec![Node::new(); ids.len()],
-            )?;
-            write_vectors_bin(&dir.join(VECTORS_FILE), &src)?;
-            std::fs::write(dir.join(FLAT_MARKER), b"")?;
-            let run = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
-            return Ok(FlushBuilt { run, seq });
-        }
         let cfg = disk_build_config();
         // Always cautious: these two are O(runs) and short, and the window
         // they would open by taking the machine is not worth the seconds saved.
@@ -4108,21 +4061,6 @@ impl DiskVamanaIndex {
                     seed_rows.push(r);
                 }
             }
-            // IVF cell seeds (base segment only, opt-in): a NOVEL query
-            // starts inside its own semantic cell instead of at the medoid -
-            // the complement of the entry cache, which only serves repeats.
-            // Extra seeds only add candidates.
-            if seg_idx == 0
-                && ivf_seeds_enabled()
-                && let Some(router) = &self.ivf
-            {
-                seed_rows.extend(
-                    router
-                        .query_cell_seeds(&qn, 4)
-                        .into_iter()
-                        .filter(|&r| r < seg.main_n),
-                );
-            }
             // Semantic entry seeds (base segment only): where similar queries
             // landed before. Extra seeds only add candidates.
             if seg_idx == 0
@@ -4160,7 +4098,7 @@ impl DiskVamanaIndex {
             if debt_fallback {
                 skeg_telemetry::tick_counter(skeg_telemetry::Counter::RunScanFallback);
             }
-            if seg.flat || debt_fallback {
+            if debt_fallback {
                 // L0 flat run: exact proxy scan of every row - no graph to
                 // walk. Downstream already handles unfiltered candidates
                 // (the navigate-all walk feeds it the same way), so admit
@@ -5017,7 +4955,7 @@ impl DiskVamanaIndex {
             seg_files.push(self.runs[ri].vectors_file.try_clone()?);
         }
         // Reuse route (the patched consolidate's idea applied to runs): the
-        // LARGEST non-flat run donates its graph; only the other runs' rows
+        // LARGEST run donates its graph; only the other runs' rows
         // are inserted. Worth it only when the donor carries the majority of
         // the survivors - below that the remap bookkeeping is pure overhead.
         let mut donor_seg = usize::MAX;
@@ -5027,7 +4965,7 @@ impl DiskVamanaIndex {
             per_run_live[ri] += 1;
         }
         for ri in 0..n_merged {
-            if !self.runs[ri].flat && per_run_live[ri] > donor_live {
+            if per_run_live[ri] > donor_live {
                 donor_live = per_run_live[ri];
                 donor_seg = ri;
             }
@@ -7511,69 +7449,6 @@ mod tests {
                 hits.iter().any(|h| h.0 == 10_000 + probe as u64),
                 "inserted id {} lost",
                 10_000 + probe
-            );
-        }
-    }
-
-    /// An L0 flat run answers searches exactly: every id flushed into a flat
-    /// run must be findable, and a reopen keeps the run flat and searchable.
-    #[test]
-    #[allow(unsafe_code)] // env knob for this test only; set before first read
-    fn l0_flat_runs_serve_and_survive_reopen() {
-        // Process-wide OnceLock knob: if another test initialised it to 0
-        // first, the flat path cannot engage in this process - skip.
-        unsafe { std::env::set_var("SKEG_L0_FLAT_MAX", "4096") };
-        if l0_flat_max() == 0 {
-            eprintln!("skipped: SKEG_L0_FLAT_MAX OnceLock already 0");
-            return;
-        }
-        let dim = 16;
-        let tier = QuantKind::TurboQuant { bits: 2 };
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
-        idx.set_auto_flush(false);
-        let base = random_vectors(400, dim, 31);
-        for (i, v) in base.chunks_exact(dim).enumerate() {
-            idx.insert(i as u64, v).unwrap();
-        }
-        idx.consolidate().unwrap();
-        // One flushed FLAT run (200 rows <= 4096).
-        let more = random_vectors(200, dim, 32);
-        for (i, v) in more.chunks_exact(dim).enumerate() {
-            idx.insert(1000 + i as u64, v).unwrap();
-        }
-        let job = idx.flush_begin().unwrap().expect("delta to flush");
-        let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
-        assert_eq!(idx.run_count(), 1);
-        assert!(
-            tmp.path().join("run-1").join(FLAT_MARKER).exists()
-                || std::fs::read_dir(tmp.path())
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .any(|e| e.path().join(FLAT_MARKER).exists()),
-            "run written without the flat marker"
-        );
-        // Every flushed id findable via the exact flat scan.
-        for probe in [0usize, 99, 199] {
-            let q = &more[probe * dim..(probe + 1) * dim];
-            let hits = idx.search(q, 5).unwrap();
-            assert!(
-                hits.iter().any(|h| h.0 == 1000 + probe as u64),
-                "id {} not found via flat run",
-                1000 + probe
-            );
-        }
-        drop(idx);
-        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
-        assert_eq!(re.run_count(), 1, "flat run lost at reopen");
-        for probe in [0usize, 150] {
-            let q = &more[probe * dim..(probe + 1) * dim];
-            let hits = re.search(q, 5).unwrap();
-            assert!(
-                hits.iter().any(|h| h.0 == 1000 + probe as u64),
-                "id {} lost at reopen",
-                1000 + probe
             );
         }
     }

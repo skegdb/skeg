@@ -47,7 +47,10 @@ async fn write_corpus(dir: &std::path::Path, generation: u64) {
     let shards = ShardSet::open_mode_with_workers(dir, SHARDS, false, TIER, 1).unwrap();
     shards.vindex_create("bk", DIM, 4, 1).await.unwrap();
     for id in 0..ROWS {
-        shards.vset("bk", id, vec_for(id, generation), 0, None, None).await.unwrap();
+        shards
+            .vset("bk", id, vec_for(id, generation), 0, None, None)
+            .await
+            .unwrap();
     }
     shards.vindex_consolidate("bk").await.unwrap();
     // The operator's quiesce step: flush what is in memory to disk.
@@ -86,12 +89,17 @@ async fn a_quiesced_copy_restores_with_identical_answers() {
     let restored_dir = dst.path().join("restored");
     copy_dir(src.path(), &restored_dir).expect("copy the data directory");
 
-    let restored =
-        ShardSet::open_mode_with_workers(&restored_dir, SHARDS, false, TIER, 1).unwrap();
+    let restored = ShardSet::open_mode_with_workers(&restored_dir, SHARDS, false, TIER, 1).unwrap();
 
     // 1. Integrity, by the engine's own reckoning.
-    let problems = restored.check("bk").await.expect("CHECK on the restored copy");
-    assert!(problems.is_empty(), "restored copy is not clean: {problems:?}");
+    let problems = restored
+        .check("bk")
+        .await
+        .expect("CHECK on the restored copy");
+    assert!(
+        problems.is_empty(),
+        "restored copy is not clean: {problems:?}"
+    );
 
     // 2. Every row is there.
     let got_rows: u64 = restored
@@ -102,11 +110,18 @@ async fn a_quiesced_copy_restores_with_identical_answers() {
         .filter(|r| r.name == "bk")
         .map(|r| r.n_vectors)
         .sum();
-    assert_eq!(got_rows, want_rows, "restored copy has {got_rows} of {want_rows} rows");
+    assert_eq!(
+        got_rows, want_rows,
+        "restored copy has {got_rows} of {want_rows} rows"
+    );
 
     // 3. Point reads return the same vectors.
     for id in [0u64, 1, ROWS / 2, ROWS - 1] {
-        let v = restored.vget("bk", id).await.unwrap().expect("row present after restore");
+        let v = restored
+            .vget("bk", id)
+            .await
+            .unwrap()
+            .expect("row present after restore");
         let expect = vec_for(id, 1);
         let dot: f32 = v.iter().zip(&expect).map(|(a, b)| a * b).sum();
         let norm = |x: &[f32]| x.iter().map(|a| a * a).sum::<f32>().sqrt();
@@ -124,7 +139,10 @@ async fn a_quiesced_copy_restores_with_identical_answers() {
             .await
             .unwrap();
         let got: Vec<u64> = hits.into_iter().map(|(id, _, _)| id).collect();
-        assert_eq!(&got, expected, "query {i} answers differently after restore");
+        assert_eq!(
+            &got, expected,
+            "query {i} answers differently after restore"
+        );
     }
 }
 
@@ -146,7 +164,10 @@ async fn a_hot_copy_is_never_corrupt_even_if_it_is_behind() {
     // Copy in the middle of a second generation of writes.
     let writer = async {
         for id in 0..ROWS {
-            shards.vset("bk", id, vec_for(id, 2), 0, None, None).await.unwrap();
+            shards
+                .vset("bk", id, vec_for(id, 2), 0, None, None)
+                .await
+                .unwrap();
         }
     };
     let copier = async {
@@ -170,7 +191,10 @@ async fn a_hot_copy_is_never_corrupt_even_if_it_is_behind() {
                 let dot: f32 = v.iter().zip(&e).map(|(a, b)| a * b).sum();
                 dot / (norm(&v) * norm(&e)) > 0.999
             });
-            assert!(matches_a_generation, "id {id} is neither generation: torn write");
+            assert!(
+                matches_a_generation,
+                "id {id} is neither generation: torn write"
+            );
         }
     }
 }
