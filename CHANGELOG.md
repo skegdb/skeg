@@ -9,6 +9,20 @@ repository.
 
 ## [Unreleased]
 
+### mmap graph validation (P0)
+
+The mmap open route cast `graph.vmn`'s node region straight into `&[Node]`
+with no per-node pass, while the in-RAM route validated every degree and
+every neighbour. So the mmap route ACCEPTED graphs the in-RAM route
+refuses, and the walk then followed whatever those bytes said - and a
+degree past MAX_R sliced out of range, which under `panic = "abort"` is a
+dead server. Both routes now run the same structural validation at open,
+and `Node::slice` clamps to MAX_R so a corrupt degree can never panic a
+neighbour read (which also keeps CHECK - the tool you reach for when a
+file IS corrupt - safe to run). Pinned: a dangling edge and a
+degree > MAX_R are each refused by BOTH routes, and a forged degree of
+u32::MAX still yields a MAX_R-long slice.
+
 ### SKEG.CHECK
 
 The operator's fsck. `SKEG.CHECK <index>` reports every integrity problem

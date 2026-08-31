@@ -80,6 +80,8 @@ pub fn fd_limit() -> (u64, u64) {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
         return (0, 0);
     }
+    // rlim_t is u64 on our targets; the casts keep it explicit where it is not.
+    #[allow(clippy::unnecessary_cast)]
     (lim.rlim_cur as u64, lim.rlim_max as u64)
 }
 

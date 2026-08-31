@@ -3558,15 +3558,34 @@ impl ShardSet {
     pub async fn check(&self, name: &str) -> Result<Vec<String>, ShardError> {
         validate_vindex_name(name)?;
         // An fsck that answers "healthy" for an index that does not exist is
-        // a trap: say so instead.
-        let known = match self.call(0, ShardReq::VindexList).await? {
-            ShardResp::VindexList(rows) => rows.iter().any(|r| r.name == name),
-            _ => false,
-        };
-        if !known {
+        // a trap. Ask EVERY shard, not shard 0 as an oracle: an index present
+        // only on some shards is itself a defect the report must name, and
+        // shard 0 alone would hide it in either direction.
+        let mut present: Vec<usize> = Vec::new();
+        let mut dim = 0usize;
+        for shard in 0..self.inner.n {
+            if let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await?
+                && let Some(row) = rows.iter().find(|r| r.name == name)
+            {
+                present.push(shard);
+                dim = row.dim as usize;
+            }
+        }
+        if present.is_empty() {
             return Err(ShardError::Storage(format!("no such vindex '{name}'")));
         }
         let mut out = Vec::new();
+        if present.len() != self.inner.n {
+            let missing: Vec<String> = (0..self.inner.n)
+                .filter(|s| !present.contains(s))
+                .map(|s| s.to_string())
+                .collect();
+            out.push(format!(
+                "index missing on shard(s) {} of {}",
+                missing.join(","),
+                self.inner.n
+            ));
+        }
         for shard in 0..self.inner.n {
             let req = ShardReq::VindexCheck {
                 name: name.to_owned(),
@@ -3583,22 +3602,18 @@ impl ShardSet {
         // are in range, and its router's dim must match the index. Both have
         // bitten before, so both are checked, not assumed.
         if let Some(router) = self.router(name) {
-            let dim = match self.call(0, ShardReq::VindexList).await? {
-                ShardResp::VindexList(rows) => rows
-                    .iter()
-                    .find(|r| r.name == name)
-                    .map_or(0, |r| r.dim as usize),
-                _ => 0,
-            };
             if dim != 0 && router.dim != dim {
                 out.push(format!(
                     "router dim {} does not match index dim {dim}",
                     router.dim
                 ));
             }
-            if router.k > self.inner.n {
+            // The invariant is one centroid PER shard: fewer leaves shards
+            // unaddressable by the router, more routes rows to shards that do
+            // not exist. Either way it is a defect, not just an excess.
+            if router.k != self.inner.n {
                 out.push(format!(
-                    "router has {} centroids for {} shards",
+                    "router has {} centroids for {} shards (want one per shard)",
                     router.k, self.inner.n
                 ));
             }

@@ -88,7 +88,14 @@ impl Node {
     }
 
     fn slice(&self) -> &[VecId] {
-        &self.neighbors[..self.degree as usize]
+        // Clamp instead of slicing blind: on the mmap path these bytes come
+        // straight from a file that another process (or a torn write) can
+        // make say anything, and `panic = "abort"` turns an out-of-range
+        // slice into a dead server. Open-time validation rejects such a file;
+        // this is the belt under that brace, and it also keeps `check` - the
+        // very tool you reach for WHEN a file is corrupt - panic-free.
+        let n = (self.degree as usize).min(MAX_R);
+        &self.neighbors[..n]
     }
 
     #[allow(clippy::cast_possible_truncation)] // n <= MAX_R = 64
@@ -2073,6 +2080,26 @@ fn open_segment(
         // hint, so a failure (sandbox, unusual fs) is only logged.
         if let Err(e) = file.advise_random() {
             tracing::debug!("graph mmap MADV_RANDOM failed: {e}");
+        }
+        // Same structural validation the owned path performs, once at open:
+        // a degree past MAX_R or a neighbour past `n` is a corrupt file, and
+        // skipping this pass here (as this path used to) meant the mmap route
+        // accepted graphs the in-RAM route refuses - the walk would then read
+        // whatever those bytes point at. O(n) over already-mapped pages.
+        {
+            let bytes: &[u8] = &file;
+            for row in 0..n as usize {
+                let base = nodes_offset + row * node_len;
+                let degree = read_u32(bytes, base) as usize;
+                if degree > MAX_R {
+                    return Err(bad());
+                }
+                for k in 0..degree {
+                    if read_u32(bytes, base + 4 + k * 4) >= n {
+                        return Err(bad());
+                    }
+                }
+            }
         }
         NodeBacking::Mapped {
             file,
@@ -7009,6 +7036,74 @@ mod tests {
             broken.iter().any(|p| p.contains("CURRENT names")),
             "bad CURRENT not caught: {broken:?}"
         );
+    }
+
+    /// Write a graph file with a deliberately corrupt node region and try to
+    /// open it both ways. Returns (owned_result_is_err, mmap_result_is_err).
+    fn open_corrupt_both_ways(bad_degree: Option<u32>, dangling: bool) -> (bool, bool) {
+        let dim = 8;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let n = 32usize;
+        let vecs = random_vectors(n, dim, 81);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut nodes = vec![Node::new(); n];
+        for (row, node) in nodes.iter_mut().enumerate() {
+            let mut e = vec![((row + 1) % n) as VecId];
+            if dangling && row == 0 {
+                e.push(n as VecId + 500);
+            }
+            node.set(&e);
+        }
+        let g0 = tmp.path().join("g0");
+        std::fs::create_dir_all(&g0).unwrap();
+        write_tier(tmp.path(), tier).unwrap();
+        write_graph_vmn(&g0.join(GRAPH_FILE), n as u32, dim, 0, MAX_R, 128, &ids, &nodes)
+            .unwrap();
+        write_vectors_bin(&g0.join(VECTORS_FILE), &InMemoryVectorSource::new(vecs, dim))
+            .unwrap();
+        set_current_slot(tmp.path(), 0).unwrap();
+        write_framed_wal(&tmp.path().join(DELTA_LOG_FILE), &[]).unwrap();
+        // Patch a degree straight into the file when asked: no writer API
+        // would produce it, which is exactly the point.
+        if let Some(d) = bad_degree {
+            let path = g0.join(GRAPH_FILE);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let node0 = HEADER_LEN + n * 8;
+            bytes[node0..node0 + 4].copy_from_slice(&d.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        let owned = DiskVamanaIndex::open_with_tier_full(tmp.path(), tier, false, false).is_err();
+        let mapped = DiskVamanaIndex::open_with_tier_full(tmp.path(), tier, false, true).is_err();
+        (owned, mapped)
+    }
+
+    /// The mmap route must refuse exactly what the in-RAM route refuses.
+    /// It used to accept both shapes (it cast the node region without a
+    /// validation pass), so a corrupt file walked straight into the search.
+    #[test]
+    fn mmap_open_refuses_the_same_corruption_as_the_owned_path() {
+        let (owned, mapped) = open_corrupt_both_ways(None, true);
+        assert!(owned, "owned path accepted a dangling edge");
+        assert!(mapped, "mmap path accepted a dangling edge");
+
+        let (owned, mapped) = open_corrupt_both_ways(Some(MAX_R as u32 + 7), false);
+        assert!(owned, "owned path accepted degree > MAX_R");
+        assert!(mapped, "mmap path accepted degree > MAX_R");
+    }
+
+    /// A corrupt degree must never make an adjacency read slice out of range:
+    /// under `panic = "abort"` that is a dead server, and `check` - the tool
+    /// you reach for precisely when a file is corrupt - must survive it.
+    #[test]
+    fn a_corrupt_degree_cannot_panic_a_neighbour_read() {
+        let mut node = Node::new();
+        node.set(&[1, 2, 3]);
+        // Forge a degree past the array: the clamp in `slice` must hold.
+        node.degree = MAX_R as u32 + 1000;
+        assert_eq!(node.slice().len(), MAX_R, "slice must clamp to MAX_R");
+        node.degree = u32::MAX;
+        assert_eq!(node.slice().len(), MAX_R);
     }
 
     /// A graph file carrying a dangling edge is REFUSED at open on the
