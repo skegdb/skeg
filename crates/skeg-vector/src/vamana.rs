@@ -6151,7 +6151,7 @@ mod tests {
 
     #[test]
     fn graph_file_roundtrip() {
-        let dim = 32;
+        let dim = 16;
         let n = 300;
         let vectors = random_vectors(n, dim, 11);
         let ids: Vec<u64> = (0..n as u64).map(|i| i * 7 + 1).collect(); // non-trivial ids
@@ -6410,7 +6410,7 @@ mod tests {
 
     #[test]
     fn search_finds_exact_match() {
-        let dim = 32;
+        let dim = 16;
         let n = 400;
         let vectors = random_vectors(n, dim, 7);
         let ids: Vec<u64> = (0..n as u64).collect();
@@ -6452,7 +6452,7 @@ mod tests {
 
     #[test]
     fn disk_delete_tombstone_filtered() {
-        let dim = 32;
+        let dim = 16;
         let n = 300;
         let vectors = random_vectors(n, dim, 2);
         let ids: Vec<u64> = (0..n as u64).collect();
@@ -6775,7 +6775,7 @@ mod tests {
 
     #[test]
     fn disk_wal_cleared_after_consolidation() {
-        let dim = 32;
+        let dim = 16;
         let n = 150;
         let vectors = random_vectors(n, dim, 8);
         let ids: Vec<u64> = (0..n as u64).collect();
@@ -7242,17 +7242,21 @@ mod tests {
         );
     }
 
-    /// Price the donor reuse: same merge, donor path vs from-scratch.
-    /// Ignored (heavy): run with `cargo test -- --ignored merge_donor_speed`.
+    /// The donor path must lose nothing the from-scratch path keeps.
+    ///
+    /// Both legs merge the same two runs - one reusing the donor's adjacency,
+    /// one rebuilding - and both must still answer probes drawn from either
+    /// source run. The timing it prints is a by-product; the assertion is the
+    /// point, which is why this runs by default now instead of sitting behind
+    /// `--ignored` at 20k x 256 dims where nobody ever ran it.
     #[test]
-    #[ignore]
-    fn merge_donor_speedup_measured() {
-        let dim = 256;
+    fn merge_donor_keeps_every_id_from_both_runs() {
+        let dim = 16;
         let tier = QuantKind::TurboQuant { bits: 2 };
         let tmp = tempfile::TempDir::new().unwrap();
         let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
         idx.set_auto_flush(false);
-        let big = random_vectors(20_000, dim, 51);
+        let big = random_vectors(2_000, dim, 51);
         for (i, v) in big.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
@@ -7263,7 +7267,7 @@ mod tests {
             .build(tmp.path())
             .unwrap();
         idx.flush_finish(built).unwrap();
-        let small = random_vectors(2_000, dim, 52);
+        let small = random_vectors(300, dim, 52);
         for (i, v) in small.chunks_exact(dim).enumerate() {
             idx.insert(100_000 + i as u64, v).unwrap();
         }
@@ -7317,14 +7321,14 @@ mod tests {
         idx2.merge_runs_finish(built).unwrap();
 
         eprintln!(
-            "merge 20k+2k dim256: reuse {:?} vs scratch {:?} ({:.2}x)",
+            "merge 2k+300 dim16: reuse {:?} vs scratch {:?} ({:.2}x)",
             reuse,
             scratch,
             scratch.as_secs_f64() / reuse.as_secs_f64()
         );
         // Both merged runs answer probes from both source runs.
         for (which, ix) in [(1u8, &idx), (2u8, &idx2)] {
-            for probe in [0usize, 19_999] {
+            for probe in [0usize, 1_999] {
                 let q = &big[probe * dim..(probe + 1) * dim];
                 assert!(
                     ix.search(q, 5).unwrap().iter().any(|h| h.0 == probe as u64),
@@ -7787,7 +7791,7 @@ mod tests {
     /// same results it returned cold.
     #[test]
     fn entry_cache_seeds_repeat_queries_without_changing_results() {
-        let dim = 32;
+        let dim = 16;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut idx = DiskVamanaIndex::create_empty_with_tier(
             tmp.path(),

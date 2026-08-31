@@ -1418,6 +1418,23 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
 /// makes it the code most likely to be read during a memory or latency
 /// incident. Inlined, it appeared in traces as `run_shard::{{closure}}::{{closure}}`.
 async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle: bool) -> bool {
+    maintenance_tick_at(arc, vdir, shard_id, idle, FLUSH_ROWS).await
+}
+
+/// The tick with the flush threshold as a parameter.
+///
+/// The invariant worth protecting here is the LADDER'S CHOICE, not the work
+/// it schedules - and driving real maintenance past a 4096-row threshold
+/// twenty times takes half an hour, which is how the starvation test ended up
+/// too slow to run and therefore protecting nothing. With the threshold as an
+/// argument the same decision sequence is exercised in seconds.
+async fn maintenance_tick_at(
+    arc: &VectorEntry,
+    vdir: &Path,
+    shard_id: usize,
+    idle: bool,
+    flush_rows: usize,
+) -> bool {
     let (delta, runs, run_rows, tombs, base) = {
         let g = arc.read();
         (
@@ -1470,7 +1487,7 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     // is due. Under sustained churn that gives the merge every other tick,
     // which is enough to keep the count flat - and it needs no threshold to
     // be guessed correctly.
-    let flush_due = delta >= FLUSH_ROWS;
+    let flush_due = delta >= flush_rows;
     // Count OR mass. The count alone left a single fat dirty run untouched
     // forever - measured at rest, three times the live count in runs with no
     // merge ever firing again, because one run is not "four runs" however
@@ -7020,6 +7037,21 @@ mod tests {
 
     /// Deterministic 64-dim test vector.
     #[allow(clippy::cast_precision_loss)]
+    /// `tvec` at 16 dims: the same deterministic shape, a quarter of the
+    /// graph work, for tests whose subject is the maintenance path and not the
+    /// geometry.
+    fn tvec16(seed: u64) -> Vec<f32> {
+        let mut s = (seed << 1) | 1;
+        (0..16)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % 1000) as f32 / 1000.0
+            })
+            .collect()
+    }
+
     fn tvec(seed: u64) -> Vec<f32> {
         let mut s = (seed << 1) | 1;
         (0..64)
@@ -7292,20 +7324,42 @@ mod tests {
     /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
     /// from 0.9925 to 0.7180 as the live set moved into short-beam run
     /// graphs.
-    /// Ignored: 32 minutes, because it drives REAL maintenance through 20
-    /// rounds of writes past the flush threshold. A half-hour test in the
-    /// default suite is skipped by everyone and protects nothing; run it with
-    /// `cargo test -p skeg-server -- --ignored starve`. The churn gate covers
-    /// the same ground continuously, on the production shape.
+    /// Sustained writes must not starve the runs-merge. Every rung of the
+    /// ladder ends in `return`, so a permanently-hot flush used to hold the
+    /// tick forever while each flush quietly added another run - measured on
+    /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
+    /// from 0.9925 to 0.7180 as the live set moved into short-beam run
+    /// graphs.
+    ///
+    /// Driven at a SMALL flush threshold. What matters is the sequence of
+    /// decisions the ladder makes when both rungs are due, not the size of
+    /// the work it schedules; at the production threshold the same test took
+    /// thirty-two minutes, which meant it sat `#[ignore]` and protected
+    /// nothing at all.
     #[tokio::test]
-    #[ignore]
     async fn sustained_writes_do_not_starve_the_runs_merge() {
+        const SMALL_FLUSH: usize = 200;
+        const DIM: usize = 16;
+        // A cheap deterministic vector at the small dim this test uses: the
+        // ladder's decision does not depend on the geometry, and the full
+        // 64-dim `tvec` makes every round build a real graph.
+        fn small(seed: u64) -> Vec<f32> {
+            let mut s = (seed << 1) | 1;
+            (0..DIM)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s % 1000) as f32 / 1000.0
+                })
+                .collect()
+        }
         let dir = TempDir::new().unwrap();
         let vdir = dir.path().join("vindex-t");
         let mut idx = DiskVamanaIndex::create_empty_with_tier(
             &vdir,
-            64,
-            64,
+            DIM,
+            32,
             QuantKind::TurboQuant { bits: 2 },
         )
         .unwrap();
@@ -7314,20 +7368,20 @@ mod tests {
             VectorBackend::Disk(Box::new(idx)),
             4,
         )));
-        // The churn shape: the delta is refilled past the flush threshold
-        // before every tick, so the flush rung is permanently hot.
+        // The churn shape: refill the delta past the threshold before every
+        // tick, so the flush rung is permanently hot.
         let mut worst_runs = 0usize;
         let mut next_id = 0u64;
-        for _ in 0..20 {
+        for _ in 0..14 {
             {
                 let mut g = arc.write();
-                for _ in 0..(FLUSH_ROWS + 100) {
-                    let v = tvec(next_id + 1);
+                for _ in 0..(SMALL_FLUSH + 20) {
+                    let v = small(next_id + 1);
                     g.backend.insert(next_id, &v).unwrap();
                     next_id += 1;
                 }
             }
-            maintenance_tick(&arc, &vdir, 0, false).await;
+            maintenance_tick_at(&arc, &vdir, 0, false, SMALL_FLUSH).await;
             worst_runs = worst_runs.max(arc.read().backend.run_count());
         }
         // The bar is the ORDINARY trigger, not an emergency ceiling: the
@@ -8704,18 +8758,24 @@ mod tests {
         assert_eq!(found, probes.len(), "every even id is indexed+self-matches");
     }
 
-    // Same, but at a scale that triggers several geometric consolidates during
-    // the load (batched VMSET, like the bench), to catch a payload/consolidate
-    // or Relaxed-blob interaction that drops index entries. Slow (~80s); the fast
-    // variant above covers the common path, so this one is opt-in.
+    // Same, but across SEVERAL geometric consolidates during the load (batched
+    // VMSET, like the bench), to catch a payload/consolidate or Relaxed-blob
+    // interaction that drops index entries.
+    //
+    // What this needs is the folds, not the row count. The old version got
+    // them by WAITING: it wrote 20k rows at 64 dims and took eighty seconds,
+    // long enough for the background maintenance loop to fire a few times -
+    // which is why it cost eighty seconds, why it lived behind `--ignored`,
+    // and why it guarded nothing. The folds are driven explicitly here, so
+    // they are certain instead of merely likely, and the test is fast.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "slow (~80s); consolidate/payload regression guard"]
     async fn vmset_indexes_all_payloads_at_scale() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 2).unwrap();
-        shards.vindex_create("idx", 64, 0, 1).await.unwrap(); // f32, disk
-        let n: u64 = 20_000;
+        shards.vindex_create("idx", 16, 0, 1).await.unwrap(); // f32, disk
+        let n: u64 = 12_000;
         let mut id = 0u64;
+        let mut folds = 0u32;
         while id < n {
             let end = (id + 256).min(n);
             let items: Vec<_> = (id..end)
@@ -8725,17 +8785,43 @@ mod tests {
                     } else {
                         b"p=no".as_slice()
                     };
-                    (i, tvec(i), Some(Bytes::copy_from_slice(pl)))
+                    (i, tvec16(i), Some(Bytes::copy_from_slice(pl)))
                 })
                 .collect();
             shards.vmset("idx", items, 0, None).await.unwrap();
             id = end;
+            // Fold mid-load, several times, with writes still arriving after
+            // each one - that ordering is the whole point.
+            if id >= u64::from(folds + 1) * 3_000 {
+                shards.vindex_consolidate("idx").await.unwrap();
+                folds += 1;
+            }
         }
+        assert!(
+            folds >= 3,
+            "only {folds} folds: the interaction is untested"
+        );
+        // The premise: this load really did fold several times. Without it a
+        // future shrink would leave a test that never reaches the path it
+        // exists to cover, and still passes.
+        let based: u64 = shards
+            .vindex_list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.name == "idx")
+            .map(|r| r.base)
+            .sum();
+        assert!(
+            based >= n / 2,
+            "the folds must reach the base, only {based} of {n} rows there"
+        );
+
         let probes: Vec<u64> = (0..n).step_by(400).collect(); // all even
         let mut found = 0;
         for &id in &probes {
             let got = shards
-                .vsearch("idx", tvec(id), 5, 0, 0, false, flt("p = yes"))
+                .vsearch("idx", tvec16(id), 5, 0, 0, false, flt("p = yes"))
                 .await
                 .unwrap();
             if ids_of(&got).contains(&id) {
