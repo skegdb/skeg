@@ -1887,6 +1887,20 @@ fn ivf_seeds_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("SKEG_IVF_SEEDS").is_ok_and(|v| v == "1"))
 }
 
+/// `SKEG_RERANK_MULT=<n>`: the per-shard f32 re-rank budget as a multiple of
+/// `k` (default 8). Exists so the budget can be re-gated with the shard
+/// fan-out in the picture - see the caveat at the default.
+fn rerank_mult() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SKEG_RERANK_MULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(8)
+    })
+}
+
 fn entry_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("SKEG_ENTRY_CACHE").is_ok_and(|v| v == "0"))
@@ -3960,7 +3974,7 @@ impl DiskVamanaIndex {
             if dense {
                 ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
             } else {
-                (k * 8).max(64)
+                (k * rerank_mult()).max(64)
             }
         } else {
             // Default disk-rerank budget. k*8 (not k*4): the rerank budget, not
@@ -3969,7 +3983,15 @@ impl DiskVamanaIndex {
             // lifts it to 0.99+ for +10-30% latency (it saturates by ~k*16), and
             // it is query-time only so writes and RAM are untouched. Override
             // per query with `search_with_params`.
-            (k * 8).max(64)
+            //
+            // CAVEAT, measured 2026-08-31: that gate was run on ONE index. A
+            // sharded set gives EVERY shard the same full budget, so a k=10
+            // query across 8 shards issues 640 f32 reads to return 10 rows -
+            // a cost that does not shrink with the match set and shows up as
+            // tail under concurrency. SKEG_RERANK_MULT exists to re-run the
+            // gate with the fan-out in the picture; the default stays 8 until
+            // a measurement moves it.
+            (k * rerank_mult()).max(64)
         };
         if filtered {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchFiltered);
