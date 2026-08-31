@@ -110,6 +110,62 @@ pub(crate) fn cpu_quota(root: &Path) -> Option<usize> {
     effective.map(|v| (v.floor() as usize).max(1))
 }
 
+/// What the cgroup says about memory: the hard limit, and current usage.
+///
+/// Both are `Option` and both mean what they say. `None` is "not known",
+/// never "zero" - a governor told its limit is zero rejects every allocation
+/// forever, and one told its usage is zero believes it has the whole machine.
+/// A file that is missing, unreadable, malformed, zero, or set to one of the
+/// two "unlimited" spellings yields `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryStatus {
+    /// The hard limit this process will be killed for crossing.
+    pub limit_bytes: Option<u64>,
+    /// Current charged usage, as the kernel accounts it.
+    pub current_bytes: Option<u64>,
+}
+
+/// cgroup v1 spells "unlimited" as PAGE_SIZE-rounded `i64::MAX` rather than a
+/// word. Anything at or above this is the sentinel, not a limit.
+const V1_UNLIMITED: u64 = 0x7FFF_FFFF_FFFF_F000;
+
+/// Parse one of these files: a bare decimal, or v2's literal `max`.
+/// Zero and the v1 sentinel are refused - neither is a usable limit.
+fn parse_mem_limit(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s == "max" {
+        return None;
+    }
+    let v: u64 = s.parse().ok()?;
+    (v > 0 && v < V1_UNLIMITED).then_some(v)
+}
+
+/// A usage counter: a bare decimal. Zero is a legitimate reading here.
+fn parse_mem_usage(s: &str) -> Option<u64> {
+    s.trim().parse().ok()
+}
+
+/// Memory limit and usage for the cgroup rooted at `root`, v2 first then v1.
+///
+/// v2 wins when both exist: a host running v2 with v1 compatibility files
+/// present would otherwise be read through the older, coarser pair.
+pub(crate) fn memory_status_at(root: &Path) -> MemoryStatus {
+    let (limit, current) = match read(root.join("memory.max")) {
+        Some(s) => (
+            parse_mem_limit(&s),
+            read(root.join("memory.current")).and_then(|s| parse_mem_usage(&s)),
+        ),
+        None => (
+            read(root.join("memory/memory.limit_in_bytes")).and_then(|s| parse_mem_limit(&s)),
+            read(root.join("memory/memory.usage_in_bytes")).and_then(|s| parse_mem_usage(&s)),
+        ),
+    };
+    MemoryStatus {
+        limit_bytes: limit,
+        current_bytes: current,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +282,89 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "cpu.max", "150000 100000"); // 1.5 vCPU
         assert_eq!(cpu_quota(dir.path()), Some(1));
+    }
+
+    // ---- memory ----
+
+    #[test]
+    fn memory_v2_reports_limit_and_current() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "memory.max", "268435456\n");
+        write(dir.path(), "memory.current", "12345678\n");
+        let m = memory_status_at(dir.path());
+        assert_eq!(m.limit_bytes, Some(268_435_456));
+        assert_eq!(m.current_bytes, Some(12_345_678));
+    }
+
+    #[test]
+    fn memory_v2_max_means_unlimited_not_zero() {
+        // The difference matters: `Some(0)` would tell the governor it has no
+        // memory at all and reject every write.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "memory.max", "max\n");
+        write(dir.path(), "memory.current", "999\n");
+        let m = memory_status_at(dir.path());
+        assert_eq!(m.limit_bytes, None);
+        assert_eq!(m.current_bytes, Some(999));
+    }
+
+    #[test]
+    fn memory_falls_back_to_v1() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "memory/memory.limit_in_bytes", "536870912\n");
+        write(dir.path(), "memory/memory.usage_in_bytes", "4096\n");
+        let m = memory_status_at(dir.path());
+        assert_eq!(m.limit_bytes, Some(536_870_912));
+        assert_eq!(m.current_bytes, Some(4096));
+    }
+
+    #[test]
+    fn memory_v1_unlimited_sentinel_is_not_a_limit() {
+        // v1 spells "unlimited" as a huge number rather than a word: PAGE_SIZE
+        // rounded i64::MAX. Believing it would set a limit of 8 exabytes,
+        // which is not wrong so much as meaningless - and it would make the
+        // reserve arithmetic below overflow-adjacent for no reason.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "memory/memory.limit_in_bytes",
+            "9223372036854771712",
+        );
+        assert_eq!(memory_status_at(dir.path()).limit_bytes, None);
+    }
+
+    #[test]
+    fn memory_malformed_is_none_never_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "memory.max", "not-a-number");
+        write(dir.path(), "memory.current", "");
+        let m = memory_status_at(dir.path());
+        assert_eq!(m.limit_bytes, None);
+        assert_eq!(m.current_bytes, None);
+    }
+
+    #[test]
+    fn memory_zero_limit_is_rejected_as_nonsense() {
+        // A zero limit is not a limit, it is a broken file. Honouring it would
+        // refuse every allocation forever.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "memory.max", "0");
+        assert_eq!(memory_status_at(dir.path()).limit_bytes, None);
+    }
+
+    #[test]
+    fn memory_nothing_set_is_all_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = memory_status_at(dir.path());
+        assert_eq!(m.limit_bytes, None);
+        assert_eq!(m.current_bytes, None);
+    }
+
+    #[test]
+    fn memory_v2_wins_over_v1_when_both_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "memory.max", "111");
+        write(dir.path(), "memory/memory.limit_in_bytes", "222");
+        assert_eq!(memory_status_at(dir.path()).limit_bytes, Some(111));
     }
 }

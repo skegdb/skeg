@@ -12,6 +12,7 @@
 
 pub mod handler;
 pub mod layout_manifest;
+pub mod memory;
 pub mod payload;
 pub mod payload_disk;
 pub mod quota;

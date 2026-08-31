@@ -32,6 +32,37 @@ pub use uring::{BatchReader, BlockingBatchReader, best_batch_reader};
 /// inside a container that only gets a fraction of the host. Falls back to
 /// `std::thread::available_parallelism()` when no quota is set (or on
 /// error, or on other platforms).
+pub use cgroup::MemoryStatus;
+
+/// What this process may use, and what it is using.
+///
+/// On Linux this is the cgroup's own accounting - the numbers the kernel will
+/// actually kill the process over. Everywhere else there is no such limit to
+/// read, so the limit is `None` and usage falls back to RSS.
+///
+/// RSS is a POOR substitute and the difference matters: it excludes what a
+/// cgroup charges to the page cache for files this process mapped, and on
+/// macOS it is unreliable enough that the same process has reported 3 MB and
+/// 338 MB minutes apart. It is a signal, not an accounting. Callers that need
+/// a real budget need Linux.
+pub fn memory_status() -> MemoryStatus {
+    #[cfg(target_os = "linux")]
+    {
+        let mut m = cgroup::memory_status_at(std::path::Path::new("/sys/fs/cgroup"));
+        if m.current_bytes.is_none() {
+            m.current_bytes = Some(rss_bytes());
+        }
+        m
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        MemoryStatus {
+            limit_bytes: None,
+            current_bytes: Some(rss_bytes()),
+        }
+    }
+}
+
 pub fn num_performance_cores() -> usize {
     #[cfg(target_os = "macos")]
     {
