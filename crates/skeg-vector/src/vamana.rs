@@ -1890,6 +1890,20 @@ fn ivf_seeds_enabled() -> bool {
 /// `SKEG_RERANK_MULT=<n>`: the per-shard f32 re-rank budget as a multiple of
 /// `k` (default 8). Exists so the budget can be re-gated with the shard
 /// fan-out in the picture - see the caveat at the default.
+fn rerank_floor() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SKEG_RERANK_FLOOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(64)
+    })
+}
+
+/// `SKEG_RERANK_MULT=<n>`: see [`rerank_floor`] for the other half. Measured
+/// 2026-08-31: at k=10 the FLOOR binds, not the multiplier - k*4 and k*8 both
+/// land on the same per-shard budget and the same recall (0,9843 / 0,9840).
 fn rerank_mult() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -3974,7 +3988,7 @@ impl DiskVamanaIndex {
             if dense {
                 ((k as f32 / selectivity).ceil() as usize * 2).clamp(64, 1024)
             } else {
-                (k * rerank_mult()).max(64)
+                (k * rerank_mult()).max(rerank_floor())
             }
         } else {
             // Default disk-rerank budget. k*8 (not k*4): the rerank budget, not
@@ -3991,7 +4005,7 @@ impl DiskVamanaIndex {
             // tail under concurrency. SKEG_RERANK_MULT exists to re-run the
             // gate with the fan-out in the picture; the default stays 8 until
             // a measurement moves it.
-            (k * rerank_mult()).max(64)
+            (k * rerank_mult()).max(rerank_floor())
         };
         if filtered {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::VsearchFiltered);

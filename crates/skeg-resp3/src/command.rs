@@ -102,6 +102,8 @@ pub enum Command {
     SkegVindexList,
     /// `SKEG.CHECK <index>` - integrity report for one index.
     SkegCheck { args: Vec<Bytes> },
+    /// `SKEG.VOWNER <index> <id> [id...]` - which shard holds each id.
+    SkegVowner { args: Vec<Bytes> },
     /// `SKEG.VINDEX.CREATE name dim [kind] backend`. The parser checks
     /// arity (3 or 4 args; 3 omits `kind` and takes the server default)
     /// and forwards the raw bytes; inner argument
@@ -340,6 +342,15 @@ fn parse_skeg(verb: &str, args: Vec<Bytes>, raw_name: String) -> Result<Command,
         // Args preserved for forward-compat with the placeholder
         // `SKEG.AUTH is reserved` handler.
         "AUTH" => Ok(Command::SkegAuth { args }),
+        "VOWNER" => {
+            if args.len() < 2 {
+                return Err(CommandError::WrongAritySkeg {
+                    command: "SKEG.VOWNER",
+                    want: "name id [id...]",
+                });
+            }
+            Ok(Command::SkegVowner { args })
+        }
         "CHECK" => {
             if args.len() != 1 {
                 return Err(CommandError::WrongArity {

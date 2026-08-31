@@ -590,7 +590,10 @@ enum ShardReq {
     VindexList,
     /// Integrity report for one vindex (the operator's fsck).
     VindexCheck { name: String },
-    /// Does this vindex still want an IVF router? (contract probe)
+    /// Does this vindex still want an IVF router? Contract probe: the only
+    /// caller is the test that pins "an explicit consolidate leaves the
+    /// index in the same state the maintenance ladder would".
+    #[cfg_attr(not(test), allow(dead_code))]
     WantsIvf { name: String },
     /// Fold a disk vindex's streaming delta into its graph on this shard.
     /// Write the vlog snapshot and a payload index per vindex, both stamped
@@ -3578,6 +3581,33 @@ impl ShardSet {
         let _ = self
             .broadcast(|| ShardReq::SnapshotAndPayloadIndexes)
             .await;
+    }
+
+    /// Which shard each id lives on: `(primary, replica)` per id, in the
+    /// order given. Diagnostic, and the enabling piece for a benchmark that
+    /// must SHOW its placement instead of claiming to be representative: a
+    /// uniformly-placed corpus and a semantically-resharded one need
+    /// completely different per-shard budgets, and only the second is what
+    /// production looks like.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is invalid or a shard is unavailable.
+    pub async fn owners_of(&self, name: &str, ids: &[u64]) -> Result<Vec<(u8, Option<u8>)>, ShardError> {
+        validate_vindex_name(name)?;
+        self.ensure_owner_map(name).await?;
+        let map = self.inner.owners.read();
+        let owned = map.get(name);
+        Ok(ids
+            .iter()
+            .map(|&id| {
+                owned.and_then(|m| m.get(&id).copied()).unwrap_or_else(|| {
+                    // Unrouted vindex: placement is computable from the id.
+                    #[allow(clippy::cast_possible_truncation)] // n <= 255 shards
+                    (shard_for(&id.to_le_bytes(), self.inner.n) as u8, None)
+                })
+            })
+            .collect())
     }
 
     /// Integrity report for `name` across every shard, plus the coordinator's
@@ -7026,6 +7056,43 @@ mod tests {
             !wants,
             "after an explicit consolidate no index should still WANT a router"
         );
+    }
+
+    /// owners_of answers for a routed index from the map, and for an
+    /// unrouted one from the id itself - so a benchmark can always report
+    /// its placement, resharded or not.
+    #[tokio::test]
+    async fn owners_of_reports_placement_routed_and_unrouted() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            4,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("ow", 8, 4, 1).await.unwrap();
+        for id in 0..400u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 4) as usize] = 1.0;
+            shards.vset("ow", id, v, 0, None, None).await.unwrap();
+        }
+        let probe: Vec<u64> = (0..40).collect();
+
+        // Unrouted: every id resolves, and to a shard in range.
+        let before = shards.owners_of("ow", &probe).await.unwrap();
+        assert_eq!(before.len(), probe.len());
+        assert!(before.iter().all(|&(p, _)| (p as usize) < 4));
+
+        shards.reshard("ow", 0.25, 10, 0).await.unwrap();
+        let after = shards.owners_of("ow", &probe).await.unwrap();
+        assert_eq!(after.len(), probe.len());
+        assert!(after.iter().all(|&(p, r)| (p as usize) < 4
+            && r.is_none_or(|s| (s as usize) < 4)));
+        // The whole point: a semantic reshard MOVES rows, so the placement a
+        // benchmark reports must change with it.
+        assert_ne!(before, after, "reshard left every id on its hash shard");
     }
 
     /// A healthy index checks clean through the coordinator, including the

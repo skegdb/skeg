@@ -447,6 +447,7 @@ fn command_kind(cmd: &Command) -> CommandKind {
         Command::SkegVindexConsolidate { .. } => CommandKind::VindexConsolidate,
         Command::SkegVindexList => CommandKind::VindexList,
         Command::SkegCheck { .. } => CommandKind::VindexList,
+        Command::SkegVowner { .. } => CommandKind::VindexList,
         // A tenant erasing its own subject's keys is a KV write; the two
         // cross-tenant / store-wide ops are admin.
         Command::SkegSubjectErase { .. } => CommandKind::KvWrite,
@@ -665,6 +666,7 @@ async fn dispatch_command(
         Command::SkegAuth { args } => skeg_auth(&args),
         Command::SkegVindexList => skeg_vindex_list(shards, *tenant).await,
         Command::SkegCheck { args } => skeg_check(args.as_slice(), shards, *tenant).await,
+        Command::SkegVowner { args } => skeg_vowner(args.as_slice(), shards, *tenant).await,
         Command::SkegVindexCreate { args } => skeg_vindex_create(&args, shards, *tenant).await,
         Command::SkegVindexDrop { args } => skeg_vindex_drop(&args, shards, *tenant).await,
         Command::SkegVindexConsolidate { args } => {
@@ -1133,6 +1135,41 @@ async fn skeg_vget(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame
 
 /// `SKEG.VINDEX.RESHARD name`: train the router, move every row to its
 /// semantic owner. Returns the number of rows moved.
+/// `SKEG.VOWNER <index> <id> [id...]` - the shard holding each id, as a flat
+/// array of integers (replica, when one exists, follows as a second entry;
+/// -1 means none). Diagnostic: lets a benchmark report the PLACEMENT its
+/// numbers were taken under.
+async fn skeg_vowner(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+    let name = match parse_utf8_arg(&args[0], "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let scoped = match scope_vindex_or_reject(tenant, name) {
+        Ok(s) => s,
+        Err(f) => return f,
+    };
+    let mut ids = Vec::with_capacity(args.len() - 1);
+    for a in &args[1..] {
+        match std::str::from_utf8(a).ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(v) => ids.push(v),
+            None => return Frame::Error("ERR id must be an unsigned integer".into()),
+        }
+    }
+    match shards.owners_of(&scoped, &ids).await {
+        Ok(rows) => Frame::Array(
+            rows.into_iter()
+                .flat_map(|(p, r)| {
+                    [
+                        Frame::Integer(i64::from(p)),
+                        Frame::Integer(r.map_or(-1, i64::from)),
+                    ]
+                })
+                .collect(),
+        ),
+        Err(e) => shard_error(&e),
+    }
+}
+
 /// `SKEG.CHECK <index>` - the operator's fsck. Returns one line per problem
 /// found, or a single `OK` line when the index is healthy. Read-only.
 async fn skeg_check(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
