@@ -3912,7 +3912,6 @@ impl ShardSet {
                 worst_runs = runs;
                 worst_shard = shard;
             }
-            let live = row.n_vectors.max(1);
             let debt = row.run_debt_ratio;
             if debt > worst_debt {
                 worst_debt = debt;
