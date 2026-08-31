@@ -1334,7 +1334,7 @@ impl VamanaIndex {
         std::fs::create_dir_all(dir)?;
         // Write into the live base slot (or dir itself for the legacy flat
         // layout), so `save` and `open` agree on where the base lives.
-        let dir = &base_dir(dir);
+        let dir = &base_dir(dir)?;
         std::fs::create_dir_all(dir)?;
         write_graph_vmn(
             &dir.join(GRAPH_FILE),
@@ -1595,16 +1595,36 @@ const ATTR_FILE: &str = "attr.bin";
 /// (int8 calibrates a scale; TurboQuant is data-oblivious, seed-derived).
 const TIER_FILE: &str = "tier.kind";
 
-/// Read the persisted RW tier kind (`Int8` if the sidecar is absent).
-fn read_tier(dir: &Path) -> QuantKind {
-    match std::fs::read_to_string(dir.join(TIER_FILE)) {
-        Ok(s) => match s.trim() {
-            "tq1" => QuantKind::TurboQuant { bits: 1 },
-            "tq2" => QuantKind::TurboQuant { bits: 2 },
-            "tq4" => QuantKind::TurboQuant { bits: 4 },
-            _ => QuantKind::Int8,
-        },
-        Err(_) => QuantKind::Int8,
+/// Read the persisted RW tier kind.
+///
+/// An ABSENT sidecar means `Int8`: stores written before this file existed
+/// used it, and that default is what keeps them opening.
+///
+/// A sidecar that exists but names no known tier is an ERROR. It used to fall
+/// through to `Int8` as well, which reads a tq2 store with the wrong
+/// quantiser - not a crash, just every distance computed against codes it
+/// cannot interpret. "Absent" and "corrupt" are different states and only one
+/// of them has a safe default.
+fn read_tier(dir: &Path) -> io::Result<QuantKind> {
+    let path = dir.join(TIER_FILE);
+    let raw = match skeg_platform::read_small_file(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(QuantKind::Int8),
+        Err(e) => return Err(e),
+    };
+    match raw.trim() {
+        "tq1" => Ok(QuantKind::TurboQuant { bits: 1 }),
+        "tq2" => Ok(QuantKind::TurboQuant { bits: 2 }),
+        "tq4" => Ok(QuantKind::TurboQuant { bits: 4 }),
+        "int8" => Ok(QuantKind::Int8),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} names tier {other:?}, which this build does not know: \
+                 refusing to read the store with a different quantiser",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -1992,27 +2012,103 @@ pub fn run_vacuum_debt() -> f32 {
     })
 }
 
-/// The directory holding the LIVE base files for `dir`: `dir/gN` per the
-/// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
-fn base_dir(dir: &Path) -> std::path::PathBuf {
-    match std::fs::read_to_string(dir.join(CURRENT_FILE)) {
-        Ok(s) => dir.join(format!("g{}", s.trim())),
-        Err(_) => dir.to_path_buf(),
+/// Which generation slot holds the live base. There are exactly two, and
+/// `CURRENT` names one of them.
+///
+/// A type rather than a `u8` because this pointer had THREE readers that did
+/// not agree: `base_dir` interpolated the file's contents into a path without
+/// looking at them (so `../..` escaped the index directory), `current_slot`
+/// parsed and validated, and `install_base_generation` read an unparseable
+/// file as "legacy layout" and wrote slot 0 - while `base_dir` was pointing
+/// somewhere else entirely. A slot that can only be constructed by parsing
+/// makes that disagreement unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    G0,
+    G1,
+}
+
+impl Slot {
+    /// The slot an install writes into: never the live one. The whole point
+    /// of the two slots is that a fold never overwrites the base being served.
+    fn other(self) -> Self {
+        match self {
+            Self::G0 => Self::G1,
+            Self::G1 => Self::G0,
+        }
+    }
+
+    /// The subdirectory name, and the only place it is spelled.
+    fn dir_name(self) -> &'static str {
+        match self {
+            Self::G0 => "g0",
+            Self::G1 => "g1",
+        }
+    }
+
+    /// What goes in `CURRENT`. Unchanged from the original format.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::G0 => "0",
+            Self::G1 => "1",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "0" => Some(Self::G0),
+            "1" => Some(Self::G1),
+            _ => None,
+        }
     }
 }
 
-/// The current live slot (`Some(0|1)`), or `None` for a legacy flat layout.
-fn current_slot(dir: &Path) -> Option<u8> {
-    std::fs::read_to_string(dir.join(CURRENT_FILE))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.dir_name())
+    }
+}
+
+/// The live slot, or `None` for a legacy flat layout.
+///
+/// The ONE parser. `None` means the file is absent, which is a real and
+/// supported state: stores written before generation slots existed keep their
+/// base flat. A file that EXISTS but names no slot is an error - guessing
+/// which generation is live is how a store gets served from the half-written
+/// one.
+fn current_slot(dir: &Path) -> io::Result<Option<Slot>> {
+    let path = dir.join(CURRENT_FILE);
+    let raw = match skeg_platform::read_small_file(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Slot::parse(&raw).map(Some).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} names {raw:?}, which is not a generation slot: refusing to \
+                 guess which base is live",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// The directory holding the LIVE base files for `dir`: `dir/gN` per the
+/// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
+fn base_dir(dir: &Path) -> io::Result<std::path::PathBuf> {
+    Ok(match current_slot(dir)? {
+        Some(slot) => dir.join(slot.dir_name()),
+        None => dir.to_path_buf(),
+    })
 }
 
 /// Atomically point `CURRENT` at `slot`: write a temp file, fsync it, rename
 /// over `CURRENT`, fsync the directory so the rename is durable.
-fn set_current_slot(dir: &Path, slot: u8) -> io::Result<()> {
+fn set_current_slot(dir: &Path, slot: Slot) -> io::Result<()> {
     let tmp = dir.join("CURRENT.tmp");
-    std::fs::write(&tmp, slot.to_string())?;
+    std::fs::write(&tmp, slot.as_str())?;
     File::open(&tmp)?.sync_all()?;
     std::fs::rename(&tmp, dir.join(CURRENT_FILE))?;
     File::open(dir)?.sync_all()?;
@@ -2033,12 +2129,11 @@ fn install_base_generation(dir: &Path, built_tmp: &Path) -> io::Result<()> {
             File::open(&path)?.sync_all()?;
         }
     }
-    let old = current_slot(dir);
-    let next = match old {
-        Some(0) => 1u8,
-        _ => 0u8,
-    };
-    let slot_dir = dir.join(format!("g{next}"));
+    let old = current_slot(dir)?;
+    // Never the live slot: `other()` is the only way to name the target, so an
+    // install cannot overwrite the base that is being served.
+    let next = old.map_or(Slot::G0, Slot::other);
+    let slot_dir = dir.join(next.dir_name());
     let _ = std::fs::remove_dir_all(&slot_dir); // a torn prior attempt, if any
     std::fs::rename(built_tmp, &slot_dir)?;
     File::open(dir)?.sync_all()?;
@@ -2076,7 +2171,7 @@ fn open_segment(
     // graph.vmn
     // The live base files live in dir's current generation slot (or dir
     // itself for a legacy flat layout).
-    let bdir = base_dir(dir);
+    let bdir = base_dir(dir)?;
     let graph_bytes = std::fs::read(bdir.join(GRAPH_FILE))?;
     if graph_bytes.len() < HEADER_LEN
         || read_u32(&graph_bytes, 0) != GRAPH_MAGIC
@@ -3110,7 +3205,7 @@ impl DiskVamanaIndex {
     /// Panics if the two files disagree on `n` or `dim`.
     #[allow(clippy::cast_possible_truncation)] // row < n, and n was read as a u32
     pub fn open(dir: &Path) -> io::Result<DiskVamanaIndex> {
-        Self::open_with_tier(dir, read_tier(dir))
+        Self::open_with_tier(dir, read_tier(dir)?)
     }
 
     /// Like [`open`](Self::open) but with an explicit tier-1 quantisation:
@@ -3348,7 +3443,7 @@ impl DiskVamanaIndex {
             &g0.join(VECTORS_FILE),
             &InMemoryVectorSource::new(Vec::new(), dim),
         )?;
-        set_current_slot(dir, 0)?;
+        set_current_slot(dir, Slot::G0)?;
         write_framed_wal(&dir.join(DELTA_LOG_FILE), &[])?;
         DiskVamanaIndex::open(dir)
     }
@@ -5015,12 +5110,18 @@ impl DiskVamanaIndex {
                 out.push(format!("run-{seq}: missing the {RUN_OK_FILE} marker"));
             }
         }
-        // Generation pointer: CURRENT must name a slot that exists.
-        if let Some(slot) = current_slot(&self.dir) {
-            let g = self.dir.join(format!("g{slot}"));
-            if !g.join(GRAPH_FILE).exists() {
-                out.push(format!("CURRENT names g{slot}, which has no {GRAPH_FILE}"));
+        // Generation pointer: CURRENT must name a slot, and that slot must
+        // exist. A pointer that names nothing is REPORTED rather than
+        // returned as an error - this is the tool an operator reaches for
+        // precisely when a file is corrupt, so it has to survive reading one.
+        match current_slot(&self.dir) {
+            Ok(Some(slot)) => {
+                if !self.dir.join(slot.dir_name()).join(GRAPH_FILE).exists() {
+                    out.push(format!("CURRENT names {slot}, which has no {GRAPH_FILE}"));
+                }
             }
+            Ok(None) => {}
+            Err(e) => out.push(format!("CURRENT is unreadable: {e}")),
         }
         Ok(out)
     }
@@ -7377,13 +7478,136 @@ mod tests {
         );
 
         // 3. CURRENT pointing at a slot with no graph
-        let slot = current_slot(tmp.path()).expect("CURRENT");
-        std::fs::remove_file(tmp.path().join(format!("g{slot}")).join(GRAPH_FILE)).unwrap();
+        let slot = current_slot(tmp.path()).unwrap().expect("CURRENT");
+        std::fs::remove_file(tmp.path().join(slot.dir_name()).join(GRAPH_FILE)).unwrap();
         let broken = idx.check().unwrap();
         assert!(
             broken.iter().any(|p| p.contains("CURRENT names")),
             "bad CURRENT not caught: {broken:?}"
         );
+    }
+
+    #[test]
+    fn an_absent_tier_sidecar_is_the_legacy_default() {
+        // Stores written before the sidecar existed used int8, and that is the
+        // only reason a missing file gets a default at all.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(read_tier(tmp.path()).unwrap(), QuantKind::Int8);
+    }
+
+    #[test]
+    fn every_written_tier_reads_back_as_itself() {
+        // `tier_str` and `read_tier` are the two halves of one format. A round
+        // trip is what stops them drifting apart.
+        let tmp = tempfile::TempDir::new().unwrap();
+        for t in [
+            QuantKind::Int8,
+            QuantKind::TurboQuant { bits: 1 },
+            QuantKind::TurboQuant { bits: 2 },
+            QuantKind::TurboQuant { bits: 4 },
+        ] {
+            std::fs::write(tmp.path().join(TIER_FILE), tier_str(t)).unwrap();
+            assert_eq!(read_tier(tmp.path()).unwrap(), t, "round trip for {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_tier_sidecar_does_not_silently_become_int8() {
+        // The dangerous one. Falling through to int8 reads a tq2 store with
+        // the wrong quantiser: no crash, no warning, every distance computed
+        // against codes it cannot interpret.
+        let tmp = tempfile::TempDir::new().unwrap();
+        for bad in ["tq3", "", "  ", "TQ2", "int9", "\u{0}"] {
+            std::fs::write(tmp.path().join(TIER_FILE), bad).unwrap();
+            let Err(e) = read_tier(tmp.path()) else {
+                panic!("{bad:?} must not be read as a tier");
+            };
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "for {bad:?}");
+        }
+    }
+
+    // ---- CURRENT: one pointer, one parser ----
+    //
+    // `CURRENT` decides which generation of base files is live. It is the
+    // pivot the whole crash-safe swap turns on, and it used to be read by
+    // three functions that did not agree: `base_dir` interpolated its
+    // contents into a path without looking at them, `current_slot` parsed and
+    // validated, and `install_base_generation` treated "unparseable" as
+    // "legacy layout" and picked slot 0 - while `base_dir` was already
+    // pointing somewhere else entirely.
+
+    #[test]
+    fn a_missing_current_is_the_legacy_layout_not_an_error() {
+        // Stores written before generation slots existed have no CURRENT and
+        // keep their base files flat. They must still open.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(current_slot(tmp.path()).unwrap(), None);
+        assert_eq!(base_dir(tmp.path()).unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn current_round_trips_both_slots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for slot in [Slot::G0, Slot::G1] {
+            set_current_slot(tmp.path(), slot).unwrap();
+            assert_eq!(current_slot(tmp.path()).unwrap(), Some(slot));
+            assert_eq!(
+                base_dir(tmp.path()).unwrap(),
+                tmp.path().join(slot.dir_name())
+            );
+        }
+    }
+
+    #[test]
+    fn a_current_that_names_no_slot_is_an_error_not_a_guess() {
+        // The three readers disagreed here, which is the whole point: a file
+        // that exists but says nothing usable must not be silently read as
+        // "legacy", because a legacy layout means the base is somewhere else.
+        let tmp = tempfile::TempDir::new().unwrap();
+        for bad in ["", "  ", "2", "-1", "banana", "0 1", "99999999999999999999"] {
+            std::fs::write(tmp.path().join(CURRENT_FILE), bad).unwrap();
+            let Err(err) = current_slot(tmp.path()) else {
+                panic!("{bad:?} must not parse as a slot");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "for {bad:?}");
+            assert!(
+                base_dir(tmp.path()).is_err(),
+                "base_dir must refuse {bad:?} too"
+            );
+        }
+    }
+
+    #[test]
+    fn current_cannot_point_outside_the_index_directory() {
+        // `dir.join(format!("g{s}"))` with an unvalidated `s`: "g" plus
+        // "../../elsewhere" is `g../../elsewhere`, and the `..` after the
+        // literal `g..` component escapes. Requires write access to the file -
+        // the same threat model as a restored backup or a shared volume.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(CURRENT_FILE), "../../elsewhere").unwrap();
+        assert!(current_slot(tmp.path()).is_err());
+        assert!(base_dir(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn a_trailing_newline_is_still_a_slot() {
+        // What `set_current_slot` writes today has no newline, but an
+        // operator inspecting a store with `echo 1 > CURRENT` produces one,
+        // and that is not corruption.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(CURRENT_FILE), "1\n").unwrap();
+        assert_eq!(current_slot(tmp.path()).unwrap(), Some(Slot::G1));
+    }
+
+    #[test]
+    fn the_install_target_is_always_the_other_slot() {
+        // The swap writes the inactive slot and flips the pointer. If the
+        // "other" of a slot were ever itself, an install would overwrite the
+        // live base in place - which is the crash the slots exist to prevent.
+        assert_eq!(Slot::G0.other(), Slot::G1);
+        assert_eq!(Slot::G1.other(), Slot::G0);
+        assert_ne!(Slot::G0.other(), Slot::G0);
+        assert_ne!(Slot::G1.other(), Slot::G1);
     }
 
     /// Write a graph file with a deliberately corrupt node region and try to
@@ -7422,7 +7646,7 @@ mod tests {
             &InMemoryVectorSource::new(vecs, dim),
         )
         .unwrap();
-        set_current_slot(tmp.path(), 0).unwrap();
+        set_current_slot(tmp.path(), Slot::G0).unwrap();
         write_framed_wal(&tmp.path().join(DELTA_LOG_FILE), &[]).unwrap();
         // Patch a degree straight into the file when asked: no writer API
         // would produce it, which is exactly the point.
@@ -7692,7 +7916,7 @@ mod tests {
             &InMemoryVectorSource::new(vecs, dim),
         )
         .unwrap();
-        set_current_slot(tmp.path(), 0).unwrap();
+        set_current_slot(tmp.path(), Slot::G0).unwrap();
         write_framed_wal(&tmp.path().join(DELTA_LOG_FILE), &[]).unwrap();
 
         match DiskVamanaIndex::open_with_tier(tmp.path(), tier) {
@@ -7771,9 +7995,11 @@ mod tests {
         // Simulate a crash mid-swap: a half-built inactive slot exists, but
         // CURRENT still names the live one. `install`'s "remove a torn prior
         // attempt" clause and the untouched pointer must ignore it.
-        let live = current_slot(tmp.path()).expect("CURRENT written");
-        let dead = if live == 0 { 1u8 } else { 0u8 };
-        let dead_dir = tmp.path().join(format!("g{dead}"));
+        let live = current_slot(tmp.path()).unwrap().expect("CURRENT written");
+        // The other slot, named by the type rather than recomputed here - the
+        // same hand-rolled "if live == 0 { 1 } else { 0 }" the install path
+        // used to carry.
+        let dead_dir = tmp.path().join(live.other().dir_name());
         std::fs::create_dir_all(&dead_dir).unwrap();
         std::fs::write(dead_dir.join(GRAPH_FILE), b"garbage").unwrap();
 

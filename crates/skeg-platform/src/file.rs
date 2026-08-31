@@ -734,6 +734,52 @@ fn sync_durable_sync_inner(file: &File, size_fixed: bool) -> io::Result<()> {
     }
 }
 
+/// The most a small fixed-format sidecar is ever allowed to be.
+///
+/// `CURRENT` is one byte, `LAYOUT` is 44, the tier marker is a short word. A
+/// page is generous for all of them and small enough that a corrupt file
+/// cannot matter.
+pub const SMALL_FILE_MAX: u64 = 4096;
+
+/// Read a small sidecar file, reading at most [`SMALL_FILE_MAX`] bytes.
+///
+/// `std::fs::read` and `read_to_string` allocate the WHOLE file before the
+/// caller can look at its size, which makes the size of an allocation a
+/// property of a file on disk. That is fine for a graph or a WAL, whose size
+/// is the point; it is not fine for a pointer, a marker or a manifest, which
+/// have a fixed shape and whose callers all run at startup.
+///
+/// A file longer than the bound comes back truncated rather than as an error,
+/// on purpose: "this is not a valid record" is the parser's judgement to make
+/// and its message to give, not this function's.
+///
+/// # Errors
+///
+/// Returns an IO error if the file cannot be opened or read. `NotFound` is
+/// passed through, since an absent sidecar is usually a legitimate state.
+pub fn read_small_file(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    File::open(path)?
+        .take(SMALL_FILE_MAX)
+        .read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+/// [`read_small_file`] for a binary record: the same bound, no UTF-8.
+///
+/// # Errors
+///
+/// Returns an IO error if the file cannot be opened or read.
+pub fn read_small_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(64);
+    File::open(path)?
+        .take(SMALL_FILE_MAX)
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// fsync a directory so a newly created or renamed entry within it survives
 /// power loss. Syncing a *file* does not persist its directory entry on ext4
 /// (data=ordered) or APFS, so a segment created during rotation - or a

@@ -49,11 +49,6 @@ const KNOWN_FLAGS: u64 = 0;
 /// far below anything that hurts.
 pub const MAX_SHARDS: usize = 4096;
 
-/// The manifest is a fixed 44 bytes. Reading more than a little over that is
-/// pointless, and reading the whole file first - which `std::fs::read` does -
-/// makes the size of an allocation at startup a property of a file on disk.
-const MAX_READ: u64 = 4096;
-
 /// What the store declares about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutManifest {
@@ -77,19 +72,6 @@ pub enum OpenMode {
 
 fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
-}
-
-/// Read at most [`MAX_READ`] bytes, so the file cannot dictate the size of
-/// the allocation. A file larger than that is refused by the exact-length
-/// check downstream, which is where "not a manifest" belongs.
-fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
-    use io::Read;
-    let f = std::fs::File::open(path)?;
-    let mut buf = Vec::with_capacity(ENCODED_LEN);
-    // +1: reading one past the expected length is what lets the exact-length
-    // check below tell "44 bytes" from "44 bytes and then some".
-    f.take(MAX_READ).read_to_end(&mut buf)?;
-    Ok(buf)
 }
 
 /// A shard count that has been checked: non-zero, and within [`MAX_SHARDS`].
@@ -157,7 +139,7 @@ impl LayoutManifest {
     ///   entry as an absent shard.
     pub fn open_or_migrate(root: &Path, mode: OpenMode) -> io::Result<Self> {
         let path = root.join(FILE);
-        match read_bounded(&path) {
+        match skeg_platform::read_small_bytes(&path) {
             Ok(bytes) => {
                 let m = Self::decode(&bytes, root)?;
                 m.check_directories(root)?;
