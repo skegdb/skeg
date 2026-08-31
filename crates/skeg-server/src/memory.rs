@@ -175,10 +175,6 @@ impl MemoryGovernor {
         self.limit.map(|l| l.saturating_sub(self.reserve))
     }
 
-    pub fn limit_bytes(&self) -> Option<u64> {
-        self.limit
-    }
-
     pub fn current_bytes(&self) -> u64 {
         self.source.current_bytes()
     }

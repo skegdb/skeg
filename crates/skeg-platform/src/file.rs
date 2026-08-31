@@ -734,12 +734,13 @@ fn sync_durable_sync_inner(file: &File, size_fixed: bool) -> io::Result<()> {
     }
 }
 
-/// The most a small fixed-format sidecar is ever allowed to be.
+/// The most a small fixed-format sidecar is ever allowed to be. Private: the
+/// bound is this module's business, callers get the readers below.
 ///
 /// `CURRENT` is one byte, `LAYOUT` is 44, the tier marker is a short word. A
 /// page is generous for all of them and small enough that a corrupt file
 /// cannot matter.
-pub const SMALL_FILE_MAX: u64 = 4096;
+const SMALL_FILE_MAX: u64 = 4096;
 
 /// Read a small sidecar file, reading at most [`SMALL_FILE_MAX`] bytes.
 ///

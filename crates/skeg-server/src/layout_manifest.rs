@@ -82,7 +82,7 @@ fn invalid(msg: String) -> io::Error {
 /// two, exactly the rule-in-two-places shape behind every P0 in this engine.
 /// The value cannot be built except through [`ShardCount::checked`], so
 /// forgetting it is a compile error rather than something review has to catch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardCount(NonZeroUsize);
 
 impl ShardCount {
@@ -118,10 +118,6 @@ impl LayoutManifest {
 
     pub fn store_uuid(&self) -> [u8; 16] {
         self.store_uuid
-    }
-
-    pub fn format_version(&self) -> u32 {
-        self.format_version
     }
 
     /// Open the store's declared layout, migrating a legacy one if the mode
