@@ -1963,7 +1963,24 @@ const RUN_DEBT_FALLBACK: f32 = 0.25;
 /// Below two runs a merge has nothing to combine, but a lone run holding
 /// several times the live count is pure ballast: it costs disk, it costs the
 /// fallback scan that reads it, and nothing else will ever clean it.
-const RUN_VACUUM_DEBT: f32 = 1.0;
+///
+/// NOTE what this number is: the vacuum runs until the debt falls under it
+/// and then stops, so THE THRESHOLD IS THE RESTING DEBT. At 1.0 a 100k index
+/// carries 100k dead rows on disk - storage doubled - which is a price, not
+/// a detail. Lower it and the resting debt falls with it, paid for in
+/// rewrites. `SKEG_VACUUM_DEBT` exists so the choice can be made from a
+/// measurement of that trade rather than from the round number this started
+/// as.
+pub fn run_vacuum_debt() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SKEG_VACUUM_DEBT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&x: &f32| x > 0.0)
+            .unwrap_or(1.0)
+    })
+}
 
 /// The directory holding the LIVE base files for `dir`: `dir/gN` per the
 /// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
@@ -4979,7 +4996,7 @@ impl DiskVamanaIndex {
         // rest after churn, runs held three times the live count and no
         // further merge ever fired, because the trigger counts runs and the
         // problem was mass.
-        if n_merged == 0 || (n_merged < 2 && self.run_debt_ratio() < RUN_VACUUM_DEBT) {
+        if n_merged == 0 || (n_merged < 2 && self.run_debt_ratio() < run_vacuum_debt()) {
             return Ok(None);
         }
         // Newer runs win on a re-inserted id: fold the front runs newest-first.

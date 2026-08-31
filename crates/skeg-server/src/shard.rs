@@ -1460,7 +1460,8 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     // merge ever firing again, because one run is not "four runs" however
     // much garbage it holds.
     let debt = arc.read().backend.run_debt_ratio();
-    let merge_due = runs >= RUNS_MERGE_TRIGGER || (runs >= 1 && debt >= 1.0);
+    let merge_due =
+        runs >= RUNS_MERGE_TRIGGER || (runs >= 1 && debt >= skeg_vector::run_vacuum_debt());
     let starved = arc.read().flush_streak.load(Ordering::Relaxed) >= 1;
     if merge_due && (!flush_due || starved) {
         let d = vdir.to_path_buf();
