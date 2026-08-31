@@ -62,12 +62,6 @@ const FLUSH_ROWS: usize = 4096;
 /// takes only two short locks around an off-thread build.
 const RUNS_MERGE_TRIGGER: usize = 4;
 
-/// Run count at which a merge OUTRANKS the flush. Above this the search is
-/// paying for the run count (each run is walked with a short beam), so
-/// letting the flush keep winning the tick trades recall for a delta that is
-/// already being written to disk anyway. Twice the normal trigger: the
-/// ordinary regime still flushes first.
-const RUNS_MERGE_STARVATION: usize = RUNS_MERGE_TRIGGER * 2;
 
 /// Reclaim dead base rows in place (delete-patch, O(deleted)) once tombstones
 /// reach base/this (~6%): frequent enough to stay in delete-patch's cheap
@@ -514,7 +508,6 @@ const ERASE_CONCURRENCY: usize = 256;
 /// one stream per shard and this multiplies that. Past the point where the
 /// queue is full, more requests only add latency to each.
 const PAYLOAD_READ_CONCURRENCY: usize = 32;
-
 
 /// Route a key to a shard index.
 #[must_use]
@@ -6948,7 +6941,6 @@ mod tests {
             "runs reached {worst_runs}: the flush starved the merge again"
         );
     }
-
 
     #[tokio::test]
     async fn maintenance_tick_prefers_flush_then_consolidate() {
