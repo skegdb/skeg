@@ -78,16 +78,25 @@ grammar are in [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Why skeg
 
-**Recall 1.000, without the corpus in RAM.** A quantized proxy walks the graph
-and the shortlist is re-ranked from disk at full precision, so the ranking is
-exact where it decides the answer while memory tracks the working set rather
-than the corpus. That is what puts a vector store where it did not fit: many
+**Recall at the top of the field, without the corpus in RAM.** A quantized
+proxy walks the graph and the shortlist is re-ranked from disk at full
+precision, so the ranking is exact where it decides the answer while memory
+tracks the working set rather than the corpus. Measured on real embeddings:
+r@10 and r@100 at or above 0.993 from 100k to 400k across the tq2, tq1 and
+int8 tiers, and 1.0000 on filtered search over eleven label shapes. A
+semantically resharded set trades a little of that for locality - 0.988 at the
+production beam - which is a real number and stated as one. That is what puts a vector store where it did not fit: many
 tenants on one machine, or a RAG index beside the model answering from it.
 
 - **Tenants that cannot leak into each other.** One index per tenant, so a query
   has no physical path to another tenant's vectors. Not a filter someone has to
   remember to apply. See [Multi-tenancy](#multi-tenancy).
-- **Filters that hold up as the corpus grows.** Payloads on the vectors, a
+- **Filters that stay exact as the corpus grows.** The match set is scored
+  exactly rather than navigated approximately, so recall does not depend on a
+  filter-aware graph: measured 1.0000 across eleven shapes including AND
+  intersections. The cost is latency proportional to the match set, which the
+  IVF route caps by scoring a shortlist instead - it does not remove the cost
+  of materialising the match set itself. Payloads on the vectors, a
   grammar with ranges, sets and boolean composition, and a planner that reads
   the size of the match set and picks the cheapest correct strategy. Work scales
   with the shortlist, not with the number of matches.
@@ -110,7 +119,9 @@ at its default configuration, LanceDB tuned to recall 1.0:
 
 The same latency band as the fastest servers there, at a fraction of the memory.
 Which is what makes co-residency work: a 3B LLM answering RAG over 1M vectors,
-both on one M1 Pro (16 GiB), index on SSD, resident set flat.
+both on one M1 Pro (16 GiB), index on SSD, with the resident set flat under
+read traffic. Under sustained WRITE churn it is not flat: the delta and the
+runs are memory, and the figures below are read-side.
 
 | Co-resident, 1M vectors | backend RSS p50 | backend RSS max |
 | --- | ---: | ---: |
