@@ -10,7 +10,7 @@ pub mod durability;
 pub mod file;
 pub mod lock;
 mod process;
-pub use process::{cpu_seconds, rss_bytes};
+pub use process::{cpu_seconds, fd_limit, open_fd_count, raise_fd_limit, rss_bytes};
 pub mod uring;
 
 pub use affinity::{QosClass, current_thread_qos, pin_current_thread_to_performance_core};

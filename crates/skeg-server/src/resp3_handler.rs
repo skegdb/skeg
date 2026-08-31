@@ -1593,13 +1593,23 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
             // Self-reported process cost, Prometheus-standard names: the
             // engine says what it uses instead of every operator deriving it
             // from ps. CPU is cumulative; consumers take window deltas.
+            // Descriptors: one per vlog segment and per vindex segment file,
+            // so an operator needs to see headroom BEFORE "too many open
+            // files" turns into a failed open.
+            let (fd_soft, _fd_hard) = skeg_platform::fd_limit();
+            let fd_open = skeg_platform::open_fd_count();
             let process = format!(
                 "# TYPE process_resident_memory_bytes gauge\n\
                  process_resident_memory_bytes {}\n\
                  # TYPE process_cpu_seconds_total counter\n\
-                 process_cpu_seconds_total {:.3}\n",
+                 process_cpu_seconds_total {:.3}\n\
+                 # TYPE process_max_fds gauge\n\
+                 process_max_fds {fd_soft}\n{}",
                 skeg_platform::rss_bytes(),
                 skeg_platform::cpu_seconds(),
+                fd_open.map_or(String::new(), |n| format!(
+                    "# TYPE process_open_fds gauge\nprocess_open_fds {n}\n"
+                )),
             );
             let body = format!(
                 "{cache_line}\n\n{process}\n{}",

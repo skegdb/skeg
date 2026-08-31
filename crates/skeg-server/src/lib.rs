@@ -269,10 +269,30 @@ impl Server {
             shards,
             tenant_backend,
         } = self;
+        // Descriptor headroom, the way every production database handles it:
+        // the default soft limit is a shell convention (256 on macOS, 1024 on
+        // many Linux distros), not a capacity decision, and this engine holds
+        // one descriptor per vlog segment and per vindex segment file. Raise
+        // it toward the hard limit at boot; a refusal is logged, not hidden,
+        // so an operator can raise the hard limit themselves.
+        let want_fds = std::env::var("SKEG_MAX_FDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(65_536);
+        let fds = skeg_platform::raise_fd_limit(want_fds);
+        if fds < want_fds {
+            tracing::warn!(
+                soft = fds,
+                wanted = want_fds,
+                "file-descriptor limit below the target; raise the hard limit \
+                 (ulimit -n) if the store grows past a few hundred segments"
+            );
+        }
         info!(
             addr = ?listener.local_addr()?,
             n_shards = shards.n_shards(),
             tenant = tenant_backend.is_some(),
+            max_fds = fds,
             "server listening (RESP3)"
         );
         // Bound concurrent connections: each can buffer up to the frame
