@@ -54,6 +54,14 @@ pub struct Server {
 }
 
 impl Server {
+    /// The shard set this server serves from. Exists so a test can assert
+    /// what a SERVE-mode bind actually opened - the shard-count bug lived in
+    /// the bind, so a test that never crosses the bind cannot catch it.
+    #[must_use]
+    pub fn shards(&self) -> &ShardSet {
+        &self.shards
+    }
+
     /// Bind the server to `addr` with data sharded under `data_dir`.
     ///
     /// The shard count equals the number of performance cores.
@@ -206,7 +214,10 @@ impl Server {
                 // The count comes from the DATA, never from a constant: this
                 // used to be a hardcoded 1, so a read-only replica of an
                 // eight-shard set silently served an eighth of it.
-                let n = ShardSet::discover_shard_count(data_dir).max(1);
+                // No `.max(1)`: an empty directory is not a one-shard
+                // replica. A layout that cannot be established is a refusal
+                // to start, not a guess.
+                let n = ShardSet::discover_shard_count(data_dir)?.get();
                 tracing::info!("serve mode: {n} shard(s) discovered on disk");
                 ShardSet::open_mode_full_mmap(
                     data_dir, n, true, tier, workers, mmap_tier, mmap_graph,

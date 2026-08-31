@@ -1936,21 +1936,22 @@ const CURRENT_FILE: &str = "CURRENT";
 /// Marker inside a run dir: this run is an L0 flat run (no graph).
 const FLAT_MARKER: &str = "flat";
 
-/// Run count at which SEARCH stops trusting the short beam on run segments
-/// and scans them exactly on the proxy instead.
+/// Fraction of the LIVE set sitting in run segments at which SEARCH stops
+/// trusting the short beam on them and scans them exactly on the proxy.
 ///
 /// Runs are walked with a deliberately short beam so latency stays flat as
-/// they accumulate. That holds while maintenance keeps the count low - and
-/// when maintenance falls behind it stops holding badly: the churn gate
-/// measured recall dropping from 0.9925 to 0.7180 as the live set moved into
-/// 33 short-beam run graphs. Above this ceiling the engine must degrade in
-/// LATENCY, not silently in recall, so run segments switch to a full proxy
-/// scan: exact with respect to the proxy (the re-rank keeps its own budget),
-/// which removes precisely the misses the beam was causing.
+/// they accumulate. That assumption holds while runs are a small tail of the
+/// index - and it fails badly when they are not: the churn gate measured
+/// recall dropping from 0.9925 to 0.7180 as the live set migrated into run
+/// graphs.
 ///
-/// Mirrors the server's runs-merge starvation ceiling; the two crates cannot
-/// share a constant, so a change here belongs with a change there.
-const RUN_SCAN_FALLBACK: usize = 8;
+/// The trigger is MASS, not count. A count cannot see the case that matters:
+/// one merged run holding 40k of 60k live rows is a single run - "healthy" by
+/// any count - with two thirds of the corpus behind a beam of 40. Above this
+/// share, run segments switch to a full proxy scan: exact with respect to the
+/// proxy (the re-rank keeps its own budget), which removes precisely the
+/// misses the beam was causing, and pays in latency instead of in recall.
+const RUN_MASS_FALLBACK: f32 = 0.25;
 
 /// `SKEG_L0_FLAT_MAX=<rows>`: a flush of at most this many rows writes an L0
 /// flat run (vectors + tier, no graph build) and search scans it exactly with
@@ -4121,9 +4122,10 @@ impl DiskVamanaIndex {
                 seg.nodes[id as usize].slice().iter().copied().collect()
             };
             let mut cand: Vec<(f32, VecId)> = Vec::new();
-            // Above the run ceiling a graphed run is scanned, not walked:
-            // maintenance is behind and the short beam is losing rows.
-            let debt_fallback = seg_idx > 0 && self.runs.len() >= RUN_SCAN_FALLBACK;
+            // Once the runs hold a large SHARE of the live set, a graphed run
+            // is scanned, not walked: maintenance is behind and the short beam
+            // is losing rows that the index really holds.
+            let debt_fallback = seg_idx > 0 && self.run_mass() >= RUN_MASS_FALLBACK;
             if debt_fallback {
                 skeg_telemetry::tick_counter(skeg_telemetry::Counter::RunScanFallback);
             }
@@ -4808,6 +4810,28 @@ impl DiskVamanaIndex {
         self.ivf = None;
         self.replay_wal_ops(suffix_ops);
         Ok(())
+    }
+
+    /// Share of the live set that sits in run segments (0.0 when there are
+    /// none). The number that decides whether the short beam on runs is still
+    /// a safe assumption - a run COUNT cannot, because one merged run can
+    /// hold most of the index.
+    #[must_use]
+    pub fn run_mass(&self) -> f32 {
+        let run_rows: usize = self.runs.iter().map(|r| r.main_n as usize).sum();
+        if run_rows == 0 {
+            return 0.0;
+        }
+        let live = self.live_count.max(1);
+        (run_rows as f32 / live as f32).min(1.0)
+    }
+
+    /// Rows in the largest single run: a merge can cut the COUNT while
+    /// leaving one enormous segment behind, which reads as healthy and is
+    /// not.
+    #[must_use]
+    pub fn max_run_rows(&self) -> usize {
+        self.runs.iter().map(|r| r.main_n as usize).max().unwrap_or(0)
     }
 
     /// Verify this index's on-disk and in-RAM invariants and report every

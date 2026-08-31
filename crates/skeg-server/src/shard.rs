@@ -12,6 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread::JoinHandle;
@@ -1604,7 +1605,39 @@ where
     T: Send + 'static,
     B: Send + 'static,
 {
-    // The permit comes FIRST, before the snapshot. `begin` is not free -
+    // The PER-VINDEX heavy gate comes FIRST, the global budget second.
+    //
+    // The other order wastes the scarcer resource: a second job on the same
+    // index would take a global permit and then park on the local gate,
+    // holding a machine-wide permit away from every OTHER index while doing
+    // nothing. Taking the local gate first means a permit is only ever held
+    // by a job that can proceed. Safe now that the flush is explicitly
+    // exempt from both.
+    //
+    // Cloned under a brief read lock and acquired holding nothing.
+    let heavy_sem = if is_budgeted(label) {
+        Some(Arc::clone(&arc.read().heavy))
+    } else {
+        None
+    };
+    let _heavy = match heavy_sem {
+        Some(s) if wait_for_budget => Some(
+            s.acquire_owned()
+                .await
+                .expect("per-vindex heavy semaphore is never closed"),
+        ),
+        Some(s) => match s.try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                // Another heavy job owns this vindex. Same contract as a busy
+                // global budget: do not consume the tick, let the flush run.
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceBudgetSkips);
+                return Ok(MaintenanceOutcome::BudgetBusy);
+            }
+        },
+        None => None,
+    };
+    // Then the global budget - still before the snapshot. `begin` is not free -
     // a runs-merge dups file descriptors, builds the survivor map and bumps
     // run_seq - and taking the permit afterwards meant throwing all of that
     // away, descriptors and sequence gap included, whenever the budget
@@ -1630,31 +1663,6 @@ where
         }
     } else {
         None
-    };
-    // Then the PER-VINDEX heavy gate, in that order: global budget first (it
-    // protects the machine), this one second (it protects the index). Cloned
-    // under a brief read lock and acquired holding nothing.
-    let heavy_sem = if is_budgeted(label) {
-        Some(Arc::clone(&arc.read().heavy))
-    } else {
-        None
-    };
-    let _heavy = match heavy_sem {
-        Some(s) if wait_for_budget => Some(
-            s.acquire_owned()
-                .await
-                .expect("per-vindex heavy semaphore is never closed"),
-        ),
-        Some(s) => match s.try_acquire_owned() {
-            Ok(p) => Some(p),
-            Err(_) => {
-                // Another heavy job owns this vindex. Same contract as a busy
-                // global budget: do not consume the tick, let the flush run.
-                skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceBudgetSkips);
-                return Ok(MaintenanceOutcome::BudgetBusy);
-            }
-        },
-        None => None,
     };
     // Short lock: snapshot only, no O(live) reads and no graph build.
     let job = {
@@ -3086,37 +3094,69 @@ pub struct ShardSet {
 
 impl ShardSet {
     /// Open `n_shards` read-write shards, each storing into
-    /// How many shards this directory was WRITTEN with, discovered by
-    /// counting `shard-N` directories (0 when the set is new).
+    /// How many shards this directory was WRITTEN with, or an error.
     ///
     /// Opening with the wrong count is silent and total: a set written with
     /// eight shards, opened with one, serves exactly the rows that landed in
     /// shard 0 - an eighth of the index - and answers every query with
     /// complete confidence. Read-only serve mode hardcoded 1 and did exactly
-    /// that. Discovery, not assumption.
-    #[must_use]
-    pub fn discover_shard_count(base_dir: &Path) -> usize {
-        let Ok(entries) = std::fs::read_dir(base_dir) else {
-            return 0;
-        };
-        let mut highest = 0usize;
-        let mut found = 0usize;
-        for e in entries.flatten() {
+    /// that.
+    ///
+    /// So this is FAIL-CLOSED. A replica that cannot establish the layout
+    /// must refuse to start, not guess and serve a fraction:
+    /// - no `shard-N` directory at all -> `NotFound` (an empty directory is
+    ///   not a one-shard replica, and treating it as one is how "healthy"
+    ///   gets printed over nothing);
+    /// - a gap in the numbering (`shard-0`, `shard-2`) -> `InvalidData`.
+    ///   Deducing "the highest id plus one" here would serve around a hole,
+    ///   which is the very failure this function exists to prevent.
+    ///
+    /// A persistent manifest carrying a version and the shard count is the
+    /// real answer; this scan is the migration path for sets written before
+    /// one exists.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when no shard directory exists, `InvalidData` when the
+    /// numbering is not contiguous from zero.
+    pub fn discover_shard_count(base_dir: &Path) -> std::io::Result<NonZeroUsize> {
+        let mut ids: Vec<usize> = Vec::new();
+        for e in std::fs::read_dir(base_dir)?.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
             if let Some(rest) = name.strip_prefix("shard-")
                 && let Ok(id) = rest.parse::<usize>()
                 && e.path().is_dir()
             {
-                found += 1;
-                highest = highest.max(id + 1);
+                ids.push(id);
             }
         }
-        // Trust the highest id, not the count: a gap would mean a missing
-        // shard, and serving around a hole is exactly the failure this
-        // function exists to stop.
-        debug_assert_eq!(found, highest, "shard directory numbering has a gap");
-        highest
+        ids.sort_unstable();
+        ids.dedup();
+        let Some(&highest) = ids.last() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no shard-N directory under {}: refusing to serve an \
+                     unknown layout",
+                    base_dir.display()
+                ),
+            ));
+        };
+        if ids.len() != highest + 1 || ids[0] != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "shard directories under {} are not contiguous from 0 \
+                     (found {:?}): refusing to serve around a hole",
+                    base_dir.display(),
+                    ids
+                ),
+            ));
+        }
+        NonZeroUsize::new(highest + 1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no shards")
+        })
     }
 
     /// `base_dir/shard-{id}/`.
@@ -3738,11 +3778,13 @@ impl ShardSet {
     /// Deliberately separate from [`check`](Self::check), which certifies
     /// INTEGRITY. The churn gate produced an index whose every structure was
     /// intact - CHECK said OK on all ten rounds - while its recall fell from
-    /// 0.9925 to 0.7180 because runs piled up faster than they merged. An
+    /// 0.9925 to 0.7180 because the live set migrated into run segments. An
     /// operator needs to see that coming, and no integrity check ever will.
     ///
-    /// `runs < 4` OK, `4..8` DEGRADED, `>= 8` CRITICAL (search has switched
-    /// run segments to a proxy scan: correct, and slower).
+    /// Graded on MASS, not on run count: one merged run holding most of the
+    /// index is a single run - healthy by any count - with the majority of
+    /// the corpus behind a short beam. `run_mass` is the share of live rows
+    /// sitting in runs.
     ///
     /// # Errors
     ///
@@ -3750,8 +3792,11 @@ impl ShardSet {
     pub async fn health(&self, name: &str) -> Result<Vec<String>, ShardError> {
         validate_vindex_name(name)?;
         let mut out = Vec::new();
-        let (mut worst, mut worst_shard) = (0usize, 0usize);
-        let (mut tot_runs, mut tot_delta, mut tot_run_rows) = (0u64, 0u64, 0u64);
+        let (mut worst_runs, mut worst_shard) = (0usize, 0usize);
+        let (mut worst_mass, mut worst_mass_shard) = (0.0f32, 0usize);
+        let (mut tot_runs, mut tot_delta, mut tot_run_rows, mut tot_live) = (0u64, 0u64, 0u64, 0u64);
+        let mut max_run_rows = 0u64;
+        let mut present: Vec<usize> = Vec::new();
         for shard in 0..self.inner.n {
             let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await? else {
                 return Err(ShardError::Unavailable);
@@ -3759,40 +3804,72 @@ impl ShardSet {
             let Some(row) = rows.iter().find(|r| r.name == name) else {
                 continue;
             };
+            present.push(shard);
             let runs = usize::try_from(row.runs).unwrap_or(usize::MAX);
-            if runs > worst {
-                worst = runs;
+            if runs > worst_runs {
+                worst_runs = runs;
                 worst_shard = shard;
             }
+            let live = row.n_vectors.max(1);
+            let mass = row.run_rows as f32 / live as f32;
+            if mass > worst_mass {
+                worst_mass = mass;
+                worst_mass_shard = shard;
+            }
+            max_run_rows = max_run_rows.max(row.run_rows);
             tot_runs += row.runs;
             tot_delta += row.delta;
             tot_run_rows += row.run_rows;
+            tot_live += row.n_vectors;
         }
-        let state = if worst >= 8 {
+        // An index absent everywhere is not healthy - it is missing. Saying
+        // OK over nothing is exactly the class of lie this command exists to
+        // stop telling.
+        if present.is_empty() {
+            return Err(ShardError::Storage(format!("no such vindex '{name}'")));
+        }
+        let state = if worst_mass >= 0.25 {
             "CRITICAL"
-        } else if worst >= 4 {
+        } else if worst_mass >= 0.10 || worst_runs >= 4 {
             "DEGRADED"
         } else {
             "OK"
         };
         out.push(format!("state {state}"));
-        out.push(format!("worst_runs {worst} shard {worst_shard}"));
+        if present.len() != self.inner.n {
+            out.push(format!(
+                "PARTIAL present on {} of {} shards",
+                present.len(),
+                self.inner.n
+            ));
+        }
+        out.push(format!("run_mass {worst_mass:.3} shard {worst_mass_shard}"));
+        out.push(format!("worst_runs {worst_runs} shard {worst_shard}"));
+        out.push(format!("max_run_rows {max_run_rows}"));
         out.push(format!("runs_total {tot_runs}"));
         out.push(format!("run_rows_total {tot_run_rows}"));
-        out.push(format!("delta_rows_total {tot_delta}"));
         out.push(format!(
-            "budget_skips {}",
+            "delta_mass {:.3}",
+            tot_delta as f32 / tot_live.max(1) as f32
+        ));
+        out.push(format!("delta_rows_total {tot_delta}"));
+        out.push(format!("live_rows_total {tot_live}"));
+        // Process-wide, NOT per index: named so nobody reads them as this
+        // vindex's own.
+        out.push(format!(
+            "process_budget_skips_total {}",
             skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceBudgetSkips)
         ));
         out.push(format!(
-            "run_scan_fallback {}",
+            "process_run_scan_fallback_total {}",
             skeg_telemetry::counter_value(skeg_telemetry::Counter::RunScanFallback)
         ));
         out.push(format!(
             "reason {}",
             match state {
-                "CRITICAL" => "runs past the ceiling: search scans run segments instead of walking them; maintenance is behind",
-                "DEGRADED" => "runs above the merge trigger: a merge is due",
+                "CRITICAL" =>
+                    "a quarter or more of the live rows sit in run segments: search scans them instead of walking, and maintenance is behind",
+                "DEGRADED" => "runs are accumulating: a merge is due",
                 _ => "maintenance is keeping up",
             }
         ));
@@ -6804,13 +6881,13 @@ mod tests {
             }
         }
         assert_eq!(
-            ShardSet::discover_shard_count(dir.path()),
+            ShardSet::discover_shard_count(dir.path()).unwrap().get(),
             8,
             "an eight-shard set must be discovered as eight"
         );
         // Reopening with the discovered count sees every row; the old
         // hardcoded 1 would see roughly an eighth of them.
-        let n = ShardSet::discover_shard_count(dir.path());
+        let n = ShardSet::discover_shard_count(dir.path()).unwrap().get();
         let re = ShardSet::open_mode_with_workers(
             dir.path(),
             n,
@@ -6822,7 +6899,11 @@ mod tests {
         let rows = re.vindex_list().await.unwrap();
         let total: u64 = rows.iter().filter(|r| r.name == "sd").map(|r| r.n_vectors).sum();
         assert_eq!(total, 800, "reopen lost rows: saw {total} of 800");
-        assert_eq!(ShardSet::discover_shard_count(&dir.path().join("nope")), 0);
+        // Fail-closed: an absent or holed layout is an ERROR, never a guess.
+        assert!(ShardSet::discover_shard_count(&dir.path().join("nope")).is_err());
+        std::fs::remove_dir_all(dir.path().join("shard-3")).unwrap();
+        let holed = ShardSet::discover_shard_count(dir.path());
+        assert!(holed.is_err(), "a gap in the numbering must not be served around");
     }
 
     /// Two heavy jobs must not run on the same vindex at once. The engine's
