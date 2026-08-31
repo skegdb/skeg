@@ -590,6 +590,8 @@ enum ShardReq {
     VindexList,
     /// Integrity report for one vindex (the operator's fsck).
     VindexCheck { name: String },
+    /// Does this vindex still want an IVF router? (contract probe)
+    WantsIvf { name: String },
     /// Fold a disk vindex's streaming delta into its graph on this shard.
     /// Write the vlog snapshot and a payload index per vindex, both stamped
     /// with the same log position. Normally the background task's job; exposed
@@ -2076,6 +2078,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::VindexCreate { .. }
         | ShardReq::VindexList
         | ShardReq::VindexCheck { .. }
+        | ShardReq::WantsIvf { .. }
         | ShardReq::VindexDrop { .. }
         | ShardReq::VindexConsolidate { .. }
         | ShardReq::SnapshotAndPayloadIndexes
@@ -2268,6 +2271,13 @@ async fn process(
                 Err(e) => ShardResp::Err(e),
             }
         }
+        ShardReq::WantsIvf { name } => {
+            let vs = vindexes.read();
+            match vs.get(&name) {
+                Some(entry) => ShardResp::Count(u64::from(entry.read().backend.wants_ivf())),
+                None => ShardResp::Count(0),
+            }
+        }
         ShardReq::VindexCheck { name } => {
             let vs = vindexes.read();
             let Some(entry) = vs.get(&name) else {
@@ -2336,7 +2346,29 @@ async fn process(
                     )
                     .await
                     {
-                        Ok(_) => ShardResp::Done,
+                        Ok(_) => {
+                            // Same lesson as the comment above, in a different
+                            // field: the maintenance path rebuilds the IVF
+                            // router after a consolidate and the explicit
+                            // command did not. An index consolidated by hand
+                            // (an operator, a bulk load) was then left with NO
+                            // router, so every filtered search fell back to
+                            // scanning the whole match set - measured: 19,976
+                            // rows scored per shard on a 160k match set, i.e.
+                            // all of it. Rebuild it here too.
+                            if arc.read().backend.wants_ivf() {
+                                let _ = try_off_thread_maintenance(
+                                    &arc,
+                                    "ivf",
+                                    true,
+                                    |b| b.ivf_begin(),
+                                    |job| job.build(),
+                                    |b, built| b.ivf_finish(built),
+                                )
+                                .await;
+                            }
+                            ShardResp::Done
+                        }
                         Err(e) => ShardResp::Err(e),
                     }
                 }
@@ -6958,6 +6990,42 @@ mod tests {
                 "probe=2 must match full fan-out for cluster query {probe_q}"
             );
         }
+    }
+
+    /// An explicit CONSOLIDATE must leave the index in the SAME state the
+    /// maintenance ladder would: router included. Without it a hand-consolidated
+    /// index scans the entire match set on every filtered search.
+    #[tokio::test]
+    async fn explicit_consolidate_rebuilds_the_ivf_router() {
+        let dir = TempDir::new().unwrap();
+        // One shard, so the per-shard base clears the router's size floor.
+        let shards = ShardSet::open_mode_with_workers(
+            dir.path(),
+            1,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        shards.vindex_create("iv", 8, 4, 1).await.unwrap();
+        // wants_ivf() has a 50k floor; below it no router is wanted and the
+        // exact scan is already the cheap answer. Assert the CONTRACT rather
+        // than build 50k rows here: after a consolidate, an index that wants
+        // a router has one.
+        for id in 0..2000u64 {
+            let mut v = vec![0.05f32; 8];
+            v[(id % 4) as usize] = 1.0;
+            shards.vset("iv", id, v, 0, None, None).await.unwrap();
+        }
+        shards.vindex_consolidate("iv").await.unwrap();
+        let wants = match shards.call(0, ShardReq::WantsIvf { name: "iv".into() }).await {
+            Ok(ShardResp::Count(n)) => n == 1,
+            _ => false,
+        };
+        assert!(
+            !wants,
+            "after an explicit consolidate no index should still WANT a router"
+        );
     }
 
     /// A healthy index checks clean through the coordinator, including the
