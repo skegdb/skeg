@@ -334,10 +334,13 @@ pub enum Counter {
     /// Filtered search, phase 2: the IVF router bucketing the rows it was
     /// handed and picking the shortlist. Also O(|S|).
     VsearchHybridRouteNanos = 38,
+    /// Run segments scanned instead of walked because the run count is over
+    /// the ceiling: the visible symptom of maintenance falling behind.
+    RunScanFallback = 39,
 }
 
 impl Counter {
-    pub const COUNT: usize = 39;
+    pub const COUNT: usize = 40;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -378,6 +381,7 @@ impl Counter {
         Counter::VsearchInner,
         Counter::VsearchHybridMapNanos,
         Counter::VsearchHybridRouteNanos,
+        Counter::RunScanFallback,
     ];
 
     #[inline]
@@ -422,6 +426,7 @@ impl Counter {
             Counter::VsearchInner => "skeg_vsearch_inner_total",
             Counter::VsearchHybridMapNanos => "skeg_vsearch_hybrid_map_nanos_total",
             Counter::VsearchHybridRouteNanos => "skeg_vsearch_hybrid_route_nanos_total",
+            Counter::RunScanFallback => "skeg_run_scan_fallback_total",
         }
     }
 }

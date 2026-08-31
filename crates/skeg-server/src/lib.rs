@@ -202,7 +202,16 @@ impl Server {
         // and the first query blocks until `run()` starts, a phantom ~8s stall
         // at 500k. Bind-after-open makes `wait_tcp` mean "ready".
         let shards =
-            ShardSet::open_mode_full_mmap(data_dir, 1, true, tier, workers, mmap_tier, mmap_graph)?;
+            {
+                // The count comes from the DATA, never from a constant: this
+                // used to be a hardcoded 1, so a read-only replica of an
+                // eight-shard set silently served an eighth of it.
+                let n = ShardSet::discover_shard_count(data_dir).max(1);
+                tracing::info!("serve mode: {n} shard(s) discovered on disk");
+                ShardSet::open_mode_full_mmap(
+                    data_dir, n, true, tier, workers, mmap_tier, mmap_graph,
+                )?
+            };
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,

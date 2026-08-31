@@ -1936,6 +1936,22 @@ const CURRENT_FILE: &str = "CURRENT";
 /// Marker inside a run dir: this run is an L0 flat run (no graph).
 const FLAT_MARKER: &str = "flat";
 
+/// Run count at which SEARCH stops trusting the short beam on run segments
+/// and scans them exactly on the proxy instead.
+///
+/// Runs are walked with a deliberately short beam so latency stays flat as
+/// they accumulate. That holds while maintenance keeps the count low - and
+/// when maintenance falls behind it stops holding badly: the churn gate
+/// measured recall dropping from 0.9925 to 0.7180 as the live set moved into
+/// 33 short-beam run graphs. Above this ceiling the engine must degrade in
+/// LATENCY, not silently in recall, so run segments switch to a full proxy
+/// scan: exact with respect to the proxy (the re-rank keeps its own budget),
+/// which removes precisely the misses the beam was causing.
+///
+/// Mirrors the server's runs-merge starvation ceiling; the two crates cannot
+/// share a constant, so a change here belongs with a change there.
+const RUN_SCAN_FALLBACK: usize = 8;
+
 /// `SKEG_L0_FLAT_MAX=<rows>`: a flush of at most this many rows writes an L0
 /// flat run (vectors + tier, no graph build) and search scans it exactly with
 /// the quantized proxy. 0 (default) keeps the graph-per-run behaviour; the
@@ -4105,7 +4121,13 @@ impl DiskVamanaIndex {
                 seg.nodes[id as usize].slice().iter().copied().collect()
             };
             let mut cand: Vec<(f32, VecId)> = Vec::new();
-            if seg.flat {
+            // Above the run ceiling a graphed run is scanned, not walked:
+            // maintenance is behind and the short beam is losing rows.
+            let debt_fallback = seg_idx > 0 && self.runs.len() >= RUN_SCAN_FALLBACK;
+            if debt_fallback {
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::RunScanFallback);
+            }
+            if seg.flat || debt_fallback {
                 // L0 flat run: exact proxy scan of every row - no graph to
                 // walk. Downstream already handles unfiltered candidates
                 // (the navigate-all walk feeds it the same way), so admit

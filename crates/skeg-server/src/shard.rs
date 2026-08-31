@@ -62,6 +62,13 @@ const FLUSH_ROWS: usize = 4096;
 /// takes only two short locks around an off-thread build.
 const RUNS_MERGE_TRIGGER: usize = 4;
 
+/// Run count at which a merge OUTRANKS the flush. Above this the search is
+/// paying for the run count (each run is walked with a short beam), so
+/// letting the flush keep winning the tick trades recall for a delta that is
+/// already being written to disk anyway. Twice the normal trigger: the
+/// ordinary regime still flushes first.
+const RUNS_MERGE_STARVATION: usize = RUNS_MERGE_TRIGGER * 2;
+
 /// Reclaim dead base rows in place (delete-patch, O(deleted)) once tombstones
 /// reach base/this (~6%): frequent enough to stay in delete-patch's cheap
 /// regime, so the base stays clean without a full O(live) rebuild.
@@ -112,6 +119,22 @@ struct Vindex {
     /// tiering controller's LRU eviction ordering. Atomic so a stamp needs only
     /// a shared borrow (no write lock on the read path).
     last_access: AtomicU64,
+    /// One HEAVY maintenance job at a time for THIS vindex (consolidate,
+    /// runs-merge, delete-patch, ivf). The engine's comments assumed a single
+    /// outstanding job; nothing enforced it, so an explicit command could
+    /// overlap the automatic loop and two runs-merges could snapshot the same
+    /// runs. The flush is deliberately NOT gated: it is designed to coexist
+    /// (it preserves delta/flushing) and must never queue behind a heavy job
+    /// waiting on the global budget.
+    ///
+    /// An `Arc` so a caller can clone it under a brief read lock and then
+    /// acquire it holding NO lock at all.
+    heavy: Arc<tokio::sync::Semaphore>,
+    /// Consecutive maintenance ticks the flush has won while a merge was
+    /// also due. Fixed priority plus an early return means a permanently-hot
+    /// rung starves the ones below it forever; this is the aging that breaks
+    /// the tie.
+    flush_streak: AtomicU64,
 }
 
 impl Vindex {
@@ -122,6 +145,8 @@ impl Vindex {
             payload: PayloadIndex::default(),
             payload_loaded: true,
             last_access: AtomicU64::new(now_ms()),
+            heavy: Arc::new(tokio::sync::Semaphore::new(1)),
+            flush_streak: AtomicU64::new(0),
         }
     }
 
@@ -1378,7 +1403,54 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     let heavy_dead = base >= DELETE_PATCH_MIN_BASE && tombs * 4 > base;
     let consolidate_due = run_rows >= base.max(IDLE_CONSOLIDATE_MIN) || heavy_dead;
 
-    if delta >= FLUSH_ROWS {
+    // Flush and merge ALTERNATE when both are due.
+    //
+    // Every rung of this ladder ends in `return`, so a rung that is
+    // permanently hot starves every rung below it. Under sustained write
+    // churn the delta is ALWAYS over the flush threshold, so the tick took
+    // the flush branch forever - and each flush adds a run. Measured on the
+    // churn gate: runs climbed 0 -> 33 over ten turnovers and never merged,
+    // and recall fell from 0.9925 to 0.7180 as more of the live set moved
+    // into run graphs, which the walk deliberately searches with a short
+    // beam. The store stayed correct throughout (0/120 stale reads) - this
+    // is starvation, not corruption.
+    //
+    // A ceiling alone was NOT enough, and the measurement said so: the run
+    // counts an operator reads are SUMMED across shards, so the "33 runs"
+    // that wrecked recall were four per shard - under any per-shard ceiling
+    // worth having, and already at the ordinary merge trigger. The rung was
+    // due every single tick and lost every single tick.
+    //
+    // So: the flush still wins the tick normally (cheapest rung, and it
+    // bounds the RAM delta), but it cannot win TWICE in a row while a merge
+    // is due. Under sustained churn that gives the merge every other tick,
+    // which is enough to keep the count flat - and it needs no threshold to
+    // be guessed correctly.
+    let flush_due = delta >= FLUSH_ROWS;
+    let merge_due = runs >= RUNS_MERGE_TRIGGER;
+    let starved = arc.read().flush_streak.load(Ordering::Relaxed) >= 1;
+    if merge_due && (!flush_due || starved) {
+        let d = vdir.to_path_buf();
+        let outcome = off_thread_maintenance(
+            arc,
+            "runs-merge",
+            shard_id,
+            |b| b.merge_runs_begin(),
+            move |job| job.build(&d),
+            |b, built| b.merge_runs_finish(built),
+        )
+        .await;
+        // Only a merge that actually RAN consumes the tick. A busy fold
+        // budget must not stop the flush: that would trade the starvation
+        // this clause removes for the one below it, and the delta - already
+        // over its threshold - would grow without bound while the merge waits
+        // for a permit it may not get for minutes.
+        if outcome != MaintenanceOutcome::BudgetBusy {
+            arc.read().flush_streak.store(0, Ordering::Relaxed);
+            return false;
+        }
+    }
+    if flush_due {
         let d = vdir.to_path_buf();
         off_thread_maintenance(
             arc,
@@ -1389,6 +1461,9 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             |b, built| b.flush_finish(built),
         )
         .await;
+        if merge_due {
+            arc.read().flush_streak.fetch_add(1, Ordering::Relaxed);
+        }
         return false;
     }
     if base >= DELETE_PATCH_MIN_BASE
@@ -1440,7 +1515,7 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             |b, built| b.consolidate_finish(built),
         )
         .await;
-        if ran && arc.read().backend.wants_ivf() {
+        if ran == MaintenanceOutcome::Ran && arc.read().backend.wants_ivf() {
             // Base changed: rebuild the IVF router off the request path AND off
             // the write lock. `begin` dups the fd, `build` runs k-means
             // off-thread, `finish` swaps under a short lock.
@@ -1454,10 +1529,10 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
             )
             .await;
         }
-        // `ran`, not `true`: with the fold budget a due consolidate can skip
+        // `Ran`, not `true`: with the fold budget a due consolidate can skip
         // its tick, and reporting it as done would reset the caller's idle
         // tracking over work that never happened. The retry is the next tick.
-        return ran;
+        return ran == MaintenanceOutcome::Ran;
     }
     false
 }
@@ -1509,6 +1584,21 @@ fn is_budgeted(label: &str) -> bool {
 /// implementation for both: it is the same dance.
 ///
 /// `Ok(false)` means there was nothing to do (begin returned None).
+/// What a maintenance attempt actually did. "Nothing to do" and "the budget
+/// was busy" used to be the same `false`, which is how a priority rung could
+/// consume a tick without doing anything AND without letting the rung below
+/// it run: starvation traded for starvation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceOutcome {
+    /// The job ran to completion.
+    Ran,
+    /// The backend had nothing to do.
+    NotNeeded,
+    /// The process-wide fold budget was taken; retry next tick. The caller
+    /// MUST consider running a cheaper rung instead of returning.
+    BudgetBusy,
+}
+
 async fn try_off_thread_maintenance<T, B>(
     arc: &VectorEntry,
     label: &str,
@@ -1516,17 +1606,69 @@ async fn try_off_thread_maintenance<T, B>(
     begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
     build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
     finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
-) -> Result<bool, String>
+) -> Result<MaintenanceOutcome, String>
 where
     T: Send + 'static,
     B: Send + 'static,
 {
+    // The permit comes FIRST, before the snapshot. `begin` is not free -
+    // a runs-merge dups file descriptors, builds the survivor map and bumps
+    // run_seq - and taking the permit afterwards meant throwing all of that
+    // away, descriptors and sequence gap included, whenever the budget
+    // happened to be busy.
+    //
+    // Waiting here holds NO lock, so reads and writes proceed normally.
+    let _permit = if is_budgeted(label) {
+        if wait_for_budget {
+            skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
+            let p = fold_budget().acquire().await;
+            skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
+            Some(p.expect("fold budget semaphore is never closed"))
+        } else {
+            match fold_budget().try_acquire() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    skeg_telemetry::tick_counter(
+                        skeg_telemetry::Counter::MaintenanceBudgetSkips,
+                    );
+                    return Ok(MaintenanceOutcome::BudgetBusy);
+                }
+            }
+        }
+    } else {
+        None
+    };
+    // Then the PER-VINDEX heavy gate, in that order: global budget first (it
+    // protects the machine), this one second (it protects the index). Cloned
+    // under a brief read lock and acquired holding nothing.
+    let heavy_sem = if is_budgeted(label) {
+        Some(Arc::clone(&arc.read().heavy))
+    } else {
+        None
+    };
+    let _heavy = match heavy_sem {
+        Some(s) if wait_for_budget => Some(
+            s.acquire_owned()
+                .await
+                .expect("per-vindex heavy semaphore is never closed"),
+        ),
+        Some(s) => match s.try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                // Another heavy job owns this vindex. Same contract as a busy
+                // global budget: do not consume the tick, let the flush run.
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceBudgetSkips);
+                return Ok(MaintenanceOutcome::BudgetBusy);
+            }
+        },
+        None => None,
+    };
     // Short lock: snapshot only, no O(live) reads and no graph build.
     let job = {
         let mut g = arc.write();
         match begin(&mut g.backend) {
             Ok(Some(j)) => j,
-            Ok(None) => return Ok(false),
+            Ok(None) => return Ok(MaintenanceOutcome::NotNeeded),
             Err(e) => return Err(format!("{label} begin failed: {e}")),
         }
     };
@@ -1541,26 +1683,6 @@ where
     // across 233k writes while folds_waiting read 6. If there is no permit
     // now, maintenance skips and retries next tick; the flush always gets its
     // turn.
-    let _permit = if is_budgeted(label) {
-        if wait_for_budget {
-            skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
-            let p = fold_budget().acquire().await;
-            skeg_telemetry::decr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
-            Some(p.expect("fold budget semaphore is never closed"))
-        } else {
-            match fold_budget().try_acquire() {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    skeg_telemetry::tick_counter(
-                        skeg_telemetry::Counter::MaintenanceBudgetSkips,
-                    );
-                    return Ok(false);
-                }
-            }
-        }
-    } else {
-        None
-    };
     let built = match tokio::task::spawn_blocking(move || build(job)).await {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => return Err(format!("{label} build failed: {e}")),
@@ -1572,7 +1694,7 @@ where
             return Err(format!("{label} finish failed: {e}"));
         }
     }
-    Ok(true)
+    Ok(MaintenanceOutcome::Ran)
 }
 
 /// Which counter a maintenance label belongs to.
@@ -1597,22 +1719,24 @@ async fn off_thread_maintenance<T, B>(
     begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
     build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
     finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
-) -> bool
+) -> MaintenanceOutcome
 where
     T: Send + 'static,
     B: Send + 'static,
 {
     match try_off_thread_maintenance(arc, label, false, begin, build, finish).await {
-        Ok(ran) => {
-            if ran && let Some(c) = maintenance_counter(label) {
+        Ok(outcome) => {
+            if outcome == MaintenanceOutcome::Ran
+                && let Some(c) = maintenance_counter(label)
+            {
                 skeg_telemetry::tick_counter(c);
             }
-            ran
+            outcome
         }
         Err(e) => {
             // Automatic maintenance retries on the next tick.
             error!("shard {shard_id}: {e}");
-            false
+            MaintenanceOutcome::NotNeeded
         }
     }
 }
@@ -2969,6 +3093,39 @@ pub struct ShardSet {
 
 impl ShardSet {
     /// Open `n_shards` read-write shards, each storing into
+    /// How many shards this directory was WRITTEN with, discovered by
+    /// counting `shard-N` directories (0 when the set is new).
+    ///
+    /// Opening with the wrong count is silent and total: a set written with
+    /// eight shards, opened with one, serves exactly the rows that landed in
+    /// shard 0 - an eighth of the index - and answers every query with
+    /// complete confidence. Read-only serve mode hardcoded 1 and did exactly
+    /// that. Discovery, not assumption.
+    #[must_use]
+    pub fn discover_shard_count(base_dir: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(base_dir) else {
+            return 0;
+        };
+        let mut highest = 0usize;
+        let mut found = 0usize;
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(rest) = name.strip_prefix("shard-")
+                && let Ok(id) = rest.parse::<usize>()
+                && e.path().is_dir()
+            {
+                found += 1;
+                highest = highest.max(id + 1);
+            }
+        }
+        // Trust the highest id, not the count: a gap would mean a missing
+        // shard, and serving around a hole is exactly the failure this
+        // function exists to stop.
+        debug_assert_eq!(found, highest, "shard directory numbering has a gap");
+        highest
+    }
+
     /// `base_dir/shard-{id}/`.
     ///
     /// # Errors
@@ -3581,6 +3738,72 @@ impl ShardSet {
         let _ = self
             .broadcast(|| ShardReq::SnapshotAndPayloadIndexes)
             .await;
+    }
+
+    /// Operational health, per vindex: is maintenance keeping up?
+    ///
+    /// Deliberately separate from [`check`](Self::check), which certifies
+    /// INTEGRITY. The churn gate produced an index whose every structure was
+    /// intact - CHECK said OK on all ten rounds - while its recall fell from
+    /// 0.9925 to 0.7180 because runs piled up faster than they merged. An
+    /// operator needs to see that coming, and no integrity check ever will.
+    ///
+    /// `runs < 4` OK, `4..8` DEGRADED, `>= 8` CRITICAL (search has switched
+    /// run segments to a proxy scan: correct, and slower).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is invalid or a shard is unavailable.
+    pub async fn health(&self, name: &str) -> Result<Vec<String>, ShardError> {
+        validate_vindex_name(name)?;
+        let mut out = Vec::new();
+        let (mut worst, mut worst_shard) = (0usize, 0usize);
+        let (mut tot_runs, mut tot_delta, mut tot_run_rows) = (0u64, 0u64, 0u64);
+        for shard in 0..self.inner.n {
+            let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await? else {
+                return Err(ShardError::Unavailable);
+            };
+            let Some(row) = rows.iter().find(|r| r.name == name) else {
+                continue;
+            };
+            let runs = usize::try_from(row.runs).unwrap_or(usize::MAX);
+            if runs > worst {
+                worst = runs;
+                worst_shard = shard;
+            }
+            tot_runs += row.runs;
+            tot_delta += row.delta;
+            tot_run_rows += row.run_rows;
+        }
+        let state = if worst >= 8 {
+            "CRITICAL"
+        } else if worst >= 4 {
+            "DEGRADED"
+        } else {
+            "OK"
+        };
+        out.push(format!("state {state}"));
+        out.push(format!("worst_runs {worst} shard {worst_shard}"));
+        out.push(format!("runs_total {tot_runs}"));
+        out.push(format!("run_rows_total {tot_run_rows}"));
+        out.push(format!("delta_rows_total {tot_delta}"));
+        out.push(format!(
+            "budget_skips {}",
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::MaintenanceBudgetSkips)
+        ));
+        out.push(format!(
+            "run_scan_fallback {}",
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::RunScanFallback)
+        ));
+        out.push(format!(
+            "reason {}",
+            match state {
+                "CRITICAL" => "runs past the ceiling: search scans run segments instead of walking them; maintenance is behind",
+                "DEGRADED" => "runs above the merge trigger: a merge is due",
+                _ => "maintenance is keeping up",
+            }
+        ));
+        Ok(out)
     }
 
     /// Which shard each id lives on: `(primary, replica)` per id, in the
@@ -5329,7 +5552,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(ran, "the flush must run with the budget exhausted");
+        assert_eq!(ran, MaintenanceOutcome::Ran, "the flush must run with the budget exhausted");
 
         // A consolidate must park until a permit frees.
         let arc2 = arc.clone();
@@ -5352,7 +5575,7 @@ mod tests {
         );
         drop(held);
         let ran = fold.await.unwrap().unwrap();
-        assert!(ran, "the parked consolidate must complete once a permit frees");
+        assert_eq!(ran, MaintenanceOutcome::Ran, "the parked consolidate must complete once a permit frees");
     }
 
     #[tokio::test]
@@ -6564,6 +6787,169 @@ mod tests {
     /// return value is what resets idle tracking, so a wrong one silently
     /// breaks the idle fold. Nothing else exercises this function: the idle
     /// loop that calls it runs on a timer.
+    /// A set written with N shards must be DISCOVERED as N. Read-only serve
+    /// mode hardcoded 1 and served an eighth of an eight-shard index without
+    /// an error, a warning, or a hint - answering every query confidently
+    /// with 12% of the data.
+    #[tokio::test]
+    async fn shard_count_is_discovered_from_disk_not_assumed() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = ShardSet::open_mode_with_workers(
+                dir.path(),
+                8,
+                false,
+                skeg_vector::QuantKind::TurboQuant { bits: 2 },
+                1,
+            )
+            .unwrap();
+            shards.vindex_create("sd", 8, 4, 1).await.unwrap();
+            for id in 0..800u64 {
+                let mut v = vec![0.05f32; 8];
+                v[(id % 4) as usize] = 1.0;
+                shards.vset("sd", id, v, 0, None, None).await.unwrap();
+            }
+        }
+        assert_eq!(
+            ShardSet::discover_shard_count(dir.path()),
+            8,
+            "an eight-shard set must be discovered as eight"
+        );
+        // Reopening with the discovered count sees every row; the old
+        // hardcoded 1 would see roughly an eighth of them.
+        let n = ShardSet::discover_shard_count(dir.path());
+        let re = ShardSet::open_mode_with_workers(
+            dir.path(),
+            n,
+            false,
+            skeg_vector::QuantKind::TurboQuant { bits: 2 },
+            1,
+        )
+        .unwrap();
+        let rows = re.vindex_list().await.unwrap();
+        let total: u64 = rows.iter().filter(|r| r.name == "sd").map(|r| r.n_vectors).sum();
+        assert_eq!(total, 800, "reopen lost rows: saw {total} of 800");
+        assert_eq!(ShardSet::discover_shard_count(&dir.path().join("nope")), 0);
+    }
+
+    /// Two heavy jobs must not run on the same vindex at once. The engine's
+    /// comments assumed it; nothing enforced it, so an explicit command could
+    /// overlap the automatic loop on the same runs.
+    #[tokio::test]
+    async fn one_heavy_job_per_vindex() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-t");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0u64..4000 {
+            idx.insert(id, &tvec(id + 1)).unwrap();
+        }
+        idx.consolidate().unwrap();
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+        // Hold the vindex's heavy gate, as an in-flight job would.
+        // Clone the handle, DROP the read lock, then acquire: exactly the
+        // discipline the production path follows.
+        let gate = Arc::clone(&arc.read().heavy);
+        let held = gate.acquire_owned().await.unwrap();
+        let d = vdir.clone();
+        let outcome = off_thread_maintenance(
+            &arc,
+            "consolidate",
+            0,
+            |b| b.consolidate_begin(),
+            move |job| job.build(&d),
+            |b, built| b.consolidate_finish(built),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            MaintenanceOutcome::BudgetBusy,
+            "a second heavy job started while one was in flight"
+        );
+        // A flush is NOT gated: it must still run alongside.
+        {
+            let mut g = arc.write();
+            for id in 100_000u64..(100_000 + FLUSH_ROWS as u64 + 50) {
+                let v = tvec(id);
+                g.backend.insert(id, &v).unwrap();
+            }
+        }
+        let d = vdir.clone();
+        let flushed = off_thread_maintenance(
+            &arc,
+            "flush",
+            0,
+            |b| b.flush_begin(),
+            move |job| job.build(&d),
+            |b, built| b.flush_finish(built),
+        )
+        .await;
+        assert_eq!(
+            flushed,
+            MaintenanceOutcome::Ran,
+            "the flush queued behind a heavy job it is meant to coexist with"
+        );
+        drop(held);
+    }
+
+    /// Sustained writes must not starve the runs-merge. Every rung of the
+    /// ladder ends in `return`, so a permanently-hot flush used to hold the
+    /// tick forever while each flush quietly added another run - measured on
+    /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
+    /// from 0.9925 to 0.7180 as the live set moved into short-beam run
+    /// graphs.
+    #[tokio::test]
+    async fn sustained_writes_do_not_starve_the_runs_merge() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-t");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            64,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+        // The churn shape: the delta is refilled past the flush threshold
+        // before every tick, so the flush rung is permanently hot.
+        let mut worst_runs = 0usize;
+        let mut next_id = 0u64;
+        for _ in 0..20 {
+            {
+                let mut g = arc.write();
+                for _ in 0..(FLUSH_ROWS + 100) {
+                    let v = tvec(next_id + 1);
+                    g.backend.insert(next_id, &v).unwrap();
+                    next_id += 1;
+                }
+            }
+            maintenance_tick(&arc, &vdir, 0, false).await;
+            worst_runs = worst_runs.max(arc.read().backend.run_count());
+        }
+        // The bar is the ORDINARY trigger, not an emergency ceiling: the
+        // damage measured on the churn gate happened at four runs per shard,
+        // which is the trigger itself. A fix that only acts at a higher
+        // ceiling would pass a test and fail the workload.
+        assert!(
+            worst_runs <= RUNS_MERGE_TRIGGER + 2,
+            "runs reached {worst_runs}: the flush starved the merge again"
+        );
+    }
+
+
     #[tokio::test]
     async fn maintenance_tick_prefers_flush_then_consolidate() {
         let dir = TempDir::new().unwrap();
@@ -7283,6 +7669,7 @@ mod tests {
                 |b, built| b.merge_runs_finish(built),
             )
             .await
+                == MaintenanceOutcome::Ran
             {
                 ran = true;
                 break;
@@ -7316,6 +7703,7 @@ mod tests {
                 |b, built| b.delete_patch_finish(built),
             )
             .await
+                == MaintenanceOutcome::Ran
             {
                 ran = true;
                 break;

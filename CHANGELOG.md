@@ -9,6 +9,25 @@ repository.
 
 ## [Unreleased]
 
+### Read-only serve mode served a fraction of the index (P0)
+
+`bind_serve*` opened the shard set with a hardcoded count of 1. A set
+written with eight shards therefore served exactly the rows that landed
+in shard 0 - an eighth of the index - with no error, no warning and no
+hint, answering every query with complete confidence. Measured: 597 of
+5,000 vectors, before and after a consolidate; recall against the full
+corpus read 0.115.
+
+The count now comes from the DATA (`ShardSet::discover_shard_count`
+counts `shard-N` directories) and is logged at open. Pinned: an
+eight-shard set is discovered as eight and a reopen sees all 800 of 800
+rows.
+
+Found while chasing something else entirely - a churn-gate recall drop -
+which is the usual way: the frozen-state experiment built to isolate that
+bug ran in serve mode, and its impossible numbers (more re-rank budget
+producing WORSE recall) were this bug, not the one under investigation.
+
 ### mmap graph validation (P0)
 
 The mmap open route cast `graph.vmn`'s node region straight into `&[Node]`
