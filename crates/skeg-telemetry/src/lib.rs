@@ -340,10 +340,14 @@ pub enum Counter {
     /// Maintenance jobs that ran and failed. Previously indistinguishable
     /// from "nothing to do", which hid real failures from every signal.
     MaintenanceFailures = 40,
+    /// Vacuum attempts declined: not enough garbage, or already done for
+    /// this generation of runs. A rising count next to a flat reclaimed
+    /// count is what an infinite rewrite loop looks like from outside.
+    VacuumSkipped = 41,
 }
 
 impl Counter {
-    pub const COUNT: usize = 41;
+    pub const COUNT: usize = 42;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -386,6 +390,7 @@ impl Counter {
         Counter::VsearchHybridRouteNanos,
         Counter::RunScanFallback,
         Counter::MaintenanceFailures,
+        Counter::VacuumSkipped,
     ];
 
     #[inline]
@@ -432,6 +437,7 @@ impl Counter {
             Counter::VsearchHybridRouteNanos => "skeg_vsearch_hybrid_route_nanos_total",
             Counter::RunScanFallback => "skeg_run_scan_fallback_total",
             Counter::MaintenanceFailures => "skeg_maintenance_failures_total",
+            Counter::VacuumSkipped => "skeg_vacuum_skipped_total",
         }
     }
 }

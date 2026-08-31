@@ -1959,26 +1959,36 @@ const CURRENT_FILE: &str = "CURRENT";
 /// carry garbage - and it is NOT the live fraction sitting in runs.
 const RUN_DEBT_FALLBACK: f32 = 0.25;
 
+/// A vacuum must reclaim at least this many rows to be worth a rewrite: a
+/// ratio alone would fire on a tiny run holding three dead rows.
+const VACUUM_MIN_ROWS: usize = 4_096;
+
 /// Run debt at which a SINGLE run is worth rewriting on its own (a vacuum).
 /// Below two runs a merge has nothing to combine, but a lone run holding
 /// several times the live count is pure ballast: it costs disk, it costs the
 /// fallback scan that reads it, and nothing else will ever clean it.
 ///
-/// NOTE what this number is: the vacuum runs until the debt falls under it
-/// and then stops, so THE THRESHOLD IS THE RESTING DEBT. At 1.0 a 100k index
-/// carries 100k dead rows on disk - storage doubled - which is a price, not
-/// a detail. Lower it and the resting debt falls with it, paid for in
-/// rewrites. `SKEG_VACUUM_DEBT` exists so the choice can be made from a
-/// measurement of that trade rather than from the round number this started
-/// as.
+/// The fraction of a run's PHYSICAL rows that must be garbage - dead,
+/// tombstoned or superseded - before rewriting it is worth the write.
+///
+/// It is garbage over physical, deliberately NOT `run_rows / live_rows`.
+/// That other ratio is AMPLIFICATION: a perfectly clean run holding every
+/// live row scores 1.0 on it. Triggering a vacuum at "ratio >= 1.0" therefore
+/// rewrote clean runs, left the ratio at 1.0, and rewrote them again on the
+/// next tick - an infinite rewrite loop that this code shipped with for
+/// about twenty minutes and whose symptoms (merges tripled, RSS climbing
+/// 89 -> 117 MB while idle) were nearly reported as a measurement.
+///
+/// Clean run: garbage_ratio 0.0. Half stale: 0.5. The number means what it
+/// says, and a vacuum that runs drives it down.
 pub fn run_vacuum_debt() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("SKEG_VACUUM_DEBT")
+        std::env::var("SKEG_VACUUM_GARBAGE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|&x: &f32| x > 0.0)
-            .unwrap_or(1.0)
+            .filter(|&x: &f32| x > 0.0 && x <= 1.0)
+            .unwrap_or(0.25)
     })
 }
 
@@ -3035,6 +3045,9 @@ pub struct DiskVamanaIndex {
     tier: QuantKind,
     /// Monotonic run-directory counter, so flushed run dirs never collide.
     run_seq: u64,
+    /// `run_seq` at the last vacuum: one rewrite per generation of runs,
+    /// never a loop if a metric fails to drop.
+    last_vacuum_seq: u64,
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
@@ -3235,6 +3248,7 @@ impl DiskVamanaIndex {
             run_dirs: run_seqs,
             tier,
             run_seq: run_seq_next,
+            last_vacuum_seq: u64::MAX,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             flushing: AHashMap::new(),
@@ -4989,16 +5003,14 @@ impl DiskVamanaIndex {
     /// Returns an I/O error if a run vector read fails.
     pub fn merge_runs_begin(&mut self) -> io::Result<Option<RunMergeJob>> {
         let n_merged = self.runs.len();
-        // Below two runs there is nothing to MERGE - but there can still be a
-        // great deal to throw away. A merge rewrites the survivors, so on a
-        // single run carrying mostly dead and superseded rows it is a vacuum,
-        // and refusing to run left exactly that state permanent: measured at
-        // rest after churn, runs held three times the live count and no
-        // further merge ever fired, because the trigger counts runs and the
-        // problem was mass.
-        if n_merged == 0 || (n_merged < 2 && self.run_debt_ratio() < run_vacuum_debt()) {
+        if n_merged == 0 {
             return Ok(None);
         }
+        // A single run cannot be MERGED, but it can be vacuumed - rewritten
+        // without its dead rows. Whether that is worth a full rewrite is
+        // decided below, from the survivor set, where the answer is exact:
+        // deciding it up here from `run_rows / live_rows` is what produced an
+        // infinite rewrite loop, because that ratio is 1.0 for a spotless run.
         // Newer runs win on a re-inserted id: fold the front runs newest-first.
         let mut seen: AHashSet<u64> = AHashSet::new();
         let mut survivors: Vec<(usize, u32)> = Vec::new();
@@ -5011,6 +5023,36 @@ impl DiskVamanaIndex {
                 }
                 survivors.push((ri, row));
             }
+        }
+        // Garbage, measured rather than inferred: physical rows in the folded
+        // runs minus the ones that survive. The loop above already computed
+        // the survivors, so this costs nothing extra - and it is the only
+        // place where the number is exact.
+        let physical: usize = self.runs[..n_merged]
+            .iter()
+            .map(|r| r.main_n as usize)
+            .sum();
+        let live = survivors.len();
+        let garbage = physical.saturating_sub(live);
+        let garbage_ratio = if physical == 0 {
+            0.0
+        } else {
+            garbage as f32 / physical as f32
+        };
+        if n_merged < 2 {
+            // Vacuum: only for a run that is actually dirty, and only once
+            // per generation of runs. Without the second guard a metric that
+            // fails to drop re-triggers forever - which is precisely what
+            // `run_rows / live_rows >= 1.0` did, since a spotless run scores
+            // 1.0 on it.
+            if garbage < VACUUM_MIN_ROWS
+                || garbage_ratio < run_vacuum_debt()
+                || self.last_vacuum_seq == self.run_seq
+            {
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::VacuumSkipped);
+                return Ok(None);
+            }
+            self.last_vacuum_seq = self.run_seq;
         }
         if survivors.is_empty() {
             // Every folded run entry is tombstoned or shadowed: just drop them.
@@ -7380,6 +7422,84 @@ mod tests {
         assert_eq!(node.slice().len(), MAX_R, "slice must clamp to MAX_R");
         node.degree = u32::MAX;
         assert_eq!(node.slice().len(), MAX_R);
+    }
+
+    /// A CLEAN run must never be rewritten, however large it is.
+    ///
+    /// The vacuum first shipped triggering on `run_rows / live_rows >= 1.0`,
+    /// which is AMPLIFICATION, not garbage: a spotless run holding every live
+    /// row scores exactly 1.0 on it. So the vacuum rewrote a clean run, left
+    /// the ratio at 1.0, and rewrote it again on the next tick - forever. The
+    /// symptoms (merges tripled, RSS climbing while idle) were nearly
+    /// reported as a measurement of the engine.
+    #[test]
+    fn a_clean_run_is_never_vacuumed_however_big() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        // One run holding every live row and nothing else: amplification 1.0,
+        // garbage 0.0.
+        let v = random_vectors(9000, dim, 81);
+        for (i, x) in v.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, x).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 1);
+
+        // Twenty quiet ticks: not one of them may produce a rewrite.
+        for tick in 0..20 {
+            assert!(
+                idx.merge_runs_begin().unwrap().is_none(),
+                "tick {tick}: a clean run was scheduled for a rewrite"
+            );
+        }
+    }
+
+    /// A DIRTY run is vacuumed - once. Then it is clean, and stays untouched
+    /// until new writes make it dirty again.
+    #[test]
+    fn a_dirty_run_is_vacuumed_once_and_then_left_alone() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        let v = random_vectors(12000, dim, 82);
+        for (i, x) in v.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, x).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+
+        // Kill most of it: the run is now mostly garbage.
+        for id in 0..9000u64 {
+            idx.delete(id).unwrap();
+        }
+        let job = idx
+            .merge_runs_begin()
+            .unwrap()
+            .expect("a mostly-dead run must be vacuumed");
+        let built = job.build(tmp.path()).unwrap();
+        idx.merge_runs_finish(built).unwrap();
+
+        // The rewrite reclaimed the dead rows...
+        assert!(
+            idx.run_rows() <= 3200,
+            "vacuum kept {} rows for 3000 live ones",
+            idx.run_rows()
+        );
+        // ...and now nothing more is due, tick after tick.
+        for tick in 0..20 {
+            assert!(
+                idx.merge_runs_begin().unwrap().is_none(),
+                "tick {tick}: vacuumed run scheduled again - the loop is back"
+            );
+        }
     }
 
     /// UNFILTERED search must score an id on its NEWEST vector.
