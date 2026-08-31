@@ -7,7 +7,10 @@ on:
 
 jobs:
   ci:
-    uses: skegdb/.github/.github/workflows/rust-ci.yml@main
+    # Pinned to a tag, not @main: a reusable workflow on a moving ref means
+    # CI can change under a commit that did not change, so a green build
+    # stops being evidence about that commit.
+    uses: skegdb/.github/.github/workflows/rust-ci.yml@v1
     with:
       workspace: true
       msrv: "1.88"
