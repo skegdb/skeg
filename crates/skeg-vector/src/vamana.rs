@@ -3731,6 +3731,22 @@ impl DiskVamanaIndex {
         Ok(None)
     }
 
+    /// Where the NEWEST copy of `id` lives: `(segment index, row)` with 0 =
+    /// base and 1.. = runs, or `None` if no segment holds it.
+    ///
+    /// Runs are appended, so a higher index is newer; a run is newer than the
+    /// base. Candidates are ranked by PROXY across all segments, so a stale
+    /// copy can outrank the current one - and then be re-ranked against a
+    /// vector its row no longer has.
+    fn newest_location(&self, id: u64) -> Option<(usize, VecId)> {
+        for (ri, run) in self.runs.iter().enumerate().rev() {
+            if let Some(&row) = run.id_to_main_row.get(&id) {
+                return Some((ri + 1, row));
+            }
+        }
+        self.base.id_to_main_row.get(&id).map(|&row| (0, row))
+    }
+
     /// Read one f32 vector from `vectors.bin` by positioned read, through the
     /// segment's row cache when one is configured.
     fn read_vector(&self, seg: &Segment, id: VecId) -> io::Result<Vec<f32>> {
@@ -4103,7 +4119,25 @@ impl DiskVamanaIndex {
                 // walk. Downstream already handles unfiltered candidates
                 // (the navigate-all walk feeds it the same way), so admit
                 // gating is unnecessary here.
+                // Liveness BEFORE the local top-N, not after. The scan is
+                // exact on the proxy but that is not the same as exact on the
+                // LIVE set: with run debt at 2x the live count, most rows in
+                // a run are dead or superseded, and taking the top-N first
+                // lets them fill the shortlist and evict live candidates that
+                // would have made it. The global re-rank then discards them,
+                // having already lost the rows they displaced.
                 let mut all: Vec<(f32, VecId)> = (0..seg.main_n)
+                    .filter(|&r| {
+                        let id = seg.ids[r as usize];
+                        !self.tombstones.contains(&id)
+                            && !self.delta.contains_key(&id)
+                            && !self.flushing.contains_key(&id)
+                            // Superseded by a newer run: physically present,
+                            // logically gone.
+                            && self
+                                .newest_location(id)
+                                .is_none_or(|(s, _)| s == seg_idx)
+                    })
                     .map(|r| (-(seg.quant.proxy(r as usize, &code) as f32), r))
                     .collect();
                 let keep = list_size.min(all.len());
@@ -4214,6 +4248,27 @@ impl DiskVamanaIndex {
             {
                 continue;
             }
+            // Re-point to the NEWEST copy before reading anything. Candidates
+            // are ranked by proxy ACROSS segments and deduplicated by
+            // first-encountered, so an id whose old vector happens to score
+            // better than its new one is re-ranked against a vector its row
+            // no longer has - and reported with that score. Measured: a query
+            // placed on a row's OLD vector got that row back at cosine 1.000
+            // when its current vector scores -0.043.
+            //
+            // The liveness check above cannot see this: it knows tombstones,
+            // the delta and the flush staging, but not "a newer RUN also
+            // holds this id". Skipped entirely when there are no runs, which
+            // is the folded steady state.
+            let (seg_idx, row) = if self.runs.is_empty() {
+                (seg_idx, row)
+            } else {
+                match self.newest_location(id) {
+                    Some(loc) => loc,
+                    None => continue,
+                }
+            };
+            let seg = segs[seg_idx];
             if let Some(m) = matches
                 && !m(id)
             {
@@ -7295,6 +7350,56 @@ mod tests {
         assert_eq!(node.slice().len(), MAX_R, "slice must clamp to MAX_R");
         node.degree = u32::MAX;
         assert_eq!(node.slice().len(), MAX_R);
+    }
+
+    /// UNFILTERED search must score an id on its NEWEST vector.
+    ///
+    /// Candidates are sorted by proxy across every segment and deduplicated
+    /// by first-encountered, so when the base still holds an id's old vector
+    /// and a run holds the new one, the OLD copy can win the dedup purely by
+    /// scoring better on the proxy - and the id is then re-ranked against a
+    /// vector it no longer has. The liveness filter does not catch it: it
+    /// checks tombstones, delta and flush staging, never "a newer RUN also
+    /// holds this id".
+    ///
+    /// The query sits on top of an OLD vector, which is where the failure is
+    /// most visible: the stale copy scores 1.0 and the correct answer does
+    /// not.
+    #[test]
+    fn unfiltered_search_scores_the_newest_version_not_the_best_proxy() {
+        let dim = 16;
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), dim, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+
+        let a = random_vectors(400, dim, 71);
+        for (i, v) in a.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        idx.consolidate().unwrap();
+
+        let b = random_vectors(400, dim, 72);
+        for (i, v) in b.chunks_exact(dim).enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let job = idx.flush_begin().unwrap().expect("delta to flush");
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap();
+        assert_eq!(idx.run_count(), 1);
+        assert_eq!(idx.delta_len(), 0);
+
+        let probe = 5usize;
+        let query = &a[probe * dim..(probe + 1) * dim];
+        let hits = idx.search(query, 20).unwrap();
+        if let Some((_, score)) = hits.iter().find(|(id, _)| *id == probe as u64) {
+            let want = cosine_f32(query, &b[probe * dim..(probe + 1) * dim]);
+            assert!(
+                (score - want).abs() < 0.01,
+                "id {probe} scored {score:.3}: that is its OLD vector \
+                 (current would be {want:.3})"
+            );
+        }
     }
 
     /// A point lookup must return the NEWEST version of a row, and a run is
