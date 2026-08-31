@@ -1959,6 +1959,12 @@ const CURRENT_FILE: &str = "CURRENT";
 /// carry garbage - and it is NOT the live fraction sitting in runs.
 const RUN_DEBT_FALLBACK: f32 = 0.25;
 
+/// Run debt at which a SINGLE run is worth rewriting on its own (a vacuum).
+/// Below two runs a merge has nothing to combine, but a lone run holding
+/// several times the live count is pure ballast: it costs disk, it costs the
+/// fallback scan that reads it, and nothing else will ever clean it.
+const RUN_VACUUM_DEBT: f32 = 1.0;
+
 /// The directory holding the LIVE base files for `dir`: `dir/gN` per the
 /// `CURRENT` pointer, or `dir` itself for a legacy flat layout.
 fn base_dir(dir: &Path) -> std::path::PathBuf {
@@ -4966,7 +4972,14 @@ impl DiskVamanaIndex {
     /// Returns an I/O error if a run vector read fails.
     pub fn merge_runs_begin(&mut self) -> io::Result<Option<RunMergeJob>> {
         let n_merged = self.runs.len();
-        if n_merged < 2 {
+        // Below two runs there is nothing to MERGE - but there can still be a
+        // great deal to throw away. A merge rewrites the survivors, so on a
+        // single run carrying mostly dead and superseded rows it is a vacuum,
+        // and refusing to run left exactly that state permanent: measured at
+        // rest after churn, runs held three times the live count and no
+        // further merge ever fired, because the trigger counts runs and the
+        // problem was mass.
+        if n_merged == 0 || (n_merged < 2 && self.run_debt_ratio() < RUN_VACUUM_DEBT) {
             return Ok(None);
         }
         // Newer runs win on a re-inserted id: fold the front runs newest-first.

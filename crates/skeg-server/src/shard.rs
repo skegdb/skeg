@@ -1455,7 +1455,12 @@ async fn maintenance_tick(arc: &VectorEntry, vdir: &Path, shard_id: usize, idle:
     // which is enough to keep the count flat - and it needs no threshold to
     // be guessed correctly.
     let flush_due = delta >= FLUSH_ROWS;
-    let merge_due = runs >= RUNS_MERGE_TRIGGER;
+    // Count OR mass. The count alone left a single fat dirty run untouched
+    // forever - measured at rest, three times the live count in runs with no
+    // merge ever firing again, because one run is not "four runs" however
+    // much garbage it holds.
+    let debt = arc.read().backend.run_debt_ratio();
+    let merge_due = runs >= RUNS_MERGE_TRIGGER || (runs >= 1 && debt >= 1.0);
     let starved = arc.read().flush_streak.load(Ordering::Relaxed) >= 1;
     if merge_due && (!flush_due || starved) {
         let d = vdir.to_path_buf();
