@@ -5240,11 +5240,31 @@ impl DiskVamanaIndex {
         // the next flush and nothing else.
         let seq = built.seq;
         self.mark_run_durable(seq)?;
+        // Compact before changing the in-memory layer set. If it fails, the
+        // caller can abort the job and return `flushing` to `delta`; the
+        // durable run marker makes the same rows recoverable even if the WAL
+        // rename reached disk before reporting a later sync error. Once this
+        // succeeds, the remaining splice is infallible and is the commit.
+        self.compact_wal()?;
         self.runs.push(built.run);
         self.run_dirs.push(seq);
         self.flushing.clear();
-        self.compact_wal()?;
         Ok(())
+    }
+
+    /// Abort an off-thread flush whose build never produced an installable
+    /// run. Returns the staged rows to the mutable delta without overwriting
+    /// writes that arrived after [`flush_begin`](Self::flush_begin).
+    ///
+    /// Deletes remove an id from `flushing` as they happen; the tombstone
+    /// check is retained as a fail-closed guard. Moving rows between the two
+    /// maps does not change logical cardinality.
+    pub fn flush_abort(&mut self) {
+        for (id, vector) in std::mem::take(&mut self.flushing) {
+            if !self.tombstones.contains(&id) {
+                self.delta.entry(id).or_insert(vector);
+            }
+        }
     }
 
     /// Fsync every file of `run-{seq}` and write its `run.ok` marker.
@@ -7960,6 +7980,31 @@ mod tests {
         let re = DiskVamanaIndex::open(tmp.path()).unwrap();
         assert_eq!(re.len(), live, "live set recovered from the WAL");
         assert!(re.get(500).unwrap().is_some(), "a staged id recovered");
+    }
+
+    #[test]
+    fn aborting_a_flush_restores_staging_without_overwriting_newer_writes() {
+        let dim = 16;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        idx.set_auto_flush(false);
+        idx.insert(1, &vec![1.0; dim]).unwrap();
+        idx.insert(2, &vec![2.0; dim]).unwrap();
+
+        let _failed_job = idx.flush_begin().unwrap().expect("flush starts");
+        idx.insert(1, &vec![10.0; dim]).unwrap();
+        idx.delete(2).unwrap();
+        idx.insert(3, &vec![3.0; dim]).unwrap();
+        idx.flush_abort();
+
+        assert_eq!(idx.get(1).unwrap().unwrap(), vec![10.0; dim]);
+        assert!(idx.get(2).unwrap().is_none());
+        assert_eq!(idx.get(3).unwrap().unwrap(), vec![3.0; dim]);
+        assert_eq!(idx.len(), 2);
+        assert!(
+            idx.flush_begin().unwrap().is_some(),
+            "the restored delta must be flushable again"
+        );
     }
 
     // set_auto_flush(false) stops the inline flush; the default keeps it.

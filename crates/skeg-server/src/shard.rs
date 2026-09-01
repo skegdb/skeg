@@ -358,6 +358,12 @@ impl VectorBackend {
         }
     }
 
+    fn flush_abort(&mut self) {
+        if let VectorBackend::Disk(i) = self {
+            i.flush_abort();
+        }
+    }
+
     /// IVF rebuild, off-thread: dup the base fd. `None` if flat / empty.
     fn ivf_begin(&self) -> std::io::Result<Option<IvfJob>> {
         match self {
@@ -1523,13 +1529,14 @@ async fn maintenance_tick_at(
     }
     if flush_due {
         let d = vdir.to_path_buf();
-        off_thread_maintenance(
+        off_thread_maintenance_with_abort(
             arc,
             "flush",
             shard_id,
             |b| b.flush_begin(),
             move |job| job.build(&d),
             |b, built| b.flush_finish(built),
+            VectorBackend::flush_abort,
         )
         .await;
         if merge_due {
@@ -1688,6 +1695,24 @@ where
     T: Send + 'static,
     B: Send + 'static,
 {
+    try_off_thread_maintenance_with_abort(arc, label, wait_for_budget, begin, build, finish, |_| {})
+        .await
+}
+
+async fn try_off_thread_maintenance_with_abort<T, B>(
+    arc: &VectorEntry,
+    label: &str,
+    wait_for_budget: bool,
+    begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
+    build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
+    finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
+    abort: impl FnOnce(&mut VectorBackend),
+) -> Result<MaintenanceOutcome, String>
+where
+    T: Send + 'static,
+    B: Send + 'static,
+{
+    let mut abort = Some(abort);
     // The PER-VINDEX heavy gate comes FIRST, the global budget second.
     //
     // The other order wastes the scarcer resource: a second job on the same
@@ -1767,12 +1792,28 @@ where
     // turn.
     let built = match tokio::task::spawn_blocking(move || build(job)).await {
         Ok(Ok(b)) => b,
-        Ok(Err(e)) => return Err(format!("{label} build failed: {e}")),
-        Err(e) => return Err(format!("{label} build task panicked: {e}")),
+        result => {
+            {
+                let mut g = arc.write();
+                abort
+                    .take()
+                    .expect("abort callback is consumed only on failure")(
+                    &mut g.backend
+                );
+            }
+            return match result {
+                Ok(Err(e)) => Err(format!("{label} build failed: {e}")),
+                Err(e) => Err(format!("{label} build task panicked: {e}")),
+                Ok(Ok(_)) => unreachable!("the successful build arm returned above"),
+            };
+        }
     };
     {
         let mut g = arc.write();
         if let Err(e) = finish(&mut g.backend, built) {
+            abort
+                .take()
+                .expect("abort callback is consumed only on failure")(&mut g.backend);
             return Err(format!("{label} finish failed: {e}"));
         }
     }
@@ -1806,7 +1847,25 @@ where
     T: Send + 'static,
     B: Send + 'static,
 {
-    match try_off_thread_maintenance(arc, label, false, begin, build, finish).await {
+    off_thread_maintenance_with_abort(arc, label, shard_id, begin, build, finish, |_| {}).await
+}
+
+async fn off_thread_maintenance_with_abort<T, B>(
+    arc: &VectorEntry,
+    label: &str,
+    shard_id: usize,
+    begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
+    build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
+    finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
+    abort: impl FnOnce(&mut VectorBackend),
+) -> MaintenanceOutcome
+where
+    T: Send + 'static,
+    B: Send + 'static,
+{
+    match try_off_thread_maintenance_with_abort(arc, label, false, begin, build, finish, abort)
+        .await
+    {
         Ok(outcome) => {
             if outcome == MaintenanceOutcome::Ran
                 && let Some(c) = maintenance_counter(label)
@@ -5905,6 +5964,97 @@ mod tests {
             ran,
             MaintenanceOutcome::Ran,
             "the parked consolidate must complete once a permit frees"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_build_does_not_block_every_later_flush() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-failed-flush");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            16,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0u64..64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        let failed = try_off_thread_maintenance_with_abort(
+            &arc,
+            "flush",
+            true,
+            |b| b.flush_begin(),
+            |_job| -> std::io::Result<FlushBuilt> {
+                Err(std::io::Error::other("injected build failure"))
+            },
+            |b, built| b.flush_finish(built),
+            VectorBackend::flush_abort,
+        )
+        .await;
+        assert!(
+            failed.unwrap_err().contains("injected build failure"),
+            "the injected failure must reach the caller"
+        );
+
+        let retry = arc.write().backend.flush_begin().unwrap();
+        assert!(
+            retry.is_some(),
+            "a build failure must return the staged delta so the next tick can retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_finish_is_precommit_and_retryable() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-failed-finish");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            16,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0u64..64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        // `compact_wal` creates this path as a file. A directory is an
+        // inexpensive deterministic I/O failure after the run build, inside
+        // finish, with no environment-specific failpoint machinery.
+        std::fs::create_dir(vdir.join("delta.log.compact")).unwrap();
+        let build_dir = vdir.clone();
+        let failed = try_off_thread_maintenance_with_abort(
+            &arc,
+            "flush",
+            true,
+            |b| b.flush_begin(),
+            move |job| job.build(&build_dir),
+            |b, built| b.flush_finish(built),
+            VectorBackend::flush_abort,
+        )
+        .await;
+        assert!(
+            failed.unwrap_err().contains("finish failed"),
+            "the injected finish failure must reach the caller"
+        );
+
+        let retry = arc.write().backend.flush_begin().unwrap();
+        assert!(
+            retry.is_some(),
+            "a pre-commit finish failure must restore staging for a retry"
         );
     }
 
