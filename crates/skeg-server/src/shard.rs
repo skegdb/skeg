@@ -554,7 +554,7 @@ pub fn shard_for(key: &[u8], n_shards: usize) -> usize {
 /// native binary protocol does not - this is the choke point both protocols
 /// cross, so it must hold on its own. Permits `:` for the `{tenant}::{name}`
 /// scope prefix the RESP3 layer prepends; rejects anything that could traverse.
-fn validate_vindex_name(name: &str) -> Result<(), ShardError> {
+pub(crate) fn validate_vindex_name(name: &str) -> Result<(), ShardError> {
     let ok = !name.is_empty()
         && name.len() <= 255
         && name != "."
@@ -632,6 +632,14 @@ enum ShardReq {
         /// Owning tenant, so its vector quota is credited for the dropped
         /// fragment. `0` for the unscoped default.
         tenant: u128,
+        /// Whether a shard that does not have this index is an error.
+        ///
+        /// True for a client's DROP: it asked for a named thing and deserves to
+        /// hear that it was not there. False when the drop is CONVERGENCE - the
+        /// rollback of a create that reached only some shards - where the
+        /// shards that never got it are the normal case and reporting them as
+        /// failures would hide whether the shards that DID get it were cleaned.
+        require_present: bool,
     },
     /// Enumerate VINDEXes known to this shard. Replicated across all
     /// shards so callers can ask any one shard.
@@ -1308,7 +1316,7 @@ const VINDEX_REGISTRY_V2_MAGIC: [u8; 4] = *b"SVI2";
 /// A bound on the catalogue, not a capacity plan. It exists so the registry
 /// has a size the reader can state up front, and so a shard cannot be talked
 /// into an unbounded one.
-const MAX_VINDEXES_PER_SHARD: usize = 1024;
+pub(crate) const MAX_VINDEXES_PER_SHARD: usize = 1024;
 
 /// The widest a single registry record can be: a 2-byte name length, a name
 /// at the 255-byte cap `validate_vindex_name` enforces, a 4-byte dim and a
@@ -2166,12 +2174,49 @@ fn recover_vindexes(
     tier: QuantKind,
     mmap_tier: bool,
     mmap_graph: bool,
-) -> std::io::Result<VindexSet> {
+    read_only: bool,
+    in_flight: &[String],
+) -> std::io::Result<(VindexSet, Vec<String>)> {
     let mut set = VindexSet::new();
+    // Names this shard resolved. Their payload blobs are KV keys and can only
+    // be reclaimed once the VLog is usable, which is the caller's scope.
+    let mut resolved = Vec::new();
+    // Names the coordinator decided about, before any shard started. In a
+    // writable open they are the ones to REMOVE - the undo of a create that
+    // did not reach everywhere, or the completion of a drop that did not. In a
+    // read-only open nothing is resolved because nothing is written, so the
+    // same list is the one to DECLINE to serve: the same refusal to publish a
+    // half-state. Deciding needs every shard's registry at once, which is why
+    // it is not decided here; see `ShardSet::open_mode_full_mmap`.
+    if !read_only {
+        for name in in_flight {
+            if read_registry(dir)?.iter().any(|e| &e.name == name) {
+                tracing::warn!(
+                    shard = shard_id,
+                    index = name,
+                    "resolving an unfinished catalogue operation by removing the index"
+                );
+                persist_registry_removing(dir, &RwLock::new(VindexSet::new()), Some(name))?;
+                remove_vindex_dir(dir, name);
+                resolved.push(name.clone());
+            }
+        }
+    }
     // Fail-closed: a registry that will not parse refuses the shard open. The
     // alternative is opening a store with an unknown number of its indexes
     // missing, which is precisely how serve mode served an eighth of one.
     for entry in read_registry(dir)? {
+        if in_flight.contains(&entry.name) {
+            // Read-only: undecided, so not served. Said out loud, because an
+            // index silently missing from serve mode is indistinguishable from
+            // one that was never there.
+            tracing::warn!(
+                shard = shard_id,
+                index = %entry.name,
+                "not serving a vindex whose catalogue operation never finished;                  open the store writable to resolve it"
+            );
+            continue;
+        }
         let open_tier = entry.kind.and_then(QuantKind::from_wire).unwrap_or(tier);
         let kind = entry
             .kind
@@ -2196,7 +2241,7 @@ fn recover_vindexes(
             ))),
         );
     }
-    Ok(set)
+    Ok((set, resolved))
 }
 
 /// Look up a vindex by its (already tenant-scoped) name, reopening it lazily if
@@ -2353,6 +2398,10 @@ fn run_shard(
     mmap_graph: bool,
     quota: Arc<crate::quota::TenantVectorQuota>,
     disk_counter: skeg_core::SharedTenantDisk,
+    // Names whose catalogue fan-out never finished, decided by the coordinator
+    // because deciding needs every shard's registry at once. Writable: remove
+    // them. Read-only: decline to serve them.
+    in_flight: Vec<String>,
     // Reports the shard's startup outcome to `ShardSet::open`: `Ok` once recovery
     // is done and the request loop is about to run, `Err` if the store cannot be
     // opened (e.g. already locked by another process). `open` blocks on this and
@@ -2406,14 +2455,26 @@ fn run_shard(
         // index lock while the shard runtime continues serving KV work.
         // The read/write locks are uncontended in inline mode (~10ns acquire
         // on M1), so there is no measurable cost for the default path.
-        let vindexes: Arc<RwLock<VindexSet>> =
-            match recover_vindexes(shard_id, &dir, tier, mmap_tier, mmap_graph) {
-                Ok(vindexes) => Arc::new(RwLock::new(vindexes)),
-                Err(e) => {
-                    let _ = ready.send(Err(e.to_string()));
-                    return;
-                }
-            };
+        let (vindexes, resolved) = match recover_vindexes(
+            shard_id, &dir, tier, mmap_tier, mmap_graph, read_only, &in_flight,
+        ) {
+            Ok((vindexes, resolved)) => (Arc::new(RwLock::new(vindexes)), resolved),
+            Err(e) => {
+                let _ = ready.send(Err(e.to_string()));
+                return;
+            }
+        };
+        let vindexes: Arc<RwLock<VindexSet>> = vindexes;
+        // The registry entry and the directory went during recovery, which is
+        // what stops the index being served. Its payload blobs are KV keys and
+        // need the VLog, so they go here - otherwise finishing a drop would
+        // leave behind exactly the blobs a completed drop reclaims, and a later
+        // index reusing the name and id would serve one of them.
+        for name in resolved {
+            if let Err(e) = sweep_payload_blobs(&vlog, unscope_key(&name).0, &name).await {
+                error!("shard {shard_id}: reclaiming blobs of resolved '{name}': {e}");
+            }
+        }
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -3227,14 +3288,21 @@ async fn process(
                 .collect();
             ShardResp::IndexStats(rows)
         }
-        ShardReq::VindexDrop { name, tenant } => {
+        ShardReq::VindexDrop {
+            name,
+            tenant,
+            require_present,
+        } => {
             match drop_vindex(
                 vlog, vindexes, dir, quota, &name, tenant, tier, mmap_tier, mmap_graph,
             )
             .await
             {
                 Ok(true) => ShardResp::Done,
-                Ok(false) => ShardResp::Err(format!("vindex '{name}' not found")),
+                Ok(false) if require_present => {
+                    ShardResp::Err(format!("vindex '{name}' not found"))
+                }
+                Ok(false) => ShardResp::Done,
                 Err(e) => ShardResp::Err(e),
             }
         }
@@ -3813,6 +3881,11 @@ struct ShardSetInner {
     /// set keeps the map (8B+overhead per id, rebuilt at open from the
     /// shards' live id sets) and point ops stay O(1) instead of broadcast.
     owners: parking_lot::RwLock<HashMap<String, OwnerMap>>,
+    /// Serialises catalogue fan-outs (CREATE/DROP). They record an intent,
+    /// touch every shard and clear it; two of them interleaving would read and
+    /// write that one file underneath each other. It also removes the race
+    /// where two CREATEs of the same name both find it absent.
+    catalog: tokio::sync::Mutex<()>,
     /// Per-id serialisation for routed point ops (review finding): a routed
     /// vset/vdel is read-await-write on `owners` with shard calls between, so
     /// concurrent ops on the SAME id could interleave into an untracked
@@ -3983,8 +4056,60 @@ impl ShardSet {
         // One disk counter shared across all shards, so the disk quota is global
         // per tenant (a tenant's keys spread over shards by hash).
         let disk_counter = skeg_core::new_shared_disk();
+        // Catalogue fan-outs that never finished, decided ONCE and here, because
+        // the decision needs to see every shard's registry and no shard can.
+        //
+        // `k` is the number of shards still listing the name. `k < n` means the
+        // fan-out reached some and not others, and undoing a create is the same
+        // action as finishing a drop: remove it. `k == n` means nothing was
+        // removed anywhere - a create that succeeded unacknowledged, which is
+        // undone, or a DROP THE STORE REFUSED, whose index is whole and whose
+        // caller was told it failed. Removing that one would turn a refused
+        // drop into a silent deletion.
+        //
+        // In a read-only open nothing is decided or written; the list is every
+        // in-flight name, and the shards decline to serve them.
+        let in_flight: Vec<String> = if read_only {
+            crate::catalog_intent::pending(base_dir)?
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect()
+        } else {
+            let mut remove = Vec::new();
+            for (op, name) in crate::catalog_intent::pending(base_dir)? {
+                let mut listed = 0usize;
+                for id in 0..n_shards {
+                    // Fail-closed: a registry that will not parse cannot be
+                    // counted as "does not have it", which would turn a refused
+                    // drop into a deletion. The shard open refuses on it too.
+                    if read_registry(&base_dir.join(format!("shard-{id}")))?
+                        .iter()
+                        .any(|e| e.name == name)
+                    {
+                        listed += 1;
+                    }
+                }
+                let resolve = listed > 0
+                    && match op {
+                        crate::catalog_intent::Op::Create => true,
+                        crate::catalog_intent::Op::Drop => listed < n_shards,
+                    };
+                if resolve {
+                    tracing::warn!(
+                        index = %name,
+                        listed_on = listed,
+                        of = n_shards,
+                        "resolving an unfinished catalogue operation by removing the index"
+                    );
+                    remove.push(name);
+                }
+            }
+            remove
+        };
+
         for id in 0..n_shards {
             let dir = base_dir.join(format!("shard-{id}"));
+            let in_flight = in_flight.clone();
             let (tx, rx) = tokio::sync::mpsc::channel::<ShardMsg>(SHARD_INBOX_CAPACITY);
             let quota = quota.clone();
             let disk_counter = disk_counter.clone();
@@ -4003,6 +4128,7 @@ impl ShardSet {
                         mmap_graph,
                         quota,
                         disk_counter,
+                        in_flight,
                         ready_tx,
                     )
                 })?;
@@ -4039,7 +4165,7 @@ impl ShardSet {
                 "shard startup failed: {msg}"
             )));
         }
-        Ok(Self {
+        let set = Self {
             inner: Arc::new(ShardSetInner {
                 senders,
                 handles,
@@ -4050,9 +4176,31 @@ impl ShardSet {
                 root: base_dir.to_path_buf(),
                 routers: parking_lot::RwLock::new(load_routers(base_dir)),
                 owners: parking_lot::RwLock::new(HashMap::new()),
+                catalog: tokio::sync::Mutex::new(()),
                 owner_locks: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
             }),
-        })
+        };
+        // Every shard has now applied the decision against its own registry (it
+        // happens before it reports ready), so what is left is the
+        // coordinator's own derived state and the record itself.
+        //
+        // The router sidecar goes with the index: it is what a recreated name
+        // would inherit stale centroids and a stale owner map from, and this is
+        // the one path that removes an index without going through
+        // `vindex_drop`. A failure is logged, not fatal - the catalogue is
+        // already consistent, and a stale sidecar is a lesser fault than a
+        // store that refuses to open.
+        if !read_only {
+            for name in &in_flight {
+                if let Err(e) = set.drop_router_state(name) {
+                    error!("router state of resolved vindex '{name}' not removed: {e}");
+                }
+            }
+            for (_, name) in crate::catalog_intent::pending(base_dir)? {
+                crate::catalog_intent::clear(base_dir, &name)?;
+            }
+        }
+        Ok(set)
     }
 
     /// Number of shards.
@@ -4413,13 +4561,73 @@ impl ShardSet {
             return Err(ShardError::Storage(reason));
         }
         let name = name.to_owned();
-        self.broadcast(|| ShardReq::VindexCreate {
-            name: name.clone(),
-            dim,
-            kind,
-            disk,
-        })
-        .await
+        let _catalog = self.inner.catalog.lock().await;
+        let root = self.inner.root.clone();
+        let intent = |e: std::io::Error| ShardError::Storage(format!("catalogue intent: {e}"));
+
+        // A name left in flight by an earlier fan-out is not a name to build
+        // on: recreating it is exactly how one name ended up with two dims,
+        // because the shard that failed the first time is the one free to
+        // accept the second. It is resolved at the next open, not here.
+        if crate::catalog_intent::pending(&root)
+            .map_err(intent)?
+            .iter()
+            .any(|(_, n)| n == &name)
+        {
+            return Err(ShardError::Storage(format!(
+                "vindex '{name}' has an unfinished catalogue operation; reopen                  the store to resolve it"
+            )));
+        }
+        crate::catalog_intent::record(&root, crate::catalog_intent::Op::Create, &name)
+            .map_err(intent)?;
+
+        match self
+            .broadcast(|| ShardReq::VindexCreate {
+                name: name.clone(),
+                dim,
+                kind,
+                disk,
+            })
+            .await
+        {
+            Ok(()) => {
+                // Cleared BEFORE the success is returned: while the record
+                // stands, the operation is not acknowledged, and the next open
+                // will undo it. Failing to clear therefore has to be reported
+                // as a failure - which the next open then makes true.
+                crate::catalog_intent::clear(&root, &name).map_err(intent)?;
+                Ok(())
+            }
+            Err(e) => {
+                // Undo on whichever shards committed. `require_present: false`:
+                // the shard that refused the create is expected not to have it,
+                // and calling that a failure would tell us nothing about the
+                // ones being cleaned up.
+                let tenant = unscope_key(&name).0;
+                let undone = self
+                    .broadcast(|| ShardReq::VindexDrop {
+                        name: name.clone(),
+                        tenant,
+                        require_present: false,
+                    })
+                    .await;
+                match undone {
+                    // Fully undone, so the record has nothing left to describe.
+                    Ok(()) => {
+                        crate::catalog_intent::clear(&root, &name).map_err(intent)?;
+                    }
+                    // Left dirty. The record stays and the next open finishes
+                    // it; the caller still hears the original failure, which is
+                    // the one it can act on.
+                    Err(undo) => tracing::error!(
+                        index = %name,
+                        error = %undo,
+                        "could not undo a partly created vindex; it is recorded                          and will be removed at the next open"
+                    ),
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Drop a vector index across all shards.
@@ -4430,11 +4638,36 @@ impl ShardSet {
     pub async fn vindex_drop(&self, name: &str, tenant: u128) -> Result<(), ShardError> {
         validate_vindex_name(name)?;
         let name = name.to_owned();
-        self.broadcast(|| ShardReq::VindexDrop {
-            name: name.clone(),
-            tenant,
-        })
-        .await?;
+        let _catalog = self.inner.catalog.lock().await;
+        let root = self.inner.root.clone();
+        let intent = |e: std::io::Error| ShardError::Storage(format!("catalogue intent: {e}"));
+
+        // A drop cannot be undone - by the time one shard refuses, the others
+        // have already deleted their data - so it is recorded to be FINISHED.
+        crate::catalog_intent::record(&root, crate::catalog_intent::Op::Drop, &name)
+            .map_err(intent)?;
+        let outcome = self
+            .broadcast(|| ShardReq::VindexDrop {
+                name: name.clone(),
+                tenant,
+                require_present: true,
+            })
+            .await;
+        match outcome {
+            Ok(()) => crate::catalog_intent::clear(&root, &name).map_err(intent)?,
+            Err(e) => {
+                // The sidecar describes an index that is at least partly gone,
+                // and the record above guarantees the rest follows. Leaving it
+                // would let a recreated name inherit centroids and an owner map
+                // for data nobody has.
+                if let Err(sidecar) = self.drop_router_state(&name) {
+                    error!("router state of partly dropped '{name}' not removed: {sidecar}");
+                }
+                return Err(ShardError::Storage(format!(
+                    "{e}; the drop is recorded and the remaining shards are cleared at the next open"
+                )));
+            }
+        }
         // The semantic router is derived state that outlives the shards it
         // describes: without this, recreating the same name inherits stale
         // centroids and an owner map for gone data (review P0). Drop the
@@ -8076,39 +8309,257 @@ mod tests {
     }
 
     /// `resident=k/n` is only worth printing if `n` is the store's shard count.
-    /// Counting the shards that ANSWERED makes an index which exists on three
-    /// shards of four read as 3/3 - complete - which is the exact failure the
-    /// field was added to prevent, one level up.
+    /// Counting the shards that ANSWERED makes an index open on three shards of
+    /// four read as 3/3 - complete - which is the exact failure the field was
+    /// added to prevent, one level up.
+    ///
+    /// The state is built by evicting ONE shard, which is the ordinary way an
+    /// index ends up unevenly resident. It used to be built from a create that
+    /// failed on one shard; that is no longer constructible, because such a
+    /// create is now undone.
     #[tokio::test]
-    async fn a_partly_created_index_does_not_read_as_complete() {
-        use std::os::unix::fs::PermissionsExt;
+    async fn an_unevenly_resident_index_does_not_read_as_complete() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 4).unwrap();
-        // Shard 2 cannot create directories, so its CREATE fails while the
-        // other three commit. Nothing rolls them back: that is the multi-shard
-        // commit defect, and this test is about how the store REPORTS it.
-        let s2 = dir.path().join("shard-2");
-        let mut perm = std::fs::metadata(&s2).unwrap().permissions();
-        perm.set_mode(0o555);
-        std::fs::set_permissions(&s2, perm).unwrap();
+        shards.vindex_create("part", 4, 1, 1).await.unwrap();
+        for id in 0u64..16 {
+            shards
+                .vset("part", id, vec![id as f32, 0.0, 0.0, 0.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("part").await.unwrap();
+
+        let row_now = |rows: Vec<VindexRow>| {
+            rows.into_iter()
+                .find(|r| r.name == "part")
+                .expect("the index is listed")
+        };
+        let full = row_now(shards.vindex_list().await.unwrap());
+        assert_eq!(
+            (full.shards_resident, full.shards_total),
+            (4, 4),
+            "fixture: resident everywhere before the evict"
+        );
+
         assert!(
-            shards.vindex_create("part", 4, 1, 1).await.is_err(),
+            matches!(
+                shards
+                    .call(
+                        2,
+                        ShardReq::Evict {
+                            name: "part".into()
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                ShardResp::Evicted(true)
+            ),
+            "fixture: shard 2 held it and released it"
+        );
+
+        let uneven = row_now(shards.vindex_list().await.unwrap());
+        assert_eq!(
+            (uneven.shards_resident, uneven.shards_total),
+            (3, 4),
+            "an index open on three shards of four must not read as complete"
+        );
+    }
+
+    /// Set `shard-N` read-only so any operation that must write there fails,
+    /// while the other shards succeed. That is the fan-out partial failure.
+    #[cfg(test)]
+    fn set_shard_writable(base: &std::path::Path, shard: usize, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let d = base.join(format!("shard-{shard}"));
+        let mut perm = std::fs::metadata(&d).unwrap().permissions();
+        perm.set_mode(if writable { 0o755 } else { 0o555 });
+        std::fs::set_permissions(&d, perm).unwrap();
+    }
+
+    #[cfg(test)]
+    fn registry_dim(base: &std::path::Path, shard: usize, name: &str) -> Option<usize> {
+        read_registry(&base.join(format!("shard-{shard}")))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| e.dim)
+    }
+
+    /// A CREATE that fails on one shard commits on the others and rolls nothing
+    /// back, so the store keeps an index the client was told does not exist -
+    /// and it accepts writes. Recreating the name then splits the catalogue:
+    /// the shard that failed takes the new dim, the rest keep the old one, and
+    /// LIST reports whichever it aggregated first as if the store agreed.
+    #[tokio::test]
+    async fn a_create_that_fails_on_one_shard_leaves_nothing_behind() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        set_shard_writable(dir.path(), 2, false);
+        assert!(
+            shards.vindex_create("x", 4, 1, 1).await.is_err(),
             "fixture: the create must fail on the read-only shard"
         );
-        let mut perm = std::fs::metadata(&s2).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&s2, perm).unwrap();
+        set_shard_writable(dir.path(), 2, true);
 
-        let rows = shards.vindex_list().await.unwrap();
-        let row = rows
-            .iter()
-            .find(|r| r.name == "part")
-            .expect("fixture: three shards did commit it");
-        assert_eq!(
-            (row.shards_resident, row.shards_total),
-            (3, 4),
-            "an index on three shards of four must not read as complete"
+        for shard in 0..4 {
+            assert_eq!(
+                registry_dim(dir.path(), shard, "x"),
+                None,
+                "shard {shard} kept an index whose creation was refused"
+            );
+        }
+        assert!(
+            shards
+                .vset("x", 0, vec![1.0; 4], 0, None, None)
+                .await
+                .is_err(),
+            "a refused index accepted a write"
         );
+
+        // And the name is clean enough to be created again, with a different
+        // shape, without splitting the catalogue.
+        shards.vindex_create("x", 8, 1, 1).await.unwrap();
+        for shard in 0..4 {
+            assert_eq!(
+                registry_dim(dir.path(), shard, "x"),
+                Some(8),
+                "shard {shard} disagrees about the dim of a freshly created index"
+            );
+        }
+    }
+
+    /// A DROP refused by EVERY shard removed nothing, and the caller was told
+    /// so. Finishing it at the next open would turn a refused deletion into a
+    /// silent one - and it is not a corner: on a single-shard store every
+    /// failed drop looks like this. It is the reason the record names the
+    /// operation instead of just the name.
+    #[tokio::test]
+    async fn a_drop_refused_everywhere_leaves_the_index_whole() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 3).unwrap();
+        shards.vindex_create("whole", 4, 1, 1).await.unwrap();
+        for id in 0u64..15 {
+            shards
+                .vset("whole", id, vec![id as f32, 1.0, 1.0, 1.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("whole").await.unwrap();
+
+        for shard in 0..3 {
+            set_shard_writable(dir.path(), shard, false);
+        }
+        assert!(
+            shards.vindex_drop("whole", 0).await.is_err(),
+            "fixture: no shard can commit the removal"
+        );
+        for shard in 0..3 {
+            set_shard_writable(dir.path(), shard, true);
+            assert_eq!(
+                registry_dim(dir.path(), shard, "whole"),
+                Some(4),
+                "fixture: shard {shard} still has it, so nothing was removed"
+            );
+        }
+        drop(shards);
+
+        let reopened = ShardSet::open(dir.path(), 3).unwrap();
+        for shard in 0..3 {
+            assert_eq!(
+                registry_dim(dir.path(), shard, "whole"),
+                Some(4),
+                "shard {shard} completed a drop that never started"
+            );
+        }
+        assert_eq!(
+            reopened
+                .vsearch("whole", vec![1.0; 4], 15, 0, 0, false, None)
+                .await
+                .unwrap()
+                .len(),
+            15,
+            "every row of a refused drop must still be there"
+        );
+    }
+
+    /// A DROP that fails on one shard has already removed the data from the
+    /// others; it cannot be undone, so it has to be finished. Until it is, the
+    /// remainder is a zombie: unreachable through search, still on disk, still
+    /// in that shard's catalogue, and back at the next open.
+    #[tokio::test]
+    async fn a_drop_that_fails_on_one_shard_is_finished_at_the_next_open() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        shards.vindex_create("y", 4, 1, 1).await.unwrap();
+        for id in 0u64..12 {
+            shards
+                .vset(
+                    "y",
+                    id,
+                    vec![id as f32, 1.0, 1.0, 1.0],
+                    0,
+                    None,
+                    Some(Bytes::from_static(b"payload")),
+                )
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("y").await.unwrap();
+        // A blob is written by the shard owning the VECTOR ID while a routed
+        // GET goes to the shard owning the KEY, so only some are observable
+        // this way. Hold the recovery to exactly the set that is.
+        let mut observable: Vec<u64> = Vec::new();
+        for id in 0u64..12 {
+            if shards
+                .get(&payload_key(0, "y", id))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                observable.push(id);
+            }
+        }
+        assert!(
+            !observable.is_empty(),
+            "fixture: no blob is observable, so the reclamation check is vacuous"
+        );
+
+        set_shard_writable(dir.path(), 0, false);
+        assert!(
+            shards.vindex_drop("y", 0).await.is_err(),
+            "fixture: the drop must fail on the read-only shard"
+        );
+        set_shard_writable(dir.path(), 0, true);
+        assert_eq!(
+            registry_dim(dir.path(), 0, "y"),
+            Some(4),
+            "fixture: shard 0 is the one that kept it"
+        );
+        drop(shards);
+
+        let reopened = ShardSet::open(dir.path(), 4).unwrap();
+        for shard in 0..4 {
+            assert_eq!(
+                registry_dim(dir.path(), shard, "y"),
+                None,
+                "shard {shard} brought a half-dropped index back"
+            );
+        }
+        assert!(
+            reopened
+                .vsearch("y", vec![1.0; 4], 5, 0, 0, false, None)
+                .await
+                .is_err(),
+            "a half-dropped index is searchable again after a restart"
+        );
+        for id in observable {
+            assert_eq!(
+                reopened.get(&payload_key(0, "y", id)).await.unwrap(),
+                None,
+                "blob {id} of a finished drop outlived its index"
+            );
+        }
     }
 
     /// An unreadable registry is the single most useful thing CHECK could ever
@@ -9815,6 +10266,7 @@ mod tests {
                 ShardReq::VindexDrop {
                     name: "hp".into(),
                     tenant: 0,
+                    require_present: true,
                 },
             )
             .await

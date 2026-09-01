@@ -10,6 +10,7 @@
 //! `tenant` module docs) can install a multi-tenant layer at runtime
 //! via [`Server::with_tenant_backend`].
 
+pub mod catalog_intent;
 pub mod handler;
 pub mod layout_manifest;
 pub mod memory;
