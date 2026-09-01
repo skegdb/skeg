@@ -162,19 +162,28 @@ fn parse_mem_usage(s: &str) -> Option<u64> {
 fn self_cgroup_path(proc_self_cgroup: &Path) -> Option<Membership> {
     let text = read(proc_self_cgroup.to_path_buf())?;
     let mut v1: Option<&str> = None;
+    let mut v2: Option<String> = None;
     for line in text.lines() {
         let mut f = line.splitn(3, ':');
         let (_hier, controllers, path) = (f.next()?, f.next()?, f.next());
         let Some(path) = path else { continue };
         if controllers.is_empty() {
-            // v2: the unified line wins outright.
-            return sanitise_cgroup_path(path).map(Membership::V2);
+            // v2 unified line. Remembered, not returned: on a HYBRID host both
+            // hierarchies are mounted, and the v2 line can exist while the
+            // memory controller lives in v1. Returning here would hide the
+            // only limit there is.
+            v2 = sanitise_cgroup_path(path);
+            continue;
         }
         if controllers.split(',').any(|c| c == "memory") {
             v1 = Some(path);
         }
     }
-    v1.and_then(sanitise_cgroup_path).map(Membership::V1)
+    // v1 first when both are present: on a hybrid host the memory controller
+    // is the one in v1, and it is the limit that applies.
+    v1.and_then(sanitise_cgroup_path)
+        .map(Membership::V1)
+        .or(v2.map(Membership::V2))
 }
 
 /// Which hierarchy the process belongs to, and where in it.
@@ -245,15 +254,41 @@ pub(crate) fn memory_status_rooted(proc_self_cgroup: &Path, mount: &Path) -> Mem
             // build will not follow. The mount root is the honest guess.
             None => return memory_status_at(mount),
         };
+    // The MINIMUM over the whole chain, not the first limit found.
+    //
+    // Every cgroup from the process's own up to the root applies at once, so
+    // the one that kills the process is the tightest of them - and it is not
+    // always the nearest. A leaf set to 1 GiB inside a parent set to 256 MiB
+    // is a 256 MiB process; stopping at the leaf reports four times the memory
+    // it actually has, which is worse than reporting none, because a governor
+    // then admits work right up to the kill.
+    let mut best: Option<(u64, MemoryStatus)> = None;
     loop {
         let m = read_at(&dir);
-        if m.limit_bytes.is_some() || dir == top {
-            return m;
+        if let Some(limit) = m.limit_bytes
+            && best.as_ref().is_none_or(|(b, _)| limit < *b)
+        {
+            // Usage from the SAME cgroup as the limit: two numbers from
+            // different accounting domains do not describe one budget.
+            best = Some((limit, m));
+        }
+        if dir == top {
+            break;
         }
         match dir.parent() {
             Some(p) if p.starts_with(&top) => dir = p.to_path_buf(),
-            _ => return m,
+            _ => break,
         }
+    }
+    match best {
+        Some((_, m)) => m,
+        // Nothing in the chain sets a limit. Report usage from the process's
+        // own cgroup, which is the one that describes it.
+        None => read_at(&match self_cgroup_path(proc_self_cgroup) {
+            Some(Membership::V2(rel)) => mount.join(rel),
+            Some(Membership::V1(rel)) => mount.join("memory").join(rel),
+            None => mount.to_path_buf(),
+        }),
     }
 }
 
@@ -444,6 +479,68 @@ mod tests {
             &dir.path().join("sys/fs/cgroup"),
         );
         assert_eq!(m.limit_bytes, Some(123));
+    }
+
+    #[test]
+    fn the_effective_limit_is_the_tightest_in_the_chain_not_the_nearest() {
+        // Every cgroup from the process's own up to the root applies at once,
+        // so the one that kills the process is the tightest - and it is not
+        // always the nearest. A leaf at 1 GiB inside a parent at 256 MiB is a
+        // 256 MiB process; reporting the leaf claims four times the memory it
+        // has, which is worse than reporting none: a governor then admits work
+        // right up to the kill.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/a/b\n");
+        write(dir.path(), "sys/fs/cgroup/a/memory.max", "268435456\n"); // 256 MiB
+        write(dir.path(), "sys/fs/cgroup/a/memory.current", "1\n");
+        write(dir.path(), "sys/fs/cgroup/a/b/memory.max", "1073741824\n"); // 1 GiB
+        write(dir.path(), "sys/fs/cgroup/a/b/memory.current", "999\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(268_435_456), "must take the tightest");
+        assert_eq!(
+            m.current_bytes,
+            Some(1),
+            "usage must come from the cgroup that set the limit, not another"
+        );
+    }
+
+    #[test]
+    fn a_hybrid_host_does_not_let_the_v2_line_hide_the_v1_limit() {
+        // Both hierarchies mounted: the v2 unified line exists but carries no
+        // memory controller, while the real limit sits in v1. Returning on the
+        // first v2 line hides the only limit there is.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "proc/self/cgroup",
+            "0::/user.slice\n9:memory:/docker/abc\n",
+        );
+        write(
+            dir.path(),
+            "sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+            "268435456\n",
+        );
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(268_435_456));
+    }
+
+    #[test]
+    fn a_chain_with_no_limit_anywhere_reports_none_and_the_leafs_usage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/a/b\n");
+        write(dir.path(), "sys/fs/cgroup/a/b/memory.current", "4242\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, None);
+        assert_eq!(m.current_bytes, Some(4242));
     }
 
     #[test]

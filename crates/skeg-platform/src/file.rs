@@ -776,18 +776,33 @@ pub fn read_small_file(path: &Path) -> io::Result<String> {
 ///
 /// Returns an IO error if the file cannot be opened or read.
 pub fn read_small_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    read_bounded(path, SMALL_FILE_MAX)
+}
+
+/// Read a file of a KNOWN maximum size, refusing anything larger.
+///
+/// The bound belongs to the caller, because it belongs to the format: a
+/// generation pointer is one byte and a catalogue grows with the number of
+/// entries it holds. Handing the catalogue the pointer's bound is how a
+/// perfectly valid write becomes unreadable on the next open, and that is not
+/// hypothetical - this is here because it happened.
+///
+/// # Errors
+///
+/// `InvalidData` if the file exceeds `max`; otherwise any IO error from
+/// opening or reading it. `NotFound` is passed through, since an absent file
+/// is often a legitimate state.
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = Vec::with_capacity(64);
-    // MAX + 1: reading one byte past the bound is what distinguishes a file
+    // max + 1: reading one byte past the bound is what distinguishes a file
     // that sits exactly at it from one that runs beyond it.
-    File::open(path)?
-        .take(SMALL_FILE_MAX + 1)
-        .read_to_end(&mut buf)?;
-    if buf.len() as u64 > SMALL_FILE_MAX {
+    File::open(path)?.take(max + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} is larger than {SMALL_FILE_MAX} bytes: not a sidecar record",
+                "{} is larger than the {max} bytes its format allows",
                 path.display()
             ),
         ));

@@ -17,8 +17,8 @@ pub use affinity::{QosClass, current_thread_qos, pin_current_thread_to_performan
 pub use aligned::AlignedBytes;
 pub use durability::{DURABILITY_MODEL, DurabilityModel, resolve_durability_model};
 pub use file::{
-    BUFFER_ALIGNMENT, MappedFile, PlatformFile, advise_sequential_file, read_small_bytes,
-    read_small_file, sync_dir,
+    BUFFER_ALIGNMENT, MappedFile, PlatformFile, advise_sequential_file, read_bounded,
+    read_small_bytes, read_small_file, sync_dir,
 };
 pub use lock::{DirLock, LOCK_FILE};
 #[cfg(all(target_os = "linux", feature = "uring"))]

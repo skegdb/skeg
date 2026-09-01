@@ -1266,6 +1266,27 @@ async fn attach_payloads(
 const VINDEX_REGISTRY: &str = "vindexes.registry";
 const VINDEX_REGISTRY_V2_MAGIC: [u8; 4] = *b"SVI2";
 
+/// The most vindexes one shard will hold.
+///
+/// A bound on the catalogue, not a capacity plan. It exists so the registry
+/// has a size the reader can state up front, and so a shard cannot be talked
+/// into an unbounded one.
+const MAX_VINDEXES_PER_SHARD: usize = 1024;
+
+/// The widest a single registry record can be: a 2-byte name length, a name
+/// at the 255-byte cap `validate_vindex_name` enforces, a 4-byte dim and a
+/// 1-byte tier.
+const MAX_REGISTRY_RECORD: usize = 2 + 255 + 4 + 1;
+
+/// What the registry may weigh: magic, count, and every record at its widest.
+///
+/// Derived from the two numbers above rather than picked, because the reader
+/// and the writer MUST agree. They did not: the reader used the 4 KiB sidecar
+/// bound while the writer had none, so sixteen indexes with maximum-length
+/// names (8 + 16 x 262 = 4,200 bytes) wrote successfully and then refused to
+/// be read back on the next open. A limit only one side knows is not a limit.
+const MAX_REGISTRY_BYTES: u64 = (8 + MAX_VINDEXES_PER_SHARD * MAX_REGISTRY_RECORD) as u64;
+
 #[derive(Clone, Debug)]
 struct RegistryEntry {
     name: String,
@@ -1279,14 +1300,40 @@ struct RegistryEntry {
 /// `[u16 nlen][name][u32 dim][u8 kind]` per disk-backed VINDEX.
 #[allow(clippy::cast_possible_truncation)] // index names are short, dims fit u32
 fn write_registry(dir: &Path, entries: &[(&str, usize, u8)]) -> std::io::Result<()> {
+    let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    // Refuse BEFORE publishing. The reader enforces the same bound, and a file
+    // the writer is willing to produce but the reader will not accept is the
+    // worst of both worlds: the write succeeds and the next open fails.
+    if entries.len() > MAX_VINDEXES_PER_SHARD {
+        return Err(bad(format!(
+            "{} vindexes exceeds the {MAX_VINDEXES_PER_SHARD} a shard holds",
+            entries.len()
+        )));
+    }
     let mut buf = Vec::new();
     buf.extend_from_slice(&VINDEX_REGISTRY_V2_MAGIC);
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let count =
+        u32::try_from(entries.len()).map_err(|_| bad("entry count overflows u32".to_owned()))?;
+    buf.extend_from_slice(&count.to_le_bytes());
     for (name, dim, kind) in entries {
-        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        // Checked, not `as`: a silent truncation writes a length that does not
+        // match the bytes beside it, and the reader then walks off into the
+        // next record.
+        let nlen = u16::try_from(name.len())
+            .map_err(|_| bad(format!("vindex name is {} bytes, too long", name.len())))?;
+        let dim32 =
+            u32::try_from(*dim).map_err(|_| bad(format!("dim {dim} overflows its field")))?;
+        buf.extend_from_slice(&nlen.to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
-        buf.extend_from_slice(&(*dim as u32).to_le_bytes());
+        buf.extend_from_slice(&dim32.to_le_bytes());
         buf.push(*kind);
+    }
+    if buf.len() as u64 > MAX_REGISTRY_BYTES {
+        return Err(bad(format!(
+            "registry would be {} bytes, over the {MAX_REGISTRY_BYTES} the \
+             reader accepts",
+            buf.len()
+        )));
     }
     // Durable publish, the same discipline as the layout manifest and the
     // generation pointer: write, fsync the file, rename, fsync the directory.
@@ -1323,7 +1370,7 @@ fn write_registry(dir: &Path, entries: &[(&str, usize, u8)]) -> std::io::Result<
 /// of them has a safe default.
 fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
     let path = dir.join(VINDEX_REGISTRY);
-    let bytes = match skeg_platform::read_small_bytes(&path) {
+    let bytes = match skeg_platform::read_bounded(&path, MAX_REGISTRY_BYTES) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -1376,6 +1423,17 @@ fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
                 ))
             })?
             .to_owned();
+        // Valid UTF-8 is not a valid NAME. This string is joined onto the data
+        // directory to build a path, and it arrives from a file: `x/../../elsewhere`
+        // is perfectly good UTF-8. The protocol already refuses such names on
+        // the way in, so the registry refuses them on the way out - one rule,
+        // both directions.
+        validate_vindex_name(&name).map_err(|e| {
+            bad(format!(
+                "{} entry {i} has a name this build will not use as a path: {e:?}",
+                path.display()
+            ))
+        })?;
         pos += nlen;
         let dim = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
@@ -1417,7 +1475,7 @@ fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
 /// (VINDEX.DROP removes the dir). This covers all three writers without touching
 /// their call sites: create adds (dir + map), evict keeps (dir, not in map),
 /// drop prunes (no dir).
-fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
+fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) -> std::io::Result<()> {
     use std::collections::BTreeMap;
     // A registry that will not parse must NOT be rewritten from the resident
     // map alone. The map holds only what is currently open, so the rewrite
@@ -1433,7 +1491,7 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
                 "refusing to rewrite an unreadable vindex registry: rebuilding \
                  it from the resident set would drop every evicted index"
             );
-            return;
+            return Err(e);
         }
     };
     let mut by_name: BTreeMap<String, (usize, u8)> = existing
@@ -1454,9 +1512,7 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
         .iter()
         .map(|(name, (dim, kind))| (name.as_str(), *dim, *kind))
         .collect();
-    if let Err(e) = write_registry(dir, &entries) {
-        error!("vindex registry write failed: {e}");
-    }
+    write_registry(dir, &entries)
 }
 
 /// Reopen the disk-backed VINDEXes recorded in the registry, with the given
@@ -2495,9 +2551,24 @@ async fn drop_vindex(
     drop(arc);
     quota.sub(tenant, fragment);
     if was_disk {
-        // A failed directory removal must not let DROP report success: the
-        // index would reappear at the next open (review P1). NotFound is fine
-        // (already gone / never flushed).
+        // COMMIT FIRST, then delete. The registry is the commit record, so the
+        // order decides what a crash in the middle means.
+        //
+        // It used to delete the directory and then rewrite the registry. A
+        // crash between the two left the registry naming a directory that no
+        // longer exists, and recovery opens every entry it lists - so the next
+        // start failed outright, on a shard whose data was intact. This way a
+        // crash after the commit leaves a directory nobody references, which
+        // is reclaimable garbage rather than a store that will not open.
+        //
+        // The index is already out of the resident map, so the rewrite drops
+        // its entry.
+        if let Err(e) = persist_registry(dir, vindexes) {
+            return Err(format!("vindex registry not updated: {e}"));
+        }
+        // A failed removal must not let DROP report success: the index would
+        // reappear at the next open (review P1). NotFound is fine - already
+        // gone, or never flushed.
         let vdir = dir.join(format!("vindex-{name}"));
         match std::fs::remove_dir_all(&vdir) {
             Ok(()) => {}
@@ -2506,7 +2577,6 @@ async fn drop_vindex(
                 return Err(format!("vindex dir {} not removed: {e}", vdir.display()));
             }
         }
-        persist_registry(dir, vindexes);
     }
     // Drop the index's payload blobs. Without this a recreated index reusing
     // the same name and id would resurface a stale blob under the same
@@ -2594,34 +2664,58 @@ async fn process(
             disk,
         } => {
             use std::collections::hash_map::Entry;
+            // Kept for the rollback below: `name` is moved into `entry`.
+            let created_name = name.clone();
             let result = match vindexes.write().entry(name) {
                 Entry::Occupied(e) => Err(format!("vindex '{}' already exists", e.key())),
                 Entry::Vacant(e) => {
                     if disk {
                         let vdir = dir.join(format!("vindex-{}", e.key()));
-                        // The disk tier is int8 by default; TurboQuant gives
-                        // sub-int8 RAM on the live write path (it needs no trained
-                        // codebook). f32/binary are flat-only -> fall back to int8.
-                        let tier = match kind {
-                            QuantKind::TurboQuant { .. } => kind,
-                            _ => QuantKind::Int8,
-                        };
-                        let kind = tier.to_wire().expect("disk tier has a VINDEX wire kind");
-                        match DiskVamanaIndex::create_empty_with_tier(
-                            &vdir,
-                            dim,
-                            VAMANA_L_SEARCH,
-                            tier,
-                        ) {
-                            Ok(mut idx) => {
-                                idx.set_auto_flush(false); // flushed off-thread by the loop
-                                e.insert(Arc::new(RwLock::new(Vindex::new(
-                                    VectorBackend::Disk(Box::new(idx)),
-                                    kind,
-                                ))));
-                                Ok(true)
+                        // An UNCOMMITTED directory is not free space.
+                        //
+                        // `create_empty_with_tier` calls `create_dir_all`, which
+                        // succeeds on an existing directory, and then writes
+                        // graph, vectors, CURRENT and the WAL over whatever is
+                        // there. So a create naming an orphan silently destroys
+                        // it - and an orphan can be a fully built index whose
+                        // registry entry was lost, not just a dead create.
+                        //
+                        // "Not in the registry" means "not committed". It does
+                        // not mean "reusable". Refuse and name the path: the
+                        // operator decides whether that data is worth keeping.
+                        if vdir.exists() {
+                            Err(format!(
+                                "vindex '{}' is not in the registry but {} \
+                                 exists: refusing to overwrite an unregistered \
+                                 index. Remove that directory to reuse the name.",
+                                e.key(),
+                                vdir.display()
+                            ))
+                        } else {
+                            // The disk tier is int8 by default; TurboQuant gives
+                            // sub-int8 RAM on the live write path (it needs no trained
+                            // codebook). f32/binary are flat-only -> fall back to int8.
+                            let tier = match kind {
+                                QuantKind::TurboQuant { .. } => kind,
+                                _ => QuantKind::Int8,
+                            };
+                            let kind = tier.to_wire().expect("disk tier has a VINDEX wire kind");
+                            match DiskVamanaIndex::create_empty_with_tier(
+                                &vdir,
+                                dim,
+                                VAMANA_L_SEARCH,
+                                tier,
+                            ) {
+                                Ok(mut idx) => {
+                                    idx.set_auto_flush(false); // flushed off-thread by the loop
+                                    e.insert(Arc::new(RwLock::new(Vindex::new(
+                                        VectorBackend::Disk(Box::new(idx)),
+                                        kind,
+                                    ))));
+                                    Ok(true)
+                                }
+                                Err(err) => Err(format!("vindex disk create failed: {err}")),
                             }
-                            Err(err) => Err(format!("vindex disk create failed: {err}")),
                         }
                     } else {
                         e.insert(Arc::new(RwLock::new(Vindex::new(
@@ -2633,11 +2727,21 @@ async fn process(
                 }
             };
             match result {
+                // The registry is the COMMIT RECORD. A create that cannot
+                // publish one has not happened, and must not be acknowledged:
+                // otherwise a directory on disk represents a confirmed
+                // operation that no catalogue knows about, and "not in the
+                // registry" stops meaning "not committed".
+                //
+                // The in-memory entry is rolled back too. Leaving it would
+                // serve an index this open can see and the next one cannot.
                 Ok(created_disk) => {
-                    if created_disk {
-                        persist_registry(dir, vindexes);
+                    if created_disk && let Err(e) = persist_registry(dir, vindexes) {
+                        vindexes.write().remove(&created_name);
+                        ShardResp::Err(format!("vindex registry not updated: {e}"))
+                    } else {
+                        ShardResp::Done
                     }
-                    ShardResp::Done
                 }
                 Err(e) => ShardResp::Err(e),
             }
@@ -6391,6 +6495,88 @@ mod tests {
         assert_eq!(
             read_registry(dir.path()).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn a_registry_name_that_would_escape_the_data_directory_refuses() {
+        // Valid UTF-8 is not a valid name. This string is joined onto the data
+        // directory to build a path, and it comes from a file.
+        let dir = TempDir::new().unwrap();
+        for evil in ["x/../../target", "..", "a/b", "", "n\u{0}m"] {
+            let mut bytes = VINDEX_REGISTRY_V2_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&(evil.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(evil.as_bytes());
+            bytes.extend_from_slice(&64u32.to_le_bytes());
+            bytes.push(2);
+            fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
+            assert_eq!(
+                read_registry(dir.path()).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "must refuse {evil:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sixteen_maximum_length_names_survive_a_round_trip() {
+        // The exact shape that broke: the reader used the 4 KiB SIDECAR bound
+        // on a file that grows with the number of indexes, while the writer had
+        // no bound at all. `validate_vindex_name` allows 255 bytes, so
+        // 8 + 16 x (2 + 255 + 4 + 1) = 4,200 - the sixteenth index wrote
+        // successfully and the next open refused to read the catalogue back.
+        let dir = TempDir::new().unwrap();
+        let names: Vec<String> = (0..16)
+            .map(|i| format!("{i:02}{}", "n".repeat(253)))
+            .collect();
+        assert!(names.iter().all(|n| n.len() == 255));
+        let entries: Vec<(&str, usize, u8)> =
+            names.iter().map(|n| (n.as_str(), 1024usize, 2u8)).collect();
+
+        write_registry(dir.path(), &entries).unwrap();
+        let size = fs::metadata(dir.path().join(VINDEX_REGISTRY))
+            .unwrap()
+            .len();
+        assert!(size > 4096, "the case only bites over 4 KiB, got {size}");
+
+        let back = read_registry(dir.path()).unwrap();
+        assert_eq!(back.len(), 16);
+        assert_eq!(back[15].name, names[15]);
+    }
+
+    #[test]
+    fn a_registry_over_the_shard_limit_refuses_to_be_written() {
+        // Refused at write time, not discovered at read time. What the writer
+        // is willing to publish and what the reader will accept have to be one
+        // number.
+        let dir = TempDir::new().unwrap();
+        let names: Vec<String> = (0..=MAX_VINDEXES_PER_SHARD)
+            .map(|i| format!("n{i}"))
+            .collect();
+        let entries: Vec<(&str, usize, u8)> =
+            names.iter().map(|n| (n.as_str(), 8usize, 2u8)).collect();
+        let err = write_registry(dir.path(), &entries).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !dir.path().join(VINDEX_REGISTRY).exists(),
+            "a refused write must not leave a file behind"
+        );
+    }
+
+    #[test]
+    fn the_writer_never_produces_what_the_reader_rejects() {
+        // The two bounds are one number, checked here rather than trusted.
+        let dir = TempDir::new().unwrap();
+        let names: Vec<String> = (0..MAX_VINDEXES_PER_SHARD)
+            .map(|i| format!("{i:04}{}", "x".repeat(251)))
+            .collect();
+        let entries: Vec<(&str, usize, u8)> =
+            names.iter().map(|n| (n.as_str(), 1024usize, 2u8)).collect();
+        write_registry(dir.path(), &entries).expect("the largest legal catalogue must write");
+        assert_eq!(
+            read_registry(dir.path()).expect("and must read back").len(),
+            MAX_VINDEXES_PER_SHARD
         );
     }
 
