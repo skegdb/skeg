@@ -238,7 +238,14 @@ fn sanitise_cgroup_path(path: &str) -> Option<String> {
     let p = path.trim();
     let p = p.strip_prefix('/')?;
     if p.is_empty() {
-        return None; // the root itself; nothing to descend into
+        // The ROOT is a membership, not the absence of one - and it is the
+        // ordinary case: a plain container reports `0::/`. Returning `None`
+        // here sent it down the no-membership fallback, which reads the limit
+        // but never computes headroom, so `available` came back `Unknown` -
+        // and under a fail-closed governor that means refusing every write in
+        // the most common deployment there is. Found by the first execution
+        // inside a real cgroup; the unit test asserted only the limit.
+        return Some(String::new());
     }
     if p.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
         return None;
@@ -532,14 +539,27 @@ mod tests {
 
     #[test]
     fn a_process_at_the_v2_root_reads_the_root() {
+        // `0::/` is what an ordinary container reports - not an exotic case,
+        // THE case. This test used to assert `limit_bytes` alone and passed
+        // while `available` came back `Unknown`, which under the governor's
+        // fail-closed policy means refusing every write. The first execution
+        // inside a real 256 MiB cgroup found it; the unit test had been
+        // agreeing with itself.
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "proc/self/cgroup", "0::/\n");
-        write(dir.path(), "sys/fs/cgroup/memory.max", "123\n");
+        write(dir.path(), "sys/fs/cgroup/memory.max", "268435456\n");
+        write(dir.path(), "sys/fs/cgroup/memory.current", "1871872\n");
         let m = memory_status_rooted(
             &dir.path().join("proc/self/cgroup"),
             &dir.path().join("sys/fs/cgroup"),
         );
-        assert_eq!(m.limit_bytes, Some(123));
+        assert_eq!(m.limit_bytes, Some(268_435_456));
+        assert_eq!(m.current_bytes, Some(1_871_872));
+        assert_eq!(
+            m.available,
+            Headroom::Known(268_435_456 - 1_871_872),
+            "a process at the cgroup root still has a computable headroom"
+        );
     }
 
     #[test]
