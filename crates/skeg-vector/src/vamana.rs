@@ -5037,6 +5037,9 @@ impl DiskVamanaIndex {
         // old base in memory with no runs beside it - the live process serving
         // fewer rows than it holds, until a restart.
         let mut cleanup_error: Option<io::Error> = None;
+        // Takes either shape: a plain `io::Result` from a cleanup step, and a
+        // `FinishResult` from one that has its own commit boundary. Both end
+        // up in the same place, because from here everything is post-commit.
         let mut note = |r: io::Result<()>| {
             if let Err(e) = r
                 && cleanup_error.is_none()
@@ -5063,7 +5066,10 @@ impl DiskVamanaIndex {
         // deleted. Through `replace_wal`, so a failure leaves the previous WAL
         // whole instead of truncating it in place.
         if runs_retired {
-            note(self.replace_wal(&[]));
+            note(match self.replace_wal(&[]) {
+                Ok(FinishOutcome::Committed) => Ok(()),
+                Ok(FinishOutcome::CommittedCleanupFailed(e)) | Err(e) => Err(e),
+            });
         }
         // ALWAYS: this is what realigns memory with the published base.
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
@@ -5220,6 +5226,9 @@ impl DiskVamanaIndex {
         // goes wrong, or this process keeps serving from a base the store no
         // longer has. Failures are collected and reported instead.
         let mut cleanup_error: Option<io::Error> = None;
+        // Takes either shape: a plain `io::Result` from a cleanup step, and a
+        // `FinishResult` from one that has its own commit boundary. Both end
+        // up in the same place, because from here everything is post-commit.
         let mut note = |r: io::Result<()>| {
             if let Err(e) = r
                 && cleanup_error.is_none()
@@ -5266,7 +5275,10 @@ impl DiskVamanaIndex {
             // ordering exists to close: the old WAL was the only remaining
             // record of what the fold deleted, and half of it is worse than
             // either version of it.
-            note(self.replace_wal(&suffix_ops));
+            note(match self.replace_wal(&suffix_ops) {
+                Ok(FinishOutcome::Committed) => Ok(()),
+                Ok(FinishOutcome::CommittedCleanupFailed(e)) | Err(e) => Err(e),
+            });
         }
         // Surgical swap: install the prebuilt base (tier already built
         // off-thread) and reconstruct the in-RAM state the way `open` would,
@@ -5720,13 +5732,17 @@ impl DiskVamanaIndex {
         // durable run marker makes the same rows recoverable even if the WAL
         // rename reached disk before reporting a later sync error. Once this
         // succeeds, the remaining splice is infallible and is the commit.
-        self.compact_wal()?;
+        // `Err` here is pre-commit and aborts the flush; a cleanup outcome is
+        // NOT - the WAL was replaced, only its directory entry is not durable
+        // yet - so it is carried through to this function's own outcome rather
+        // than discarded by a `?`.
+        let wal = self.compact_wal()?;
         self.runs.push(built.run);
         self.run_dirs.push(seq);
         self.flushing.clear();
-        // The splice above is the commit and cannot fail, so there is no
-        // post-commit step here to report on.
-        Ok(FinishOutcome::Committed)
+        // The splice above is the commit and cannot fail, so the only thing
+        // left to report is whatever the WAL replacement left behind.
+        Ok(wal)
     }
 
     /// Abort an off-thread flush whose build never produced an installable
@@ -5793,7 +5809,7 @@ impl DiskVamanaIndex {
     /// Rewrite the WAL to exactly the recoverable in-RAM state: one delete per
     /// live tombstone, one insert per delta row. Written to a temp file and
     /// renamed, then the append handle is reopened on the new inode.
-    fn compact_wal(&mut self) -> io::Result<()> {
+    fn compact_wal(&mut self) -> FinishResult {
         let mut ops: Vec<DeltaWalOp> = Vec::with_capacity(self.tombstones.len() + self.delta.len());
         for &id in &self.tombstones {
             ops.push(DeltaWalOp::Delete { id });
@@ -5823,19 +5839,34 @@ impl DiskVamanaIndex {
     /// would swallow later appends. The old handle is dropped only once the
     /// new one is in hand, so a failure at any step leaves the previous WAL
     /// and the previous handle both intact.
-    fn replace_wal(&mut self, ops: &[DeltaWalOp]) -> io::Result<()> {
+    fn replace_wal(&mut self, ops: &[DeltaWalOp]) -> FinishResult {
         let path = self.dir.join(DELTA_LOG_FILE);
         let tmp = self.dir.join("delta.log.compact");
         write_framed_wal(&tmp, ops)?;
         let new_log = std::fs::OpenOptions::new().append(true).open(&tmp)?;
         new_log.sync_all()?;
+        // THE COMMIT: from here `delta.log` names the new inode.
         std::fs::rename(&tmp, &path)?;
-        File::open(&self.dir)?.sync_all()?; // the rename's directory entry
+        // The handle goes in IMMEDIATELY, before anything else that can fail.
+        //
+        // The directory fsync used to come first, with a `?`. A failure there
+        // returned an error after the rename had already happened, so the path
+        // named the new inode while this process kept appending to the old one
+        // - now unlinked. Those writes were acknowledged and invisible to every
+        // reopen. And the epoch did not move, so a fold building at that moment
+        // compared its offset against a file that had been replaced under it.
         self.delta_log = new_log;
         self.wal_format = DeltaWalFormat::FramedV2;
         // The file is a new one: every recorded offset into the old is void.
         self.wal_epoch = self.wal_epoch.wrapping_add(1);
-        Ok(())
+        // Post-commit: making the rename itself durable. A failure here means
+        // a crash could lose the rename, and the OLD WAL comes back - whose
+        // rows are still covered, by the run marker for a flush and by the
+        // published base for a fold. Durability warning, not a lost write.
+        Ok(match File::open(&self.dir).and_then(|d| d.sync_all()) {
+            Ok(()) => FinishOutcome::Committed,
+            Err(e) => FinishOutcome::CommittedCleanupFailed(e),
+        })
     }
 
     /// Snapshot for a background delete-patch of the base graph (short,
@@ -8109,6 +8140,58 @@ mod tests {
             assert!(
                 re.get(id).unwrap().is_some(),
                 "id {id} survived the process but not the reopen"
+            );
+        }
+    }
+
+    /// After the WAL is replaced, appends must reach the file `delta.log`
+    /// NAMES - even when the directory fsync that follows the rename fails.
+    ///
+    /// `replace_wal` renamed, then fsynced the directory with `?`, and only
+    /// then installed the new handle. So a failing fsync returned an error
+    /// with the rename already done: `delta.log` named the new inode while
+    /// the process kept appending to the old one, now unlinked. Those writes
+    /// are acknowledged and invisible to every reopen. The epoch did not move
+    /// either, so a fold building at that moment would compare offsets against
+    /// a file that had been replaced under it.
+    ///
+    /// The failpoint: a directory with no READ permission still allows rename
+    /// (write and execute), but `File::open` on it fails - which is exactly
+    /// the fsync call and nothing else on this path.
+    #[test]
+    fn appends_after_a_wal_replacement_reach_the_named_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), 16, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        for id in 0..64u64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+
+        let saved = std::fs::metadata(tmp.path()).unwrap().permissions();
+        std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o333)).unwrap();
+        // A flush compacts the WAL, which is a replacement.
+        let flushed = idx.flush_begin().unwrap().and_then(|j| {
+            let b = j.build(tmp.path()).ok()?;
+            Some(idx.flush_finish(b))
+        });
+        std::fs::set_permissions(tmp.path(), saved).unwrap();
+        let _ = flushed;
+
+        // Whatever that reported, the index is still open and accepting
+        // writes. Those writes have to land in the file the directory names.
+        for id in 900..920u64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        drop(idx);
+
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        for id in 900..920u64 {
+            assert!(
+                re.get(id).unwrap().is_some(),
+                "id {id} was acknowledged after a WAL replacement and is not \
+                 in the file delta.log names"
             );
         }
     }
