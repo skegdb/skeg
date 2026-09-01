@@ -667,6 +667,18 @@ enum ShardReq {
         tenant: u128,
         /// Tenant's max vectors, if any. `None` skips quota enforcement.
         limit: Option<u64>,
+        /// True when this write moves or replicates a row the tenant ALREADY
+        /// owns, so it must not consume a quota slot.
+        ///
+        /// The quota counts a tenant's LOGICAL cardinality, and a per-shard
+        /// check cannot see that: a shard decides `was_new` from its own
+        /// contents, so a row arriving from elsewhere looks new every time.
+        /// Two opposite bugs came from it. A cross-shard overwrite took a slot
+        /// for a row the tenant already had, and was refused at exactly the
+        /// limit. And a reshard move wrote with no limit (no increment) while
+        /// its delete credited one back, leaking the counter downward once per
+        /// moved row - so a tenant ended up counted below its own contents.
+        internal: bool,
         /// Optional opaque payload blob stored alongside the vector. `None`
         /// leaves the write path byte-identical to a payload-less VSET.
         payload: Option<Bytes>,
@@ -717,6 +729,11 @@ enum ShardReq {
         id: u64,
         /// Owning tenant, so its vector quota is credited on a real delete.
         tenant: u128,
+        /// True when this removes a copy the tenant still owns elsewhere: the
+        /// far side of an internal write, or a replica whose primary has
+        /// already been credited. The row is not leaving the tenant, so
+        /// crediting again would drop the counter for a row that still exists.
+        internal: bool,
     },
     Vsearch {
         name: String,
@@ -3016,6 +3033,7 @@ async fn process(
             vector,
             tenant,
             limit,
+            internal,
             payload,
         } => {
             // Outer read to look up the entry; clone the Arc and drop the
@@ -3041,7 +3059,9 @@ async fn process(
                             // before the insert (race-free under this write
                             // lock) so an over-limit insert is rejected without
                             // storing; an overwrite never touches the quota.
-                            let was_new = !idx.backend.contains(id);
+                            // `internal` first: a moved or replicated row is
+                            // new to THIS shard and not to the tenant.
+                            let was_new = !internal && !idx.backend.contains(id);
                             if was_new
                                 && let Some(max) = limit
                                 && quota.try_add(tenant, 1, max).is_err()
@@ -3273,7 +3293,12 @@ async fn process(
                 }
             }
         }
-        ShardReq::Vdel { name, id, tenant } => {
+        ShardReq::Vdel {
+            name,
+            id,
+            tenant,
+            internal,
+        } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
@@ -3291,7 +3316,9 @@ async fn process(
                     match result {
                         Ok(existed) => {
                             if existed {
-                                quota.sub(tenant, 1);
+                                if !internal {
+                                    quota.sub(tenant, 1);
+                                }
                                 // Reclaim the payload blob, if any. Harmless when
                                 // the id never had one (del returns false).
                                 let key = payload_key(tenant, &name, id);
@@ -4698,6 +4725,9 @@ impl ShardSet {
                 vector,
                 tenant,
                 limit,
+                // An overwrite of a row the tenant already owns changes no
+                // cardinality, wherever the old copy happened to live.
+                internal: old.is_some(),
                 payload,
             };
             match self.call(owner, req).await? {
@@ -4731,6 +4761,8 @@ impl ShardSet {
                                     name: name.to_owned(),
                                     id,
                                     tenant,
+                                    // The row moved; it did not leave.
+                                    internal: true,
                                 },
                             )
                             .await
@@ -4769,6 +4801,9 @@ impl ShardSet {
             vector,
             tenant,
             limit,
+            // Hash placement never moves a row, so the shard's own `was_new`
+            // is the whole truth here.
+            internal: false,
             payload,
         };
         match self.call(shard, req).await? {
@@ -4963,6 +4998,8 @@ impl ShardSet {
                             vector,
                             tenant,
                             limit: None,
+                            // A reshard move: the row arrives, it is not new.
+                            internal: true,
                             payload,
                         };
                         match self.call(usize::from(owner), req).await? {
@@ -4980,6 +5017,10 @@ impl ShardSet {
                                 name: name.to_owned(),
                                 id,
                                 tenant,
+                                // Same move, far side. Crediting here while the
+                                // destination does not charge is what leaked
+                                // the counter downward once per moved row.
+                                internal: true,
                             },
                         )
                         .await?
@@ -5064,6 +5105,9 @@ impl ShardSet {
                         vector,
                         tenant,
                         limit: None,
+                        // A boundary replica: a second physical copy of one
+                        // logical row.
+                        internal: true,
                         payload,
                     };
                     match self.call(usize::from(second), req).await? {
@@ -5210,6 +5254,9 @@ impl ShardSet {
             name: name.to_owned(),
             id,
             tenant,
+            // The row really is leaving the tenant: this is the one delete
+            // that credits the quota.
+            internal: false,
         };
         let existed = match self.call(shard, req).await? {
             ShardResp::Existed(b) => b,
@@ -5234,6 +5281,10 @@ impl ShardSet {
                         name: name.to_owned(),
                         id,
                         tenant,
+                        // The primary's delete above already credited this row.
+                        // Crediting again would drop the counter by two for one
+                        // logical row.
+                        internal: true,
                     },
                 )
                 .await?
@@ -5350,34 +5401,83 @@ impl ShardSet {
                 .send(ShardMsg { req, reply: tx })
                 .await
                 .map_err(|_| ShardError::Unavailable)?;
-            pending.push(rx);
+            pending.push((shard, rx));
         }
-        let mut merged: Vec<(u64, f32, Option<Bytes>)> = Vec::new();
+        // Hits carry the shard that produced them, so the dedup below can
+        // prefer the COMMITTED copy rather than the best-scoring one.
+        let mut merged: Vec<(u64, f32, Option<Bytes>, usize)> = Vec::new();
         let mut first_err = None;
-        for rx in pending {
+        for (shard, rx) in pending {
             match rx.await.map_err(|_| ShardError::Unavailable)? {
-                ShardResp::Vsearch(hits) => merged.extend(hits),
+                ShardResp::Vsearch(hits) => {
+                    merged.extend(hits.into_iter().map(|(id, s, p)| (id, s, p, shard)));
+                }
                 ShardResp::Err(e) => {
                     first_err.get_or_insert(e);
                 }
                 _ => return Err(ShardError::Unavailable),
             }
         }
-        // Every shard erroring with no hits means the index is missing or the
-        // query dim is wrong - surface that rather than an empty result.
-        if merged.is_empty()
-            && let Some(e) = first_err
-        {
+        // FAIL-CLOSED: any shard failing fails the search.
+        //
+        // It used to surface an error only when the merged set came back
+        // EMPTY, so a shard that failed while others returned hits produced a
+        // shorter top-k that looks exactly like a complete one. The client
+        // cannot tell the difference - not from the shape of the answer, not
+        // from the scores, not from the count, since k is a maximum and a
+        // genuine query can legitimately return fewer. An incomplete top-k is
+        // not a slightly worse answer; it is a wrong answer that cannot be
+        // recognised as one, and it silently corrupts anything built on top:
+        // a RAG context missing its best passage, a dedup that misses the
+        // duplicate, a recommendation that omits the obvious.
+        //
+        // Consistency over availability, deliberately. A best-effort mode is
+        // a reasonable thing to want, but it has to be an explicit contract
+        // that says so in the response - at minimum a partial flag and which
+        // shards failed - not a silent default.
+        if let Some(e) = first_err {
             return Err(ShardError::Storage(e));
         }
-        merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        // Dedup by id, best score first: a mid-reshard crash can leave the
-        // same id on two shards (the move is vset-then-vdel, so a crash
-        // duplicates, never loses), and boundary overlap will do it on
-        // purpose. One id, one hit.
+        // Dedup by id, preferring the copy the OWNER MAP calls live.
+        //
+        // Best-score-wins was not enough. A duplicate exists on purpose
+        // (boundary overlap) and by accident (a crash mid-move, or a cleanup
+        // that failed after an overwrite committed on the new shard), and in
+        // the accidental case the two copies hold DIFFERENT vectors: the old
+        // one and the new one. A query resembling the old vector then scores
+        // the stale copy higher, and best-score-wins hands back the value the
+        // write replaced - with a confident score. That is the same shape as
+        // the stale-vector P0s: a wrong answer that looks certain.
+        //
+        // The owner map is what VGET routes by, so preferring it also makes
+        // search and point reads agree, which they otherwise would not.
+        let owner_of: Option<std::collections::HashMap<u64, u8>> = {
+            let owners = self.inner.owners.read();
+            owners.get(name).map(|m| {
+                merged
+                    .iter()
+                    .filter_map(|&(id, _, _, _)| m.get(&id).map(|&(p, _)| (id, p)))
+                    .collect()
+            })
+        };
+        merged.sort_unstable_by(|a, b| {
+            let live = |h: &(u64, f32, Option<Bytes>, usize)| {
+                owner_of
+                    .as_ref()
+                    .and_then(|m| m.get(&h.0))
+                    .is_some_and(|&p| usize::from(p) == h.3)
+            };
+            // Live copy first for the same id; then by score, as before.
+            live(b).cmp(&live(a)).then_with(|| b.1.total_cmp(&a.1))
+        });
         let mut seen = ahash::AHashSet::new();
-        merged.retain(|&(id, _, _)| seen.insert(id));
+        merged.retain(|&(id, _, _, _)| seen.insert(id));
+        // Scores decide the ranking, so restore that order once one hit per
+        // id survives: the pass above only chose WHICH copy of an id to keep.
+        merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
+        let merged: Vec<(u64, f32, Option<Bytes>)> =
+            merged.into_iter().map(|(id, s, p, _)| (id, s, p)).collect();
         // Shard 0 by convention: a scattered op belongs to no single shard.
         skeg_telemetry::record_op(skeg_telemetry::Op::VSearch, 0, started.elapsed());
         Ok(merged)
