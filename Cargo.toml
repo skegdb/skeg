@@ -49,6 +49,15 @@ unknown_lints = "allow"
 uninlined_format_args = "allow"   # 1.88 deny vs 1.93 noise; cosmetic
 manual_is_multiple_of = "allow"   # 1.93 asks for `.is_multiple_of()` which is unstable < 1.87
 
+# A parking_lot guard held across an `.await` is a hang, not a warning: the
+# shard runs on a current_thread runtime, so the task that owns the guard is
+# also the task that must make progress to release it. Introduced exactly
+# this way once - `match vindexes.write().remove(name) { ... }` keeps the
+# scrutinee guard alive for the whole match, and the miss arm awaited inside
+# it. Ten minutes at 0.0% CPU. The compiler can hold this rule; a reviewer
+# reliably cannot.
+await_holding_lock = "deny"
+
 [workspace.dependencies]
 # Async
 tokio = { version = "1", features = ["full"] }
