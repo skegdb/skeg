@@ -145,7 +145,7 @@ fn main() {
         for (id, v) in corpus.iter().enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let build_s = build_t.elapsed().as_secs_f64();
         // resident = logical index footprint (graph + tq1 codes).
         let ram_mb = idx.resident_bytes() as f64 / (1024.0 * 1024.0);

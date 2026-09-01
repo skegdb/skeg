@@ -132,7 +132,7 @@ fn open_or_build(dir: &Path, corpus: &[Vec<f32>], pad: usize, n: usize) -> DiskV
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     drop(idx);
     DiskVamanaIndex::open_with_tier(dir, QuantKind::TurboQuant { bits: 1 }).unwrap()
 }

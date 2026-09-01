@@ -144,7 +144,7 @@ fn open_or_build(dir: &Path, corpus: &[Vec<f32>], pad: usize, n: usize) -> (Disk
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     let build_s = t.elapsed().as_secs_f64();
     drop(idx);
     (

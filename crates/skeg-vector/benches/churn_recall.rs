@@ -117,7 +117,7 @@ fn build_gold(
     for &r in live_rows {
         idx.insert(r, &vat(corpus, r, dim)).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     idx
 }
 
@@ -137,7 +137,7 @@ fn build_churned(
     for r in 0..n as u64 {
         idx.insert(r, &vat(corpus, r, dim)).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     let mut base_job: Option<
         std::thread::JoinHandle<std::io::Result<skeg_vector::ConsolidateBuilt>>,
     > = None;
@@ -198,7 +198,7 @@ fn build_churned(
             _ => {
                 // "inline": the server's delta-size-triggered consolidate.
                 if idx.delta_len() >= idx.main_len().max(4096) {
-                    idx.consolidate().unwrap();
+                    idx.consolidate().unwrap().expect_clean();
                 }
             }
         }

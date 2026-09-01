@@ -8193,7 +8193,7 @@ mod tests {
         for id in 0u64..4000 {
             idx.insert(id, &tvec(id + 1)).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
             VectorBackend::Disk(Box::new(idx)),
             4,
@@ -8502,23 +8502,47 @@ mod tests {
 
         // The flushed rows are now a run of 4196 against an empty base, so the
         // geometric trigger fires: run_rows >= base.max(IDLE_CONSOLIDATE_MIN).
-        // Note it is the run size that decides, not idleness; the tick is
-        // passed `idle` here only because the old chain needed it, and the
-        // assertion below holds either way.
-        // A tick can legitimately skip when the global fold budget is held
-        // by a concurrent test; production retries next tick, so so do we.
-        let mut folded = false;
-        for _ in 0..100 {
-            if maintenance_tick(&arc, &vdir, 0, true).await {
-                folded = true;
-                break;
+        // It is the run size that decides, not idleness.
+        //
+        // Asserted as a DECISION first, which is what this test is named for
+        // and the only part that is deterministic. Driving it through
+        // `maintenance_tick` is not: the tick deliberately refuses to park on
+        // the process-wide fold budget, so a concurrent test holding it makes
+        // the tick skip. This used to be a hundred retries over five seconds -
+        // mitigation, not determinism, and it still failed about one full-suite
+        // run in four.
+        let state = {
+            let g = arc.read();
+            LsmState {
+                delta: g.backend.delta_len(),
+                runs: g.backend.run_count(),
+                run_rows: g.backend.run_rows(),
+                tombs: g.backend.tombstone_count(),
+                base: g.backend.main_len(),
+                flush_streak: g.flush_streak.load(Ordering::Relaxed),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            folded,
-            "a run grown past the geometric threshold must consolidate"
+        };
+        assert_eq!(
+            ladder_plan(&state, FLUSH_ROWS),
+            vec![Rung::Consolidate],
+            "a run past the geometric threshold must plan the fold: {state:?}"
         );
+
+        // Then that the planned fold actually completes - WAITING for the
+        // budget rather than skipping, since here there is no request path to
+        // protect and no next tick to retry on.
+        let d = vdir.clone();
+        let ran = try_off_thread_maintenance(
+            &arc,
+            "consolidate",
+            true,
+            |b| b.consolidate_begin(),
+            move |job| job.build(&d),
+            |b, built| b.consolidate_finish(built),
+        )
+        .await
+        .expect("the fold must not fail");
+        assert_eq!(ran, MaintenanceOutcome::Ran);
         assert_eq!(arc.read().backend.run_count(), 0, "runs did not fold");
 
         // Nothing left to do: quiet tick, no consolidate reported.
@@ -8551,7 +8575,7 @@ mod tests {
         for id in 0u64..20_000 {
             idx.insert(id, &tvec(id + 1)).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let base = idx.main_len();
         assert!(base >= 20_000, "base did not build: {base}");
         idx.set_auto_flush(false);
@@ -8606,7 +8630,7 @@ mod tests {
         for id in 0u64..6_000 {
             idx.insert(id, &tvec(id + 1)).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // Kill 40% of the base: well past the crossover, squarely in the
         // regime where patching loses.
         for id in 0u64..2_400 {
@@ -9264,7 +9288,7 @@ mod tests {
         for id in 0u64..5000 {
             idx.insert(id, &tvec(id + 1)).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let base_before = idx.main_len();
         for id in 5000u64..14000 {
             idx.insert(id, &tvec(id + 1)).unwrap();

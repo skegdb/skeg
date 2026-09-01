@@ -3619,7 +3619,15 @@ impl DiskVamanaIndex {
     /// Bytes held in RAM: graph + ids + int8 tier + the (small) f32 delta.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        let delta_bytes: usize = self.delta.values().map(|v| v.len() * 4 + 24).sum();
+        // BOTH buffers. `flush_begin` does `flushing = take(&mut delta)`, so
+        // counting only `delta` makes this number DROP at the exact moment the
+        // process is holding the most: the staging copy is still resident, is
+        // still searched, and is not freed until `flush_finish`. An operator
+        // watching for a memory problem saw it go down when it went up, and a
+        // budget derived from it would admit against memory already committed.
+        let vec_bytes =
+            |m: &AHashMap<u64, Vec<f32>>| -> usize { m.values().map(|v| v.len() * 4 + 24).sum() };
+        let delta_bytes = vec_bytes(&self.delta) + vec_bytes(&self.flushing);
         let seg_bytes = |s: &Segment| {
             s.nodes.len() * std::mem::size_of::<Node>()
                 + s.ids.len() * std::mem::size_of::<u64>()
@@ -4895,7 +4903,7 @@ impl DiskVamanaIndex {
         }
     }
 
-    pub fn consolidate(&mut self) -> io::Result<()> {
+    pub fn consolidate(&mut self) -> FinishResult {
         let dim = self.dim;
         // Collect the surviving (id, location) refs only - ~24 B each, not the
         // full 2 GB of vectors. Precedence (newest wins): delta > runs (newest
@@ -4925,7 +4933,8 @@ impl DiskVamanaIndex {
         }
         self.append_persisted_survivors(&mut seen, &mut survivors);
         if survivors.is_empty() {
-            return Ok(());
+            // Nothing to fold, so nothing committed and nothing left behind.
+            return Ok(FinishOutcome::Committed);
         }
         // Rebuild in id order so a query's near-neighbours land at nearby
         // vectors.bin rows and the re-rank's f32 reads stay cache-local. Without
@@ -4961,12 +4970,50 @@ impl DiskVamanaIndex {
         let t = std::time::Instant::now();
         let rebuilt = build_disk_graph(tier, vectors, ids, dim, &disk_build_config());
         let build_ms = t.elapsed().as_millis();
+        // THE COMMIT: the new base is on disk. Nothing below may leave this
+        // function early, for the same reason `consolidate_finish` may not -
+        // the in-memory state has to be brought in line with what was
+        // published, or the process serves a base the store no longer has.
         rebuilt.save(&dir)?;
         let save_ms = t.elapsed().as_millis();
-        self.discard_runs()?;
-        // The delta + runs are now folded into the graph: the WAL must start
-        // empty so the reopen below does not replay stale records.
-        write_framed_wal(&dir.join(DELTA_LOG_FILE), &[])?;
+
+        // Post-commit, and the same three rules as the background path.
+        //
+        // This used to be three `?` in a row, which was wrong in a way the
+        // background path had already been fixed for: `discard_runs` clears
+        // `runs` and `run_dirs` BEFORE it can fail, so returning here left the
+        // old base in memory with no runs beside it - the live process serving
+        // fewer rows than it holds, until a restart.
+        let mut cleanup_error: Option<io::Error> = None;
+        let mut note = |r: io::Result<()>| {
+            if let Err(e) = r
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(e);
+            }
+        };
+        let runs_retired = match self.discard_runs() {
+            Ok(dir_error) => {
+                if let Some(e) = dir_error {
+                    note(Err(e));
+                }
+                true
+            }
+            Err(e) => {
+                note(Err(e));
+                false
+            }
+        };
+        // The delta and runs are folded into the graph, so the WAL must start
+        // empty or the reopen replays stale records - but ONLY once every run
+        // is durably retired. A surviving marker means a reopen brings that
+        // run back, and the WAL is the only thing still masking what this fold
+        // deleted. Through `replace_wal`, so a failure leaves the previous WAL
+        // whole instead of truncating it in place.
+        if runs_retired {
+            note(self.replace_wal(&[]));
+        }
+        // ALWAYS: this is what realigns memory with the published base.
         *self = DiskVamanaIndex::open_with_tier(&dir, tier)?;
         if timing {
             let reopen_ms = t.elapsed().as_millis() - save_ms;
@@ -4976,7 +5023,10 @@ impl DiskVamanaIndex {
                 save_ms - build_ms,
             );
         }
-        Ok(())
+        Ok(match cleanup_error {
+            Some(e) => FinishOutcome::CommittedCleanupFailed(e),
+            None => FinishOutcome::Committed,
+        })
     }
 
     /// Begin a background consolidate: the short, exclusive phase.
@@ -6199,7 +6249,7 @@ mod tests {
         for id in 0u64..200 {
             idx.insert(id, &vec_for(id)).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         assert!(
             idx.get(0).unwrap().is_some(),
             "base did not survive its fold"
@@ -6211,7 +6261,7 @@ mod tests {
             idx.insert(id, &vec_for(id)).unwrap();
         }
         let job = idx.flush_begin().unwrap().expect("delta is non-empty");
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // Every id must still be retrievable. Before the fix the fold missed
         // them, the WAL was truncated, and the reopen dropped the staging map.
         for id in 0u64..400 {
@@ -6719,7 +6769,7 @@ mod tests {
         for id in 0..n {
             tq.insert(id as u64, row(&vectors, id as u32, dim)).unwrap();
         }
-        tq.consolidate().unwrap();
+        tq.consolidate().unwrap().expect_clean();
         // tier.kind persisted: a fresh `open` (no explicit tier) rebuilds tq2.
         drop(tq);
         let tq = DiskVamanaIndex::open(tmp.path()).unwrap();
@@ -6753,7 +6803,7 @@ mod tests {
         for id in 0..n {
             i8.insert(id as u64, row(&vectors, id as u32, dim)).unwrap();
         }
-        i8.consolidate().unwrap();
+        i8.consolidate().unwrap().expect_clean();
         assert!(
             tq.resident_bytes() < i8.resident_bytes(),
             "tq2 RAM {} should be < int8 RAM {}",
@@ -6923,7 +6973,7 @@ mod tests {
         let before = disk.len();
         assert_eq!(before, n + 50 - 30);
 
-        disk.consolidate().unwrap();
+        disk.consolidate().unwrap().expect_clean();
         assert_eq!(disk.len(), before, "consolidation preserves the live count");
         assert_eq!(disk.delta_len(), 0, "delta is empty after consolidation");
 
@@ -7104,7 +7154,7 @@ mod tests {
 
         let mut reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
         assert_eq!(reopened.get(7).unwrap(), Some(vec![1.0; 4]));
-        reopened.consolidate().unwrap();
+        reopened.consolidate().unwrap().expect_clean();
         assert!(
             std::fs::read(wal_path)
                 .unwrap()
@@ -7148,7 +7198,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut disk = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
         let vectors = fill_past_flush(&mut disk, n, dim);
-        disk.consolidate().unwrap();
+        disk.consolidate().unwrap().expect_clean();
 
         assert!(disk.runs.is_empty(), "consolidate clears the runs");
         assert_eq!(
@@ -7212,7 +7262,7 @@ mod tests {
             disk.insert(9000 + j, &random_vectors(1, dim, 100 + j))
                 .unwrap();
         }
-        disk.consolidate().unwrap();
+        disk.consolidate().unwrap().expect_clean();
         // Consolidation leaves only the V2 header.
         let wal = std::fs::read(tmp.path().join("delta.log")).unwrap();
         assert_eq!(
@@ -7317,7 +7367,7 @@ mod tests {
         };
         let t_inline = tempfile::TempDir::new().unwrap();
         let mut inline = mk(t_inline.path());
-        inline.consolidate().unwrap();
+        inline.consolidate().unwrap().expect_clean();
 
         let t_bg = tempfile::TempDir::new().unwrap();
         let mut bg = mk(t_bg.path());
@@ -7514,7 +7564,7 @@ mod tests {
         for (i, v) in vecs.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap(); // land every vector in the base
+        idx.consolidate().unwrap().expect_clean(); // land every vector in the base
         let base_before = idx.main_len();
         assert_eq!(base_before, n, "all rows in base");
 
@@ -7570,7 +7620,7 @@ mod tests {
         for (i, v) in vecs.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         for id in (0..n as u64).step_by(5) {
             idx.delete(id).unwrap(); // dead-at-begin base rows
         }
@@ -7635,7 +7685,7 @@ mod tests {
         for (i, v) in base.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let more = random_vectors(300, dim, 8);
         for (i, v) in more.chunks_exact(dim).enumerate() {
             idx.insert(500 + i as u64, v).unwrap();
@@ -7840,6 +7890,92 @@ mod tests {
         assert_eq!(re.len(), live + 1);
     }
 
+    /// The reported resident bytes must not DROP when a flush starts.
+    ///
+    /// `flush_begin` does `flushing = take(&mut delta)`, so a figure counting
+    /// only `delta` fell to nothing at the moment the process was holding the
+    /// most - the staging copy is still resident and still searched until
+    /// `flush_finish`. An operator watching for a memory problem saw the
+    /// number go down as the memory went up, and a budget derived from it
+    /// would admit against memory already committed.
+    #[test]
+    fn resident_bytes_counts_the_flush_staging_buffer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), 256, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        for id in 0..512u64 {
+            idx.insert(id, &[id as f32; 256]).unwrap();
+        }
+        let with_delta = idx.resident_bytes();
+        // 512 vectors of 256 f32 is a megabyte of payload; the figure has to
+        // be in that neighbourhood, or it is not measuring the delta at all.
+        assert!(
+            with_delta > 512 * 256 * 4,
+            "the delta itself must be counted: {with_delta}"
+        );
+
+        // Between begin and finish the rows live in `flushing`, not `delta`.
+        let job = idx.flush_begin().unwrap().unwrap();
+        let staged = idx.resident_bytes();
+        assert!(
+            staged >= with_delta,
+            "resident bytes fell from {with_delta} to {staged} while the rows \
+             were merely moved into the staging buffer"
+        );
+
+        let built = job.build(tmp.path()).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
+        assert!(
+            idx.resident_bytes() < staged,
+            "and it must come back down once the run replaces the staging"
+        );
+    }
+
+    /// The INLINE fold must obey the same rules as the background one.
+    ///
+    /// `consolidate()` and `consolidate_finish()` publish the same thing and
+    /// were fixed apart: the background path got the post-commit ordering
+    /// while the inline path kept three `?` in a row. `discard_runs` clears
+    /// `runs` and `run_dirs` before it can fail, so returning early left the
+    /// OLD base in memory with no runs beside it - a live process serving
+    /// fewer rows than it holds, until a restart.
+    #[test]
+    fn the_inline_fold_realigns_memory_even_when_cleanup_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let (mut idx, doomed, live) = folded_fixture(tmp.path(), tier);
+
+        let run = tmp.path().join("run-0");
+        let saved = std::fs::metadata(&run).unwrap().permissions();
+        std::fs::set_permissions(&run, PermissionsExt::from_mode(0o555)).unwrap();
+        let outcome = idx.consolidate().unwrap();
+        std::fs::set_permissions(&run, saved).unwrap();
+        assert!(
+            outcome.cleanup_error().is_some(),
+            "the fixture must actually fail the cleanup"
+        );
+
+        // The LIVE process, before any restart: it must serve the folded base.
+        assert_eq!(
+            idx.len(),
+            live,
+            "the inline fold left the process serving a stale base"
+        );
+        for &id in &doomed {
+            assert!(idx.get(id).unwrap().is_none(), "id {id} came back live");
+        }
+
+        // And across the boundary.
+        drop(idx);
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert_eq!(re.len(), live);
+        for &id in &doomed {
+            assert!(re.get(id).unwrap().is_none(), "id {id} came back on reopen");
+        }
+    }
+
     /// A fold whose DIRECTORY removal fails must still stop the run from being
     /// a layer after a restart.
     ///
@@ -7956,7 +8092,7 @@ mod tests {
         for (i, v) in vecs.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // A run too, so the run checks have something to look at.
         for (i, v) in random_vectors(100, dim, 62).chunks_exact(dim).enumerate() {
             idx.insert(9000 + i as u64, v).unwrap();
@@ -8297,7 +8433,7 @@ mod tests {
         for (i, v) in a.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
 
         let b = random_vectors(400, dim, 72);
         for (i, v) in b.chunks_exact(dim).enumerate() {
@@ -8342,7 +8478,7 @@ mod tests {
         for (i, v) in old.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         assert_eq!(
             idx.run_count(),
             0,
@@ -8491,7 +8627,7 @@ mod tests {
         for (id, v) in vecs.chunks_exact(dim).enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let base_before = idx.main_len();
         assert!(base_before >= 300);
         drop(idx);
@@ -8533,7 +8669,7 @@ mod tests {
         for (i, v) in random_vectors(3000, dim, 77).chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         if !entry_cache_enabled() {
             return; // the suite also runs with SKEG_ENTRY_CACHE=0
         }
@@ -8573,7 +8709,7 @@ mod tests {
         for (i, v) in base.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // Two flushed runs plus a small live delta.
         for batch in 0..2u64 {
             let more = random_vectors(200, dim, 22 + batch);
@@ -8628,7 +8764,7 @@ mod tests {
         for (i, v) in base.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let more = random_vectors(300, dim, 10);
         for (i, v) in more.chunks_exact(dim).enumerate() {
             idx.insert(500 + i as u64, v).unwrap();
@@ -8677,7 +8813,7 @@ mod tests {
         for (i, v) in base.chunks_exact(dim).enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let more = random_vectors(300, dim, 12);
         for (i, v) in more.chunks_exact(dim).enumerate() {
             idx.insert(400 + i as u64, v).unwrap();

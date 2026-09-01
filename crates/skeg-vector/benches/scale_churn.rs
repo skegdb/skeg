@@ -32,7 +32,7 @@ fn run_l3(n: usize, del_frac: f64, dim: usize, tier: QuantKind) {
         for i in 0..n as u64 {
             idx.insert(i, &uvec(dim, &mut s)).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // Deterministic delete set (same for both indices).
         let d = (n as f64 * del_frac) as usize;
         let mut r = 0xBEEF_5678u64 ^ (n as u64);
@@ -47,7 +47,7 @@ fn run_l3(n: usize, del_frac: f64, dim: usize, tier: QuantKind) {
 
     let (mut a, _) = build("cons");
     let t = Instant::now();
-    a.consolidate().unwrap();
+    a.consolidate().unwrap().expect_clean();
     let cons_s = t.elapsed().as_secs_f64();
     let base_a = a.main_len();
     let dir_a = std::env::temp_dir().join(format!("skeg_l3_cons_{n}"));
@@ -113,7 +113,7 @@ fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind, mod
         idx.insert(i, &uvec(dim, &mut s)).unwrap();
         ids.push(i);
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
 
     let ops = turns * n;
     let mut next = n as u64;
@@ -194,7 +194,7 @@ fn run_l2(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) 
         idx.insert(i, &uvec(dim, &mut s)).unwrap();
         ids.push(i);
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
 
     let ops = turns * n;
     let mut next = n as u64;

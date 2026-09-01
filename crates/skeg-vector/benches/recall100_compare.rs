@@ -84,7 +84,7 @@ fn main() {
         for (id, v) in corpus.iter().enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // (label, l_search, rerank).
         for &(label, ls, rr) in &[("default", 300usize, 800usize), ("wide", 2000, 12800)] {
             let mut hits = 0usize;

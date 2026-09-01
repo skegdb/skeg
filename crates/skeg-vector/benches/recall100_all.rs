@@ -130,7 +130,7 @@ fn main() {
             for (id, v) in corpus.iter().enumerate() {
                 idx.insert(id as u64, v).unwrap();
             }
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
             let rec = |ls: usize, rr: usize| -> f64 {
                 let mut hits = 0usize;
                 for (q, tr) in queries.iter().zip(&truth) {

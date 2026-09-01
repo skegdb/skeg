@@ -84,7 +84,7 @@ fn main() {
         for (id, v) in corpus.iter().enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         let build_s = t.elapsed().as_secs_f64();
         // recall@10 (plain search, l_search=100, k*8 rerank).
         let mut hits = 0usize;

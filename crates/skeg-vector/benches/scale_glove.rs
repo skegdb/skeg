@@ -71,7 +71,7 @@ fn build(dir: &Path, corpus: &[Vec<f32>], n: usize) -> DiskVamanaIndex {
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     println!("build {n} vecs (RW): {:.0}s", t.elapsed().as_secs_f64());
     drop(idx);
     DiskVamanaIndex::open_with_tier(dir, tier).unwrap()

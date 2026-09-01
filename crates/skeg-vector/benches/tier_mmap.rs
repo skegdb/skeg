@@ -138,7 +138,7 @@ fn main() {
         for (id, v) in corpus.iter().enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         // recall (valid; mmap does not change results) - measured here with the corpus.
         let mut h10 = 0usize;
         let mut h100 = 0usize;

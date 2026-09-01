@@ -105,7 +105,7 @@ fn build_rw(
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap(); // RW streaming insert
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     let s = t.elapsed().as_secs_f64();
     drop(idx);
     (DiskVamanaIndex::open_with_tier(dir, tier).unwrap(), s)

@@ -487,7 +487,7 @@ fn main() {
             for (id, v) in corpus.iter().enumerate() {
                 idx.insert(id as u64, v).unwrap();
             }
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
             let build_s = t.elapsed().as_secs_f64();
             let r = |k: usize, tr: &[AHashSet<u64>], rr: usize| -> f64 {
                 let mut h = 0usize;

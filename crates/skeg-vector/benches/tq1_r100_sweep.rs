@@ -74,7 +74,7 @@ fn main() {
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     println!(
         "tq1 recall@100 sweep: mxbai {n} x {dim}, {} queries",
         queries.len()

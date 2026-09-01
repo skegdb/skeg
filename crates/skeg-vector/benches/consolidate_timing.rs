@@ -14,6 +14,6 @@ fn main() {
         .join(format!("rw_tq2_n{n}"));
     let mut idx = DiskVamanaIndex::open_with_tier(&dir, QuantKind::TurboQuant { bits: 2 }).unwrap();
     let t = std::time::Instant::now();
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     eprintln!("total consolidate: {:.1}s", t.elapsed().as_secs_f64());
 }

@@ -94,7 +94,7 @@ fn build_churned(
         idx.insert(i, &uvec(dim, &mut s)).unwrap();
         ids.push(i);
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     let mut next = n as u64;
     let mut job: Option<std::thread::JoinHandle<std::io::Result<ConsolidateBuilt>>> = None;
     for _ in 0..churn {
@@ -121,7 +121,7 @@ fn build_churned(
                     .expect_clean();
             }
         } else if idx.delta_len() >= idx.main_len().max(4096) {
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
         }
     }
     if let Some(h) = job.take() {

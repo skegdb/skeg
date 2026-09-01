@@ -112,7 +112,7 @@ fn main() {
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     drop(idx);
     let build_s = t_build.elapsed().as_secs_f64();
 

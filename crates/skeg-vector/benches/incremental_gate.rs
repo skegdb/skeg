@@ -148,7 +148,7 @@ fn main() {
             .unwrap();
         max_pause_ms = max_pause_ms.max(t.elapsed().as_secs_f64() * 1000.0);
         if idx.delta_len() >= idx.main_len().max(DISK_CONSOLIDATE_MIN) {
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
             let (r, _) = recall_p50(&idx, &corpus[..n * dim], i + 1, dim, &queries);
             min_recall = min_recall.min(r);
         }
@@ -156,7 +156,7 @@ fn main() {
     let ingest_s = ingest_t0.elapsed().as_secs_f64();
     // Just after a consolidation: delta ~ 0. Time the full rebuild for contrast.
     let cons_t0 = Instant::now();
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     let consolidate_s = cons_t0.elapsed().as_secs_f64();
     let (recall_lo, p50_lo) = recall_p50(&idx, &corpus[..n * dim], n, dim, &queries);
     min_recall = min_recall.min(recall_lo);

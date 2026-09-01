@@ -87,7 +87,7 @@ fn run(bits: u8, dim: usize, n: usize, background: bool) {
         ids.push(next_id);
         next_id += 1;
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
 
     // churn: one full turnover
     let mut job: Option<std::thread::JoinHandle<std::io::Result<skeg_vector::ConsolidateBuilt>>> =
@@ -123,7 +123,7 @@ fn run(bits: u8, dim: usize, n: usize, background: bool) {
                 folds += 1;
             }
         } else if idx.delta_len() >= idx.main_len().max(CONSOLIDATE_MIN) {
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
         }
     }
     // Land an in-flight fold before measuring steady state.
@@ -140,7 +140,7 @@ fn run(bits: u8, dim: usize, n: usize, background: bool) {
     let (qd_p50, qd_p99) = query_lat(&idx, dim, &mut s);
 
     let tk = Instant::now();
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     let cons_s = tk.elapsed().as_secs_f64();
     let (qc_p50, qc_p99) = query_lat(&idx, dim, &mut s);
 

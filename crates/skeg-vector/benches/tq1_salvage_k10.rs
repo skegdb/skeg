@@ -51,7 +51,7 @@ fn build(corpus: &[Vec<f32>], dim: usize, bits: u8, tag: &str) -> DiskVamanaInde
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     idx
 }
 

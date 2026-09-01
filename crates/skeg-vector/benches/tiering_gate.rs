@@ -88,7 +88,7 @@ fn build(root: &Path, k: usize, n: usize, dim: usize, tier: QuantKind) -> Vec<st
             idx.insert(id, &v).unwrap();
         }
         if n > 0 {
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
         }
         drop(idx);
         dirs.push(dir);

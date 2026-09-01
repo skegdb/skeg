@@ -88,7 +88,7 @@ fn main() {
         for (id, v) in corpus.iter().take(n).enumerate() {
             idx.insert(id as u64, v).unwrap();
         }
-        idx.consolidate().unwrap();
+        idx.consolidate().unwrap().expect_clean();
         idx.build_ivf(0, 8).unwrap().expect_clean();
         Some(idx)
     };
@@ -124,7 +124,7 @@ fn main() {
             for (i, v) in slice.iter().enumerate() {
                 idx.insert(i as u64, v).unwrap();
             }
-            idx.consolidate().unwrap();
+            idx.consolidate().unwrap().expect_clean();
             Some(idx)
         } else {
             None

@@ -91,7 +91,7 @@ fn main() {
     for (id, v) in corpus.iter().enumerate() {
         idx.insert(id as u64, v).unwrap();
     }
-    idx.consolidate().unwrap();
+    idx.consolidate().unwrap().expect_clean();
     println!(
         "tq1 risk oracle: {n} x {dim}, {} queries, k=100 default(l=300,rr=800)",
         queries.len()
