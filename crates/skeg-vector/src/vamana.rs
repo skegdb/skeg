@@ -4706,23 +4706,47 @@ impl DiskVamanaIndex {
     /// A directory that will not unlink is garbage; a layer set that disagrees
     /// with the base is a correctness problem, and only one of the two is
     /// worth stopping for.
-    fn discard_runs(&mut self) -> io::Result<()> {
-        let mut first_error = None;
-        for seq in 0..self.run_seq {
-            let d = self.dir.join(format!("run-{seq}"));
-            if d.exists()
-                && let Err(e) = std::fs::remove_dir_all(&d)
-                && first_error.is_none()
+    /// Drop every run: retire the markers, remove the directories, and clear
+    /// the in-memory lists.
+    ///
+    /// Two different failures, reported separately, because only one of them
+    /// affects correctness. `Err` means a MARKER survived, so a reopen would
+    /// bring that run back as a live layer; the caller must then leave the WAL
+    /// alone, since it is what still masks the folded rows. `Ok(Some(e))`
+    /// means the markers are gone and only directories are left: garbage, and
+    /// a reopen deletes them.
+    ///
+    /// The MEMORY half always completes. Returning early on the first failure
+    /// left runs listed beside a base that had just folded them in - the same
+    /// rows in two layers, with run precedence putting the pre-fold copies on
+    /// top.
+    fn discard_runs(&mut self) -> io::Result<Option<io::Error>> {
+        let seqs: Vec<u64> = (0..self.run_seq).collect();
+        // Markers first, and all of them, before anything is unlinked.
+        let mut marker_error = None;
+        for &seq in &seqs {
+            if let Err(e) = self.retire_run(seq)
+                && marker_error.is_none()
             {
-                first_error = Some(e);
+                marker_error = Some(e);
             }
         }
         self.runs.clear();
         self.run_dirs.clear();
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = marker_error {
+            return Err(e);
         }
+        let mut dir_error = None;
+        for seq in seqs {
+            let d = self.dir.join(format!("run-{seq}"));
+            if d.exists()
+                && let Err(e) = std::fs::remove_dir_all(&d)
+                && dir_error.is_none()
+            {
+                dir_error = Some(e);
+            }
+        }
+        Ok(dir_error)
     }
 
     /// Survivor locations that are not a segment index: the in-RAM layers.
@@ -4983,37 +5007,56 @@ impl DiskVamanaIndex {
         };
 
         self.run_seq = built.run_seq_high.max(self.run_seq);
-        // The runs are folded into the new base; their directories are
-        // superseded. Leaving one behind is garbage, and a reopen ignores it -
-        // `run_dirs` no longer names it.
-        note(self.discard_runs());
-        // Re-encode the post-begin suffix as V2. Failing here leaves the OLD
-        // WAL next to the NEW base, so a reopen replays operations already
-        // folded in: their values are identical to what the base holds, the
-        // LSM precedence puts the replayed copies on top, and the cost is RAM
-        // until the next flush - the same trade `flush_finish` documents for
-        // its own crash window. Not a loss, so not a failure.
-        note(write_framed_wal(&wal_path, &suffix_ops));
+        // The runs are folded into the new base, so they must stop being
+        // layers. Retiring their MARKERS is what achieves that across a
+        // reopen: `open` reopens exactly the run directories carrying one.
+        // A directory left behind is garbage; a marker left behind is a live
+        // layer holding pre-fold rows.
+        let runs_retired = match self.discard_runs() {
+            Ok(dir_error) => {
+                if let Some(e) = dir_error {
+                    note(Err(e));
+                }
+                true
+            }
+            Err(e) => {
+                note(Err(e));
+                false
+            }
+        };
+        // Re-encode the post-begin suffix as V2 - but ONLY if the runs are
+        // durably retired.
+        //
+        // This rewrite is what drops the folded operations, tombstones
+        // included. If a marker survived, a reopen brings that run back with
+        // its pre-fold rows, and the WAL is the only thing left masking the
+        // ones this fold deleted: rewriting it here would resurrect deleted
+        // data at the next start. Keeping the old WAL costs a replay and some
+        // RAM, and keeps every row correct.
+        //
+        // Failing the rewrite itself is the mild case the flush path already
+        // documents: a reopen replays operations already folded in, their
+        // values identical to the base's, and the cost is RAM until the next
+        // flush.
+        if runs_retired {
+            // Atomically, through the one path that rewrites this file. A
+            // truncate-in-place here failed straight into the gap this whole
+            // ordering exists to close: the old WAL was the only remaining
+            // record of what the fold deleted, and half of it is worse than
+            // either version of it.
+            note(self.replace_wal(&suffix_ops));
+        }
         // Surgical swap: install the prebuilt base (tier already built
         // off-thread) and reconstruct the in-RAM state the way `open` would,
         // then replay the WAL suffix - WITHOUT a full reopen, so the O(live)
         // tier rebuild does not run here on the shard thread. `tier` is unused
         // now (the segment carries its own quant).
         let _ = tier;
-        // Reopened BEFORE the swap and kept only on success: an append handle
-        // that could not be reopened is the one post-commit failure that must
-        // not be papered over, since the old handle may point at an inode the
-        // rewrite above replaced. Keeping the previous handle is strictly
-        // better than dropping it - the WAL path is unchanged - so it is
-        // reported and carried on with.
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-        {
-            Ok(f) => self.delta_log = f,
-            Err(e) => note(Err(e)),
-        }
+        // No separate reopen: `replace_wal` hands over the append handle for
+        // the inode it renamed into place, and when it fails the previous
+        // handle and the previous WAL are both still the right ones. Reopening
+        // the path by name afterwards was the version of this that could grab
+        // a different inode than the one the rewrite had installed.
         self.base = built.base;
         self.delta.clear();
         self.tombstones.clear();
@@ -5436,6 +5479,28 @@ impl DiskVamanaIndex {
     }
 
     /// Fsync every file of `run-{seq}` and write its `run.ok` marker.
+    /// Retire a run: unlink its `run.ok` marker and fsync the directory.
+    ///
+    /// The marker IS the durable membership - `open` reopens exactly the run
+    /// directories that carry one, and deletes the rest. So retiring a run is
+    /// removing one file, which is a far smaller thing to ask of the
+    /// filesystem than `remove_dir_all`, and it is what makes the difference
+    /// between a leftover directory and a leftover LAYER.
+    fn retire_run(&self, seq: u64) -> io::Result<()> {
+        let d = self.dir.join(format!("run-{seq}"));
+        let marker = d.join(RUN_OK_FILE);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            // Already gone: retired, or never marked.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        // The unlink has to reach the disk, or a crash brings the marker - and
+        // the run - back.
+        File::open(&d)?.sync_all()?;
+        Ok(())
+    }
+
     fn mark_run_durable(&self, seq: u64) -> io::Result<()> {
         let d = self.dir.join(format!("run-{seq}"));
         // Durability order (a crash between any two steps must not leave the
@@ -5473,14 +5538,29 @@ impl DiskVamanaIndex {
                 vector: v.clone(),
             });
         }
+        self.replace_wal(&ops)
+    }
+
+    /// Replace the delta WAL with exactly `ops`, atomically, and take the new
+    /// append handle.
+    ///
+    /// The only way this file is ever rewritten. `std::fs::write` truncates in
+    /// place, so a failure part-way leaves a WAL that is neither the old
+    /// content nor the new one - and the process carries on appending to it.
+    /// The fold used to rewrite its suffix that way, right after publishing a
+    /// new base generation, which is the worst possible moment: the old
+    /// content was the only remaining record of what the fold had deleted.
+    ///
+    /// Write the temp, open the append handle on the TEMP inode, fsync, then
+    /// rename: the handle follows the inode to its new name, so there is no
+    /// window where `delta_log` points at a renamed-over, unlinked file that
+    /// would swallow later appends. The old handle is dropped only once the
+    /// new one is in hand, so a failure at any step leaves the previous WAL
+    /// and the previous handle both intact.
+    fn replace_wal(&mut self, ops: &[DeltaWalOp]) -> io::Result<()> {
         let path = self.dir.join(DELTA_LOG_FILE);
         let tmp = self.dir.join("delta.log.compact");
-        write_framed_wal(&tmp, &ops)?;
-        // Open the append handle on the TEMP inode, fsync, then rename: the
-        // handle follows the inode to its new name, so there is no window
-        // where delta_log points at a renamed-over, unlinked file that would
-        // swallow later WAL appends (review finding). The old handle is
-        // dropped only once the new one is in hand.
+        write_framed_wal(&tmp, ops)?;
         let new_log = std::fs::OpenOptions::new().append(true).open(&tmp)?;
         new_log.sync_all()?;
         std::fs::rename(&tmp, &path)?;
@@ -5597,12 +5677,17 @@ impl DiskVamanaIndex {
     /// the base vectors once for k-means. `n_cells == 0` picks ~sqrtn.
     ///
     /// # Errors
-    /// I/O error if a base vector read fails.
-    pub fn build_ivf(&mut self, n_cells: usize, iters: usize) -> io::Result<()> {
+    /// I/O error if a base vector read fails - that is, before the router
+    /// exists. A router that was built but whose sidecar could not be written
+    /// comes back as [`FinishOutcome::CommittedCleanupFailed`]: it is live for
+    /// this process and gone at the next open, which is worth saying out loud
+    /// rather than dropping on the floor.
+    pub fn build_ivf(&mut self, n_cells: usize, iters: usize) -> FinishResult {
         let n = self.base.main_n;
         if n == 0 {
+            // Nothing to route: no router, and nothing left behind either.
             self.ivf = None;
-            return Ok(());
+            return Ok(FinishOutcome::Committed);
         }
         let dim = self.dim;
         let mut all = vec![0.0f32; n as usize * dim];
@@ -5616,10 +5701,18 @@ impl DiskVamanaIndex {
             n_cells
         };
         let router = IvfRouter::build(&all, n, dim, n_cells, iters);
-        let _ = std::fs::write(self.dir.join(IVF_FILE), router.to_bytes());
+        // The sidecar is what carries the router across a reopen; the swap
+        // below is what makes it live now. Dropping the write error with
+        // `let _ =` meant the router silently vanished at the next open, and
+        // every filtered search above the scan threshold went back to scanning
+        // the whole match set - measured once at 19,976 rows per shard.
+        let write = std::fs::write(self.dir.join(IVF_FILE), router.to_bytes());
         self.ivf = Some(Box::new(router));
         self.refresh_zonemap();
-        Ok(())
+        Ok(match write {
+            Ok(()) => FinishOutcome::Committed,
+            Err(e) => FinishOutcome::CommittedCleanupFailed(e),
+        })
     }
 
     /// Begin an OFF-THREAD IVF rebuild: dup the base vectors fd (O(1)). `None`
@@ -6447,7 +6540,7 @@ mod tests {
         let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
         let attr: Vec<u64> = (0..n as u64).collect(); // attr[row] = row = id
         disk.set_attr(&attr).unwrap();
-        disk.build_ivf(0, 6).unwrap();
+        disk.build_ivf(0, 6).unwrap().expect_clean();
 
         let check = |d: &DiskVamanaIndex, lo: u64, hi: u64| {
             let mut rng = StdRng::seed_from_u64(9);
@@ -7557,6 +7650,187 @@ mod tests {
                     "leg {which}: donor id {probe} lost"
                 );
             }
+        }
+    }
+
+    /// Build a run of 128 rows, delete some, and return the doomed ids plus
+    /// the live count the index must report from here on.
+    fn folded_fixture(dir: &Path, tier: QuantKind) -> (DiskVamanaIndex, Vec<u64>, usize) {
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(dir, 16, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+        for id in 0..128u64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let built = idx.flush_begin().unwrap().unwrap().build(dir).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
+        assert_eq!(idx.run_count(), 1);
+        let doomed: Vec<u64> = (0..128).step_by(8).collect();
+        for &id in &doomed {
+            idx.delete(id).unwrap();
+        }
+        let live = idx.len();
+        (idx, doomed, live)
+    }
+
+    /// A WAL rewrite that fails must leave the previous WAL whole, and the
+    /// index still writable.
+    ///
+    /// The fold used to rewrite its suffix with `std::fs::write`, which
+    /// truncates in place - so a failure part-way through leaves a file that
+    /// is neither the old content nor the new one, and the process carries on
+    /// appending to it. And it happened right after publishing a new base
+    /// generation, when the old WAL was the only remaining record of what the
+    /// fold had deleted: half a WAL there is worse than either version of it.
+    ///
+    /// The failpoint is the same one the flush path uses: `replace_wal` writes
+    /// through `delta.log.compact`, and a directory at that path cannot be
+    /// created as a file.
+    #[test]
+    fn a_failed_wal_rewrite_leaves_the_previous_one_intact_and_appendable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let (mut idx, doomed, live) = folded_fixture(tmp.path(), tier);
+        let wal_before = std::fs::read(tmp.path().join(DELTA_LOG_FILE)).unwrap();
+        assert!(
+            !wal_before.is_empty(),
+            "the fixture must have a WAL to protect"
+        );
+
+        std::fs::create_dir(tmp.path().join("delta.log.compact")).unwrap();
+        let job = idx.consolidate_begin().unwrap().unwrap();
+        let b = job.build(tmp.path()).unwrap();
+        let outcome = idx.consolidate_finish(b).unwrap();
+        assert!(
+            outcome.cleanup_error().is_some(),
+            "the fixture must actually fail the rewrite"
+        );
+
+        // Byte for byte: a truncate-in-place would have left a prefix.
+        assert_eq!(
+            std::fs::read(tmp.path().join(DELTA_LOG_FILE)).unwrap(),
+            wal_before,
+            "a failed rewrite must not have touched the WAL at all"
+        );
+        // And the handle it kept still works.
+        idx.insert(9_999, &[1.0f32; 16]).unwrap();
+        assert!(idx.get(9_999).unwrap().is_some());
+
+        std::fs::remove_dir(tmp.path().join("delta.log.compact")).unwrap();
+        drop(idx);
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert!(
+            re.get(9_999).unwrap().is_some(),
+            "the row appended after the failed rewrite must survive a reopen"
+        );
+        for &id in &doomed {
+            assert!(
+                re.get(id).unwrap().is_none(),
+                "id {id} was deleted before the fold and came back"
+            );
+        }
+        assert_eq!(re.len(), live + 1);
+    }
+
+    /// A fold whose DIRECTORY removal fails must still stop the run from being
+    /// a layer after a restart.
+    ///
+    /// `open` rebuilds the layer set by enumerating `run-*` directories that
+    /// carry a `run.ok` marker, so a directory that would not unlink used to
+    /// come back as an ACTIVE run - on top of a base that had already folded
+    /// its rows in, and after the fold cleared the tombstones out of memory
+    /// and out of the rewritten WAL. Deleted data returned.
+    ///
+    /// The marker IS the durable membership, so retiring it is what the fold
+    /// must do; unlinking the directory is only reclaiming space. Here the
+    /// marker can be removed and the directory cannot.
+    ///
+    /// Honest about its own strength: this one does NOT discriminate against
+    /// the previous code, because `remove_dir_all` walks the directory and may
+    /// unlink `run.ok` before it reaches the entry it cannot remove - taking
+    /// the marker with it by accident. It pins the property; the test below is
+    /// the one that catches the bug.
+    #[test]
+    fn a_fold_retires_its_runs_even_when_the_directory_will_not_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let (mut idx, doomed, live) = folded_fixture(tmp.path(), tier);
+
+        // A read-only SUBdirectory holding a file: `run-0` itself stays
+        // writable, so the marker can be unlinked, but `remove_dir_all` cannot
+        // empty the child.
+        let run = tmp.path().join("run-0");
+        let stuck = run.join("stuck");
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("f"), b"x").unwrap();
+        let saved = std::fs::metadata(&stuck).unwrap().permissions();
+        std::fs::set_permissions(&stuck, PermissionsExt::from_mode(0o555)).unwrap();
+
+        let job = idx.consolidate_begin().unwrap().unwrap();
+        let b = job.build(tmp.path()).unwrap();
+        let outcome = idx.consolidate_finish(b).unwrap();
+        assert!(
+            outcome.cleanup_error().is_some(),
+            "the fixture must actually fail the directory removal"
+        );
+        std::fs::set_permissions(&stuck, saved).unwrap();
+        assert_eq!(idx.run_count(), 0, "the live process drops the run");
+        drop(idx);
+
+        // THE BOUNDARY.
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert_eq!(
+            re.run_count(),
+            0,
+            "a retired run must not come back as a layer because its directory \
+             survived"
+        );
+        assert_eq!(re.len(), live, "and the rows it deleted must stay deleted");
+        for &id in &doomed {
+            assert!(re.get(id).unwrap().is_none(), "id {id} came back");
+        }
+    }
+
+    /// And when even the MARKER cannot be retired, the fold must keep the WAL.
+    ///
+    /// The rewrite is what drops the folded operations, tombstones included.
+    /// If a marker survived, a reopen brings that run back with its pre-fold
+    /// rows, and the WAL is the only thing still masking the ones this fold
+    /// deleted - so rewriting it would resurrect deleted data at the next
+    /// start. Keeping it costs a replay and some RAM, and keeps every row
+    /// correct. The run reappearing is then acceptable; a deleted row
+    /// reappearing never is.
+    #[test]
+    fn a_fold_that_cannot_retire_a_run_keeps_the_wal_that_masks_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let (mut idx, doomed, live) = folded_fixture(tmp.path(), tier);
+
+        // No write permission on `run-0` itself: the marker cannot be unlinked.
+        let run = tmp.path().join("run-0");
+        let saved = std::fs::metadata(&run).unwrap().permissions();
+        std::fs::set_permissions(&run, PermissionsExt::from_mode(0o555)).unwrap();
+
+        let job = idx.consolidate_begin().unwrap().unwrap();
+        let b = job.build(tmp.path()).unwrap();
+        let outcome = idx.consolidate_finish(b).unwrap();
+        assert!(
+            outcome.cleanup_error().is_some(),
+            "the fixture must actually fail the retire"
+        );
+        std::fs::set_permissions(&run, saved).unwrap();
+        drop(idx);
+
+        // THE ASSERTION THAT MATTERS. The run may well come back - what must
+        // not is a row the fold deleted.
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        assert_eq!(re.len(), live, "live count changed across the reopen");
+        for &id in &doomed {
+            assert!(
+                re.get(id).unwrap().is_none(),
+                "id {id} was deleted before the fold and came back"
+            );
         }
     }
 

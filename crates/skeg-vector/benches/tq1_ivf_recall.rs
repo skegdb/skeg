@@ -138,7 +138,7 @@ fn main() {
     let (r, m) = walk(&tq1, 600, 800);
     println!("  tq1 walk  l=600            recall@100 {r:.4}  {m:.2} ms/q");
     let tb = std::time::Instant::now();
-    tq1.build_ivf(0, 8).unwrap();
+    tq1.build_ivf(0, 8).unwrap().expect_clean();
     println!(
         "  (build_ivf: {:.0}s, {} cells)",
         tb.elapsed().as_secs_f64(),

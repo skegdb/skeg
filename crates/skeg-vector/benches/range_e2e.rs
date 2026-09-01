@@ -89,7 +89,7 @@ fn main() {
     let mut disk = DiskVamanaIndex::open(tmp.path()).unwrap();
     let attr: Vec<u64> = (0..n).map(|r| splitmix(r as u64) % ATTR_RANGE).collect();
     disk.set_attr(&attr).unwrap();
-    disk.build_ivf(0, 8).unwrap();
+    disk.build_ivf(0, 8).unwrap().expect_clean();
     eprintln!("build+attr+ivf: {:.1}s\n", t.elapsed().as_secs_f64());
 
     eprintln!(

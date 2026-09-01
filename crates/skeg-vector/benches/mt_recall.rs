@@ -89,7 +89,7 @@ fn main() {
             idx.insert(id as u64, v).unwrap();
         }
         idx.consolidate().unwrap();
-        idx.build_ivf(0, 8).unwrap();
+        idx.build_ivf(0, 8).unwrap().expect_clean();
         Some(idx)
     };
     let mode = if isolated {
