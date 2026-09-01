@@ -762,13 +762,20 @@ enum ShardReq {
 #[derive(Debug, Clone)]
 pub struct VindexRow {
     pub name: String,
-    /// Shards on which this index is OPEN, and shards on which the catalogue
-    /// says it exists. Every other number in this row is summed only over the
-    /// former, so `shards_resident < shards_present` means the row is a partial
-    /// reading and must be reported as one - the same "partial answer that
-    /// looks complete" this codebase keeps closing elsewhere.
+    /// Shards on which this index is OPEN, out of the shards in the STORE.
+    ///
+    /// Every other number in this row is summed over the resident shards only,
+    /// so `shards_resident < shards_total` means the row is a partial reading
+    /// and must be reported as one.
+    ///
+    /// `shards_total` is deliberately the store's shard count and not the
+    /// number of shards that answered with this index. Counting answers made an
+    /// index committed on three shards of four - a create that failed partway
+    /// and rolled nothing back - read as `3/3`, complete: the same "partial
+    /// answer that looks complete" the field exists to prevent, one level up.
+    /// The per-shard value is a placeholder; the coordinator fills it in.
     pub shards_resident: u32,
-    pub shards_present: u32,
+    pub shards_total: u32,
     pub dim: u32,
     pub kind: u8,
     pub backend: u8,
@@ -3073,7 +3080,7 @@ async fn process(
                     VindexRow {
                         name: name.clone(),
                         shards_resident: 1,
-                        shards_present: 1,
+                        shards_total: 1, // placeholder; the coordinator sets it
                         dim: backend.dim() as u32,
                         kind: vindex.kind,
                         backend: backend.backend_byte(),
@@ -3109,7 +3116,7 @@ async fn process(
                     .map(|e| VindexRow {
                         name: e.name,
                         shards_resident: 0,
-                        shards_present: 1,
+                        shards_total: 1, // placeholder; the coordinator sets it
                         dim: e.dim as u32,
                         kind: e.kind.unwrap_or(1),
                         backend: 1,
@@ -4985,7 +4992,6 @@ impl ShardSet {
                             std::collections::btree_map::Entry::Occupied(mut e) => {
                                 let a = e.get_mut();
                                 a.shards_resident += row.shards_resident;
-                                a.shards_present += row.shards_present;
                                 a.n_vectors = a.n_vectors.saturating_add(row.n_vectors);
                                 a.delta = a.delta.saturating_add(row.delta);
                                 a.runs = a.runs.saturating_add(row.runs);
@@ -5006,7 +5012,16 @@ impl ShardSet {
                 _ => return Err(ShardError::Unavailable),
             }
         }
-        Ok(agg.into_values().collect())
+        // The denominator is the STORE, not the shards that answered - see the
+        // field's own note. Set once here, where the count is known.
+        let total = u32::try_from(self.inner.n).unwrap_or(u32::MAX);
+        Ok(agg
+            .into_values()
+            .map(|mut row| {
+                row.shards_total = total;
+                row
+            })
+            .collect())
     }
 
     /// Insert a vector under `id` into `name`. Routes by `id`.
@@ -8023,7 +8038,7 @@ mod tests {
         let cold = listed(shards.vindex_list().await.unwrap())
             .expect("a committed index must be listed even when nothing is resident");
         assert_eq!(
-            (cold.shards_resident, cold.shards_present),
+            (cold.shards_resident, cold.shards_total),
             (0, 2),
             "the row must say the numbers below it were not read from anywhere"
         );
@@ -8057,6 +8072,42 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("not resident")),
             "check reported clean on an index it never opened: {lines:?}"
+        );
+    }
+
+    /// `resident=k/n` is only worth printing if `n` is the store's shard count.
+    /// Counting the shards that ANSWERED makes an index which exists on three
+    /// shards of four read as 3/3 - complete - which is the exact failure the
+    /// field was added to prevent, one level up.
+    #[tokio::test]
+    async fn a_partly_created_index_does_not_read_as_complete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        // Shard 2 cannot create directories, so its CREATE fails while the
+        // other three commit. Nothing rolls them back: that is the multi-shard
+        // commit defect, and this test is about how the store REPORTS it.
+        let s2 = dir.path().join("shard-2");
+        let mut perm = std::fs::metadata(&s2).unwrap().permissions();
+        perm.set_mode(0o555);
+        std::fs::set_permissions(&s2, perm).unwrap();
+        assert!(
+            shards.vindex_create("part", 4, 1, 1).await.is_err(),
+            "fixture: the create must fail on the read-only shard"
+        );
+        let mut perm = std::fs::metadata(&s2).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&s2, perm).unwrap();
+
+        let rows = shards.vindex_list().await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.name == "part")
+            .expect("fixture: three shards did commit it");
+        assert_eq!(
+            (row.shards_resident, row.shards_total),
+            (3, 4),
+            "an index on three shards of four must not read as complete"
         );
     }
 

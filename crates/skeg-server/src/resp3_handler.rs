@@ -1623,7 +1623,7 @@ async fn skeg_vindex_list(shards: &ShardSet, tenant: TenantId) -> Frame {
                     row.tombs,
                     row.base,
                     row.shards_resident,
-                    row.shards_present,
+                    row.shards_total,
                 ));
             }
             Frame::Bulk(Bytes::from(body))
