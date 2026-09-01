@@ -1610,10 +1610,20 @@ async fn skeg_vindex_list(shards: &ShardSet, tenant: TenantId) -> Frame {
                         ));
                     }
                 };
+                // `resident` is not decoration: every count on this line is
+                // summed over the resident shards only, so anything less than
+                // all of them means the numbers are a partial reading.
                 body.push_str(&format!(
                     "name={visible_name} dim={dim} kind={kind_label} backend={backend_label} \
-                     n_vectors={n_vectors} delta={} runs={} run_rows={} tombs={} base={}\n",
-                    row.delta, row.runs, row.run_rows, row.tombs, row.base,
+                     n_vectors={n_vectors} delta={} runs={} run_rows={} tombs={} base={} \
+                     resident={}/{}\n",
+                    row.delta,
+                    row.runs,
+                    row.run_rows,
+                    row.tombs,
+                    row.base,
+                    row.shards_resident,
+                    row.shards_present,
                 ));
             }
             Frame::Bulk(Bytes::from(body))

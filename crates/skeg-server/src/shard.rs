@@ -762,6 +762,13 @@ enum ShardReq {
 #[derive(Debug, Clone)]
 pub struct VindexRow {
     pub name: String,
+    /// Shards on which this index is OPEN, and shards on which the catalogue
+    /// says it exists. Every other number in this row is summed only over the
+    /// former, so `shards_resident < shards_present` means the row is a partial
+    /// reading and must be reported as one - the same "partial answer that
+    /// looks complete" this codebase keeps closing elsewhere.
+    pub shards_resident: u32,
+    pub shards_present: u32,
     pub dim: u32,
     pub kind: u8,
     pub backend: u8,
@@ -3017,9 +3024,28 @@ async fn process(
             }
         }
         ShardReq::VindexCheck { name } => {
-            let vs = vindexes.read();
-            let Some(entry) = vs.get(&name) else {
-                return ShardResp::Problems(Vec::new());
+            // Cloned out from under a short read lock: the catalogue read below
+            // is blocking I/O and must not happen with the map held.
+            let resident = vindexes.read().get(&name).cloned();
+            let Some(entry) = resident else {
+                // Not open. "No problems" about an index nobody looked at is
+                // the false green this command exists to prevent, so separate
+                // the two reasons it can be missing: absent from the catalogue
+                // (genuinely not here, and the coordinator already reports
+                // that) versus committed but evicted (unchecked, and the report
+                // has to say so instead of staying quiet).
+                return match read_registry(dir) {
+                    Ok(entries) if entries.iter().any(|e| e.name == name) => {
+                        ShardResp::Problems(vec![
+                            "not resident: not checked (its files were not opened)".to_owned(),
+                        ])
+                    }
+                    Ok(_) => ShardResp::Problems(Vec::new()),
+                    Err(e) => ShardResp::Err(format!(
+                        "vindex registry unreadable, cannot tell an absent index \
+                         from an unchecked one: {e}"
+                    )),
+                };
             };
             let vindex = entry.read();
             match &vindex.backend {
@@ -3042,6 +3068,8 @@ async fn process(
                     let (_, run_live, run_dead) = backend.run_contents();
                     VindexRow {
                         name: name.clone(),
+                        shards_resident: 1,
+                        shards_present: 1,
                         dim: backend.dim() as u32,
                         kind: vindex.kind,
                         backend: backend.backend_byte(),
@@ -3058,6 +3086,49 @@ async fn process(
                     }
                 })
                 .collect();
+            drop(vs);
+            // Then the catalogue entries that are NOT resident. Only disk
+            // indexes are ever in the registry, so backend is known; dim and
+            // kind are recorded there too. Everything else is a property of the
+            // open index and is left at zero - `shards_resident: 0` is what
+            // tells the reader those zeros were not measured.
+            //
+            // Fail-closed, like the shard open and like VSEARCH: a registry
+            // that will not parse must not become a silently shorter list,
+            // which is indistinguishable from a store that lost indexes.
+            let resident: std::collections::HashSet<&str> =
+                rows.iter().map(|r| r.name.as_str()).collect();
+            let extra: Vec<VindexRow> = match read_registry(dir) {
+                Ok(entries) => entries
+                    .into_iter()
+                    .filter(|e| !resident.contains(e.name.as_str()))
+                    .map(|e| VindexRow {
+                        name: e.name,
+                        shards_resident: 0,
+                        shards_present: 1,
+                        dim: e.dim as u32,
+                        kind: e.kind.unwrap_or(1),
+                        backend: 1,
+                        n_vectors: 0,
+                        delta: 0,
+                        runs: 0,
+                        run_rows: 0,
+                        max_run_rows: 0,
+                        run_debt_ratio: 0.0,
+                        run_live: 0,
+                        run_dead: 0,
+                        tombs: 0,
+                        base: 0,
+                    })
+                    .collect(),
+                Err(e) => {
+                    return ShardResp::Err(format!(
+                        "vindex registry unreadable, refusing to return a \
+                         possibly short list: {e}"
+                    ));
+                }
+            };
+            rows.extend(extra);
             // Stable order so the TUI doesn't flicker between polls.
             rows.sort_by(|a, b| a.name.cmp(&b.name));
             ShardResp::VindexList(rows)
@@ -4467,6 +4538,7 @@ impl ShardSet {
         let (mut tot_live_rows, mut tot_dead) = (0u64, 0u64);
         let mut max_run_rows = 0u64;
         let mut present: Vec<usize> = Vec::new();
+        let mut assessed = 0usize;
         for shard in 0..self.inner.n {
             let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await? else {
                 return Err(ShardError::Unavailable);
@@ -4475,6 +4547,13 @@ impl ShardSet {
                 continue;
             };
             present.push(shard);
+            // In the catalogue is not the same as readable. An evicted index's
+            // row carries zeros nobody measured; folding them into the totals
+            // below would report a quiet, healthy index.
+            if row.shards_resident == 0 {
+                continue;
+            }
+            assessed += 1;
             let runs = usize::try_from(row.runs).unwrap_or(usize::MAX);
             if runs > worst_runs {
                 worst_runs = runs;
@@ -4499,12 +4578,21 @@ impl ShardSet {
         if present.is_empty() {
             return Err(ShardError::Storage(format!("no such vindex '{name}'")));
         }
-        // ONE ordered state, worst-wins: MISSING > PARTIAL > CRITICAL >
-        // DEGRADED > OK. Reporting OK and then adding a PARTIAL line below it
-        // is the false green this command exists to prevent - a monitor reads
-        // `state` and nothing else.
+        // ONE ordered state, worst-wins: MISSING > UNASSESSED > PARTIAL >
+        // CRITICAL > DEGRADED > OK. Reporting OK and then adding a PARTIAL line
+        // below it is the false green this command exists to prevent - a
+        // monitor reads `state` and nothing else. UNASSESSED sits directly
+        // under MISSING because it carries the same amount of information about
+        // the index's health as MISSING does: none.
         let partial = present.len() != self.inner.n;
-        let state = if partial {
+        // Committed somewhere, readable nowhere: every number below is a zero
+        // nobody measured. Calling that OK is the same false green as calling
+        // an absent index OK, so it gets its own state instead of being folded
+        // into PARTIAL, which means "some shards".
+        let unassessed = present.len() - assessed;
+        let state = if assessed == 0 {
+            "UNASSESSED"
+        } else if partial || unassessed > 0 {
             "PARTIAL"
         } else if worst_debt >= 0.25 {
             "CRITICAL"
@@ -4514,6 +4602,13 @@ impl ShardSet {
             "OK"
         };
         out.push(format!("state {state}"));
+        if unassessed > 0 {
+            out.push(format!(
+                "not_assessed {unassessed} of {} shards holding it (evicted; any \
+                 count below covers only the rest)",
+                present.len()
+            ));
+        }
         if partial {
             out.push(format!(
                 "present_on {} of {} shards",
@@ -4871,6 +4966,8 @@ impl ShardSet {
                             }
                             std::collections::btree_map::Entry::Occupied(mut e) => {
                                 let a = e.get_mut();
+                                a.shards_resident += row.shards_resident;
+                                a.shards_present += row.shards_present;
                                 a.n_vectors = a.n_vectors.saturating_add(row.n_vectors);
                                 a.delta = a.delta.saturating_add(row.delta);
                                 a.runs = a.runs.saturating_add(row.runs);
@@ -7875,6 +7972,116 @@ mod tests {
                 "payload blob of id {id} survived the drop of an evicted index"
             );
         }
+    }
+
+    /// LIST reads the resident map, so an index that is committed but evicted
+    /// vanishes from it: an operator sees a store smaller than it is, and the
+    /// existing erasure test could assert "not listed" about an index the
+    /// erasure had silently skipped.
+    #[tokio::test]
+    async fn listing_shows_a_committed_vindex_that_is_not_resident() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("cold", 4, 1, 1).await.unwrap();
+        for id in 1u64..=20 {
+            shards
+                .vset("cold", id, vec![id as f32, 0.0, 0.0, 0.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("cold").await.unwrap();
+
+        let listed = |rows: Vec<VindexRow>| rows.into_iter().find(|r| r.name == "cold");
+        let hot = listed(shards.vindex_list().await.unwrap())
+            .expect("fixture: resident before the evict");
+        assert_eq!(
+            hot.shards_resident, 2,
+            "fixture: resident on both shards before the evict"
+        );
+
+        let ctl = shards.control_handle();
+        assert!(ctl.evict(0, "cold").await.unwrap(), "fixture: was resident");
+
+        let cold = listed(shards.vindex_list().await.unwrap())
+            .expect("a committed index must be listed even when nothing is resident");
+        assert_eq!(
+            (cold.shards_resident, cold.shards_present),
+            (0, 2),
+            "the row must say the numbers below it were not read from anywhere"
+        );
+        assert_eq!(cold.dim, 4, "dim is knowable from the catalogue alone");
+    }
+
+    /// CHECK answered `Problems(vec![])` - "nothing wrong" - for any index it
+    /// did not find in the resident map. An fsck that reports clean about a
+    /// thing it never opened is the false green the command exists to prevent.
+    #[tokio::test]
+    async fn check_does_not_report_clean_on_an_index_it_never_opened() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("cold", 4, 1, 1).await.unwrap();
+        for id in 1u64..=20 {
+            shards
+                .vset("cold", id, vec![id as f32, 0.0, 0.0, 0.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("cold").await.unwrap();
+        assert!(
+            shards.check("cold").await.unwrap().is_empty(),
+            "fixture: clean while resident"
+        );
+
+        let ctl = shards.control_handle();
+        assert!(ctl.evict(0, "cold").await.unwrap(), "fixture: was resident");
+
+        let lines = shards.check("cold").await.unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("not resident")),
+            "check reported clean on an index it never opened: {lines:?}"
+        );
+    }
+
+    /// HEALTH answered "no such vindex" for an index that is committed on every
+    /// shard and merely evicted from all of them - the exact false answer this
+    /// command exists to refuse. It must say it could not assess it instead.
+    #[tokio::test]
+    async fn health_refuses_to_judge_an_index_it_could_not_read() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("cold", 4, 1, 1).await.unwrap();
+        for id in 1u64..=20 {
+            shards
+                .vset("cold", id, vec![id as f32, 0.0, 0.0, 0.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("cold").await.unwrap();
+        assert!(
+            shards
+                .health("cold")
+                .await
+                .unwrap()
+                .iter()
+                .any(|l| l == "state OK"),
+            "fixture: healthy while resident"
+        );
+
+        let ctl = shards.control_handle();
+        assert!(ctl.evict(0, "cold").await.unwrap(), "fixture: was resident");
+
+        let lines = shards
+            .health("cold")
+            .await
+            .expect("a committed index is not 'no such vindex'");
+        assert!(
+            !lines.iter().any(|l| l == "state OK"),
+            "called an index OK on numbers it never read: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("not_assessed ")),
+            "state must name what it could not read: {lines:?}"
+        );
     }
 
     /// A committed index whose files will not open is still committed: it is in

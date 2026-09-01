@@ -81,7 +81,7 @@ name = "erase_tenant_scaling"
 harness = false
 
 [[bench]]
-name = "vindex_drop_scaling"
+name = "vindex_admin_scaling"
 harness = false
 
 # Tenant erasure on real embeddings: does a survivor come through untouched?
