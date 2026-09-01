@@ -145,6 +145,118 @@ fn parse_mem_usage(s: &str) -> Option<u64> {
     s.trim().parse().ok()
 }
 
+/// The cgroup path this process actually belongs to, relative to the cgroup
+/// mount, parsed from `/proc/self/cgroup`.
+///
+/// This is the piece that makes the difference between a memory budget and a
+/// decoration. Under systemd a service is not at the cgroup root - the file
+/// reads `0::/system.slice/skeg.service` - and the limit that will kill the
+/// process lives THERE, while the root's `memory.max` says `max`. A governor
+/// reading only the root reports "no limit" and admits everything right up to
+/// the OOM kill.
+///
+/// v2 lines look like `0::/path`; v1 lists one line per controller and only
+/// the `memory` one is relevant. Returns `None` when the file is absent
+/// (not Linux, /proc not mounted) or names nothing usable - the caller then
+/// reads the root, which is the honest guess.
+fn self_cgroup_path(proc_self_cgroup: &Path) -> Option<Membership> {
+    let text = read(proc_self_cgroup.to_path_buf())?;
+    let mut v1: Option<&str> = None;
+    for line in text.lines() {
+        let mut f = line.splitn(3, ':');
+        let (_hier, controllers, path) = (f.next()?, f.next()?, f.next());
+        let Some(path) = path else { continue };
+        if controllers.is_empty() {
+            // v2: the unified line wins outright.
+            return sanitise_cgroup_path(path).map(Membership::V2);
+        }
+        if controllers.split(',').any(|c| c == "memory") {
+            v1 = Some(path);
+        }
+    }
+    v1.and_then(sanitise_cgroup_path).map(Membership::V1)
+}
+
+/// Which hierarchy the process belongs to, and where in it.
+///
+/// The two are not interchangeable on disk: under v2 the path hangs directly
+/// off the mount, while under v1 the CONTROLLER is part of the path
+/// (`/sys/fs/cgroup/memory/<path>`) and the files are named differently.
+/// Treating them as one layout reads a v1 limit from a directory that does
+/// not exist, and reports "unlimited" for a capped process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Membership {
+    V2(String),
+    V1(String),
+}
+
+/// Accept only a plain absolute cgroup path. The value comes from a FILE, and
+/// joining `..` onto the cgroup mount would read arbitrary files as if they
+/// were limits. Anything suspicious yields `None`, and the caller falls back
+/// to the root.
+fn sanitise_cgroup_path(path: &str) -> Option<String> {
+    let p = path.trim();
+    let p = p.strip_prefix('/')?;
+    if p.is_empty() {
+        return None; // the root itself; nothing to descend into
+    }
+    if p.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return None;
+    }
+    Some(p.to_string())
+}
+
+/// v2 files, read from one directory.
+fn v2_at(dir: &Path) -> MemoryStatus {
+    MemoryStatus {
+        limit_bytes: read(dir.join("memory.max")).and_then(|s| parse_mem_limit(&s)),
+        current_bytes: read(dir.join("memory.current")).and_then(|s| parse_mem_usage(&s)),
+    }
+}
+
+/// v1 files, read from one directory (already including the controller).
+fn v1_at(dir: &Path) -> MemoryStatus {
+    MemoryStatus {
+        limit_bytes: read(dir.join("memory.limit_in_bytes")).and_then(|s| parse_mem_limit(&s)),
+        current_bytes: read(dir.join("memory.usage_in_bytes")).and_then(|s| parse_mem_usage(&s)),
+    }
+}
+
+/// Memory limit and usage for the process's OWN cgroup.
+///
+/// Reads membership from `proc_self_cgroup`, then walks from the process's own
+/// directory up to the hierarchy root, taking the first limit it finds.
+/// Climbing is deliberate: a nested cgroup often sets nothing itself and is
+/// capped by an ancestor, and the limit that matters is the tightest one that
+/// applies - reading only the leaf reports "unlimited" for a process capped
+/// one level up.
+///
+/// Usage comes from the same directory as the limit, so the two numbers
+/// describe one accounting domain rather than two.
+pub(crate) fn memory_status_rooted(proc_self_cgroup: &Path, mount: &Path) -> MemoryStatus {
+    let (mut dir, top, read_at): (_, _, fn(&Path) -> MemoryStatus) =
+        match self_cgroup_path(proc_self_cgroup) {
+            Some(Membership::V2(rel)) => (mount.join(rel), mount.to_path_buf(), v2_at),
+            Some(Membership::V1(rel)) => {
+                let top = mount.join("memory");
+                (top.join(rel), top, v1_at)
+            }
+            // No membership to read: not Linux, /proc absent, or a path this
+            // build will not follow. The mount root is the honest guess.
+            None => return memory_status_at(mount),
+        };
+    loop {
+        let m = read_at(&dir);
+        if m.limit_bytes.is_some() || dir == top {
+            return m;
+        }
+        match dir.parent() {
+            Some(p) if p.starts_with(&top) => dir = p.to_path_buf(),
+            _ => return m,
+        }
+    }
+}
+
 /// Memory limit and usage for the cgroup rooted at `root`, v2 first then v1.
 ///
 /// v2 wins when both exist: a host running v2 with v1 compatibility files
@@ -282,6 +394,130 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write(dir.path(), "cpu.max", "150000 100000"); // 1.5 vCPU
         assert_eq!(cpu_quota(dir.path()), Some(1));
+    }
+
+    // ---- where the process actually lives ----
+
+    #[test]
+    fn v2_membership_comes_from_proc_self_cgroup() {
+        // Under systemd a service is NOT at the cgroup root. `/proc/self/cgroup`
+        // reads `0::/system.slice/skeg.service`, and the limit lives there -
+        // the root's `memory.max` is `max`. Reading only the root reports "no
+        // limit" for a process that has one, which makes a memory governor a
+        // placebo: it admits everything right up to the OOM kill.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "proc/self/cgroup",
+            "0::/system.slice/skeg.service\n",
+        );
+        write(dir.path(), "sys/fs/cgroup/memory.max", "max\n");
+        write(
+            dir.path(),
+            "sys/fs/cgroup/system.slice/skeg.service/memory.max",
+            "268435456\n",
+        );
+        write(
+            dir.path(),
+            "sys/fs/cgroup/system.slice/skeg.service/memory.current",
+            "1000\n",
+        );
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(
+            m.limit_bytes,
+            Some(268_435_456),
+            "must read the LEAF, not the root"
+        );
+        assert_eq!(m.current_bytes, Some(1000));
+    }
+
+    #[test]
+    fn a_process_at_the_v2_root_reads_the_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/\n");
+        write(dir.path(), "sys/fs/cgroup/memory.max", "123\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(123));
+    }
+
+    #[test]
+    fn a_leaf_without_its_own_limit_climbs_to_the_nearest_ancestor_that_has_one() {
+        // A nested cgroup often sets nothing itself; the limit that will kill
+        // the process is the tightest one above it. Reading only the leaf
+        // reports "unlimited" for a process that is capped one level up.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/a/b/c\n");
+        write(dir.path(), "sys/fs/cgroup/a/memory.max", "999\n");
+        write(dir.path(), "sys/fs/cgroup/a/b/memory.max", "max\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(999));
+    }
+
+    #[test]
+    fn v1_membership_uses_the_memory_controller_line() {
+        // v1 lists one line per controller; only the `memory` one matters here.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "proc/self/cgroup",
+            "12:cpu,cpuacct:/other\n9:memory:/docker/abc\n3:devices:/x\n",
+        );
+        write(
+            dir.path(),
+            "sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+            "536870912\n",
+        );
+        write(
+            dir.path(),
+            "sys/fs/cgroup/memory/docker/abc/memory.usage_in_bytes",
+            "77\n",
+        );
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(536_870_912));
+        assert_eq!(m.current_bytes, Some(77));
+    }
+
+    #[test]
+    fn a_missing_proc_file_falls_back_to_the_root() {
+        // Not Linux, or /proc not mounted. The root is the honest guess, and
+        // "no limit found" is reported as None rather than invented.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "sys/fs/cgroup/memory.max", "42\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(42));
+    }
+
+    #[test]
+    fn a_malformed_proc_file_does_not_escape_the_cgroup_root() {
+        // The path comes from a file. `..` in it must not walk out of
+        // /sys/fs/cgroup and read arbitrary files as if they were limits.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/../../../../etc\n");
+        write(dir.path(), "sys/fs/cgroup/memory.max", "7\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(
+            m.limit_bytes,
+            Some(7),
+            "must fall back to the root, not climb out"
+        );
     }
 
     // ---- memory ----

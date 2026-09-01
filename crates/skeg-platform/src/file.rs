@@ -750,21 +750,24 @@ const SMALL_FILE_MAX: u64 = 4096;
 /// is the point; it is not fine for a pointer, a marker or a manifest, which
 /// have a fixed shape and whose callers all run at startup.
 ///
-/// A file longer than the bound comes back truncated rather than as an error,
-/// on purpose: "this is not a valid record" is the parser's judgement to make
-/// and its message to give, not this function's.
+/// A file LONGER than the bound is an error, not a silent prefix. Handing the
+/// parser the first 4 KiB of a bigger file gives it something that may parse
+/// perfectly while being a fragment, and it makes the diagnostics lie too: a
+/// caller reporting "the file is 4096 bytes" about a 512 MiB file sends the
+/// next person looking in the wrong place.
 ///
 /// # Errors
 ///
 /// Returns an IO error if the file cannot be opened or read. `NotFound` is
 /// passed through, since an absent sidecar is usually a legitimate state.
 pub fn read_small_file(path: &Path) -> io::Result<String> {
-    use std::io::Read;
-    let mut buf = String::new();
-    File::open(path)?
-        .take(SMALL_FILE_MAX)
-        .read_to_string(&mut buf)?;
-    Ok(buf)
+    let bytes = read_small_bytes(path)?;
+    String::from_utf8(bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {e}", path.display()),
+        )
+    })
 }
 
 /// [`read_small_file`] for a binary record: the same bound, no UTF-8.
@@ -775,9 +778,20 @@ pub fn read_small_file(path: &Path) -> io::Result<String> {
 pub fn read_small_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = Vec::with_capacity(64);
+    // MAX + 1: reading one byte past the bound is what distinguishes a file
+    // that sits exactly at it from one that runs beyond it.
     File::open(path)?
-        .take(SMALL_FILE_MAX)
+        .take(SMALL_FILE_MAX + 1)
         .read_to_end(&mut buf)?;
+    if buf.len() as u64 > SMALL_FILE_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is larger than {SMALL_FILE_MAX} bytes: not a sidecar record",
+                path.display()
+            ),
+        ));
+    }
     Ok(buf)
 }
 

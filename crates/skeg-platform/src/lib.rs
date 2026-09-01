@@ -51,7 +51,13 @@ pub use cgroup::MemoryStatus;
 pub fn memory_status() -> MemoryStatus {
     #[cfg(target_os = "linux")]
     {
-        let mut m = cgroup::memory_status_at(std::path::Path::new("/sys/fs/cgroup"));
+        // From the process's OWN cgroup, not the mount root. Under systemd a
+        // service lives at /system.slice/<name>.service and the root reports
+        // `max`, so reading the root makes the budget a decoration.
+        let mut m = cgroup::memory_status_rooted(
+            std::path::Path::new("/proc/self/cgroup"),
+            std::path::Path::new("/sys/fs/cgroup"),
+        );
         if m.current_bytes.is_none() {
             m.current_bytes = Some(rss_bytes());
         }

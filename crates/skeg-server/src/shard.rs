@@ -1266,7 +1266,7 @@ async fn attach_payloads(
 const VINDEX_REGISTRY: &str = "vindexes.registry";
 const VINDEX_REGISTRY_V2_MAGIC: [u8; 4] = *b"SVI2";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct RegistryEntry {
     name: String,
     dim: usize,
@@ -1288,55 +1288,123 @@ fn write_registry(dir: &Path, entries: &[(&str, usize, u8)]) -> std::io::Result<
         buf.extend_from_slice(&(*dim as u32).to_le_bytes());
         buf.push(*kind);
     }
+    // Durable publish, the same discipline as the layout manifest and the
+    // generation pointer: write, fsync the file, rename, fsync the directory.
+    // A rename whose directory entry has not reached the disk can vanish on
+    // reboot, taking the registry - and therefore every index it lists - with
+    // it, while the vindex directories sit there unreferenced.
     let tmp = dir.join(format!("{VINDEX_REGISTRY}.tmp"));
-    std::fs::write(&tmp, &buf)?;
-    std::fs::rename(&tmp, dir.join(VINDEX_REGISTRY))
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(VINDEX_REGISTRY))?;
+    skeg_platform::sync_dir(dir)
 }
 
-/// Read the registry. Missing or truncated registries yield whatever parsed
-/// cleanly. The old `[u32 count]` format is accepted with no tier metadata.
-fn read_registry(dir: &Path) -> Vec<RegistryEntry> {
-    let Ok(bytes) = std::fs::read(dir.join(VINDEX_REGISTRY)) else {
-        return Vec::new();
+/// Read the registry of on-disk vindexes.
+///
+/// An ABSENT registry is an empty store - the ordinary state of a fresh data
+/// directory. Everything else that does not parse exactly is an error.
+///
+/// It used to return "whatever parsed cleanly", which means indexes silently
+/// DISAPPEAR: three of seven entries read back as three indexes, with full
+/// confidence and no warning. That is the serve-mode failure in a different
+/// costume - partial data accepted as complete - and the fix is the same one:
+/// refuse rather than guess.
+///
+/// `kind: None` still means the old `[u32 count]` format, which recorded no
+/// tier and legitimately takes the caller's default. A V2 entry naming a wire
+/// kind this build does not know is NOT that: it opens the index with the
+/// process default quantiser, computing every distance against codes it
+/// cannot interpret. Absent and unreadable are different states and only one
+/// of them has a safe default.
+fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
+    let path = dir.join(VINDEX_REGISTRY);
+    let bytes = match skeg_platform::read_small_bytes(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
+    let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+
     let (mut pos, versioned) = if bytes.starts_with(&VINDEX_REGISTRY_V2_MAGIC) {
         (4usize, true)
     } else {
         (0usize, false)
     };
     if bytes.len() < pos + 4 {
-        return Vec::new();
+        return Err(bad(format!(
+            "{} is {} bytes: too short to hold an entry count",
+            path.display(),
+            bytes.len()
+        )));
     }
     let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-    // A corrupt count must not drive a huge reservation (review P1): every
-    // entry is at least a 2-byte length prefix, so it cannot exceed
-    // bytes.len()/2. The loop still bounds-checks each entry.
+    // A corrupt count must not drive a huge reservation: every entry is at
+    // least a 2-byte length prefix, so it cannot exceed bytes.len()/2. The
+    // loop bounds-checks each entry regardless.
     let mut out = Vec::with_capacity(count.min(bytes.len() / 2));
     pos += 4;
-    for _ in 0..count {
+    for i in 0..count {
+        let short = || {
+            bad(format!(
+                "{} claims {count} entries but runs out during entry {i}: \
+                 refusing to report a truncated registry as a complete one",
+                path.display()
+            ))
+        };
         if pos + 2 > bytes.len() {
-            break;
+            return Err(short());
         }
         let nlen = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2;
         let tail = 4 + usize::from(versioned);
         if pos + nlen + tail > bytes.len() {
-            break;
+            return Err(short());
         }
-        let name = String::from_utf8_lossy(&bytes[pos..pos + nlen]).into_owned();
+        // NOT `from_utf8_lossy`: replacing corrupt bytes with U+FFFD produces a
+        // name that no longer matches the directory on disk, so the index
+        // quietly cannot be reopened.
+        let name = std::str::from_utf8(&bytes[pos..pos + nlen])
+            .map_err(|e| {
+                bad(format!(
+                    "{} entry {i} has a name that is not UTF-8: {e}",
+                    path.display()
+                ))
+            })?
+            .to_owned();
         pos += nlen;
         let dim = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        let kind = versioned
-            .then(|| {
-                let kind = bytes[pos];
-                pos += 1;
-                kind
-            })
-            .filter(|kind| QuantKind::from_wire(*kind).is_some());
+        let kind = if versioned {
+            let k = bytes[pos];
+            pos += 1;
+            if QuantKind::from_wire(k).is_none() {
+                return Err(bad(format!(
+                    "{} entry {i} ({name}) names tier byte {k}, which this \
+                     build does not know: refusing to open it with a different \
+                     quantiser",
+                    path.display()
+                )));
+            }
+            Some(k)
+        } else {
+            None
+        };
         out.push(RegistryEntry { name, dim, kind });
     }
-    out
+    if pos != bytes.len() {
+        return Err(bad(format!(
+            "{} has {} bytes after its {count} entries: either the count or \
+             the file is wrong",
+            path.display(),
+            bytes.len() - pos
+        )));
+    }
+    Ok(out)
 }
 
 /// Rewrite the registry (best-effort).
@@ -1351,7 +1419,24 @@ fn read_registry(dir: &Path) -> Vec<RegistryEntry> {
 /// drop prunes (no dir).
 fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) {
     use std::collections::BTreeMap;
-    let mut by_name: BTreeMap<String, (usize, u8)> = read_registry(dir)
+    // A registry that will not parse must NOT be rewritten from the resident
+    // map alone. The map holds only what is currently open, so the rewrite
+    // would drop every evicted vindex - turning an unreadable file into a
+    // permanently and silently smaller store. Leave the file for repair and
+    // say so; the next successful read picks the work back up.
+    let existing = match read_registry(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(
+                dir = %dir.display(),
+                error = %e,
+                "refusing to rewrite an unreadable vindex registry: rebuilding \
+                 it from the resident set would drop every evicted index"
+            );
+            return;
+        }
+    };
+    let mut by_name: BTreeMap<String, (usize, u8)> = existing
         .into_iter()
         .map(|entry| (entry.name, (entry.dim, entry.kind.unwrap_or(1))))
         .collect();
@@ -1504,10 +1589,16 @@ fn ladder_plan(s: &LsmState, flush_rows: usize) -> Vec<Rung> {
     // below it. Under sustained write churn the delta is ALWAYS over the flush
     // threshold, so the tick took the flush branch forever - and each flush
     // adds a run. Measured on the churn gate: runs climbed 0 -> 33 over ten
-    // turnovers and never merged, recall falling 0.9925 -> 0.7180 as more of
-    // the live set moved into run graphs, which the walk searches with a short
-    // beam. The store stayed correct throughout (0/120 stale) - starvation,
-    // not corruption.
+    // turnovers and never merged, and recall fell 0.9925 -> 0.7180 alongside.
+    //
+    // The MECHANISM of that fall was never isolated, and this comment used to
+    // assert one: that run graphs are walked with a short beam. Two P0s found
+    // later explain it at least as well - unfiltered search scored candidates
+    // against SUPERSEDED vectors, so a shortlist drawn from many runs was
+    // contaminated by stale copies. Run debt certainly exposed the defect;
+    // calling it the cause is a claim nobody measured. What the gate does show
+    // is the correlation and that the fix holds, and the store stayed correct
+    // throughout (0/120 stale) - starvation, not corruption.
     //
     // A ceiling alone was NOT enough, and the measurement said so: run counts
     // an operator reads are SUMMED across shards, so the "33 runs" were four
@@ -1882,7 +1973,10 @@ fn recover_vindexes(
     mmap_graph: bool,
 ) -> std::io::Result<VindexSet> {
     let mut set = VindexSet::new();
-    for entry in read_registry(dir) {
+    // Fail-closed: a registry that will not parse refuses the shard open. The
+    // alternative is opening a store with an unknown number of its indexes
+    // missing, which is precisely how serve mode served an eighth of one.
+    for entry in read_registry(dir)? {
         let open_tier = entry.kind.and_then(QuantKind::from_wire).unwrap_or(tier);
         let kind = entry
             .kind
@@ -1952,9 +2046,22 @@ async fn get_or_reopen(
     }
     // Miss. Only disk-backed indexes survive in the registry and can be
     // reopened; a flat (in-RAM) index that is gone is gone.
-    let registry = read_registry(dir)
-        .into_iter()
-        .find(|entry| entry.name == name)?;
+    // The registry parsed at open, so a failure HERE means the file changed
+    // under a live shard. Log it: returning None would report the index as
+    // absent, which is indistinguishable from a name that never existed.
+    let registry = match read_registry(dir) {
+        Ok(entries) => entries.into_iter().find(|entry| entry.name == name)?,
+        Err(e) => {
+            tracing::error!(
+                dir = %dir.display(),
+                index = name,
+                error = %e,
+                "vindex registry became unreadable while the shard was open: \
+                 cannot reopen this index"
+            );
+            return None;
+        }
+    };
     let open_tier = registry.kind.and_then(QuantKind::from_wire).unwrap_or(tier);
     let kind = registry
         .kind
@@ -3927,8 +4034,9 @@ impl ShardSet {
     /// Deliberately separate from [`check`](Self::check), which certifies
     /// INTEGRITY. The churn gate produced an index whose every structure was
     /// intact - CHECK said OK on all ten rounds - while its recall fell from
-    /// 0.9925 to 0.7180 because the live set migrated into run segments. An
-    /// operator needs to see that coming, and no integrity check ever will.
+    /// 0.9925 to 0.7180 as the live set migrated into run segments. WHY it
+    /// fell was never isolated - see `ladder_plan` - but an operator needs to
+    /// see run debt climbing either way, and no integrity check ever will.
     ///
     /// Graded on run DEBT, not on run count: one merged run holding most of
     /// the index is a single run - healthy by any count - with the majority
@@ -6166,8 +6274,21 @@ mod tests {
         }
     }
 
+    /// A V2 entry naming a wire kind this build does not know is an ERROR.
+    ///
+    /// This test used to assert the opposite - "unknown kind falls back to
+    /// legacy tier selection" - and pinned the dangerous behaviour as the
+    /// desired one. The fallback runs through `kind.and_then(from_wire)
+    /// .unwrap_or(tier)`, so an unreadable byte opens the index with the
+    /// PROCESS DEFAULT quantiser: no crash, no warning, every distance
+    /// computed against codes it cannot interpret. It is the same defect
+    /// `read_tier` had for the on-disk tier sidecar, in its second home.
+    ///
+    /// `None` still means "V1 format, no tier recorded", which is a real state
+    /// and legitimately takes the default. Absent and unreadable are different
+    /// things and only one of them has a safe default.
     #[test]
-    fn registry_v2_ignores_unknown_kind() {
+    fn registry_v2_refuses_an_unknown_kind() {
         let dir = TempDir::new().unwrap();
         let mut bytes = VINDEX_REGISTRY_V2_MAGIC.to_vec();
         bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -6177,13 +6298,114 @@ mod tests {
         bytes.push(99); // not a supported VINDEX wire kind
         fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
 
-        let entries = read_registry(dir.path());
+        let err = read_registry(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("99"), "must name the byte: {err}");
+    }
+
+    #[test]
+    fn a_v1_registry_still_has_no_kind_and_that_is_fine() {
+        // The old `[u32 count]` format records no tier. That is absence, not
+        // corruption, and it keeps taking the caller's default.
+        let dir = TempDir::new().unwrap();
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"idx");
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
+
+        let entries = read_registry(dir.path()).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "idx");
+        assert_eq!(entries[0].kind, None);
+    }
+
+    #[test]
+    fn an_absent_registry_is_an_empty_store() {
+        let dir = TempDir::new().unwrap();
+        assert!(read_registry(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_truncated_registry_refuses_instead_of_returning_what_it_got() {
+        // "Whatever parsed cleanly" means indexes silently DISAPPEAR: three of
+        // seven entries read back as three indexes, with full confidence and
+        // no warning. That is the serve-mode failure in a different costume -
+        // partial data accepted as complete.
+        let dir = TempDir::new().unwrap();
+        let mut bytes = VINDEX_REGISTRY_V2_MAGIC.to_vec();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // claims two
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"one");
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&3u16.to_le_bytes()); // second entry, cut off
+        fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
+
+        let err = read_registry(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains('2'), "must name the count: {err}");
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_last_entry_refuse() {
+        // A count that under-reports leaves data nobody reads. Either the
+        // writer or the file is wrong; both are worth stopping for.
+        let dir = TempDir::new().unwrap();
+        let mut bytes = VINDEX_REGISTRY_V2_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"one");
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(b"leftover");
+        fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
         assert_eq!(
-            entries[0].kind, None,
-            "unknown kind falls back to legacy tier selection"
+            read_registry(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn an_invalid_name_refuses_instead_of_being_mangled() {
+        // `from_utf8_lossy` turns corrupt bytes into U+FFFD and carries on, so
+        // the name in the registry stops matching the directory on disk - and
+        // the index quietly cannot be reopened.
+        let dir = TempDir::new().unwrap();
+        let mut bytes = VINDEX_REGISTRY_V2_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        bytes.push(1);
+        fs::write(dir.path().join(VINDEX_REGISTRY), bytes).unwrap();
+        assert_eq!(
+            read_registry(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn an_enormous_registry_refuses_without_reading_it_all() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(VINDEX_REGISTRY), vec![0u8; 8 * 1024 * 1024]).unwrap();
+        assert_eq!(
+            read_registry(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn the_registry_round_trips_every_entry_it_was_given() {
+        let dir = TempDir::new().unwrap();
+        let entries = [("alpha", 64usize, 1u8), ("beta", 1024, 2), ("gamma", 8, 4)];
+        write_registry(dir.path(), &entries).unwrap();
+        let back = read_registry(dir.path()).unwrap();
+        assert_eq!(back.len(), 3);
+        for (i, (name, dim, kind)) in entries.iter().enumerate() {
+            assert_eq!(&back[i].name, name);
+            assert_eq!(back[i].dim, *dim);
+            assert_eq!(back[i].kind, Some(*kind));
+        }
     }
 
     #[tokio::test]
@@ -7377,7 +7599,9 @@ mod tests {
     fn the_merge_goes_first_once_the_flush_has_already_won_a_tick() {
         // The anti-starvation rule: a permanently hot flush cannot hold the
         // tick forever while runs pile up. Measured cost of getting this
-        // wrong: 0 -> 33 runs over ten turnovers, recall 0.9925 -> 0.7180.
+        // wrong: 0 -> 33 runs over ten turnovers, with recall falling
+        // 0.9925 -> 0.7180 alongside (mechanism never isolated - see
+        // `ladder_plan`).
         let mut s = st(5000, 4, 4000, 0, 10_000);
         s.flush_streak = 1;
         assert_eq!(ladder_plan(&s, 4096).first(), Some(&Rung::RunsMerge));
@@ -7483,14 +7707,9 @@ mod tests {
     /// ladder ends in `return`, so a permanently-hot flush used to hold the
     /// tick forever while each flush quietly added another run - measured on
     /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
-    /// from 0.9925 to 0.7180 as the live set moved into short-beam run
-    /// graphs.
-    /// Sustained writes must not starve the runs-merge. Every rung of the
-    /// ladder ends in `return`, so a permanently-hot flush used to hold the
-    /// tick forever while each flush quietly added another run - measured on
-    /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
-    /// from 0.9925 to 0.7180 as the live set moved into short-beam run
-    /// graphs.
+    /// from 0.9925 to 0.7180 alongside. (The MECHANISM of that fall was never
+    /// isolated; two stale-vector P0s found later explain it at least as well
+    /// as the short beam this used to assert. See `ladder_plan`.)
     ///
     /// Driven at a SMALL flush threshold. What matters is the sequence of
     /// decisions the ladder makes when both rungs are due, not the size of
