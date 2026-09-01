@@ -2380,6 +2380,42 @@ fn new_row_cache(dim: usize) -> Option<std::sync::Mutex<RowSlotCache>> {
     (b > 0).then(|| std::sync::Mutex::new(RowSlotCache::new(b, dim)))
 }
 
+/// Removes a partially-built maintenance directory on every early return or
+/// panic. A successful build explicitly preserves it for the finish phase.
+struct BuildDirGuard {
+    path: PathBuf,
+    preserve: bool,
+}
+
+impl BuildDirGuard {
+    fn prepare(path: PathBuf) -> io::Result<Self> {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)?;
+        Ok(Self {
+            path,
+            preserve: false,
+        })
+    }
+
+    fn preserve(mut self) {
+        self.preserve = true;
+    }
+}
+
+impl Drop for BuildDirGuard {
+    fn drop(&mut self) {
+        if !self.preserve
+            && let Err(e) = std::fs::remove_dir_all(&self.path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "failed to remove incomplete maintenance directory {}: {e}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// The snapshot a background consolidate builds from. Produced by
 /// [`DiskVamanaIndex::consolidate_begin`] (short, exclusive), consumed by
 /// [`ConsolidateJob::build`] on any thread (long, no lock on the index),
@@ -2517,8 +2553,7 @@ impl ConsolidateJob {
     ) -> io::Result<ConsolidateBuilt> {
         let phase_start = std::time::Instant::now();
         let tmp = index_dir.join("consolidating");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp)?;
+        let build_dir = BuildDirGuard::prepare(tmp.clone())?;
         let ConsolidateJob {
             delta_vectors,
             delta_ids,
@@ -2611,13 +2646,15 @@ impl ConsolidateJob {
             phase_start.elapsed() - t_graph,
             phase_start.elapsed(),
         );
-        Ok(ConsolidateBuilt {
+        let built = ConsolidateBuilt {
             base,
             tmp,
             run_seq_high,
             wal_offset,
             patched: was_patched,
-        })
+        };
+        build_dir.preserve();
+        Ok(built)
     }
 }
 
@@ -2721,7 +2758,7 @@ impl RunMergeJob {
             donor_seg,
         } = self;
         let dir = index_dir.join(format!("run-{merged_seq}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let build_dir = BuildDirGuard::prepare(dir.clone())?;
         // Read survivor vectors OFF-THREAD from the duped run fds.
         let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
         // Per merged row: the donor-run row it came from (keeps its edges), or
@@ -2756,12 +2793,14 @@ impl RunMergeJob {
         // Open the merged run HERE (off-thread): the quant-tier build for the
         // merged run happens now, not on the shard thread in finish.
         let merged = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
-        Ok(RunMergeBuilt {
+        let built = RunMergeBuilt {
             merged,
             merged_seq,
             n_merged,
             old_dirs,
-        })
+        };
+        build_dir.preserve();
+        Ok(built)
     }
 }
 
@@ -2843,7 +2882,7 @@ impl FlushJob {
             seq,
         } = self;
         let dir = index_dir.join(format!("run-{seq}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let build_dir = BuildDirGuard::prepare(dir.clone())?;
         let cfg = disk_build_config();
         // Always cautious: these two are O(runs) and short, and the window
         // they would open by taking the machine is not worth the seconds saved.
@@ -2855,7 +2894,9 @@ impl FlushJob {
         };
         rebuilt.save(&dir)?;
         let run = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
-        Ok(FlushBuilt { run, seq })
+        let built = FlushBuilt { run, seq };
+        build_dir.preserve();
+        Ok(built)
     }
 }
 
@@ -2901,8 +2942,7 @@ impl DeletePatchJob {
     /// Returns an I/O error if writing the sidecar files fails.
     pub fn build(self, index_dir: &Path) -> io::Result<DeletePatchBuilt> {
         let tmp = index_dir.join("patching");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp)?;
+        let build_dir = BuildDirGuard::prepare(tmp.clone())?;
         let DeletePatchJob {
             seg_file,
             n_rows,
@@ -2931,7 +2971,9 @@ impl DeletePatchJob {
         // Open the patched base HERE (off-thread): the O(live) tier rebuild
         // happens off the shard thread, not in finish.
         let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
-        Ok(DeletePatchBuilt { base, tmp })
+        let built = DeletePatchBuilt { base, tmp };
+        build_dir.preserve();
+        Ok(built)
     }
 }
 
@@ -5734,6 +5776,29 @@ impl DiskVamanaIndex {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // test sizes are tiny
 mod tests {
+
+    #[test]
+    fn maintenance_build_directories_survive_only_successful_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let failed = tmp.path().join("failed-build");
+        {
+            let _guard = BuildDirGuard::prepare(failed.clone()).unwrap();
+            std::fs::write(failed.join("partial"), b"partial").unwrap();
+        }
+        assert!(!failed.exists(), "an incomplete sidecar must be removed");
+
+        let completed = tmp.path().join("completed-build");
+        {
+            let guard = BuildDirGuard::prepare(completed.clone()).unwrap();
+            std::fs::write(completed.join("complete"), b"complete").unwrap();
+            guard.preserve();
+        }
+        assert!(
+            completed.join("complete").exists(),
+            "a completed sidecar must remain for the finish phase"
+        );
+    }
 
     /// A wrong dimension is a client mistake, not a reason to abort. The
     /// server used to pre-check it purely because these two entry points
