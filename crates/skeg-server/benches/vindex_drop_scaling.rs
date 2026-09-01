@@ -12,9 +12,25 @@
 //!   A. index size fixed, unrelated keyspace grows -> isolates the walk term.
 //!   B. keyspace fixed, index size grows           -> isolates the delete term.
 //!
-//! If A is flat, the walk is not the price and the change is free at these
-//! sizes. If A climbs with the keyspace, a DROP in a large store pays for keys
-//! that have nothing to do with it, and the reclamation needs an index.
+//! Measured 2026-09-01, aarch64, 4 shards, dim 8, debug-built bench in release:
+//!
+//!   A  bystanders      0   25k    100k    250k
+//!      drop ms      37.2  36.6    52.2    54.3     (index fixed at 2k vectors)
+//!
+//!   B  vectors       500    2k      8k     20k
+//!      drop ms      68.7  40.1    65.0    70.4     (keyspace fixed at 50k)
+//!
+//! A climbs: the walk is real, about 68 ns per key, so +46% on a small index in
+//! a store with 250k unrelated keys - and by extrapolation ~+68 ms at 1M keys,
+//! ~+0.7 s at 10M. B is flat, so below ~20k vectors a DROP is dominated by
+//! fixed per-shard costs (registry rewrite, directory removal), not by the
+//! deletes; its first point is cold-start noise, not a real inversion.
+//!
+//! Verdict: DROP is now O(whole keyspace), the same property `count_tenant_keys`
+//! and the erase sweep already declare. Acceptable on an admin path at these
+//! sizes and recorded here so the ceiling is known rather than discovered. If a
+//! store ever makes that walk hurt, the answer is an index on blob keys, not a
+//! return to `live_ids` - that path cannot serve an index which will not open.
 //!
 //! `harness = false`, custom main, wall-clock ms. The store is rebuilt for every
 //! point (a drop is destructive), so populate time dominates the run; only the
