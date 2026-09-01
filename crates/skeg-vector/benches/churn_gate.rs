@@ -118,7 +118,7 @@ fn run(bits: u8, dim: usize, n: usize, background: bool) {
             {
                 let built = job.take().unwrap().join().unwrap().unwrap();
                 let t = Instant::now();
-                idx.consolidate_finish(built).unwrap();
+                idx.consolidate_finish(built).unwrap().expect_clean();
                 max_pause_ms = max_pause_ms.max(t.elapsed().as_secs_f64() * 1000.0);
                 folds += 1;
             }
@@ -130,7 +130,7 @@ fn run(bits: u8, dim: usize, n: usize, background: bool) {
     if let Some(h) = job.take() {
         let built = h.join().unwrap().unwrap();
         let t = Instant::now();
-        idx.consolidate_finish(built).unwrap();
+        idx.consolidate_finish(built).unwrap().expect_clean();
         max_pause_ms = max_pause_ms.max(t.elapsed().as_secs_f64() * 1000.0);
         folds += 1;
     }

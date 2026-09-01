@@ -344,10 +344,16 @@ pub enum Counter {
     /// this generation of runs. A rising count next to a flat reclaimed
     /// count is what an infinite rewrite loop looks like from outside.
     VacuumSkipped = 41,
+    /// Maintenance jobs that COMMITTED but could not reclaim what they
+    /// replaced: an old run directory left on disk, a router sidecar not
+    /// written, a WAL not re-encoded. The work happened - this is not a
+    /// failure count - but each one leaves something behind, and a rising
+    /// number means disk that nothing will ever free on its own.
+    MaintenanceCleanupFailures = 42,
 }
 
 impl Counter {
-    pub const COUNT: usize = 42;
+    pub const COUNT: usize = 43;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -390,6 +396,7 @@ impl Counter {
         Counter::VsearchHybridRouteNanos,
         Counter::RunScanFallback,
         Counter::MaintenanceFailures,
+        Counter::MaintenanceCleanupFailures,
         Counter::VacuumSkipped,
     ];
 
@@ -437,6 +444,7 @@ impl Counter {
             Counter::VsearchHybridRouteNanos => "skeg_vsearch_hybrid_route_nanos_total",
             Counter::RunScanFallback => "skeg_run_scan_fallback_total",
             Counter::MaintenanceFailures => "skeg_maintenance_failures_total",
+            Counter::MaintenanceCleanupFailures => "skeg_maintenance_cleanup_failures_total",
             Counter::VacuumSkipped => "skeg_vacuum_skipped_total",
         }
     }

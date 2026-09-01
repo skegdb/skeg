@@ -2809,6 +2809,57 @@ impl RunMergeJob {
 /// and hands the vectors here; `build` builds the run graph + opens it, all off
 /// the caller; `flush_finish` splices the run and clears the staging. The delta
 /// batch never blocks the caller on a graph build.
+/// What a `*_finish` did, when "it failed" stops being one answer.
+///
+/// Every maintenance job has a COMMIT POINT - the atomic rename that publishes
+/// a new base generation, the marker that makes a run survive a reopen, the
+/// splice that makes it live in memory. Before it, a failure means nothing
+/// happened and the job may be rolled back. After it, the change is visible
+/// and the work is done; what can still fail is reclaiming what it replaced.
+///
+/// Collapsing the two into `io::Result<()>` made the caller undo, or report as
+/// failed, operations that had already taken effect. Same mistake as failing a
+/// DROP whose registry entry is published, or telling a client that a
+/// committed write did not happen: after the commit point, "failed" is not a
+/// description of the operation, only of the leftovers.
+#[derive(Debug)]
+#[must_use = "a cleanup failure has to be reported, not dropped"]
+pub enum FinishOutcome {
+    /// Applied, with nothing left behind.
+    Committed,
+    /// Committed and visible; a step AFTER that point failed. What remains is
+    /// garbage to reclaim, never work to retry or undo.
+    CommittedCleanupFailed(io::Error),
+}
+
+impl FinishOutcome {
+    /// Panic unless the job left nothing behind.
+    ///
+    /// For callers that have arranged for cleanup to be impossible - almost
+    /// always a test. Written as an assertion rather than `let _ =` on
+    /// purpose: discarding the outcome silences exactly the signal this type
+    /// exists to give, and a test that quietly tolerates a cleanup failure
+    /// stops noticing when one appears.
+    pub fn expect_clean(self) {
+        if let Self::CommittedCleanupFailed(e) = self {
+            panic!("the job committed but left something behind: {e}");
+        }
+    }
+
+    /// The cleanup error, if there was one.
+    #[must_use]
+    pub fn cleanup_error(&self) -> Option<&io::Error> {
+        match self {
+            Self::Committed => None,
+            Self::CommittedCleanupFailed(e) => Some(e),
+        }
+    }
+}
+
+/// A `*_finish` result. `Err` means the job failed BEFORE its commit point and
+/// may be rolled back.
+pub type FinishResult = io::Result<FinishOutcome>;
+
 pub struct FlushJob {
     vectors: Vec<f32>,
     ids: Vec<u64>,
@@ -4645,16 +4696,33 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// Returns an I/O error if a run directory cannot be removed.
+    /// Drop every run: the directories on disk, and the in-memory lists that
+    /// name them.
+    ///
+    /// The MEMORY half always completes, even when an unlink fails. Returning
+    /// early on the first error left the runs still listed beside a base that
+    /// had just folded them in - the same rows in two layers, with run
+    /// precedence putting the pre-fold copies on top of the post-fold base.
+    /// A directory that will not unlink is garbage; a layer set that disagrees
+    /// with the base is a correctness problem, and only one of the two is
+    /// worth stopping for.
     fn discard_runs(&mut self) -> io::Result<()> {
+        let mut first_error = None;
         for seq in 0..self.run_seq {
             let d = self.dir.join(format!("run-{seq}"));
-            if d.exists() {
-                std::fs::remove_dir_all(&d)?;
+            if d.exists()
+                && let Err(e) = std::fs::remove_dir_all(&d)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
             }
         }
         self.runs.clear();
         self.run_dirs.clear();
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Survivor locations that are not a segment index: the in-RAM layers.
@@ -4871,7 +4939,7 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// Returns an I/O error if a file move, the WAL rewrite, or the reopen fails.
-    pub fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> io::Result<()> {
+    pub fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> FinishResult {
         tracing::info!(
             "consolidate_finish: installing {} base ({} rows)",
             if built.patched { "patched" } else { "rebuilt" },
@@ -4896,31 +4964,68 @@ impl DiskVamanaIndex {
         // cache) is installed under one CURRENT flip - never a torn mix of
         // old and new files (review P0). built.base's fds follow the inodes
         // across the rename.
+        // THE COMMIT. One atomic CURRENT flip publishes the whole new
+        // generation. Everything above may fail freely; from here the new base
+        // IS the base, on disk and for any reopen.
         install_base_generation(&dir, &built.tmp)?;
+
+        // POST-COMMIT. Nothing below may abandon the function with `?`: the
+        // in-memory state must be brought in line with the disk whatever else
+        // goes wrong, or this process keeps serving from a base the store no
+        // longer has. Failures are collected and reported instead.
+        let mut cleanup_error: Option<io::Error> = None;
+        let mut note = |r: io::Result<()>| {
+            if let Err(e) = r
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(e);
+            }
+        };
+
         self.run_seq = built.run_seq_high.max(self.run_seq);
-        self.discard_runs()?;
-        // Re-encode the post-begin suffix as V2.
-        write_framed_wal(&wal_path, &suffix_ops)?;
-        // Surgical swap: install the prebuilt base (tier already built off-thread)
-        // and reconstruct the in-RAM state the way `open` would, then replay the
-        // WAL suffix - WITHOUT a full reopen, so the O(live) tier rebuild does not
-        // run here on the shard thread. `tier` is unused now (the segment carries
-        // its own quant); keep the arg-free reopen out of the hot path.
+        // The runs are folded into the new base; their directories are
+        // superseded. Leaving one behind is garbage, and a reopen ignores it -
+        // `run_dirs` no longer names it.
+        note(self.discard_runs());
+        // Re-encode the post-begin suffix as V2. Failing here leaves the OLD
+        // WAL next to the NEW base, so a reopen replays operations already
+        // folded in: their values are identical to what the base holds, the
+        // LSM precedence puts the replayed copies on top, and the cost is RAM
+        // until the next flush - the same trade `flush_finish` documents for
+        // its own crash window. Not a loss, so not a failure.
+        note(write_framed_wal(&wal_path, &suffix_ops));
+        // Surgical swap: install the prebuilt base (tier already built
+        // off-thread) and reconstruct the in-RAM state the way `open` would,
+        // then replay the WAL suffix - WITHOUT a full reopen, so the O(live)
+        // tier rebuild does not run here on the shard thread. `tier` is unused
+        // now (the segment carries its own quant).
         let _ = tier;
-        let delta_log = std::fs::OpenOptions::new()
+        // Reopened BEFORE the swap and kept only on success: an append handle
+        // that could not be reopened is the one post-commit failure that must
+        // not be papered over, since the old handle may point at an inode the
+        // rewrite above replaced. Keeping the previous handle is strictly
+        // better than dropping it - the WAL path is unchanged - so it is
+        // reported and carried on with.
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&wal_path)?;
+            .open(&wal_path)
+        {
+            Ok(f) => self.delta_log = f,
+            Err(e) => note(Err(e)),
+        }
         self.base = built.base;
         self.delta.clear();
         self.tombstones.clear();
         self.live_count = self.base.main_n as usize;
-        self.delta_log = delta_log;
         self.wal_format = DeltaWalFormat::FramedV2;
         *self.tq1 = Default::default();
         self.ivf = None;
         self.replay_wal_ops(suffix_ops);
-        Ok(())
+        Ok(match cleanup_error {
+            Some(e) => FinishOutcome::CommittedCleanupFailed(e),
+            None => FinishOutcome::Committed,
+        })
     }
 
     /// What the runs are actually holding: `(physical, live, garbage)`.
@@ -5213,22 +5318,41 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// Returns an I/O error if opening the merged run or deleting a dir fails.
-    pub fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> io::Result<()> {
-        // The merged run replaces marked runs; it must be marked itself or a
-        // reopen would drop it AND find no WAL rows to rebuild it from.
+    pub fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> FinishResult {
+        // PRE-COMMIT. The merged run replaces marked runs; it must be marked
+        // itself or a reopen would drop it AND find no WAL rows to rebuild it
+        // from. A failure here means nothing has changed yet.
         self.mark_run_durable(built.merged_seq)?;
-        // The merged run was already opened off-thread in build; splice it in.
+        // THE COMMIT: the merged run is durable on disk and now live in
+        // memory. Infallible by construction, which is what makes the line
+        // between the two halves of this function a real one.
         let keep_runs = self.runs.split_off(built.n_merged);
         let keep_dirs = self.run_dirs.split_off(built.n_merged);
         self.runs = std::iter::once(built.merged).chain(keep_runs).collect();
         self.run_dirs = std::iter::once(built.merged_seq).chain(keep_dirs).collect();
+        // POST-COMMIT cleanup. The old run directories are superseded, and
+        // nothing reads them any more: `runs` no longer lists them and a
+        // reopen loads what `run_dirs` names. Failing to unlink one leaves
+        // disk garbage, not an unfinished merge - so it is REPORTED, not
+        // returned as an error, which would have had the caller roll back a
+        // merge that is already serving queries.
+        //
+        // Every directory is attempted: stopping at the first failure would
+        // leave more garbage for no reason.
+        let mut cleanup_error = None;
         for seq in built.old_dirs {
             let d = self.dir.join(format!("run-{seq}"));
-            if d.exists() {
-                std::fs::remove_dir_all(&d)?;
+            if d.exists()
+                && let Err(e) = std::fs::remove_dir_all(&d)
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(e);
             }
         }
-        Ok(())
+        Ok(match cleanup_error {
+            Some(e) => FinishOutcome::CommittedCleanupFailed(e),
+            None => FinishOutcome::Committed,
+        })
     }
 
     /// Begin an OFF-THREAD flush of the delta into a run (short, exclusive).
@@ -5272,7 +5396,7 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// Infallible today; `io::Result` for symmetry.
-    pub fn flush_finish(&mut self, built: FlushBuilt) -> io::Result<()> {
+    pub fn flush_finish(&mut self, built: FlushBuilt) -> FinishResult {
         // Durability order matters. 1) fsync the run's files; 2) write and
         // fsync `run.ok` - from here a reopen loads this run instead of
         // replaying its rows; 3) install; 4) compact the WAL down to the
@@ -5291,7 +5415,9 @@ impl DiskVamanaIndex {
         self.runs.push(built.run);
         self.run_dirs.push(seq);
         self.flushing.clear();
-        Ok(())
+        // The splice above is the commit and cannot fail, so there is no
+        // post-commit step here to report on.
+        Ok(FinishOutcome::Committed)
     }
 
     /// Abort an off-thread flush whose build never produced an installable
@@ -5432,7 +5558,7 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// I/O error if the sidecar open or the file renames fail.
-    pub fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> io::Result<()> {
+    pub fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> FinishResult {
         let dir = self.dir.clone();
         // The patched base was already opened off-thread in build; swap it in.
         let new_base = built.base;
@@ -5451,7 +5577,9 @@ impl DiskVamanaIndex {
             present.extend(run.ids.iter().copied());
         }
         self.tombstones.retain(|id| present.contains(id));
-        Ok(())
+        // Everything after `install_base_generation` here is in-memory and
+        // infallible, so this job has no post-commit failure to report.
+        Ok(FinishOutcome::Committed)
     }
 
     /// True if this index is large enough to benefit from a routed filtered
@@ -5519,11 +5647,20 @@ impl DiskVamanaIndex {
     /// # Errors
     ///
     /// Infallible today; `io::Result` for symmetry.
-    pub fn ivf_finish(&mut self, built: IvfBuilt) -> io::Result<()> {
-        let _ = std::fs::write(self.dir.join(IVF_FILE), built.router.to_bytes());
+    pub fn ivf_finish(&mut self, built: IvfBuilt) -> FinishResult {
+        // The sidecar is what carries the router across a reopen; the swap
+        // below is what makes it live NOW. A failed write used to be dropped
+        // on the floor with `let _ =`, so the router silently vanished at the
+        // next open and every filtered search above the scan threshold went
+        // back to scanning the whole match set - which this engine has already
+        // measured once, at 19,976 rows scored per shard.
+        let write = std::fs::write(self.dir.join(IVF_FILE), built.router.to_bytes());
         self.ivf = Some(Box::new(built.router));
         self.refresh_zonemap();
-        Ok(())
+        Ok(match write {
+            Ok(()) => FinishOutcome::Committed,
+            Err(e) => FinishOutcome::CommittedCleanupFailed(e),
+        })
     }
 
     /// Load the persisted IVF router, if present + consistent with the base.
@@ -5944,7 +6081,7 @@ mod tests {
         let job = idx.consolidate_begin().unwrap().expect("work to fold");
         let built = job.build(&vdir).unwrap();
         assert!(!built.patched, "an empty base must take the full route");
-        idx.consolidate_finish(built).unwrap();
+        idx.consolidate_finish(built).unwrap().expect_clean();
 
         // Churn: delete some base ids, add new ones. The new mass is well under
         // the live base, which is the regime the cheap route is for.
@@ -5960,7 +6097,7 @@ mod tests {
             built.patched,
             "600 new rows against 1950 live base rows must take the patched route"
         );
-        idx.consolidate_finish(built).unwrap();
+        idx.consolidate_finish(built).unwrap().expect_clean();
 
         // Every live id answers for itself...
         let mut misses = Vec::new();
@@ -6984,7 +7121,7 @@ mod tests {
         let mut bg = mk(t_bg.path());
         let job = bg.consolidate_begin().unwrap().expect("non-empty");
         let built = job.build(t_bg.path()).unwrap();
-        bg.consolidate_finish(built).unwrap();
+        bg.consolidate_finish(built).unwrap().expect_clean();
 
         assert_eq!(bg.len(), inline.len(), "same live count");
         assert_eq!(bg.run_count(), 0, "runs folded");
@@ -7022,7 +7159,7 @@ mod tests {
         assert!(idx.delete(1002).unwrap(), "post-begin id was live");
 
         let built = job.build(tmp.path()).unwrap();
-        idx.consolidate_finish(built).unwrap();
+        idx.consolidate_finish(built).unwrap().expect_clean();
 
         assert_eq!(idx.len(), 200 + 2 - 1, "200 folded + 2 new - 1 deleted");
         assert!(idx.get(1000).unwrap().is_some(), "post-begin insert kept");
@@ -7064,7 +7201,7 @@ mod tests {
         }
         assert!(idx.run_count() > 0, "a post-begin run exists");
         let built = job.build(tmp.path()).unwrap();
-        idx.consolidate_finish(built).unwrap();
+        idx.consolidate_finish(built).unwrap().expect_clean();
         assert_eq!(
             idx.len(),
             100 + DiskVamanaIndex::FLUSH + 10,
@@ -7101,7 +7238,7 @@ mod tests {
 
         let job = idx.merge_runs_begin().unwrap().expect("runs to merge");
         let built = job.build(tmp.path()).unwrap();
-        idx.merge_runs_finish(built).unwrap();
+        idx.merge_runs_finish(built).unwrap().expect_clean();
 
         assert_eq!(idx.run_count(), 1, "runs folded into one");
         assert_eq!(idx.len(), live_before, "live set unchanged by the merge");
@@ -7137,7 +7274,7 @@ mod tests {
         assert!(idx.delete(90_001).unwrap(), "insert+delete in the window");
 
         let built = job.build(tmp.path()).unwrap();
-        idx.merge_runs_finish(built).unwrap();
+        idx.merge_runs_finish(built).unwrap().expect_clean();
 
         assert_eq!(
             idx.len(),
@@ -7190,7 +7327,7 @@ mod tests {
             .unwrap()
             .expect("dead rows to reclaim");
         let built = job.build(tmp.path()).unwrap();
-        idx.delete_patch_finish(built).unwrap();
+        idx.delete_patch_finish(built).unwrap().expect_clean();
 
         assert_eq!(
             idx.main_len(),
@@ -7247,7 +7384,7 @@ mod tests {
         idx.insert(90_001, &vec![0.22f32; dim]).unwrap();
         assert!(idx.delete(90_001).unwrap(), "insert+delete in the window");
         let built = job.build(tmp.path()).unwrap();
-        idx.delete_patch_finish(built).unwrap();
+        idx.delete_patch_finish(built).unwrap().expect_clean();
 
         // +1 (90000 live), -1 (id 1 deleted). Deletes of already-dead rows n/a.
         assert_eq!(idx.len(), live_before + 1 - 1);
@@ -7317,7 +7454,7 @@ mod tests {
         assert!(idx.get(x).unwrap().is_some(), "staged get() mid-flush");
 
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         assert_eq!(idx.run_count(), 1, "flushed into one run");
         assert_eq!(idx.len(), live, "live set unchanged");
         assert_eq!(
@@ -7351,7 +7488,7 @@ mod tests {
             .unwrap()
             .build(tmp.path())
             .unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         let small = random_vectors(300, dim, 52);
         for (i, v) in small.chunks_exact(dim).enumerate() {
             idx.insert(100_000 + i as u64, v).unwrap();
@@ -7362,7 +7499,7 @@ mod tests {
             .unwrap()
             .build(tmp.path())
             .unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
 
         let job = idx.merge_runs_begin().unwrap().unwrap();
         assert!(job.patch.is_some());
@@ -7372,7 +7509,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let built = job.build(tmp.path()).unwrap();
         let reuse = t0.elapsed();
-        idx.merge_runs_finish(built).unwrap();
+        idx.merge_runs_finish(built).unwrap().expect_clean();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
         let mut idx2 = DiskVamanaIndex::create_empty_with_tier(tmp2.path(), dim, 64, tier).unwrap();
@@ -7386,7 +7523,7 @@ mod tests {
             .unwrap()
             .build(tmp2.path())
             .unwrap();
-        idx2.flush_finish(built).unwrap();
+        idx2.flush_finish(built).unwrap().expect_clean();
         for (i, v) in small.chunks_exact(dim).enumerate() {
             idx2.insert(100_000 + i as u64, v).unwrap();
         }
@@ -7396,14 +7533,14 @@ mod tests {
             .unwrap()
             .build(tmp2.path())
             .unwrap();
-        idx2.flush_finish(built).unwrap();
+        idx2.flush_finish(built).unwrap().expect_clean();
         let mut job2 = idx2.merge_runs_begin().unwrap().unwrap();
         job2.patch = None;
         job2.donor_seg = usize::MAX;
         let t0 = std::time::Instant::now();
         let built = job2.build(tmp2.path()).unwrap();
         let scratch = t0.elapsed();
-        idx2.merge_runs_finish(built).unwrap();
+        idx2.merge_runs_finish(built).unwrap().expect_clean();
 
         eprintln!(
             "merge 2k+300 dim16: reuse {:?} vs scratch {:?} ({:.2}x)",
@@ -7447,7 +7584,7 @@ mod tests {
             .unwrap()
             .build(tmp.path())
             .unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
 
         let clean = idx.check().unwrap();
         assert!(clean.is_empty(), "healthy index reported: {clean:?}");
@@ -7574,7 +7711,7 @@ mod tests {
         }
         let job = idx.flush_begin().unwrap().expect("delta to flush");
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         assert_eq!(idx.run_count(), 1);
 
         // Twenty quiet ticks: not one of them may produce a rewrite.
@@ -7601,7 +7738,7 @@ mod tests {
         }
         let job = idx.flush_begin().unwrap().expect("delta to flush");
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
 
         // Kill most of it: the run is now mostly garbage.
         for id in 0..9000u64 {
@@ -7612,7 +7749,7 @@ mod tests {
             .unwrap()
             .expect("a mostly-dead run must be vacuumed");
         let built = job.build(tmp.path()).unwrap();
-        idx.merge_runs_finish(built).unwrap();
+        idx.merge_runs_finish(built).unwrap().expect_clean();
 
         // The rewrite reclaimed the dead rows...
         assert!(
@@ -7662,7 +7799,7 @@ mod tests {
         }
         let job = idx.flush_begin().unwrap().expect("delta to flush");
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         assert_eq!(idx.run_count(), 1);
         assert_eq!(idx.delta_len(), 0);
 
@@ -7714,7 +7851,7 @@ mod tests {
         }
         let job = idx.flush_begin().unwrap().expect("delta to flush");
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         assert_eq!(
             idx.run_count(),
             1,
@@ -7802,19 +7939,19 @@ mod tests {
         }
         let job = idx.flush_begin().unwrap().expect("flush 1");
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         let small = random_vectors(300, dim, 42);
         for (i, v) in small.chunks_exact(dim).enumerate() {
             idx.insert(10_000 + i as u64, v).unwrap();
         }
         let job = idx.flush_begin().unwrap().expect("flush 2");
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
         assert_eq!(idx.run_count(), 2);
         let job = idx.merge_runs_begin().unwrap().expect("merge job");
         assert!(job.patch.is_some(), "donor path must engage (1200 of 1500)");
         let built = job.build(tmp.path()).unwrap();
-        idx.merge_runs_finish(built).unwrap();
+        idx.merge_runs_finish(built).unwrap().expect_clean();
         assert_eq!(idx.run_count(), 1);
         for probe in [0usize, 600, 1199] {
             let q = &big[probe * dim..(probe + 1) * dim];
@@ -7937,7 +8074,7 @@ mod tests {
             }
             let job = idx.flush_begin().unwrap().expect("delta to flush");
             let built = job.build(tmp.path()).unwrap();
-            idx.flush_finish(built).unwrap();
+            idx.flush_finish(built).unwrap().expect_clean();
         }
         let tail = random_vectors(50, dim, 30);
         for (i, v) in tail.chunks_exact(dim).enumerate() {
@@ -7960,7 +8097,7 @@ mod tests {
         re.insert(9000, &vec![0.25f32; dim]).unwrap();
         let job = re.flush_begin().unwrap().expect("delta to flush");
         let built = job.build(tmp.path()).unwrap();
-        re.flush_finish(built).unwrap();
+        re.flush_finish(built).unwrap().expect_clean();
         assert_eq!(re.run_count(), 3, "post-reopen flush adds a new run");
     }
 
@@ -7995,7 +8132,7 @@ mod tests {
         assert!(idx.delete(500).unwrap(), "delete a staged id"); // 500 is staged
         idx.insert(501, &vec![0.7f32; dim]).unwrap(); // overwrite a staged id
         let built = job.build(tmp.path()).unwrap();
-        idx.flush_finish(built).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
 
         assert!(idx.get(9000).unwrap().is_some(), "post-begin insert kept");
         assert!(idx.get(500).unwrap().is_none(), "deleted staged id gone");
