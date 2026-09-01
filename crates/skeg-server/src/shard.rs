@@ -3041,10 +3041,14 @@ async fn process(
                         ])
                     }
                     Ok(_) => ShardResp::Problems(Vec::new()),
-                    Err(e) => ShardResp::Err(format!(
+                    // A finding, not an error. The fail-closed rule forbids a
+                    // short answer that looks complete; a report that names the
+                    // damage IS complete, and this is the single most useful
+                    // thing CHECK could tell an operator.
+                    Err(e) => ShardResp::Problems(vec![format!(
                         "vindex registry unreadable, cannot tell an absent index \
                          from an unchecked one: {e}"
-                    )),
+                    )]),
                 };
             };
             let vindex = entry.read();
@@ -4716,21 +4720,35 @@ impl ShardSet {
         // shard 0 alone would hide it in either direction.
         let mut present: Vec<usize> = Vec::new();
         let mut dim = 0usize;
+        // Shards that could not answer at all. Counting one of those as "not
+        // present" reports a MISSING index, which is a different fault from an
+        // unreadable shard and sends the operator the wrong way.
+        let mut unlisted: Vec<(usize, String)> = Vec::new();
         for shard in 0..self.inner.n {
-            if let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await?
-                && let Some(row) = rows.iter().find(|r| r.name == name)
-            {
-                present.push(shard);
-                dim = row.dim as usize;
+            match self.call(shard, ShardReq::VindexList).await? {
+                ShardResp::VindexList(rows) => {
+                    if let Some(row) = rows.iter().find(|r| r.name == name) {
+                        present.push(shard);
+                        dim = row.dim as usize;
+                    }
+                }
+                ShardResp::Err(e) => {
+                    unlisted.push((shard, format!("shard {shard}: cannot be listed: {e}")));
+                }
+                _ => return Err(ShardError::Unavailable),
             }
         }
         if present.is_empty() {
             return Err(ShardError::Storage(format!("no such vindex '{name}'")));
         }
-        let mut out = Vec::new();
-        if present.len() != self.inner.n {
+        let mut out: Vec<String> = unlisted.iter().map(|(_, line)| line.clone()).collect();
+        // MISSING is "the shard answered and does not have it". A shard that
+        // could not answer is UNKNOWN and is reported on its own line above;
+        // putting it in this list too would name one fault twice, as the wrong
+        // one of the two.
+        if present.len() + unlisted.len() != self.inner.n {
             let missing: Vec<String> = (0..self.inner.n)
-                .filter(|s| !present.contains(s))
+                .filter(|s| !present.contains(s) && !unlisted.iter().any(|(u, _)| u == s))
                 .map(|s| s.to_string())
                 .collect();
             out.push(format!(
@@ -8039,6 +8057,45 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("not resident")),
             "check reported clean on an index it never opened: {lines:?}"
+        );
+    }
+
+    /// An unreadable registry is the single most useful thing CHECK could ever
+    /// tell an operator, so it must arrive as a FINDING, not as an error that
+    /// takes the whole report down with it. The fail-closed rule is about not
+    /// returning a short answer that looks complete; a report which names the
+    /// damage is complete.
+    #[tokio::test]
+    async fn check_reports_an_unreadable_registry_instead_of_going_dark() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("cold", 4, 1, 1).await.unwrap();
+        shards
+            .vset("cold", 1, vec![1.0, 0.0, 0.0, 0.0], 0, None, None)
+            .await
+            .unwrap();
+        shards.vindex_consolidate("cold").await.unwrap();
+        let ctl = shards.control_handle();
+        assert!(ctl.evict(0, "cold").await.unwrap(), "fixture: was resident");
+
+        // Break the catalogue on shard 0 only, so the coordinator still knows
+        // the index exists and the report has something to be wrong about.
+        let reg = dir.path().join("shard-0").join(VINDEX_REGISTRY);
+        assert!(reg.exists(), "fixture: shard 0 has a registry to break");
+        std::fs::write(&reg, b"not a registry").unwrap();
+
+        let lines = shards
+            .check("cold")
+            .await
+            .expect("an unreadable registry is a finding, not a dead report");
+        assert!(
+            lines.iter().any(|l| l.contains("registry")),
+            "check said nothing about a registry it could not read: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("missing on shard")),
+            "an unreadable shard is UNKNOWN, not missing; saying missing sends \
+             the operator after the wrong fault: {lines:?}"
         );
     }
 
