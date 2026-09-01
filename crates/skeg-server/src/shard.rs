@@ -4651,10 +4651,24 @@ impl ShardSet {
         payload: Option<Bytes>,
     ) -> Result<(), ShardError> {
         // Semantic placement when a router exists: the vector picks its owner
-        // shard, and an overwrite whose OLD copy lives elsewhere deletes it
-        // first (vset-then-vdel order would duplicate under a same-id race;
-        // delete-then-set keeps overwrite atomic per shard and the search
-        // dedup covers the crash window either way).
+        // shard, and an overwrite whose old copy lives elsewhere has to remove
+        // it.
+        //
+        // WRITE THE NEW COPY FIRST, then move the reader, then delete the old.
+        //
+        // It used to delete first, on the reasoning that set-then-delete would
+        // duplicate under a same-id race. That race is now impossible: the
+        // stripe lock below serialises the whole span for this id. What
+        // delete-first cost instead was durability - a VSET that failed for
+        // ANY reason (quota, WAL I/O, a missing index, an unavailable shard)
+        // returned an error with the previously acknowledged version already
+        // deleted. A refused write that destroys the value it was overwriting
+        // is worse than either outcome a client can plan for. Reproduced
+        // deterministically in tests/semantic_overwrite.rs.
+        //
+        // `reshard` already writes then deletes, for exactly this reason: a
+        // duplicate is recoverable (the search path dedups, and the owner map
+        // says which copy is live) and a hole is not.
         if let Some(router) = self.router(name) {
             // Serialise the whole read-delete-set-record span against a
             // concurrent routed vset/vdel on the SAME id (review finding).
@@ -4678,6 +4692,35 @@ impl ShardSet {
                 .read()
                 .get(name)
                 .and_then(|m| m.get(&id).copied());
+            let req = ShardReq::Vset {
+                name: name.to_owned(),
+                id,
+                vector,
+                tenant,
+                limit,
+                payload,
+            };
+            match self.call(owner, req).await? {
+                // Nothing has been removed yet, so a refusal here leaves the
+                // committed version exactly where it was.
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Done => {}
+                _ => return Err(ShardError::Unavailable),
+            }
+            // THE COMMIT POINT: reads route through this map, so the new copy
+            // becomes the live one here, before the old one is touched.
+            self.inner
+                .owners
+                .write()
+                .entry(name.to_owned())
+                .or_default()
+                .insert(id, (owner as u8, None));
+            // Cleanup, after the fact. A failure here leaves a stale duplicate
+            // on a shard the map no longer points at: search dedups it and the
+            // next overwrite of this id removes it. Reporting an error would
+            // tell the client a write failed that is committed and readable -
+            // the same mistake as failing a DROP whose registry entry is
+            // already published.
             if let Some((old_primary, old_replica)) = old {
                 for s in std::iter::once(old_primary).chain(old_replica) {
                     if usize::from(s) != owner {
@@ -4690,36 +4733,34 @@ impl ShardSet {
                                     tenant,
                                 },
                             )
-                            .await?
+                            .await
                         {
-                            ShardResp::Existed(_) => {}
-                            ShardResp::Err(e) => return Err(ShardError::Storage(e)),
-                            _ => return Err(ShardError::Unavailable),
+                            Ok(ShardResp::Existed(_)) => {}
+                            Ok(ShardResp::Err(e)) => {
+                                tracing::error!(
+                                    index = name,
+                                    id,
+                                    shard = usize::from(s),
+                                    error = %e,
+                                    "overwrite committed on shard {owner} but the \
+                                     old copy was not removed"
+                                );
+                            }
+                            Ok(_) | Err(_) => {
+                                tracing::error!(
+                                    index = name,
+                                    id,
+                                    shard = usize::from(s),
+                                    "overwrite committed on shard {owner} but the \
+                                     old copy could not be removed: shard \
+                                     unavailable"
+                                );
+                            }
                         }
                     }
                 }
             }
-            let req = ShardReq::Vset {
-                name: name.to_owned(),
-                id,
-                vector,
-                tenant,
-                limit,
-                payload,
-            };
-            return match self.call(owner, req).await? {
-                ShardResp::Done => {
-                    self.inner
-                        .owners
-                        .write()
-                        .entry(name.to_owned())
-                        .or_default()
-                        .insert(id, (owner as u8, None));
-                    Ok(())
-                }
-                ShardResp::Err(e) => Err(ShardError::Storage(e)),
-                _ => Err(ShardError::Unavailable),
-            };
+            return Ok(());
         }
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
