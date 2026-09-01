@@ -2548,11 +2548,10 @@ async fn drop_vindex(
             guard.backend.live_ids(),
         )
     };
-    drop(arc);
-    quota.sub(tenant, fragment);
     if was_disk {
-        // COMMIT FIRST, then delete. The registry is the commit record, so the
-        // order decides what a crash in the middle means.
+        // COMMIT FIRST, then delete, and change NOTHING the client can observe
+        // until the commit lands. The registry is the commit record, so the
+        // order decides both what a crash means and what a failure means.
         //
         // It used to delete the directory and then rewrite the registry. A
         // crash between the two left the registry naming a directory that no
@@ -2561,20 +2560,41 @@ async fn drop_vindex(
         // crash after the commit leaves a directory nobody references, which
         // is reclaimable garbage rather than a store that will not open.
         //
-        // The index is already out of the resident map, so the rewrite drops
-        // its entry.
+        // The `arc` is still held and the quota untouched, so a failed commit
+        // can be undone. Doing that work first made a refused DROP incoherent:
+        // the index was gone from this process, still listed in the registry -
+        // so it came back on the next open or lazy reopen - and its quota had
+        // already been returned to the tenant.
+        //
+        // The rewrite drops the entry because the index is out of the resident
+        // map; putting it back is what makes the rollback complete.
         if let Err(e) = persist_registry(dir, vindexes) {
+            vindexes.write().insert(name.to_owned(), arc);
             return Err(format!("vindex registry not updated: {e}"));
         }
-        // A failed removal must not let DROP report success: the index would
-        // reappear at the next open (review P1). NotFound is fine - already
-        // gone, or never flushed.
+    }
+    // Past this point the drop is COMMITTED: the catalogue no longer lists it.
+    drop(arc);
+    quota.sub(tenant, fragment);
+    if was_disk {
+        // Cleanup, after the fact. A failure here is NOT a failed drop - the
+        // commit record is already published, so the index will not come back
+        // at the next open, and telling the client otherwise invites a retry
+        // of an operation that has already happened. What is left is an
+        // orphan directory: reclaimable, protected from being overwritten by
+        // a same-named create, and owed an ORPHAN line in HEALTH.
         let vdir = dir.join(format!("vindex-{name}"));
         match std::fs::remove_dir_all(&vdir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(format!("vindex dir {} not removed: {e}", vdir.display()));
+                tracing::error!(
+                    dir = %vdir.display(),
+                    error = %e,
+                    "vindex dropped from the registry but its directory could \
+                     not be removed: it is now an orphan and must be reclaimed \
+                     by hand"
+                );
             }
         }
     }

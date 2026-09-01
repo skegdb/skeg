@@ -119,10 +119,25 @@ pub(crate) fn cpu_quota(root: &Path) -> Option<usize> {
 /// two "unlimited" spellings yields `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemoryStatus {
-    /// The hard limit this process will be killed for crossing.
+    /// The tightest hard limit on this process's cgroup chain.
     pub limit_bytes: Option<u64>,
-    /// Current charged usage, as the kernel accounts it.
+    /// Usage charged to the cgroup that set `limit_bytes`.
     pub current_bytes: Option<u64>,
+    /// What this process may still allocate before the FIRST cgroup on its
+    /// chain is saturated: `min(limit - current)` over the whole hierarchy.
+    ///
+    /// A separate number because one limit/current pair cannot describe a
+    /// hierarchy. Every cgroup from the process's own to the root applies at
+    /// once, and the one that runs out first is the one with the least
+    /// headroom, which is NOT the one with the smallest limit: a leaf at
+    /// 256 MiB holding 10 MiB has 246 MiB free, but inside a parent at
+    /// 512 MiB already holding 500 MiB, twelve more megabytes end the
+    /// process.
+    ///
+    /// `None` means unknown, never zero and never unlimited: no limit exists
+    /// anywhere, or one does and its usage could not be read. A budget cannot
+    /// be derived from either, and guessing is what makes a governor unsafe.
+    pub available_bytes: Option<u64>,
 }
 
 /// cgroup v1 spells "unlimited" as PAGE_SIZE-rounded `i64::MAX` rather than a
@@ -220,6 +235,8 @@ fn v2_at(dir: &Path) -> MemoryStatus {
     MemoryStatus {
         limit_bytes: read(dir.join("memory.max")).and_then(|s| parse_mem_limit(&s)),
         current_bytes: read(dir.join("memory.current")).and_then(|s| parse_mem_usage(&s)),
+        // One directory cannot know the chain's headroom.
+        available_bytes: None,
     }
 }
 
@@ -228,6 +245,7 @@ fn v1_at(dir: &Path) -> MemoryStatus {
     MemoryStatus {
         limit_bytes: read(dir.join("memory.limit_in_bytes")).and_then(|s| parse_mem_limit(&s)),
         current_bytes: read(dir.join("memory.usage_in_bytes")).and_then(|s| parse_mem_usage(&s)),
+        available_bytes: None,
     }
 }
 
@@ -254,23 +272,36 @@ pub(crate) fn memory_status_rooted(proc_self_cgroup: &Path, mount: &Path) -> Mem
             // build will not follow. The mount root is the honest guess.
             None => return memory_status_at(mount),
         };
-    // The MINIMUM over the whole chain, not the first limit found.
+    // Walk the WHOLE chain and keep two things: the tightest limit (for
+    // reporting) and the least headroom (for deciding).
     //
     // Every cgroup from the process's own up to the root applies at once, so
-    // the one that kills the process is the tightest of them - and it is not
-    // always the nearest. A leaf set to 1 GiB inside a parent set to 256 MiB
-    // is a 256 MiB process; stopping at the leaf reports four times the memory
-    // it actually has, which is worse than reporting none, because a governor
-    // then admits work right up to the kill.
-    let mut best: Option<(u64, MemoryStatus)> = None;
+    // what runs out first is the one with the least `limit - current`. That is
+    // not the one with the smallest limit: a leaf at 256 MiB holding 10 MiB
+    // has 246 MiB free, but inside a parent at 512 MiB already holding
+    // 500 MiB - siblings' memory - twelve more megabytes end the process.
+    //
+    // A limit whose usage cannot be read makes the headroom UNKNOWN, and
+    // unknown must not be substituted with zero (rejects everything) or with
+    // the limit (invents room that may not exist).
+    let mut tightest: Option<(u64, MemoryStatus)> = None;
+    let mut headroom: Option<u64> = None;
+    let mut saw_limit = false;
+    let mut headroom_unknown = false;
     loop {
         let m = read_at(&dir);
-        if let Some(limit) = m.limit_bytes
-            && best.as_ref().is_none_or(|(b, _)| limit < *b)
-        {
-            // Usage from the SAME cgroup as the limit: two numbers from
-            // different accounting domains do not describe one budget.
-            best = Some((limit, m));
+        if let Some(limit) = m.limit_bytes {
+            saw_limit = true;
+            if tightest.as_ref().is_none_or(|(b, _)| limit < *b) {
+                tightest = Some((limit, m));
+            }
+            match m.current_bytes {
+                Some(cur) => {
+                    let free = limit.saturating_sub(cur);
+                    headroom = Some(headroom.map_or(free, |h: u64| h.min(free)));
+                }
+                None => headroom_unknown = true,
+            }
         }
         if dir == top {
             break;
@@ -280,15 +311,26 @@ pub(crate) fn memory_status_rooted(proc_self_cgroup: &Path, mount: &Path) -> Mem
             _ => break,
         }
     }
-    match best {
-        Some((_, m)) => m,
+    let available_bytes = if !saw_limit || headroom_unknown {
+        None
+    } else {
+        headroom
+    };
+    match tightest {
+        Some((_, m)) => MemoryStatus {
+            available_bytes,
+            ..m
+        },
         // Nothing in the chain sets a limit. Report usage from the process's
         // own cgroup, which is the one that describes it.
-        None => read_at(&match self_cgroup_path(proc_self_cgroup) {
-            Some(Membership::V2(rel)) => mount.join(rel),
-            Some(Membership::V1(rel)) => mount.join("memory").join(rel),
-            None => mount.to_path_buf(),
-        }),
+        None => MemoryStatus {
+            available_bytes: None,
+            ..read_at(&match self_cgroup_path(proc_self_cgroup) {
+                Some(Membership::V2(rel)) => mount.join(rel),
+                Some(Membership::V1(rel)) => mount.join("memory").join(rel),
+                None => mount.to_path_buf(),
+            })
+        },
     }
 }
 
@@ -310,6 +352,8 @@ pub(crate) fn memory_status_at(root: &Path) -> MemoryStatus {
     MemoryStatus {
         limit_bytes: limit,
         current_bytes: current,
+        // One directory is not a chain; `memory_status_rooted` computes this.
+        available_bytes: None,
     }
 }
 
@@ -479,6 +523,91 @@ mod tests {
             &dir.path().join("sys/fs/cgroup"),
         );
         assert_eq!(m.limit_bytes, Some(123));
+    }
+
+    #[test]
+    fn what_runs_out_first_is_the_least_headroom_not_the_lowest_limit() {
+        // The counterexample that the "smallest limit" rule gets wrong.
+        //
+        //   leaf   256 MiB limit, 10 MiB used  -> 246 MiB of headroom
+        //   parent 512 MiB limit, 500 MiB used ->  12 MiB of headroom
+        //
+        // The smallest LIMIT is the leaf, and reading it promises 246 MiB.
+        // But the parent is shared with sibling processes that have already
+        // taken 500 MiB of it, so twelve more megabytes saturate it and this
+        // process is killed. What a budget needs is the least headroom on the
+        // chain, not the lowest number on it.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/parent/leaf\n");
+        write(dir.path(), "sys/fs/cgroup/parent/memory.max", "536870912\n");
+        write(
+            dir.path(),
+            "sys/fs/cgroup/parent/memory.current",
+            "524288000\n",
+        );
+        write(
+            dir.path(),
+            "sys/fs/cgroup/parent/leaf/memory.max",
+            "268435456\n",
+        );
+        write(
+            dir.path(),
+            "sys/fs/cgroup/parent/leaf/memory.current",
+            "10485760\n",
+        );
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(
+            m.available_bytes,
+            Some(12 * 1024 * 1024),
+            "the parent has 12 MiB left; the leaf's 246 MiB is unreachable"
+        );
+    }
+
+    #[test]
+    fn a_limit_whose_usage_cannot_be_read_yields_no_headroom_at_all() {
+        // A limit with unknown usage cannot produce a safe number. Falling
+        // back to zero would reject everything; falling back to RSS, or to the
+        // limit itself, would invent headroom that may not exist. `None` says
+        // what is true: this build does not know.
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/a\n");
+        write(dir.path(), "sys/fs/cgroup/a/memory.max", "268435456\n");
+        // no memory.current
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, Some(268_435_456), "the limit is still known");
+        assert_eq!(m.available_bytes, None, "the headroom is not");
+    }
+
+    #[test]
+    fn no_limit_anywhere_means_no_headroom_figure_either() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/a\n");
+        write(dir.path(), "sys/fs/cgroup/a/memory.current", "999\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.limit_bytes, None);
+        assert_eq!(m.available_bytes, None, "unlimited is not zero headroom");
+    }
+
+    #[test]
+    fn a_cgroup_already_over_its_limit_has_no_headroom_not_negative() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(dir.path(), "proc/self/cgroup", "0::/a\n");
+        write(dir.path(), "sys/fs/cgroup/a/memory.max", "1000\n");
+        write(dir.path(), "sys/fs/cgroup/a/memory.current", "1500\n");
+        let m = memory_status_rooted(
+            &dir.path().join("proc/self/cgroup"),
+            &dir.path().join("sys/fs/cgroup"),
+        );
+        assert_eq!(m.available_bytes, Some(0));
     }
 
     #[test]

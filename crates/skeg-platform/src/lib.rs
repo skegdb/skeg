@@ -68,6 +68,10 @@ pub fn memory_status() -> MemoryStatus {
         MemoryStatus {
             limit_bytes: None,
             current_bytes: Some(rss_bytes()),
+            // No cgroup, so no headroom this build can vouch for. RSS is a
+            // signal, not an accounting, and a budget must not be derived
+            // from it.
+            available_bytes: None,
         }
     }
 }

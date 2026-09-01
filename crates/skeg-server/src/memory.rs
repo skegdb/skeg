@@ -15,20 +15,28 @@
 //! its usable limit, the caller is told NO and the client sees an error. A
 //! refused write is a bad afternoon; a killed process mid-fold is a bad week.
 //!
-//! Two deliberate shapes here:
+//! Three deliberate shapes here:
 //!
-//! The limit is read from the CGROUP, not from RSS, because the cgroup number
+//! The question is HEADROOM, not a limit. Admission asks what is left, and
+//! `limit - current` on one cgroup does not answer it: every cgroup from the
+//! process's own up to the root applies at once, so the one that runs out
+//! first is the one with the least headroom - which is not the one with the
+//! smallest limit. A leaf capped at 256 MiB holding 10 MiB looks like 246 MiB
+//! of room, but inside a parent capped at 512 MiB that siblings have already
+//! filled to 500 MiB, twelve more megabytes end the process.
+//!
+//! That figure comes from the CGROUP, not from RSS, because the cgroup number
 //! is the one the kernel kills on. RSS is what this process thinks it is
 //! using; the cgroup also charges page cache for files it mapped. Off Linux
-//! there is no such limit to read, so the governor runs unlimited and says
-//! so, which is honest, and is one more reason the Linux gate is a release
+//! there is nothing to read, so the governor runs unlimited and says so,
+//! which is honest, and is one more reason the Linux gate is a release
 //! blocker rather than a nicety.
 //!
-//! And usage comes from an injectable [`MemorySource`] rather than being read
-//! directly. A budget test that works by actually allocating gigabytes is a
-//! test nobody runs, which is a guard that guards nothing - the same lesson
-//! the `#[ignore]` tests taught. With a source behind a trait the rejection
-//! path is exercised deterministically, in milliseconds, at any limit.
+//! And it arrives through an injectable [`MemorySource`] rather than being
+//! read directly. A budget test that works by really allocating gigabytes is
+//! a test nobody runs, which is a guard that guards nothing - the same lesson
+//! the `#[ignore]` tests taught. Behind a trait the rejection path runs
+//! deterministically, in milliseconds, at any limit.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,10 +50,21 @@ const RESERVE_DIVISOR: u64 = 10;
 ///
 /// Behind a trait so the rejection path can be driven deterministically.
 pub trait MemorySource: std::fmt::Debug + Send + Sync + 'static {
-    /// Bytes currently charged to this process.
-    fn current_bytes(&self) -> u64;
-    /// The limit crossing which the process is killed, if there is one.
-    fn hard_limit_bytes(&self) -> Option<u64>;
+    /// Bytes this process may still allocate before the FIRST cgroup on its
+    /// chain is saturated, or `None` when that is not known.
+    ///
+    /// Headroom, not a limit. Admission is a question about what is left, and
+    /// `limit - current` on one cgroup does not answer it: every cgroup from
+    /// the process's own to the root applies at once, and the one that runs
+    /// out first is the one with the least headroom - which is not the one
+    /// with the smallest limit. A leaf at 256 MiB holding 10 MiB has 246 MiB
+    /// free, but inside a parent at 512 MiB already holding 500 MiB of
+    /// siblings' memory, twelve more megabytes end the process.
+    ///
+    /// `None` means unknown, and unknown is not zero: no limit anywhere, or
+    /// one whose usage could not be read. Substituting either extreme is how
+    /// a governor becomes unsafe in one direction or useless in the other.
+    fn available_bytes(&self) -> Option<u64>;
 }
 
 /// The real one: whatever the platform can actually observe.
@@ -53,13 +72,8 @@ pub trait MemorySource: std::fmt::Debug + Send + Sync + 'static {
 pub struct PlatformMemory;
 
 impl MemorySource for PlatformMemory {
-    fn current_bytes(&self) -> u64 {
-        skeg_platform::memory_status()
-            .current_bytes
-            .unwrap_or_default()
-    }
-    fn hard_limit_bytes(&self) -> Option<u64> {
-        skeg_platform::memory_status().limit_bytes
+    fn available_bytes(&self) -> Option<u64> {
+        skeg_platform::memory_status().available_bytes
     }
 }
 
@@ -67,12 +81,13 @@ impl MemorySource for PlatformMemory {
 /// with their numbers, because "out of memory" without them is untriageable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryRejected {
-    /// The reservation would cross the usable limit.
-    HardLimit {
-        current: u64,
+    /// The reservation would consume more than the headroom left.
+    NoHeadroom {
+        /// Already promised to other callers and not yet allocated.
         reserved: u64,
         requested: u64,
-        usable_limit: u64,
+        /// Headroom on the tightest cgroup, less the reserve held back.
+        usable: u64,
     },
     /// The request is so large that adding it overflows. A caller computing a
     /// size from wire input can produce this, so it is refused rather than
@@ -83,15 +98,14 @@ pub enum MemoryRejected {
 impl std::fmt::Display for MemoryRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HardLimit {
-                current,
+            Self::NoHeadroom {
                 reserved,
                 requested,
-                usable_limit,
+                usable,
             } => write!(
                 f,
-                "memory budget: current={current} reserved={reserved} \
-                 requested={requested} limit={usable_limit}"
+                "memory budget: reserved={reserved} requested={requested} \
+                 usable={usable}"
             ),
             Self::ArithmeticOverflow { requested } => {
                 write!(f, "memory budget: requested={requested} overflows")
@@ -128,9 +142,11 @@ fn default_reserve(limit: u64) -> u64 {
 #[derive(Debug)]
 pub struct MemoryGovernor {
     source: Arc<dyn MemorySource>,
-    limit: Option<u64>,
+    /// An operator's override, if any. NOT a cached cgroup reading.
+    explicit: Option<u64>,
     reserve: u64,
-    /// Bytes promised to callers but not yet visible in `current_bytes`.
+    /// Bytes promised to callers but not yet charged to the cgroup, so not
+    /// yet reflected in the headroom the source reports.
     /// Without this, N concurrent reservations all read the same pre-
     /// allocation usage and all succeed - the classic overbooking race.
     outstanding: AtomicU64,
@@ -148,13 +164,21 @@ impl MemoryGovernor {
         explicit_limit: Option<u64>,
         explicit_reserve: Option<u64>,
     ) -> Result<Self, String> {
-        let limit = resolve_limit(explicit_limit, source.hard_limit_bytes());
-        let reserve = match (explicit_reserve, limit) {
+        // Only an EXPLICIT override is stored. The cgroup's figure must not
+        // be cached here: headroom moves with every allocation this process
+        // and its cgroup siblings make, and a governor holding the number it
+        // saw at startup keeps admitting against memory a sibling has since
+        // taken. It is read afresh on every attempt instead.
+        let explicit = explicit_limit.filter(|v| *v > 0);
+        // The reserve is sized once, from whatever is known now - it is a
+        // configuration choice, not a live measurement.
+        let known_now = resolve_limit(explicit_limit, source.available_bytes());
+        let reserve = match (explicit_reserve, known_now) {
             (Some(r), _) => r,
             (None, Some(l)) => default_reserve(l),
             (None, None) => MIN_RESERVE,
         };
-        if let Some(l) = limit
+        if let Some(l) = known_now
             && reserve >= l
         {
             return Err(format!(
@@ -164,19 +188,24 @@ impl MemoryGovernor {
         }
         Ok(Self {
             source,
-            limit,
+            explicit,
             reserve,
             outstanding: AtomicU64::new(0),
         })
     }
 
     /// The ceiling admissions are actually measured against.
-    pub fn usable_limit(&self) -> Option<u64> {
-        self.limit.map(|l| l.saturating_sub(self.reserve))
+    /// Headroom the governor will actually hand out: what the tightest cgroup
+    /// has left, less the reserve. Re-read each time, because the number moves
+    /// with every allocation this process and its cgroup siblings make.
+    pub fn usable(&self) -> Option<u64> {
+        self.effective_limit()
+            .map(|l| l.saturating_sub(self.reserve))
     }
 
-    pub fn current_bytes(&self) -> u64 {
-        self.source.current_bytes()
+    /// The headroom figure in force: an explicit override, else the live one.
+    fn effective_limit(&self) -> Option<u64> {
+        self.explicit.or_else(|| self.source.available_bytes())
     }
 
     pub fn reserved_bytes(&self) -> u64 {
@@ -190,33 +219,33 @@ impl MemoryGovernor {
     /// of their allocations is what kills the process. Only one of them wins
     /// the exchange; the other retries against the new total.
     pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<MemoryReservation, MemoryRejected> {
-        let Some(usable) = self.usable_limit() else {
-            // No limit to enforce. Still tracked, so the counters report
-            // something true and a limit can be applied later.
+        let Some(usable) = self.usable() else {
+            // No headroom figure to enforce against. Still tracked, so the
+            // counters report something true and a limit can apply later.
             self.outstanding.fetch_add(bytes, Ordering::AcqRel);
             return Ok(MemoryReservation {
                 governor: Arc::clone(self),
                 bytes,
             });
         };
-        let current = self.source.current_bytes();
+        // `usable` is HEADROOM: it already has current usage subtracted, on
+        // the tightest cgroup of the chain. What has to fit inside it is what
+        // is promised but not yet allocated, plus this request.
         let mut held = self.outstanding.load(Ordering::Acquire);
         loop {
-            let projected = current
-                .checked_add(held)
-                .and_then(|t| t.checked_add(bytes))
+            let wanted = held
+                .checked_add(bytes)
                 .ok_or(MemoryRejected::ArithmeticOverflow { requested: bytes })?;
-            if projected > usable {
-                return Err(MemoryRejected::HardLimit {
-                    current,
+            if wanted > usable {
+                return Err(MemoryRejected::NoHeadroom {
                     reserved: held,
                     requested: bytes,
-                    usable_limit: usable,
+                    usable,
                 });
             }
             match self.outstanding.compare_exchange_weak(
                 held,
-                held + bytes,
+                wanted,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -232,13 +261,13 @@ impl MemoryGovernor {
     }
 }
 
-#[derive(Debug)]
 /// A reservation, released when dropped.
 ///
 /// Dropping releases only the PROMISE. Whether the memory itself came back is
-/// a separate question, answered by `MemorySource` on the next reservation -
-/// which is why a fold that really did grow the heap does not get its budget
-/// back just because its job object went away.
+/// a separate question, answered by the cgroup's own headroom on the next
+/// reservation - which is why a fold that really did grow the heap does not
+/// get its budget back just because its job object went away.
+#[derive(Debug)]
 pub struct MemoryReservation {
     governor: Arc<MemoryGovernor>,
     bytes: u64,
@@ -262,27 +291,21 @@ impl Drop for MemoryReservation {
 mod tests {
     use super::*;
 
-    /// A source the test drives directly.
+    /// A source the test drives directly. It reports HEADROOM, which is what
+    /// admission is a question about.
     #[derive(Debug)]
     struct Fake {
-        current: AtomicU64,
-        limit: Option<u64>,
+        available: Option<u64>,
     }
 
     impl MemorySource for Fake {
-        fn current_bytes(&self) -> u64 {
-            self.current.load(Ordering::Acquire)
-        }
-        fn hard_limit_bytes(&self) -> Option<u64> {
-            self.limit
+        fn available_bytes(&self) -> Option<u64> {
+            self.available
         }
     }
 
-    fn gov(current: u64, limit: Option<u64>, reserve: u64) -> Arc<MemoryGovernor> {
-        let src = Arc::new(Fake {
-            current: AtomicU64::new(current),
-            limit,
-        });
+    fn gov(available: Option<u64>, reserve: u64) -> Arc<MemoryGovernor> {
+        let src = Arc::new(Fake { available });
         Arc::new(MemoryGovernor::new(src, None, Some(reserve)).unwrap())
     }
 
@@ -292,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cgroup_limit_is_used_when_nothing_is_explicit() {
+    fn the_cgroup_headroom_is_used_when_nothing_is_explicit() {
         assert_eq!(resolve_limit(None, Some(999)), Some(999));
     }
 
@@ -317,52 +340,71 @@ mod tests {
     #[test]
     fn a_reserve_that_swallows_the_limit_refuses_to_start() {
         let src = Arc::new(Fake {
-            current: AtomicU64::new(0),
-            limit: Some(1000),
+            available: Some(1000),
         });
         let err = MemoryGovernor::new(src, None, Some(1000)).unwrap_err();
         assert!(err.contains("1000"), "the refusal must show the numbers");
     }
 
     #[test]
-    fn a_reservation_within_the_budget_is_admitted() {
-        let g = gov(0, Some(1000), 100);
+    fn a_reservation_within_the_headroom_is_admitted() {
+        let g = gov(Some(1000), 100);
         let r = g.try_reserve(500).unwrap();
         assert_eq!(r.bytes(), 500);
         assert_eq!(g.reserved_bytes(), 500);
     }
 
     #[test]
-    fn a_reservation_past_the_usable_limit_is_refused() {
-        // usable = 1000 - 100 = 900. Already using 800, asking for 200.
-        let g = gov(800, Some(1000), 100);
-        let err = g.try_reserve(200).unwrap_err();
+    fn a_reservation_past_the_headroom_is_refused() {
+        // usable = 1000 - 100 = 900.
+        let g = gov(Some(1000), 100);
+        let err = g.try_reserve(901).unwrap_err();
         match err {
-            MemoryRejected::HardLimit {
-                current,
-                requested,
-                usable_limit,
-                ..
-            } => {
-                assert_eq!((current, requested, usable_limit), (800, 200, 900));
-            }
+            MemoryRejected::NoHeadroom {
+                requested, usable, ..
+            } => assert_eq!((requested, usable), (901, 900)),
             other => panic!("wrong rejection: {other:?}"),
         }
     }
 
     #[test]
-    fn the_reserve_is_held_back_from_the_budget() {
-        // Without the reserve this fits exactly; with it, it does not. That
-        // difference is the headroom, and it must be real.
-        let g = gov(0, Some(1000), 100);
-        assert_eq!(g.usable_limit(), Some(900));
+    fn shrinking_headroom_tightens_admission_without_a_restart() {
+        // The number moves with every allocation this process AND its cgroup
+        // siblings make, so it is re-read on each attempt rather than cached.
+        // A governor that latched the figure at startup would keep admitting
+        // against memory a sibling has since taken.
+        #[derive(Debug)]
+        struct Shrinking(std::sync::atomic::AtomicU64);
+        impl MemorySource for Shrinking {
+            fn available_bytes(&self) -> Option<u64> {
+                Some(self.0.load(Ordering::Acquire))
+            }
+        }
+        let src = Arc::new(Shrinking(AtomicU64::new(1000)));
+        let g = Arc::new(MemoryGovernor::new(src.clone(), None, Some(0)).unwrap());
+        // HELD, not dropped: the first version of this test let the
+        // reservation fall out of scope immediately, so nothing was
+        // outstanding and admitting one more byte was correct. The test was
+        // wrong, not the governor.
+        let _held = g.try_reserve(800).unwrap();
+        src.0.store(100, Ordering::Release);
+        assert!(
+            g.try_reserve(1).is_err(),
+            "800 promised against 100 of headroom must refuse"
+        );
+    }
+
+    #[test]
+    fn the_reserve_is_held_back_from_the_headroom() {
+        let g = gov(Some(1000), 100);
+        assert_eq!(g.usable(), Some(900));
         assert!(g.try_reserve(1000).is_err());
         assert!(g.try_reserve(900).is_ok());
     }
 
     #[test]
     fn dropping_a_reservation_restores_headroom() {
-        let g = gov(0, Some(1000), 100);
+        let g = gov(Some(1000), 100);
         {
             let _r = g.try_reserve(900).unwrap();
             assert!(g.try_reserve(1).is_err(), "budget full while held");
@@ -373,28 +415,28 @@ mod tests {
 
     #[test]
     fn outstanding_reservations_count_even_before_they_allocate() {
-        // The race this exists to stop: usage has not moved yet, but the
-        // bytes are already promised.
-        let g = gov(0, Some(1000), 0);
+        // The race this exists to stop: the cgroup has not been charged yet,
+        // but the bytes are already promised.
+        let g = gov(Some(1000), 0);
         let _a = g.try_reserve(600).unwrap();
         assert!(
             g.try_reserve(600).is_err(),
-            "a second 600 must not be admitted against an unchanged usage"
+            "a second 600 must not be admitted against unchanged headroom"
         );
     }
 
     #[test]
     fn concurrent_reservations_never_overbook() {
-        // Ten threads racing for a budget that fits six. Exactly six may win;
-        // a lost compare-exchange must retry against the NEW total, not
-        // against the value it first read.
+        // Ten threads racing for headroom that fits six. Exactly six may win;
+        // a lost compare-exchange must retry against the NEW total, not the
+        // value it first read.
         //
         // Repeated, on purpose. A read-check-write governor overbooks most
         // rounds but not every round, so a single-round version of this test
         // passes roughly one time in five against code that is plainly wrong.
         // Measured: naive store fails 4 of 5 single rounds, 25 of 25 here.
         for round in 0..25 {
-            let g = gov(0, Some(700), 100); // usable 600
+            let g = gov(Some(700), 100); // usable 600
             let admitted = Arc::new(AtomicU64::new(0));
             std::thread::scope(|s| {
                 for _ in 0..10 {
@@ -425,7 +467,8 @@ mod tests {
     fn an_overflowing_request_is_refused_not_wrapped() {
         // A wrapped total is a reservation that always succeeds, which is
         // worse than no governor at all.
-        let g = gov(u64::MAX - 10, Some(u64::MAX), 1);
+        let g = gov(Some(u64::MAX), 1);
+        let _held = g.try_reserve(1).unwrap();
         assert_eq!(
             g.try_reserve(u64::MAX).unwrap_err(),
             MemoryRejected::ArithmeticOverflow {
@@ -435,10 +478,13 @@ mod tests {
     }
 
     #[test]
-    fn without_a_limit_everything_is_admitted_but_still_counted() {
-        let g = gov(0, None, 0);
+    fn unknown_headroom_admits_but_still_counts() {
+        // `None` is "not known", not "no memory". Rejecting everything on an
+        // unreadable cgroup - or on macOS, where there is nothing to read -
+        // would make the server unusable rather than safe.
+        let g = gov(None, 0);
         let _r = g.try_reserve(u64::MAX / 2).unwrap();
-        assert_eq!(g.usable_limit(), None);
+        assert_eq!(g.usable(), None);
         assert_eq!(g.reserved_bytes(), u64::MAX / 2);
     }
 }

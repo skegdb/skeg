@@ -160,3 +160,112 @@ async fn a_dropped_index_leaves_nothing_behind_and_the_name_is_reusable() {
         .await
         .expect("the name is free again after a complete DROP");
 }
+
+/// Make the registry publish fail deterministically: `write_registry` creates
+/// `<VINDEX_REGISTRY>.tmp`, and `File::create` cannot create a file where a
+/// directory already sits.
+fn block_registry_writes(shard_dir: &std::path::Path) {
+    std::fs::create_dir_all(shard_dir.join("vindexes.registry.tmp")).unwrap();
+}
+
+fn unblock_registry_writes(shard_dir: &std::path::Path) {
+    std::fs::remove_dir_all(shard_dir.join("vindexes.registry.tmp")).unwrap();
+}
+
+#[tokio::test]
+async fn a_drop_whose_commit_fails_changes_nothing_the_client_can_see() {
+    // The drop did the visible work FIRST - out of the resident map, quota
+    // returned - and only then tried to commit. A failed commit therefore left
+    // the index gone from this process while the registry still listed it, so
+    // it reappeared at the next open with its quota already given back.
+    //
+    // Nothing observable may move until the commit lands.
+    let dir = tempfile::TempDir::new().unwrap();
+    let shard0 = dir.path().join("shard-0");
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 1, false, TIER, 1).unwrap();
+    shards.vindex_create("keep", 8, 4, 1).await.unwrap();
+    for id in 0..20u64 {
+        shards
+            .vset("keep", id, vec_for(id), 0, None, None)
+            .await
+            .unwrap();
+    }
+
+    block_registry_writes(&shard0);
+    let err = shards
+        .vindex_drop("keep", 0)
+        .await
+        .expect_err("a drop that cannot commit must fail");
+    assert!(
+        format!("{err}").contains("registry"),
+        "the error must name the commit record, got: {err}"
+    );
+
+    // Still there, still readable, still listed.
+    let rows = shards.vindex_list().await.unwrap();
+    assert!(
+        rows.iter().any(|r| r.name == "keep"),
+        "a refused drop must leave the index listed"
+    );
+    assert!(
+        shards.vget("keep", 7).await.unwrap().is_some(),
+        "and readable"
+    );
+    assert!(
+        shard0.join("vindex-keep").exists(),
+        "and its directory intact"
+    );
+
+    // And it survives a restart, since the registry was never rewritten.
+    unblock_registry_writes(&shard0);
+    drop(shards);
+    let again = ShardSet::open_mode_with_workers(dir.path(), 1, false, TIER, 1).unwrap();
+    let rows = again.vindex_list().await.unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.name == "keep")
+        .expect("still there after restart");
+    assert_eq!(row.n_vectors, 20, "with every row it had");
+}
+
+#[tokio::test]
+async fn a_create_whose_commit_fails_is_not_acknowledged() {
+    // The registry is the commit record, so a create that cannot publish one
+    // has not happened. Reporting Done would make an orphan directory the
+    // trace of a CONFIRMED operation, which is exactly what "not in the
+    // registry means not committed" cannot survive.
+    let dir = tempfile::TempDir::new().unwrap();
+    let shard0 = dir.path().join("shard-0");
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 1, false, TIER, 1).unwrap();
+
+    block_registry_writes(&shard0);
+    let err = shards
+        .vindex_create("ghost", 8, 4, 1)
+        .await
+        .expect_err("a create that cannot commit must fail");
+    assert!(
+        format!("{err}").contains("registry"),
+        "the error must name the commit record, got: {err}"
+    );
+
+    // Not visible in this process either: the in-memory entry is rolled back.
+    let rows = shards.vindex_list().await.unwrap();
+    assert!(
+        !rows.iter().any(|r| r.name == "ghost"),
+        "a create that did not commit must not be servable"
+    );
+
+    // And after a restart it is still not an index - just an orphan directory,
+    // which the create guard then refuses to overwrite.
+    unblock_registry_writes(&shard0);
+    drop(shards);
+    let again = ShardSet::open_mode_with_workers(dir.path(), 1, false, TIER, 1).unwrap();
+    assert!(
+        !again
+            .vindex_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.name == "ghost")
+    );
+}
