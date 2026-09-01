@@ -9,7 +9,7 @@
 //! `xxh3_64(key) % n_shards`.
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2646,6 +2646,19 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
 /// decides whether that is an error (an explicit DROP) or a no-op (an erasure
 /// sweep racing a concurrent drop).
 ///
+/// "Not there" is decided by the CATALOGUE, not by the resident map. The map
+/// holds what is open right now; an evicted disk index is committed, on disk,
+/// and comes back on the next access. Reading absence off the map told a DROP
+/// its target did not exist and let a tenant erasure walk past the tenant's own
+/// vectors while reporting success - the KV sweep took the payload blobs and
+/// left the index behind. So a miss reopens through `get_or_reopen`, which is
+/// already the one place that turns a catalogue entry back into a live index,
+/// and only a miss THERE is a genuine absence.
+///
+/// Reopening an index in order to delete it is not wasted work: its quota
+/// fragment and the ids of its payload blobs are only knowable from the open
+/// index, and both must be reclaimed here.
+///
 /// Pops the entry from the outer map first; this prevents new ops from
 /// observing it. In-flight ops on this vindex keep their cloned `Arc` alive and
 /// finish their inner lock window before dropping it. `remove_dir_all` on POSIX
@@ -2658,9 +2671,32 @@ async fn drop_vindex(
     quota: &Arc<crate::quota::TenantVectorQuota>,
     name: &str,
     tenant: u128,
+    tier: QuantKind,
+    mmap_tier: bool,
+    mmap_graph: bool,
 ) -> Result<bool, String> {
-    let Some(arc) = vindexes.write().remove(name) else {
-        return Ok(false);
+    // Bound to a local FIRST: a guard built in a `match` scrutinee lives for
+    // the whole `match`, so the miss arm below would hold the write lock across
+    // its `.await` and `get_or_reopen`'s own `read()` would never be granted.
+    // Measured as a hang, not reasoned about.
+    let resident = vindexes.write().remove(name);
+    let arc = match resident {
+        Some(arc) => arc,
+        None => {
+            // Not resident. Ask the catalogue before believing it is gone.
+            if get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, name)
+                .await
+                .is_none()
+            {
+                return Ok(false);
+            }
+            // Reopened and published. Take it back out; `None` here means a
+            // concurrent drop won the race, which is the same no-op.
+            match vindexes.write().remove(name) {
+                Some(arc) => arc,
+                None => return Ok(false),
+            }
+        }
     };
     // Read everything off the index in a tight block so the guard is gone
     // before the payload-del `await` below. `live_ids` is enumerated now,
@@ -3028,7 +3064,11 @@ async fn process(
             ShardResp::IndexStats(rows)
         }
         ShardReq::VindexDrop { name, tenant } => {
-            match drop_vindex(vlog, vindexes, dir, quota, &name, tenant).await {
+            match drop_vindex(
+                vlog, vindexes, dir, quota, &name, tenant, tier, mmap_tier, mmap_graph,
+            )
+            .await
+            {
                 Ok(true) => ShardResp::Done,
                 Ok(false) => ShardResp::Err(format!("vindex '{name}' not found")),
                 Err(e) => ShardResp::Err(e),
@@ -3058,15 +3098,42 @@ async fn process(
             // and leave the index pointing at a hole. Dropping the index first
             // reclaims its blobs and its vector quota through the same path a
             // VINDEX.DROP takes, and leaves nothing dangling.
-            let mine: Vec<String> = vindexes
-                .read()
-                .keys()
-                .filter(|k| unscope_key(k).0 == tenant)
-                .cloned()
-                .collect();
+            // The tenant's indexes come from the CATALOGUE, unioned with the
+            // resident map. Walking the map alone skipped every evicted index:
+            // the sweep below then deleted its payload blobs - they are KV keys
+            // under this tenant's prefix - and left the vectors on disk while
+            // the call reported success. For an erasure that is the whole point
+            // of the operation, so the registry read is fail-closed: an
+            // unreadable catalogue must not become a successful erasure.
+            let mut mine: BTreeSet<String> = match read_registry(dir) {
+                Ok(entries) => entries
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .filter(|k| unscope_key(k).0 == tenant)
+                    .collect(),
+                Err(e) => {
+                    return ShardResp::Err(format!(
+                        "vindex registry unreadable, refusing to report a \
+                         partial erasure: {e}"
+                    ));
+                }
+            };
+            // Flat (in-RAM) indexes are never in the registry, so the resident
+            // map is still authoritative for them.
+            mine.extend(
+                vindexes
+                    .read()
+                    .keys()
+                    .filter(|k| unscope_key(k).0 == tenant)
+                    .cloned(),
+            );
             let mut dropped = 0u64;
             for name in mine {
-                match drop_vindex(vlog, vindexes, dir, quota, &name, tenant).await {
+                match drop_vindex(
+                    vlog, vindexes, dir, quota, &name, tenant, tier, mmap_tier, mmap_graph,
+                )
+                .await
+                {
                     Ok(true) => dropped += 1,
                     // Lost a race with a concurrent drop: already gone, fine.
                     Ok(false) => {}
@@ -7636,6 +7703,129 @@ mod tests {
             ctl.open_indices().await.iter().any(|s| s.index == "ev"),
             "reopened index is resident again"
         );
+    }
+
+    /// The registry is the catalogue; the resident map is a cache. An evicted
+    /// disk index is committed and still on disk, so a DROP must delete it -
+    /// not report it absent because it happens not to be in RAM right now.
+    #[tokio::test]
+    async fn dropping_an_evicted_vindex_deletes_it_instead_of_reporting_it_absent() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        // Disk-backed (backend byte 1): only these survive an evict.
+        shards.vindex_create("ev", 4, 1, 1).await.unwrap();
+        for id in 1u64..=20 {
+            let v = vec![id as f32, 0.0, 0.0, 0.0];
+            shards
+                .vset(
+                    "ev",
+                    id,
+                    v,
+                    0,
+                    None,
+                    // Payloads, because reclaiming their blobs is work the drop
+                    // can only do from the OPEN index - `live_ids` comes off the
+                    // backend. A drop that reopens must reclaim them exactly
+                    // like a drop that never evicted, and a test that checked
+                    // only the directory would not notice if it did not.
+                    Some(Bytes::from_static(b"payload")),
+                )
+                .await
+                .unwrap();
+        }
+        // Fold, so the data is in the graph rather than only in the WAL.
+        shards.vindex_consolidate("ev").await.unwrap();
+
+        let ctl = shards.control_handle();
+        assert!(
+            ctl.evict(0, "ev").await.unwrap(),
+            "fixture: the index must be resident so the evict has something to do"
+        );
+        let sdirs: Vec<_> = (0..2)
+            .map(|i| dir.path().join(format!("shard-{i}")))
+            .collect();
+        assert!(
+            sdirs
+                .iter()
+                .all(|d| read_registry(d).unwrap().iter().any(|e| e.name == "ev")),
+            "fixture: the registry must still name the evicted index, or this \
+             test is not about eviction at all"
+        );
+
+        shards.vindex_drop("ev", 0).await.unwrap();
+
+        for (i, sdir) in sdirs.iter().enumerate() {
+            assert!(
+                !read_registry(sdir).unwrap().iter().any(|e| e.name == "ev"),
+                "shard {i}: the catalogue still names a dropped vindex, so it \
+                 comes back on the next open"
+            );
+            assert!(
+                !sdir.join("vindex-ev").exists(),
+                "shard {i}: the directory of a dropped vindex is still on disk"
+            );
+        }
+        for id in 1u64..=20 {
+            assert_eq!(
+                shards.get(&payload_key(0, "ev", id)).await.unwrap(),
+                None,
+                "payload blob of id {id} survived the drop of an evicted index"
+            );
+        }
+    }
+
+    /// The erasure path walks the resident map, so a tenant's evicted index is
+    /// never even attempted: the KV sweep deletes its payload blobs, the call
+    /// reports success, and the vectors stay on disk. The existing erasure test
+    /// cannot see this - it builds a flat index, which cannot be evicted.
+    #[tokio::test]
+    async fn erasing_a_tenant_erases_its_evicted_vindexes_too() {
+        const VICTIM: u128 = 7;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        let name = scope_key(VICTIM, "idx");
+        shards.vindex_create(&name, 4, 1, 1).await.unwrap();
+        for id in 0u64..20 {
+            shards
+                .vset(
+                    &name,
+                    id,
+                    vec![id as f32, 0.2, 0.3, 0.4],
+                    VICTIM,
+                    None,
+                    Some(Bytes::from_static(b"payload")),
+                )
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate(&name).await.unwrap();
+
+        let ctl = shards.control_handle();
+        assert!(
+            ctl.evict(VICTIM, "idx").await.unwrap(),
+            "fixture: the index must be resident so the evict has something to do"
+        );
+
+        let (vindexes, _) = shards
+            .erase_tenant(VICTIM, Durability::Kernel)
+            .await
+            .unwrap();
+        assert!(
+            vindexes >= 1,
+            "erasure reported no vindex for a tenant that owns one on disk"
+        );
+
+        for i in 0..2 {
+            let sdir = dir.path().join(format!("shard-{i}"));
+            assert!(
+                !sdir.join(format!("vindex-{name}")).exists(),
+                "shard {i}: the erased tenant's vectors are still on disk"
+            );
+            assert!(
+                !read_registry(&sdir).unwrap().iter().any(|e| e.name == name),
+                "shard {i}: the catalogue still names the erased tenant's index"
+            );
+        }
     }
 
     /// Scale-to-zero: a fleet of K disk-backed tenant indices, all resident,
