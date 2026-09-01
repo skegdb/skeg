@@ -2678,35 +2678,68 @@ async fn drop_vindex(
     // Bound to a local FIRST: a guard built in a `match` scrutinee lives for
     // the whole `match`, so the miss arm below would hold the write lock across
     // its `.await` and `get_or_reopen`'s own `read()` would never be granted.
-    // Measured as a hang, not reasoned about.
+    // Measured as a hang, not reasoned about. `clippy::await_holding_lock` is
+    // denied workspace-wide so the compiler holds this rule now.
     let resident = vindexes.write().remove(name);
-    let arc = match resident {
-        Some(arc) => arc,
+    let target = match resident {
+        Some(arc) => DropTarget::Live(arc),
         None => {
-            // Not resident. Ask the catalogue before believing it is gone.
-            if get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, name)
-                .await
-                .is_none()
-            {
+            // Not resident. The catalogue decides existence, and it must be
+            // READ, not guessed: an unreadable registry cannot be reported as
+            // "no such index" when the index may well be there.
+            let listed = read_registry(dir)
+                .map_err(|e| {
+                    format!("vindex registry unreadable, refusing to decide whether '{name}' exists: {e}")
+                })?
+                .into_iter()
+                .any(|entry| entry.name == name);
+            if !listed {
                 return Ok(false);
             }
-            // Reopened and published. Take it back out; `None` here means a
-            // concurrent drop won the race, which is the same no-op.
-            match vindexes.write().remove(name) {
-                Some(arc) => arc,
-                None => return Ok(false),
+            // Listed. Reopening is worth attempting because only the open index
+            // knows its quota fragment; if it will not open, the entry is still
+            // committed and still has to go.
+            match get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, name).await {
+                // `None` from the map means a concurrent drop won the race.
+                Some(_) => match vindexes.write().remove(name) {
+                    Some(arc) => DropTarget::Live(arc),
+                    None => return Ok(false),
+                },
+                None => DropTarget::Orphan,
             }
         }
     };
+    let arc = match target {
+        DropTarget::Live(arc) => arc,
+        DropTarget::Orphan => {
+            // Committed but unopenable. Same commit order as below - registry
+            // first, files after - but nothing to roll back, because nothing
+            // was taken out of the resident map. A failed commit leaves the
+            // store exactly as it was.
+            persist_registry_removing(dir, vindexes, Some(name))
+                .map_err(|e| format!("vindex registry not updated: {e}"))?;
+            remove_vindex_dir(dir, name);
+            // The quota is deliberately NOT credited: only the open index knows
+            // how many vectors it held, and subtracting a guess corrupts a
+            // counter that other tenants share the meaning of. The tenant's
+            // count stays high until it is rebuilt from the data.
+            tracing::warn!(
+                index = name,
+                tenant,
+                "dropped a committed vindex that would not open: its vector \
+                 quota cannot be credited and must be rebuilt"
+            );
+            sweep_payload_blobs(vlog, tenant, name).await?;
+            return Ok(true);
+        }
+    };
     // Read everything off the index in a tight block so the guard is gone
-    // before the payload-del `await` below. `live_ids` is enumerated now,
-    // while the index still exists, so we can reclaim its payload blobs.
-    let (was_disk, fragment, payload_ids) = {
+    // before the payload sweep below.
+    let (was_disk, fragment) = {
         let guard = arc.read();
         (
             matches!(guard.backend, VectorBackend::Disk(_)),
             guard.backend.len() as u64,
-            guard.backend.live_ids(),
         )
     };
     if was_disk {
@@ -2744,40 +2777,89 @@ async fn drop_vindex(
         // of an operation that has already happened. What is left is an
         // orphan directory: reclaimable, protected from being overwritten by
         // a same-named create, and owed an ORPHAN line in HEALTH.
-        let vdir = dir.join(format!("vindex-{name}"));
-        match std::fs::remove_dir_all(&vdir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::error!(
-                    dir = %vdir.display(),
-                    error = %e,
-                    "vindex dropped from the registry but its directory could \
-                     not be removed: it is now an orphan and must be reclaimed \
-                     by hand"
-                );
-            }
+        remove_vindex_dir(dir, name);
+    }
+    sweep_payload_blobs(vlog, tenant, name).await?;
+    Ok(true)
+}
+
+/// What a DROP found when it looked for its target.
+enum DropTarget {
+    /// Open, in hand, and out of the resident map.
+    Live(VectorEntry),
+    /// In the catalogue, on disk, and it will not open. Still has to go.
+    Orphan,
+}
+
+/// Remove a vindex's directory after its catalogue entry is already gone.
+///
+/// A failure here is NOT a failed drop: the commit record is published, so the
+/// index will not come back at the next open, and telling the client otherwise
+/// invites a retry of an operation that has already happened. What is left is
+/// an orphan directory - reclaimable, protected from being overwritten by a
+/// same-named create, and owed an ORPHAN line in HEALTH.
+fn remove_vindex_dir(dir: &Path, name: &str) {
+    let vdir = dir.join(format!("vindex-{name}"));
+    match std::fs::remove_dir_all(&vdir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::error!(
+                dir = %vdir.display(),
+                error = %e,
+                "vindex dropped from the registry but its directory could not \
+                 be removed: it is now an orphan and must be reclaimed by hand"
+            );
         }
     }
-    // Drop the index's payload blobs. Without this a recreated index reusing
-    // the same name and id would resurface a stale blob under the same
-    // reserved key. Concurrently, for the same reason the KV erase sweep is:
-    // one blob per flush would make a full-index drop take seconds (a 20k-
-    // vector index cost ~28s serial). Bounded like the erase sweep.
-    let results: Vec<_> = stream::iter(payload_ids)
-        .map(|id| {
-            let key = payload_key(tenant, name, id);
-            async move { vlog.del(&key, PAYLOAD_DURABILITY).await }
-        })
+}
+
+/// Delete every payload blob belonging to exactly this vindex.
+///
+/// Without this, a recreated index reusing the same name and id resurfaces a
+/// stale blob under the same reserved key.
+///
+/// Selected by EXACT name, not by prefix. The key is
+/// `tenant | PAYLOAD_MARKER | name | id` with nothing between the name and the
+/// id, so `starts_with` on the name would also take the blobs of every index
+/// whose name this one prefixes - dropping `ev` would eat `ev2`. Requiring the
+/// key to be the head plus exactly eight more bytes is what makes it exact.
+///
+/// Enumerating keys rather than the index's own `live_ids` is deliberate: it
+/// needs no open index, so the orphan path reclaims blobs too, and it catches
+/// blobs an earlier partial failure left behind. Deletes run
+/// `buffer_unordered` so they share the group committer's flushes - awaiting
+/// each in turn put one record per batch and paid a flush per key (~1.4 ms
+/// each, ~14 s per 10k).
+async fn sweep_payload_blobs(vlog: &VLog, tenant: u128, name: &str) -> Result<u64, String> {
+    let mut head = Vec::with_capacity(16 + PAYLOAD_MARKER.len() + name.len());
+    head.extend_from_slice(&tenant.to_le_bytes());
+    head.extend_from_slice(PAYLOAD_MARKER);
+    head.extend_from_slice(name.as_bytes());
+    let exact_len = head.len() + std::mem::size_of::<u64>();
+    let victims: Vec<Vec<u8>> = {
+        let mut v = Vec::new();
+        vlog.for_each_key(|k| {
+            if k.len() == exact_len && k.starts_with(&head) {
+                v.push(k.to_vec());
+            }
+        });
+        v
+    };
+    let results: Vec<_> = stream::iter(victims.iter())
+        .map(|key| vlog.del(key, PAYLOAD_DURABILITY))
         .buffer_unordered(ERASE_CONCURRENCY)
         .collect()
         .await;
+    let mut deleted = 0u64;
     for r in results {
-        if let Err(e) = r {
-            return Err(format!("vindex drop payload failed: {e}"));
+        match r {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(e) => return Err(format!("vindex drop payload failed: {e}")),
         }
     }
-    Ok(true)
+    Ok(deleted)
 }
 
 /// Delete every live KV key that starts with `prefix`, concurrently. Returns
@@ -7736,6 +7818,27 @@ mod tests {
         // Fold, so the data is in the graph rather than only in the WAL.
         shards.vindex_consolidate("ev").await.unwrap();
 
+        // A blob is written by the shard owning the VECTOR ID and a routed GET
+        // goes to the shard owning the KEY, so only some blobs are observable
+        // this way. Asserting `None` over all ids would pass for free; hold the
+        // drop to the set that is actually observable now.
+        let mut observable: Vec<u64> = Vec::new();
+        for id in 1u64..=20 {
+            if shards
+                .get(&payload_key(0, "ev", id))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                observable.push(id);
+            }
+        }
+        assert!(
+            !observable.is_empty(),
+            "fixture: no payload blob is observable, so the reclamation \
+             assertion below would be vacuous"
+        );
+
         let ctl = shards.control_handle();
         assert!(
             ctl.evict(0, "ev").await.unwrap(),
@@ -7765,12 +7868,124 @@ mod tests {
                 "shard {i}: the directory of a dropped vindex is still on disk"
             );
         }
-        for id in 1u64..=20 {
+        for id in observable {
             assert_eq!(
                 shards.get(&payload_key(0, "ev", id)).await.unwrap(),
                 None,
                 "payload blob of id {id} survived the drop of an evicted index"
             );
+        }
+    }
+
+    /// A committed index whose files will not open is still committed: it is in
+    /// the catalogue, it occupies disk, and no client can get rid of it. Reading
+    /// "cannot open" as "does not exist" left the entry unremovable forever -
+    /// the store had a row nobody could delete, and a tenant erasure returned
+    /// success with the vectors on disk.
+    #[tokio::test]
+    async fn dropping_a_committed_vindex_that_will_not_open_still_removes_it() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        shards.vindex_create("orph", 4, 1, 1).await.unwrap();
+        // A second index whose name has the first as a PREFIX. Reclaiming blobs
+        // by key prefix would take this one's too: the key is
+        // `tenant | marker | name | id`, with nothing between name and id.
+        shards.vindex_create("orph2", 4, 1, 1).await.unwrap();
+        for name in ["orph", "orph2"] {
+            for id in 1u64..=12 {
+                shards
+                    .vset(
+                        name,
+                        id,
+                        vec![id as f32, 0.0, 0.0, 0.0],
+                        0,
+                        None,
+                        Some(Bytes::from_static(b"payload")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            shards.vindex_consolidate(name).await.unwrap();
+        }
+
+        // A payload blob is written by the shard that owns the VECTOR ID, while
+        // a routed GET goes to the shard that owns the KEY, so only some blobs
+        // are observable this way - measured, 28 of 48. Asserting `None` over
+        // all of them would therefore pass for free. Record what IS observable
+        // now and hold the drop to exactly that set.
+        let mut observable: Vec<(&str, u64)> = Vec::new();
+        for name in ["orph", "orph2"] {
+            for id in 1u64..=12 {
+                if shards
+                    .get(&payload_key(0, name, id))
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    observable.push((name, id));
+                }
+            }
+        }
+        assert!(
+            observable.iter().any(|&(n, _)| n == "orph")
+                && observable.iter().any(|&(n, _)| n == "orph2"),
+            "fixture: no observable blob for one of the two indexes, so this \
+             test could not tell the two apart: {observable:?}"
+        );
+
+        let ctl = shards.control_handle();
+        assert!(ctl.evict(0, "orph").await.unwrap(), "fixture: was resident");
+
+        // Break it on disk: every graph the index would load, filled with bytes
+        // that are not a graph.
+        let mut broken = 0usize;
+        for i in 0..2 {
+            let vdir = dir.path().join(format!("shard-{i}")).join("vindex-orph");
+            let mut stack = vec![vdir];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.file_name().is_some_and(|n| n == "graph.vmn") {
+                        std::fs::write(&p, b"not a graph").unwrap();
+                        broken += 1;
+                    }
+                }
+            }
+        }
+        assert!(broken > 0, "fixture: found no graph to break");
+
+        shards.vindex_drop("orph", 0).await.unwrap();
+
+        for i in 0..2 {
+            let sdir = dir.path().join(format!("shard-{i}"));
+            assert!(
+                !read_registry(&sdir)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.name == "orph"),
+                "shard {i}: the catalogue still names an index nobody can remove"
+            );
+            assert!(
+                !sdir.join("vindex-orph").exists(),
+                "shard {i}: the unopenable index still occupies disk"
+            );
+        }
+        for (name, id) in observable {
+            let seen = shards.get(&payload_key(0, name, id)).await.unwrap();
+            if name == "orph" {
+                assert_eq!(
+                    seen, None,
+                    "payload blob of id {id} outlived the index it belonged to"
+                );
+            } else {
+                assert!(
+                    seen.is_some(),
+                    "dropping 'orph' took blob {id} of 'orph2', whose name it \
+                     prefixes"
+                );
+            }
         }
     }
 
