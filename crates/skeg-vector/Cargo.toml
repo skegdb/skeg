@@ -42,6 +42,10 @@ name = "vamana"
 harness = false
 
 [[bench]]
+name = "ram_attribution"
+harness = false
+
+[[bench]]
 name = "flat_index"
 harness = false
 

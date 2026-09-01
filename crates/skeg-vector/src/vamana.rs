@@ -2582,6 +2582,7 @@ pub struct ConsolidateJob {
     dim: usize,
     tier: QuantKind,
     run_seq_high: u64,
+    wal_epoch: u64,
     wal_offset: u64,
     /// `Some` when this fold will keep the base edges and insert only the new
     /// rows; `None` for the from-scratch rebuild.
@@ -2597,6 +2598,7 @@ pub struct ConsolidateBuilt {
     base: Segment,
     tmp: PathBuf,
     run_seq_high: u64,
+    wal_epoch: u64,
     wal_offset: u64,
     /// Which route built this: `true` when the base edges were reused. Read by
     /// the correctness tests so they cannot silently pass against the wrong
@@ -2657,6 +2659,7 @@ impl ConsolidateJob {
             dim,
             tier,
             run_seq_high,
+            wal_epoch,
             wal_offset,
             patch,
         } = self;
@@ -2745,6 +2748,7 @@ impl ConsolidateJob {
             base,
             tmp,
             run_seq_high,
+            wal_epoch,
             wal_offset,
             patched: was_patched,
         };
@@ -3245,6 +3249,14 @@ pub struct DiskVamanaIndex {
     /// during the build; `flush_finish` clears it once the run is spliced in.
     /// Empty except during an off-thread flush.
     flushing: AHashMap<u64, Vec<f32>>,
+    /// Bumped every time the WAL is REPLACED rather than appended to.
+    ///
+    /// A background fold captures a byte offset into the WAL at `begin` and
+    /// slices the suffix at `finish`. A flush that completes in between calls
+    /// `compact_wal`, which rewrites the file from scratch - so that offset
+    /// then indexes into a different file, and the slice is meaningless. This
+    /// counter is how `finish` can tell.
+    wal_epoch: u64,
     /// When true (default), `insert` flushes the delta into a run inline once it
     /// fills. A server turns this off and flushes off-thread instead.
     auto_flush: bool,
@@ -3440,6 +3452,7 @@ impl DiskVamanaIndex {
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             flushing: AHashMap::new(),
+            wal_epoch: 0,
             auto_flush: true,
             tombstones: AHashSet::new(),
             live_count,
@@ -3520,11 +3533,30 @@ impl DiskVamanaIndex {
         l_search: usize,
         tier: QuantKind,
     ) -> io::Result<DiskVamanaIndex> {
-        assert!(dim > 0, "dim must be positive");
-        assert!(
-            matches!(tier, QuantKind::Int8 | QuantKind::TurboQuant { .. }),
-            "RW disk tier must be int8 or turboquant; pq/f32/binary are not incrementally rebuildable here"
-        );
+        if dim == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dim must be positive",
+            ));
+        }
+        if !matches!(tier, QuantKind::Int8 | QuantKind::TurboQuant { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RW disk tier must be int8 or turboquant; pq/f32/binary are not \
+                 incrementally rebuildable here",
+            ));
+        }
+        // The tier has to be able to PACK this dimension. `QuantKind` already
+        // answers that with a `Result` and a message naming the divisor, two
+        // hundred lines away in the same crate - but nothing on this path asked
+        // it, so an unpackable dim reached a deeper `assert_eq!` instead. Under
+        // `panic = "abort"` that is the process, not an error.
+        //
+        // The RESP surface validates before it gets here, so this is not
+        // reachable from a client. Benches, bulk loads and any embedded use of
+        // the library are, and an assertion is not an answer for them either.
+        tier.validate_dim(dim)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         std::fs::create_dir_all(dir)?;
         write_tier(dir, tier)?;
         // The base starts in generation slot g0; CURRENT points at it. A
@@ -4822,8 +4854,15 @@ impl DiskVamanaIndex {
     /// left runs listed beside a base that had just folded them in - the same
     /// rows in two layers, with run precedence putting the pre-fold copies on
     /// top.
-    fn discard_runs(&mut self) -> io::Result<Option<io::Error>> {
-        let seqs: Vec<u64> = (0..self.run_seq).collect();
+    /// Drop the runs numbered below `upto`.
+    ///
+    /// Bounded, not "everything": a fold folds the runs that existed at
+    /// `begin`, and a flush completing during its build creates a NEWER one
+    /// whose rows the fold never saw. Discarding to `self.run_seq` deleted
+    /// that run too, and its rows were then in no layer at all - not the new
+    /// base, not a run, not the WAL the fold was about to rewrite.
+    fn discard_runs_upto(&mut self, upto: u64) -> io::Result<Option<io::Error>> {
+        let seqs: Vec<u64> = (0..upto).collect();
         // Markers first, and all of them, before anything is unlinked.
         let mut marker_error = None;
         for &seq in &seqs {
@@ -4833,8 +4872,21 @@ impl DiskVamanaIndex {
                 marker_error = Some(e);
             }
         }
-        self.runs.clear();
-        self.run_dirs.clear();
+        // Only the discarded ones leave the layer set. `runs` and `run_dirs`
+        // are parallel, so they are filtered TOGETHER - written as a zip
+        // rather than two `retain`s driven by a shared external iterator,
+        // which worked but relied on `retain` visiting in order to keep the
+        // two vectors aligned. A run paired with another run's sequence
+        // number is not a bug anyone would find quickly.
+        let kept: Vec<(Segment, u64)> = std::mem::take(&mut self.runs)
+            .into_iter()
+            .zip(std::mem::take(&mut self.run_dirs))
+            .filter(|(_, seq)| *seq >= upto)
+            .collect();
+        for (run, seq) in kept {
+            self.runs.push(run);
+            self.run_dirs.push(seq);
+        }
         if let Some(e) = marker_error {
             return Err(e);
         }
@@ -4992,7 +5044,7 @@ impl DiskVamanaIndex {
                 cleanup_error = Some(e);
             }
         };
-        let runs_retired = match self.discard_runs() {
+        let runs_retired = match self.discard_runs_upto(self.run_seq) {
             Ok(dir_error) => {
                 if let Some(e) = dir_error {
                     note(Err(e));
@@ -5099,6 +5151,7 @@ impl DiskVamanaIndex {
             dim: self.dim,
             tier: self.tier,
             run_seq_high: self.run_seq,
+            wal_epoch: self.wal_epoch,
             wal_offset,
             patch,
         }))
@@ -5132,9 +5185,25 @@ impl DiskVamanaIndex {
         // reopen truncates.
         let wal_path = dir.join(DELTA_LOG_FILE);
         let wal = std::fs::read(&wal_path)?;
-        let suffix_start = usize::try_from(built.wal_offset).unwrap_or(wal.len());
-        let suffix = wal.get(suffix_start..).unwrap_or(&[]).to_vec();
-        let suffix_ops = decode_wal_payload(self.wal_format, &suffix, self.dim)?;
+        // If the WAL was REPLACED while this fold was building - a flush
+        // completing in between calls `compact_wal` - the offset captured at
+        // `begin` indexes into a file that no longer exists, and slicing at it
+        // silently yields either garbage or nothing. The whole current WAL is
+        // then the right suffix: a compaction leaves exactly the tombstones
+        // and the live delta, which is what still has to be replayed on top of
+        // the new base.
+        let wal_replaced = built.wal_epoch != self.wal_epoch;
+        let suffix_ops = if wal_replaced {
+            // A whole file, header included, so it needs the decoder that
+            // reads the header. Handing it to the PAYLOAD decoder made the
+            // magic itself parse as an opcode: "unknown vector WAL operation
+            // 83", which is the 'S' of SKEG.
+            decode_wal(&wal, self.dim)?.1
+        } else {
+            let suffix_start = usize::try_from(built.wal_offset).unwrap_or(wal.len());
+            let suffix = wal.get(suffix_start..).unwrap_or(&[]);
+            decode_wal_payload(self.wal_format, suffix, self.dim)?
+        };
         // Swap in the built base, drop every run dir (pre-begin runs are folded
         // into the new base; post-begin runs replay from the WAL suffix).
         // Atomic base swap: the whole new generation (graph + vectors + tier
@@ -5165,7 +5234,7 @@ impl DiskVamanaIndex {
         // reopen: `open` reopens exactly the run directories carrying one.
         // A directory left behind is garbage; a marker left behind is a live
         // layer holding pre-fold rows.
-        let runs_retired = match self.discard_runs() {
+        let runs_retired = match self.discard_runs_upto(built.run_seq_high) {
             Ok(dir_error) => {
                 if let Some(e) = dir_error {
                     note(Err(e));
@@ -5213,7 +5282,27 @@ impl DiskVamanaIndex {
         self.base = built.base;
         self.delta.clear();
         self.tombstones.clear();
-        self.live_count = self.base.main_n as usize;
+        // Base PLUS whatever runs survived the bounded discard. It used to be
+        // the base alone, which was right only while every run was thrown
+        // away: a run minted after `begin` now stays, and counting the base
+        // alone reported a live set thousands of rows short of what the index
+        // actually held.
+        //
+        // The union is only computed when a run actually survived. `finish`
+        // holds the write lock and is documented as SHORT, so an O(live) hash
+        // build here is a stall every reader pays - and in the ordinary case,
+        // where the fold took every run, the answer is just the base.
+        self.live_count = if self.runs.is_empty() {
+            self.base.main_n as usize
+        } else {
+            // Union, not sum: a run row can shadow a base row and it is still
+            // one live id.
+            let mut live: AHashSet<u64> = self.base.id_to_main_row.keys().copied().collect();
+            for run in &self.runs {
+                live.extend(run.id_to_main_row.keys().copied());
+            }
+            live.len()
+        };
         self.wal_format = DeltaWalFormat::FramedV2;
         *self.tq1 = Default::default();
         self.ivf = None;
@@ -5541,7 +5630,22 @@ impl DiskVamanaIndex {
         //
         // Every directory is attempted: stopping at the first failure would
         // leave more garbage for no reason.
+        // MARKERS FIRST, then the directories - the same order the fold uses,
+        // and for the same reason. `open` rebuilds the layer set from the
+        // directories that carry a `run.ok`, so a directory that will not
+        // unlink is only garbage if its marker is gone. Left marked, it comes
+        // back as a live layer holding rows the merged run already contains,
+        // and a later compaction can drop the tombstone that was masking the
+        // ones it dropped.
         let mut cleanup_error = None;
+        let mut marker_error = None;
+        for &seq in &built.old_dirs {
+            if let Err(e) = self.retire_run(seq)
+                && marker_error.is_none()
+            {
+                marker_error = Some(e);
+            }
+        }
         for seq in built.old_dirs {
             let d = self.dir.join(format!("run-{seq}"));
             if d.exists()
@@ -5551,6 +5655,9 @@ impl DiskVamanaIndex {
                 cleanup_error = Some(e);
             }
         }
+        // A surviving MARKER is the one worth reporting first: a leftover
+        // directory is reclaimable, a leftover layer is not.
+        let cleanup_error = marker_error.or(cleanup_error);
         Ok(match cleanup_error {
             Some(e) => FinishOutcome::CommittedCleanupFailed(e),
             None => FinishOutcome::Committed,
@@ -5726,6 +5833,8 @@ impl DiskVamanaIndex {
         File::open(&self.dir)?.sync_all()?; // the rename's directory entry
         self.delta_log = new_log;
         self.wal_format = DeltaWalFormat::FramedV2;
+        // The file is a new one: every recorded offset into the old is void.
+        self.wal_epoch = self.wal_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -7930,6 +8039,78 @@ mod tests {
             idx.resident_bytes() < staged,
             "and it must come back down once the run replaces the staging"
         );
+    }
+
+    /// ADVERSARIAL: a flush that completes DURING a fold's build.
+    ///
+    /// `flush` is deliberately exempt from the per-vindex heavy gate - it must
+    /// never be starved by a fold - and a fold holds no lock while it builds.
+    /// So this interleaving is reachable whenever an explicit
+    /// SKEG.VINDEX.CONSOLIDATE overlaps the maintenance loop's flush:
+    ///
+    ///     consolidate_begin   captures survivors, run set, and a WAL OFFSET
+    ///     (build, no lock)
+    ///     flush_finish        compact_wal REWRITES the WAL from scratch
+    ///     consolidate_finish  slices the new WAL at the old offset, and
+    ///                         discards every run up to the current run_seq -
+    ///                         including the one the flush just created
+    ///
+    /// The flushed rows would then be in no layer at all: not in the new base
+    /// (the fold never saw them), not in a run (deleted), not in the WAL
+    /// (compacted away, and the offset no longer means anything).
+    #[test]
+    fn a_flush_completing_during_a_fold_does_not_lose_its_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tier = QuantKind::TurboQuant { bits: 2 };
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), 16, 64, tier).unwrap();
+        idx.set_auto_flush(false);
+
+        // A base worth folding.
+        for id in 0..256u64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let built = idx
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp.path())
+            .unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
+
+        // The fold starts.
+        let job = idx.consolidate_begin().unwrap().unwrap();
+
+        // While it builds, new rows arrive AND a flush completes.
+        let late: Vec<u64> = (1000..1100).collect();
+        for &id in &late {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let fbuilt = idx
+            .flush_begin()
+            .unwrap()
+            .unwrap()
+            .build(tmp.path())
+            .unwrap();
+        idx.flush_finish(fbuilt).unwrap().expect_clean();
+
+        // The fold finishes.
+        let b = job.build(tmp.path()).unwrap();
+        let _ = idx.consolidate_finish(b).unwrap();
+
+        for &id in &late {
+            assert!(
+                idx.get(id).unwrap().is_some(),
+                "id {id} was flushed during the fold and is now in no layer"
+            );
+        }
+        drop(idx);
+        let re = DiskVamanaIndex::open_with_tier(tmp.path(), tier).unwrap();
+        for &id in &late {
+            assert!(
+                re.get(id).unwrap().is_some(),
+                "id {id} survived the process but not the reopen"
+            );
+        }
     }
 
     /// The INLINE fold must obey the same rules as the background one.
