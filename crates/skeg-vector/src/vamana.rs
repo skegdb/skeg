@@ -5022,11 +5022,45 @@ impl DiskVamanaIndex {
         let t = std::time::Instant::now();
         let rebuilt = build_disk_graph(tier, vectors, ids, dim, &disk_build_config());
         let build_ms = t.elapsed().as_millis();
-        // THE COMMIT: the new base is on disk. Nothing below may leave this
-        // function early, for the same reason `consolidate_finish` may not -
-        // the in-memory state has to be brought in line with what was
-        // published, or the process serves a base the store no longer has.
-        rebuilt.save(&dir)?;
+        // Build the new generation BESIDE the live one, then publish it with a
+        // single rename - the same protocol the background fold uses, and the
+        // reason the generation slots exist.
+        //
+        // This used to be `rebuilt.save(&dir)`, which resolves to the slot
+        // CURRENT names and overwrites it in place: graph.vmn first, then
+        // vectors.bin. A failure between the two left a base whose graph was
+        // the new one and whose vectors were the old, with no earlier
+        // generation to fall back to - and the index then refused to open at
+        // all, with "graph.vmn and vectors.bin disagree on n/dim". Everything
+        // in the store, gone until someone repaired it by hand.
+        // Through the SAME guard the background build uses, not a raw
+        // remove-then-create pair. Two reasons, both found by attacking this
+        // change rather than the code it replaced: an earlier commit
+        // introduced this guard precisely so a build that dies part-way leaves
+        // no half-written sidecar behind, and writing the pair out again here
+        // reintroduced that in a second place; and both paths name the same
+        // `consolidating` directory, so the raw `remove_dir_all` could have
+        // deleted a directory a background build was writing into.
+        let staging = BuildDirGuard::prepare(dir.join("consolidating"))?;
+        let staging_path = dir.join("consolidating");
+        // `save` resolves through `base_dir`, and a staging directory has no
+        // CURRENT of its own, so this writes straight into it.
+        rebuilt.save(&staging_path)?;
+        // THE COMMIT: one atomic rename publishes the whole generation.
+        //
+        // The guard is deliberately NOT preserved. A successful install has
+        // renamed the directory away, and the guard treats `NotFound` as
+        // nothing to do; a failed one leaves it, and the guard removes it.
+        // Preserving before the install - which is how this was first written
+        // - would have left a half-built generation behind on exactly the
+        // failure the guard exists for.
+        //
+        // Nothing below may leave this function early, for the same reason
+        // `consolidate_finish` may not: the in-memory state has to be brought
+        // in line with what was published, or the process serves a base the
+        // store no longer has.
+        install_base_generation(&dir, &staging_path)?;
+        drop(staging);
         let save_ms = t.elapsed().as_millis();
 
         // Post-commit, and the same three rules as the background path.

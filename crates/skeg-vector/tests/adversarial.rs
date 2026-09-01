@@ -444,3 +444,72 @@ fn a_merge_that_cannot_unlink_does_not_leave_the_old_runs_as_layers() {
         );
     }
 }
+
+/// The INLINE fold must publish a new generation, not overwrite the live one.
+///
+/// `consolidate()` calls `save()`, which writes graph.vmn and then
+/// vectors.bin straight into the slot CURRENT names. A failure between the
+/// two leaves a base whose graph is the new one and whose vectors are the
+/// old: torn, with no previous generation left to fall back to. The
+/// background fold builds into a temp directory and installs it with one
+/// atomic rename, which is what the generation slots exist for.
+///
+/// The failpoint writes nothing of its own: `vectors.bin` in the live slot is
+/// made read-only, so the graph write succeeds and the vector write does not.
+#[test]
+fn the_inline_fold_does_not_tear_the_live_base() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut i = idx(tmp.path());
+    for id in 0..300u64 {
+        i.insert(id, &v(id)).unwrap();
+    }
+    flush(&mut i, tmp.path());
+    fold(&mut i, tmp.path());
+    let live = i.len();
+
+    // More to fold, so the next consolidate has real work.
+    for id in 300..600u64 {
+        i.insert(id, &v(id)).unwrap();
+    }
+    flush(&mut i, tmp.path());
+
+    // Freeze the vectors file of whichever slot is live.
+    let slot = std::fs::read_to_string(tmp.path().join("CURRENT")).unwrap();
+    let vbin = tmp
+        .path()
+        .join(format!("g{}", slot.trim()))
+        .join("vectors.bin");
+    assert!(vbin.exists(), "the fixture must find the live vectors file");
+    let saved = std::fs::metadata(&vbin).unwrap().permissions();
+    std::fs::set_permissions(&vbin, PermissionsExt::from_mode(0o444)).unwrap();
+
+    // Deliberately NOT asserting that the fold fails. Freezing the live
+    // vectors file is a failpoint only for a fold that writes there; one that
+    // builds beside the base and installs it never touches this file and
+    // simply succeeds. Requiring the failure would have made this test stop
+    // discriminating the moment it was fixed - which it did, on the first try.
+    //
+    // The invariant is the same either way: whatever the fold does, the base
+    // that was committed before it must still be readable.
+    let _ = i.consolidate();
+    std::fs::set_permissions(&vbin, saved).unwrap();
+    drop(i);
+
+    // THE ASSERTION: a fold that could not complete must leave a base that
+    // still opens, and still holds everything that was committed before it.
+    let re = DiskVamanaIndex::open_with_tier(tmp.path(), TIER)
+        .expect("a failed fold must leave a readable base behind");
+    assert!(
+        re.len() >= live,
+        "the failed fold lost committed rows: {} of at least {live}",
+        re.len()
+    );
+    for id in (0..300u64).step_by(23) {
+        assert_eq!(
+            re.get(id).unwrap().as_deref(),
+            Some(v(id).as_slice()),
+            "id {id} did not survive a failed inline fold"
+        );
+    }
+}
