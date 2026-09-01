@@ -124,20 +124,36 @@ pub struct MemoryStatus {
     /// Usage charged to the cgroup that set `limit_bytes`.
     pub current_bytes: Option<u64>,
     /// What this process may still allocate before the FIRST cgroup on its
-    /// chain is saturated: `min(limit - current)` over the whole hierarchy.
+    /// chain is saturated.
+    pub available: Headroom,
+}
+
+/// How much room is left, and - when the answer is no number - WHY.
+///
+/// The distinction is the whole point. `Option<u64>` collapsed two opposite
+/// situations into `None`: a process with no cgroup limit at all, and a
+/// process that is limited but whose usage could not be read. Treating both
+/// as "no limit" means an unreadable `memory.current` silently switches the
+/// governor off, which is the placebo it was built to stop - re-entering
+/// through a different door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Headroom {
+    /// `min(limit - current)` over the whole hierarchy.
     ///
-    /// A separate number because one limit/current pair cannot describe a
-    /// hierarchy. Every cgroup from the process's own to the root applies at
-    /// once, and the one that runs out first is the one with the least
-    /// headroom, which is NOT the one with the smallest limit: a leaf at
-    /// 256 MiB holding 10 MiB has 246 MiB free, but inside a parent at
-    /// 512 MiB already holding 500 MiB, twelve more megabytes end the
-    /// process.
-    ///
-    /// `None` means unknown, never zero and never unlimited: no limit exists
-    /// anywhere, or one does and its usage could not be read. A budget cannot
-    /// be derived from either, and guessing is what makes a governor unsafe.
-    pub available_bytes: Option<u64>,
+    /// The minimum, because every cgroup from the process's own to the root
+    /// applies at once and the one that runs out first is the one with the
+    /// least room - not the one with the smallest limit. A leaf at 256 MiB
+    /// holding 10 MiB has 246 MiB free, but inside a parent at 512 MiB that
+    /// siblings have filled to 500 MiB, twelve more megabytes end it.
+    Known(u64),
+    /// No cgroup on the chain sets a memory limit: nothing to be killed for.
+    Unlimited,
+    /// A limit exists and the room left could not be computed - usage
+    /// unreadable, or no cgroup accounting on this platform at all. NOT a
+    /// synonym for `Unlimited`, and the caller has to decide what to do about
+    /// it rather than being handed a number that looks safe.
+    #[default]
+    Unknown,
 }
 
 /// cgroup v1 spells "unlimited" as PAGE_SIZE-rounded `i64::MAX` rather than a
@@ -236,7 +252,7 @@ fn v2_at(dir: &Path) -> MemoryStatus {
         limit_bytes: read(dir.join("memory.max")).and_then(|s| parse_mem_limit(&s)),
         current_bytes: read(dir.join("memory.current")).and_then(|s| parse_mem_usage(&s)),
         // One directory cannot know the chain's headroom.
-        available_bytes: None,
+        available: Headroom::Unknown,
     }
 }
 
@@ -245,7 +261,7 @@ fn v1_at(dir: &Path) -> MemoryStatus {
     MemoryStatus {
         limit_bytes: read(dir.join("memory.limit_in_bytes")).and_then(|s| parse_mem_limit(&s)),
         current_bytes: read(dir.join("memory.usage_in_bytes")).and_then(|s| parse_mem_usage(&s)),
-        available_bytes: None,
+        available: Headroom::Unknown,
     }
 }
 
@@ -311,20 +327,21 @@ pub(crate) fn memory_status_rooted(proc_self_cgroup: &Path, mount: &Path) -> Mem
             _ => break,
         }
     }
-    let available_bytes = if !saw_limit || headroom_unknown {
-        None
-    } else {
-        headroom
+    let available = match (saw_limit, headroom_unknown, headroom) {
+        // A limit exists and every level's usage was readable.
+        (true, false, Some(h)) => Headroom::Known(h),
+        // A limit exists but at least one level's usage was not: the number
+        // cannot be computed, and must not be invented in either direction.
+        (true, _, _) => Headroom::Unknown,
+        // Nothing on the chain caps this process.
+        (false, _, _) => Headroom::Unlimited,
     };
     match tightest {
-        Some((_, m)) => MemoryStatus {
-            available_bytes,
-            ..m
-        },
+        Some((_, m)) => MemoryStatus { available, ..m },
         // Nothing in the chain sets a limit. Report usage from the process's
         // own cgroup, which is the one that describes it.
         None => MemoryStatus {
-            available_bytes: None,
+            available,
             ..read_at(&match self_cgroup_path(proc_self_cgroup) {
                 Some(Membership::V2(rel)) => mount.join(rel),
                 Some(Membership::V1(rel)) => mount.join("memory").join(rel),
@@ -353,7 +370,7 @@ pub(crate) fn memory_status_at(root: &Path) -> MemoryStatus {
         limit_bytes: limit,
         current_bytes: current,
         // One directory is not a chain; `memory_status_rooted` computes this.
-        available_bytes: None,
+        available: Headroom::Unknown,
     }
 }
 
@@ -560,8 +577,8 @@ mod tests {
             &dir.path().join("sys/fs/cgroup"),
         );
         assert_eq!(
-            m.available_bytes,
-            Some(12 * 1024 * 1024),
+            m.available,
+            Headroom::Known(12 * 1024 * 1024),
             "the parent has 12 MiB left; the leaf's 246 MiB is unreachable"
         );
     }
@@ -581,7 +598,12 @@ mod tests {
             &dir.path().join("sys/fs/cgroup"),
         );
         assert_eq!(m.limit_bytes, Some(268_435_456), "the limit is still known");
-        assert_eq!(m.available_bytes, None, "the headroom is not");
+        assert_eq!(
+            m.available,
+            Headroom::Unknown,
+            "a limit with unreadable usage is UNKNOWN, never unlimited: \
+             treating it as unlimited switches a governor off in silence"
+        );
     }
 
     #[test]
@@ -594,7 +616,12 @@ mod tests {
             &dir.path().join("sys/fs/cgroup"),
         );
         assert_eq!(m.limit_bytes, None);
-        assert_eq!(m.available_bytes, None, "unlimited is not zero headroom");
+        assert_eq!(
+            m.available,
+            Headroom::Unlimited,
+            "no limit anywhere is Unlimited, which is a different thing from \
+             Unknown and must not be confused with it"
+        );
     }
 
     #[test]
@@ -607,7 +634,7 @@ mod tests {
             &dir.path().join("proc/self/cgroup"),
             &dir.path().join("sys/fs/cgroup"),
         );
-        assert_eq!(m.available_bytes, Some(0));
+        assert_eq!(m.available, Headroom::Known(0));
     }
 
     #[test]

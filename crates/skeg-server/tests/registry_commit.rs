@@ -269,3 +269,51 @@ async fn a_create_whose_commit_fails_is_not_acknowledged() {
             .any(|r| r.name == "ghost")
     );
 }
+
+#[tokio::test]
+async fn a_dropped_index_stays_dropped_across_a_restart() {
+    // The gap the other DROP tests walked straight past, because they either
+    // recreated the same name immediately (which overwrites the stale entry)
+    // or never restarted at all.
+    //
+    // `persist_registry` decides its content by starting from the existing
+    // registry and keeping every entry whose DIRECTORY still exists - a rule
+    // written when the directory was deleted BEFORE the publish. Committing
+    // first inverted that: at publish time the directory is still there, the
+    // entry is retained, and the "commit" republishes the index it was meant
+    // to remove. Then the directory goes, and the registry names something
+    // that no longer exists. Recovery opens every entry it lists, so the next
+    // start fails outright - the exact failure the commit-first ordering was
+    // introduced to prevent.
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let shards = ShardSet::open_mode_with_workers(dir.path(), 1, false, TIER, 1).unwrap();
+        shards.vindex_create("keep", 8, 4, 1).await.unwrap();
+        shards.vindex_create("gone", 8, 4, 1).await.unwrap();
+        for id in 0..10u64 {
+            shards
+                .vset("gone", id, vec_for(id), 0, None, None)
+                .await
+                .unwrap();
+            shards
+                .vset("keep", id, vec_for(id), 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_drop("gone", 0).await.unwrap();
+        shards.write_snapshot_and_payload_indexes().await;
+    }
+
+    // Reopen WITHOUT recreating the name.
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 1, false, TIER, 1)
+        .expect("a shard whose index was dropped must still open");
+    let rows = shards.vindex_list().await.unwrap();
+    assert!(
+        !rows.iter().any(|r| r.name == "gone"),
+        "the dropped index must not come back: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.name == "keep"),
+        "and the one that was kept must still be there"
+    );
+}

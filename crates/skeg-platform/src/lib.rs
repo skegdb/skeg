@@ -35,7 +35,7 @@ pub use uring::{BatchReader, BlockingBatchReader, best_batch_reader};
 /// inside a container that only gets a fraction of the host. Falls back to
 /// `std::thread::available_parallelism()` when no quota is set (or on
 /// error, or on other platforms).
-pub use cgroup::MemoryStatus;
+pub use cgroup::{Headroom, MemoryStatus};
 
 /// What this process may use, and what it is using.
 ///
@@ -68,10 +68,12 @@ pub fn memory_status() -> MemoryStatus {
         MemoryStatus {
             limit_bytes: None,
             current_bytes: Some(rss_bytes()),
-            // No cgroup, so no headroom this build can vouch for. RSS is a
-            // signal, not an accounting, and a budget must not be derived
-            // from it.
-            available_bytes: None,
+            // No cgroup accounting on this platform, so the room left is
+            // UNKNOWN - not unlimited. RSS is a signal, not an accounting, and
+            // a budget must not be derived from it. The caller decides what an
+            // unknown budget means; this must not decide it for them by
+            // reporting a number that looks safe.
+            available: cgroup::Headroom::Unknown,
         }
     }
 }

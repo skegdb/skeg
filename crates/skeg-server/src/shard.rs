@@ -1470,12 +1470,30 @@ fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
 /// The registry tracks every on-disk vindex (the `vindex-<name>/` dirs), NOT
 /// only the resident ones. An evicted vindex is gone from the map but its dir
 /// stays; rebuilding the registry purely from the map would drop it and break
-/// lazy reopen + restart recovery. So: start from the existing registry, fold in
-/// the resident disk vindexes, then keep only entries whose dir still exists
-/// (VINDEX.DROP removes the dir). This covers all three writers without touching
-/// their call sites: create adds (dir + map), evict keeps (dir, not in map),
-/// drop prunes (no dir).
+/// lazy reopen + restart recovery. So: start from the existing registry, fold
+/// in the resident disk vindexes, then keep only entries whose dir still
+/// exists: create adds (dir + map), evict keeps (dir, not in map).
+///
+/// A DROP is NOT inferred from the filesystem. It used to be - "drop prunes
+/// (no dir)" - and that only worked while the directory was deleted BEFORE
+/// the publish. Committing first inverted it: at publish time the directory
+/// is still there, so the entry survived, the commit republished the index it
+/// was meant to remove, and the following delete left the registry naming
+/// something gone. The next start then refused to open, which is precisely
+/// the failure commit-first exists to prevent.
+///
+/// So a removal is stated, not deduced.
 fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) -> std::io::Result<()> {
+    persist_registry_removing(dir, vindexes, None)
+}
+
+/// [`persist_registry`], with `removing` naming an entry that must be dropped
+/// whether or not its directory is still on disk.
+fn persist_registry_removing(
+    dir: &Path,
+    vindexes: &RwLock<VindexSet>,
+    removing: Option<&str>,
+) -> std::io::Result<()> {
     use std::collections::BTreeMap;
     // A registry that will not parse must NOT be rewritten from the resident
     // map alone. The map holds only what is currently open, so the rewrite
@@ -1506,6 +1524,13 @@ fn persist_registry(dir: &Path, vindexes: &RwLock<VindexSet>) -> std::io::Result
                 by_name.insert(name.clone(), (i.dim(), vindex.kind));
             }
         }
+    }
+    // The explicit removal first: the resident-map fold above cannot express
+    // it (the index is already out of the map, so it simply is not re-added),
+    // and the directory test below cannot either (the directory is still
+    // there, deleted only after this commit lands).
+    if let Some(gone) = removing {
+        by_name.remove(gone);
     }
     by_name.retain(|name, _| dir.join(format!("vindex-{name}")).exists());
     let entries: Vec<(&str, usize, u8)> = by_name
@@ -2568,7 +2593,7 @@ async fn drop_vindex(
         //
         // The rewrite drops the entry because the index is out of the resident
         // map; putting it back is what makes the rollback complete.
-        if let Err(e) = persist_registry(dir, vindexes) {
+        if let Err(e) = persist_registry_removing(dir, vindexes, Some(name)) {
             vindexes.write().insert(name.to_owned(), arc);
             return Err(format!("vindex registry not updated: {e}"));
         }
