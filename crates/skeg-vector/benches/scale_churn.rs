@@ -59,7 +59,7 @@ fn run_l3(n: usize, del_frac: f64, dim: usize, tier: QuantKind) {
     let t = Instant::now();
     let patch_s = if let Some(job) = b.delete_patch_begin().unwrap() {
         let built = job.build(&dir_b).unwrap();
-        b.delete_patch_finish(built).unwrap();
+        b.delete_patch_finish(built).unwrap().expect_clean();
         t.elapsed().as_secs_f64()
     } else {
         0.0
@@ -149,7 +149,7 @@ fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind, mod
             .is_some_and(std::thread::JoinHandle::is_finished)
         {
             let built = job.take().unwrap().join().unwrap().unwrap();
-            idx.consolidate_finish(built).unwrap();
+            idx.consolidate_finish(built).unwrap().expect_clean();
             let dt = fold_start.elapsed();
             fold_busy += dt;
             build_total += dt;
@@ -157,7 +157,9 @@ fn run(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind, mod
         }
     }
     if let Some(h) = job.take() {
-        idx.consolidate_finish(h.join().unwrap().unwrap()).unwrap();
+        idx.consolidate_finish(h.join().unwrap().unwrap())
+            .unwrap()
+            .expect_clean();
         let dt = fold_start.elapsed();
         fold_busy += dt;
         build_total += dt;
@@ -228,7 +230,7 @@ fn run_l2(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) 
             .is_some_and(std::thread::JoinHandle::is_finished)
         {
             let built = base_job.take().unwrap().join().unwrap().unwrap();
-            idx.consolidate_finish(built).unwrap();
+            idx.consolidate_finish(built).unwrap().expect_clean();
             let dt = job_start.elapsed();
             base_busy += dt;
             base_total += dt;
@@ -238,7 +240,7 @@ fn run_l2(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) 
             .is_some_and(std::thread::JoinHandle::is_finished)
         {
             let built = merge_job.take().unwrap().join().unwrap().unwrap();
-            idx.merge_runs_finish(built).unwrap();
+            idx.merge_runs_finish(built).unwrap().expect_clean();
             let dt = job_start.elapsed();
             merge_busy += dt;
             merge_total += dt;
@@ -265,14 +267,18 @@ fn run_l2(n: usize, turns: usize, dim: usize, max_runs: usize, tier: QuantKind) 
         }
     }
     if let Some(h) = base_job.take() {
-        idx.consolidate_finish(h.join().unwrap().unwrap()).unwrap();
+        idx.consolidate_finish(h.join().unwrap().unwrap())
+            .unwrap()
+            .expect_clean();
         let dt = job_start.elapsed();
         base_busy += dt;
         base_total += dt;
         base_folds += 1;
     }
     if let Some(h) = merge_job.take() {
-        idx.merge_runs_finish(h.join().unwrap().unwrap()).unwrap();
+        idx.merge_runs_finish(h.join().unwrap().unwrap())
+            .unwrap()
+            .expect_clean();
         let dt = job_start.elapsed();
         merge_busy += dt;
         merge_total += dt;

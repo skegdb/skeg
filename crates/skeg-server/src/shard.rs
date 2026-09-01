@@ -350,10 +350,16 @@ impl VectorBackend {
         }
     }
 
-    fn flush_finish(&mut self, built: FlushBuilt) -> std::io::Result<()> {
+    fn flush_finish(&mut self, built: FlushBuilt) -> skeg_vector::FinishResult {
         match self {
-            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Flat(_) => Ok(skeg_vector::FinishOutcome::Committed),
             VectorBackend::Disk(i) => i.flush_finish(built),
+        }
+    }
+
+    fn flush_abort(&mut self) {
+        if let VectorBackend::Disk(i) = self {
+            i.flush_abort();
         }
     }
 
@@ -365,9 +371,9 @@ impl VectorBackend {
         }
     }
 
-    fn ivf_finish(&mut self, built: IvfBuilt) -> std::io::Result<()> {
+    fn ivf_finish(&mut self, built: IvfBuilt) -> skeg_vector::FinishResult {
         match self {
-            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Flat(_) => Ok(skeg_vector::FinishOutcome::Committed),
             VectorBackend::Disk(i) => i.ivf_finish(built),
         }
     }
@@ -393,9 +399,9 @@ impl VectorBackend {
         }
     }
 
-    fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> std::io::Result<()> {
+    fn consolidate_finish(&mut self, built: ConsolidateBuilt) -> skeg_vector::FinishResult {
         match self {
-            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Flat(_) => Ok(skeg_vector::FinishOutcome::Committed),
             VectorBackend::Disk(i) => i.consolidate_finish(built),
         }
     }
@@ -409,9 +415,9 @@ impl VectorBackend {
         }
     }
 
-    fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> std::io::Result<()> {
+    fn merge_runs_finish(&mut self, built: RunMergeBuilt) -> skeg_vector::FinishResult {
         match self {
-            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Flat(_) => Ok(skeg_vector::FinishOutcome::Committed),
             VectorBackend::Disk(i) => i.merge_runs_finish(built),
         }
     }
@@ -425,9 +431,9 @@ impl VectorBackend {
         }
     }
 
-    fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> std::io::Result<()> {
+    fn delete_patch_finish(&mut self, built: DeletePatchBuilt) -> skeg_vector::FinishResult {
         match self {
-            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Flat(_) => Ok(skeg_vector::FinishOutcome::Committed),
             VectorBackend::Disk(i) => i.delete_patch_finish(built),
         }
     }
@@ -1690,7 +1696,7 @@ fn ladder_plan(s: &LsmState, flush_rows: usize) -> Vec<Rung> {
     // turnovers and never merged, and recall fell 0.9925 -> 0.7180 alongside.
     //
     // The MECHANISM of that fall was never isolated, and this comment used to
-    // assert one: that run graphs are walked with a short beam. Two P0s found
+    // assert one: that run graphs are walked with a short beam. Two defects found
     // later explain it at least as well - unfiltered search scored candidates
     // against SUPERSEDED vectors, so a shortlist drawn from many runs was
     // contaminated by stale copies. Run debt certainly exposed the defect;
@@ -1776,13 +1782,18 @@ async fn maintenance_tick_at(
                 }
             }
             Rung::Flush => {
-                off_thread_maintenance(
+                // WITH the abort: a flush that fails before its commit has
+                // already moved the delta into the `flushing` staging buffer,
+                // and without giving it back the rows are searched but never
+                // re-flushed. The other rungs have nothing to hand back.
+                off_thread_maintenance_with_abort(
                     arc,
                     "flush",
                     shard_id,
                     |b| b.flush_begin(),
                     move |job| job.build(&d),
                     |b, built| b.flush_finish(built),
+                    VectorBackend::flush_abort,
                 )
                 .await;
                 if merge_due {
@@ -1920,12 +1931,30 @@ async fn try_off_thread_maintenance<T, B>(
     wait_for_budget: bool,
     begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
     build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
-    finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
+    finish: impl FnOnce(&mut VectorBackend, B) -> skeg_vector::FinishResult,
 ) -> Result<MaintenanceOutcome, String>
 where
     T: Send + 'static,
     B: Send + 'static,
 {
+    try_off_thread_maintenance_with_abort(arc, label, wait_for_budget, begin, build, finish, |_| {})
+        .await
+}
+
+async fn try_off_thread_maintenance_with_abort<T, B>(
+    arc: &VectorEntry,
+    label: &str,
+    wait_for_budget: bool,
+    begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
+    build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
+    finish: impl FnOnce(&mut VectorBackend, B) -> skeg_vector::FinishResult,
+    abort: impl FnOnce(&mut VectorBackend),
+) -> Result<MaintenanceOutcome, String>
+where
+    T: Send + 'static,
+    B: Send + 'static,
+{
+    let mut abort = Some(abort);
     // The PER-VINDEX heavy gate comes FIRST, the global budget second.
     //
     // The other order wastes the scarcer resource: a second job on the same
@@ -2005,14 +2034,50 @@ where
     // turn.
     let built = match tokio::task::spawn_blocking(move || build(job)).await {
         Ok(Ok(b)) => b,
-        Ok(Err(e)) => return Err(format!("{label} build failed: {e}")),
-        Err(e) => return Err(format!("{label} build task panicked: {e}")),
-    };
-    {
-        let mut g = arc.write();
-        if let Err(e) = finish(&mut g.backend, built) {
-            return Err(format!("{label} finish failed: {e}"));
+        result => {
+            {
+                let mut g = arc.write();
+                abort
+                    .take()
+                    .expect("abort callback is consumed only on failure")(
+                    &mut g.backend
+                );
+            }
+            return match result {
+                Ok(Err(e)) => Err(format!("{label} build failed: {e}")),
+                Err(e) => Err(format!("{label} build task panicked: {e}")),
+                Ok(Ok(_)) => unreachable!("the successful build arm returned above"),
+            };
         }
+    };
+    let cleanup = {
+        let mut g = arc.write();
+        match finish(&mut g.backend, built) {
+            Ok(outcome) => outcome,
+            // BEFORE the commit point: nothing took effect, so undoing is
+            // both safe and required.
+            Err(e) => {
+                abort
+                    .take()
+                    .expect("abort callback is consumed only on failure")(
+                    &mut g.backend
+                );
+                return Err(format!("{label} finish failed: {e}"));
+            }
+        }
+    };
+    // AFTER it: the job is done and visible. Rolling back here would undo a
+    // change the store has already published, and reporting failure would
+    // have the ladder retry work that happened - so this is `Ran`, with the
+    // leftovers reported as leftovers.
+    if let Some(e) = cleanup.cleanup_error() {
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceCleanupFailures);
+        tracing::error!(
+            job = label,
+            error = %e,
+            "{label} committed but could not reclaim what it replaced: the \
+             change stands, something was left on disk"
+        );
     }
     Ok(MaintenanceOutcome::Ran)
 }
@@ -2038,13 +2103,31 @@ async fn off_thread_maintenance<T, B>(
     shard_id: usize,
     begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
     build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
-    finish: impl FnOnce(&mut VectorBackend, B) -> std::io::Result<()>,
+    finish: impl FnOnce(&mut VectorBackend, B) -> skeg_vector::FinishResult,
 ) -> MaintenanceOutcome
 where
     T: Send + 'static,
     B: Send + 'static,
 {
-    match try_off_thread_maintenance(arc, label, false, begin, build, finish).await {
+    off_thread_maintenance_with_abort(arc, label, shard_id, begin, build, finish, |_| {}).await
+}
+
+async fn off_thread_maintenance_with_abort<T, B>(
+    arc: &VectorEntry,
+    label: &str,
+    shard_id: usize,
+    begin: impl FnOnce(&mut VectorBackend) -> std::io::Result<Option<T>>,
+    build: impl FnOnce(T) -> std::io::Result<B> + Send + 'static,
+    finish: impl FnOnce(&mut VectorBackend, B) -> skeg_vector::FinishResult,
+    abort: impl FnOnce(&mut VectorBackend),
+) -> MaintenanceOutcome
+where
+    T: Send + 'static,
+    B: Send + 'static,
+{
+    match try_off_thread_maintenance_with_abort(arc, label, false, begin, build, finish, abort)
+        .await
+    {
         Ok(outcome) => {
             if outcome == MaintenanceOutcome::Ran
                 && let Some(c) = maintenance_counter(label)
@@ -5447,7 +5530,7 @@ impl ShardSet {
         // one and the new one. A query resembling the old vector then scores
         // the stale copy higher, and best-score-wins hands back the value the
         // write replaced - with a confident score. That is the same shape as
-        // the stale-vector P0s: a wrong answer that looks certain.
+        // the stale-vector defects: a wrong answer that looks certain.
         //
         // The owner map is what VGET routes by, so preferring it also makes
         // search and point reads agree, which they otherwise would not.
@@ -6359,6 +6442,240 @@ mod tests {
             MaintenanceOutcome::Ran,
             "the parked consolidate must complete once a permit frees"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_build_does_not_block_every_later_flush() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-failed-flush");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            16,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0u64..64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        let failed = try_off_thread_maintenance_with_abort(
+            &arc,
+            "flush",
+            true,
+            |b| b.flush_begin(),
+            |_job| -> std::io::Result<FlushBuilt> {
+                Err(std::io::Error::other("injected build failure"))
+            },
+            |b, built| b.flush_finish(built),
+            VectorBackend::flush_abort,
+        )
+        .await;
+        assert!(
+            failed.unwrap_err().contains("injected build failure"),
+            "the injected failure must reach the caller"
+        );
+
+        let retry = arc.write().backend.flush_begin().unwrap();
+        assert!(
+            retry.is_some(),
+            "a build failure must return the staged delta so the next tick can retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_finish_is_precommit_and_retryable() {
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-failed-finish");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            16,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0u64..64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        // `compact_wal` creates this path as a file. A directory is an
+        // inexpensive deterministic I/O failure after the run build, inside
+        // finish, with no environment-specific failpoint machinery.
+        std::fs::create_dir(vdir.join("delta.log.compact")).unwrap();
+        let build_dir = vdir.clone();
+        let failed = try_off_thread_maintenance_with_abort(
+            &arc,
+            "flush",
+            true,
+            |b| b.flush_begin(),
+            move |job| job.build(&build_dir),
+            |b, built| b.flush_finish(built),
+            VectorBackend::flush_abort,
+        )
+        .await;
+        assert!(
+            failed.unwrap_err().contains("finish failed"),
+            "the injected finish failure must reach the caller"
+        );
+
+        let retry = arc.write().backend.flush_begin().unwrap();
+        assert!(
+            retry.is_some(),
+            "a pre-commit finish failure must restore staging for a retry"
+        );
+    }
+
+    /// A merge that COMMITS and then cannot unlink what it replaced is a
+    /// merge that happened.
+    ///
+    /// `merge_runs_finish` marks the merged run durable and splices it in -
+    /// that is the commit - and only then removes the old run directories.
+    /// Those removals used to use `?`, so a failure returned an error, the
+    /// caller ran the abort callback, and the ladder counted a failure: all
+    /// of it over a merge that was already serving queries.
+    ///
+    /// The failpoint is targeted at the post-commit step alone: an old run
+    /// directory with no write permission cannot have its contents unlinked,
+    /// while everything before the commit touches other paths entirely.
+    #[tokio::test]
+    async fn a_merge_that_cannot_unlink_its_old_runs_still_counts_as_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-m");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            16,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        // Two runs, so there is a merge to do and an old directory to remove.
+        for round in 0..2u64 {
+            for id in 0..64u64 {
+                idx.insert(round * 1000 + id, &[id as f32; 16]).unwrap();
+            }
+            let built = idx.flush_begin().unwrap().unwrap().build(&vdir).unwrap();
+            idx.flush_finish(built).unwrap().expect_clean();
+        }
+        assert_eq!(
+            idx.run_count(),
+            2,
+            "the fixture must give the merge something"
+        );
+        let live_before = idx.len();
+
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        let old_run = vdir.join("run-0");
+        assert!(
+            old_run.exists(),
+            "the fixture must have an old run to unlink"
+        );
+        let saved = std::fs::metadata(&old_run).unwrap().permissions();
+        std::fs::set_permissions(&old_run, PermissionsExt::from_mode(0o555)).unwrap();
+
+        let build_dir = vdir.clone();
+        let outcome = off_thread_maintenance(
+            &arc,
+            "runs-merge",
+            0,
+            |b| b.merge_runs_begin(),
+            move |job| job.build(&build_dir),
+            |b, built| b.merge_runs_finish(built),
+        )
+        .await;
+        std::fs::set_permissions(&old_run, saved).unwrap();
+
+        assert_eq!(
+            outcome,
+            MaintenanceOutcome::Ran,
+            "a committed merge whose cleanup failed is not a failed merge"
+        );
+        let g = arc.read();
+        assert_eq!(
+            g.backend.run_count(),
+            1,
+            "and the merge really did take effect"
+        );
+        assert_eq!(g.backend.len(), live_before, "with every row still live");
+    }
+
+    /// The same rule for the fold, whose commit is the atomic CURRENT flip.
+    ///
+    /// Everything after `install_base_generation` used `?`, so a run directory
+    /// that would not unlink turned a published generation into a reported
+    /// failure - and `discard_runs` returned early, leaving those runs still
+    /// listed in memory beside a base that had just folded them in.
+    #[tokio::test]
+    async fn a_fold_that_cannot_unlink_its_runs_still_counts_as_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-c");
+        let mut idx = DiskVamanaIndex::create_empty_with_tier(
+            &vdir,
+            16,
+            64,
+            QuantKind::TurboQuant { bits: 2 },
+        )
+        .unwrap();
+        idx.set_auto_flush(false);
+        for id in 0..128u64 {
+            idx.insert(id, &[id as f32; 16]).unwrap();
+        }
+        let built = idx.flush_begin().unwrap().unwrap().build(&vdir).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
+        assert_eq!(idx.run_count(), 1);
+        let live_before = idx.len();
+
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new(
+            VectorBackend::Disk(Box::new(idx)),
+            4,
+        )));
+
+        let run = vdir.join("run-0");
+        let saved = std::fs::metadata(&run).unwrap().permissions();
+        std::fs::set_permissions(&run, PermissionsExt::from_mode(0o555)).unwrap();
+
+        let build_dir = vdir.clone();
+        let outcome = off_thread_maintenance(
+            &arc,
+            "consolidate",
+            0,
+            |b| b.consolidate_begin(),
+            move |job| job.build(&build_dir),
+            |b, built| b.consolidate_finish(built),
+        )
+        .await;
+        std::fs::set_permissions(&run, saved).unwrap();
+
+        assert_eq!(
+            outcome,
+            MaintenanceOutcome::Ran,
+            "a published generation whose cleanup failed is not a failed fold"
+        );
+        let g = arc.read();
+        assert_eq!(
+            g.backend.run_count(),
+            0,
+            "the run must be gone from the layer set even though its directory \
+             would not unlink: leaving it listed puts the pre-fold rows on top \
+             of the base that just folded them in"
+        );
+        assert_eq!(g.backend.len(), live_before, "with every row still live");
     }
 
     #[tokio::test]
@@ -8080,8 +8397,8 @@ mod tests {
     /// tick forever while each flush quietly added another run - measured on
     /// the churn gate as 0 -> 33 runs over ten turnovers, with recall falling
     /// from 0.9925 to 0.7180 alongside. (The MECHANISM of that fall was never
-    /// isolated; two stale-vector P0s found later explain it at least as well
-    /// as the short beam this used to assert. See `ladder_plan`.)
+    /// isolated; two stale-vector defects found later explain it at least as
+    /// well as the short beam this used to assert. See `ladder_plan`.)
     ///
     /// Driven at a SMALL flush threshold. What matters is the sequence of
     /// decisions the ladder makes when both rungs are due, not the size of

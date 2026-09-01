@@ -162,7 +162,7 @@ fn build_churned(
                     .is_some_and(std::thread::JoinHandle::is_finished)
                 {
                     let built = base_job.take().unwrap().join().unwrap().unwrap();
-                    idx.consolidate_finish(built).unwrap();
+                    idx.consolidate_finish(built).unwrap().expect_clean();
                 }
             }
             "l2" => {
@@ -172,13 +172,13 @@ fn build_churned(
                     .is_some_and(std::thread::JoinHandle::is_finished)
                 {
                     let built = base_job.take().unwrap().join().unwrap().unwrap();
-                    idx.consolidate_finish(built).unwrap();
+                    idx.consolidate_finish(built).unwrap().expect_clean();
                 } else if merge_job
                     .as_ref()
                     .is_some_and(std::thread::JoinHandle::is_finished)
                 {
                     let built = merge_job.take().unwrap().join().unwrap().unwrap();
-                    idx.merge_runs_finish(built).unwrap();
+                    idx.merge_runs_finish(built).unwrap().expect_clean();
                 }
                 if base_job.is_none() && merge_job.is_none() {
                     if op >= next_base {
@@ -204,10 +204,14 @@ fn build_churned(
         }
     }
     if let Some(h) = base_job.take() {
-        idx.consolidate_finish(h.join().unwrap().unwrap()).unwrap();
+        idx.consolidate_finish(h.join().unwrap().unwrap())
+            .unwrap()
+            .expect_clean();
     }
     if let Some(h) = merge_job.take() {
-        idx.merge_runs_finish(h.join().unwrap().unwrap()).unwrap();
+        idx.merge_runs_finish(h.join().unwrap().unwrap())
+            .unwrap()
+            .expect_clean();
     }
     idx
 }

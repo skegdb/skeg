@@ -185,7 +185,7 @@ async fn search_returns_the_committed_copy_not_the_best_scoring_stale_one() {
     // new one. A query resembling the old vector scores the stale copy higher,
     // so search handed back the value the write had replaced, with a confident
     // score, while VGET returned the new one. The same shape as the
-    // stale-vector P0s, one level up.
+    // stale-vector defects found earlier, one level up.
     let dir = tempfile::TempDir::new().unwrap();
     let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
     shards.vindex_create("dup", DIM as u32, 4, 1).await.unwrap();

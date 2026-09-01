@@ -68,7 +68,7 @@ fn main() {
         queries.len()
     );
     let t = std::time::Instant::now();
-    idx.build_ivf(0, 8).unwrap();
+    idx.build_ivf(0, 8).unwrap().expect_clean();
     println!("build_ivf: {:.0}s", t.elapsed().as_secs_f64());
 
     // correlated cluster ranking (by distance to a fixed center).

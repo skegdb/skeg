@@ -41,8 +41,8 @@ pub use tq1_control::{SHADOW_EVERY, Tq1ProxyController};
 pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuant4};
 pub use vamana::{
     ConsolidateBuilt, ConsolidateJob, ConsolidatePace, DeletePatchBuilt, DeletePatchJob,
-    DiskVamanaIndex, FlushBuilt, FlushJob, IvfBuilt, IvfJob, RunMergeBuilt, RunMergeJob,
-    VamanaConfig, VamanaIndex, build_phase_times_ns, reset_build_phase_times, run_vacuum_debt,
-    set_speed_enabled,
+    DiskVamanaIndex, FinishOutcome, FinishResult, FlushBuilt, FlushJob, IvfBuilt, IvfJob,
+    RunMergeBuilt, RunMergeJob, VamanaConfig, VamanaIndex, build_phase_times_ns,
+    reset_build_phase_times, run_vacuum_debt, set_speed_enabled,
 };
 pub use visited::VisitedBitset;

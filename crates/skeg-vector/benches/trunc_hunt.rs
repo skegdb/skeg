@@ -117,14 +117,17 @@ fn build_churned(
                 .is_some_and(std::thread::JoinHandle::is_finished)
             {
                 idx.consolidate_finish(job.take().unwrap().join().unwrap().unwrap())
-                    .unwrap();
+                    .unwrap()
+                    .expect_clean();
             }
         } else if idx.delta_len() >= idx.main_len().max(4096) {
             idx.consolidate().unwrap();
         }
     }
     if let Some(h) = job.take() {
-        idx.consolidate_finish(h.join().unwrap().unwrap()).unwrap();
+        idx.consolidate_finish(h.join().unwrap().unwrap())
+            .unwrap()
+            .expect_clean();
     }
     // keep idx alive until after the caller checks files
     std::mem::forget(idx);
