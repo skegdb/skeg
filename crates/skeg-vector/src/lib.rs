@@ -21,6 +21,7 @@
 //! The Vamana graph is layered on top of the same vector storage.
 
 mod balance;
+pub mod failpoint;
 mod flat;
 mod ivf_router;
 mod quant;
