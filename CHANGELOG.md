@@ -18,15 +18,22 @@ crates.io - irreversibly - while a binary build was failing. And
 a tag the release workflow rejected still produced `:<version>` and
 `:latest` images.
 
-Now: guard -> test (fmt, clippy, serial workspace suite) -> build-binaries
--> docker -> publish-crates -> homebrew, one workflow. The Docker workflow
-no longer answers `v*` on its own: `release.yml` calls it after every
-`build-binaries` target succeeded, so `:<version>` and `:latest` cannot
-ship while a tarball is failing, and crates.io (irreversible) waits for the
-image too. What is *not* atomic: a failure in `publish-crates` or the
-Homebrew bump leaves the GitHub Release, the tarballs and the image already
-published - those steps are re-runnable, but the release is visible before
-they finish.
+Now the workflow is split into build and promote. guard -> test ->
+{build-binaries, docker-build} produce nothing public: each tarball is a
+run artifact (it used to be uploaded to the GitHub Release by its own
+matrix job, so one architecture could publish while another failed), and
+the image is pushed by digest only - untagged, unreachable by any tag.
+Only once all of them succeeded does promotion start: `promote-release`
+creates the GitHub Release with every tarball at once, `docker-promote`
+binds the digests under `:<version>` / `:latest` (the Docker workflow is
+called twice, `stage: build` and `stage: promote`; it no longer answers
+`v*` on its own), then `publish-crates` (irreversible), then Homebrew. A
+failed build of any single target leaves nothing public behind.
+`scripts/check-release-graph.rb` asserts that shape against the YAML:
+every publishing job transitively needs every build job, no build job
+publishes. What remains non-atomic is the promotion chain itself: it is
+sequential and each step re-runnable, but a failure in crates.io or the
+Homebrew bump leaves the GitHub Release and the image already visible.
 
 Off the tag path, the Docker workflow keeps its own copy of the ancestry
 guard and of the test job (workflows cannot share jobs): `:release-edge`

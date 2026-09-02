@@ -10,14 +10,16 @@ on:
         type: boolean
         default: true
 
-# Gated pipeline: guard -> test -> build-binaries -> docker -> publish-crates
-# -> bump-homebrew. `docker` (ghcr.io image, via docker-publish.yml) waits
-# for every build-binaries target; `publish-crates` (irreversible:
-# crates.io) only runs once `test`, `build-binaries`, and `docker` have all
-# succeeded, so a broken build or a failing test/lint cannot let a crate
-# escape onto crates.io. Homebrew is bumped last, after publish-crates and
-# build-binaries (the latter is where the GitHub Release tarballs the
-# formula points at get uploaded).
+# Build, then promote. guard -> test -> {build-binaries, docker-build}
+# produce nothing public: tarballs are run artifacts, images are pushed by
+# digest only (untagged). Only once all of them succeeded does
+# `promote-release` create the GitHub Release with every tarball, then
+# `docker-promote` binds the digests under `:<version>` / `:latest`, then
+# `publish-crates` (irreversible: crates.io), then `bump-homebrew`. A failed
+# build of any one target therefore leaves nothing public behind. The
+# promotion steps themselves are sequential and each is re-runnable, but a
+# failure among them does leave the earlier ones visible.
+# `scripts/check-release-graph.rb` asserts this shape.
 #
 # `dry_run` (manual trigger only) skips publish-crates and bump-homebrew
 # so you can validate the binary build pipeline without releasing.
@@ -77,7 +79,7 @@ jobs:
 
   publish-crates:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
-    needs: [guard, test, build-binaries, docker]
+    needs: [promote-release, docker-promote]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -198,38 +200,68 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar -czf skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz skeg skeg-resp3
           shasum -a 256 skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
-      - uses: softprops/action-gh-release@v3
-        if: github.event_name == 'push'
-        with:
-          files: |
-            target/${{ matrix.target }}/release/skeg-*.tar.gz
-            target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
+      # Run artifact only; `promote-release` uploads them to the GitHub
+      # Release once every target (and the image) has built.
       - uses: actions/upload-artifact@v5
-        if: github.event_name == 'workflow_dispatch'
         with:
           name: skeg-${{ github.sha }}-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/skeg-*.tar.gz
             target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
 
-  # Build and push the multi-binary container image to ghcr.io.
+  # Build the multi-binary container image for ghcr.io.
   # The image bundles both `skeg` (native protocol, 7379) and
   # `skeg-resp3` (Redis-compat, 6379). Default entrypoint is `skeg`.
   # Built natively per architecture (arm64 + amd64 manifest); published tags:
   #   ghcr.io/skegdb/skeg:<version>   (e.g. 0.1.1)
   #   ghcr.io/skegdb/skeg:latest      (only on tag pushes)
-  docker:
-    # The image is a shipped artefact like a crate, so it is published from
-    # here, after the same gates: not before `test`, and not before every
-    # `build-binaries` target succeeded. docker-publish.yml no longer fires
-    # on `v*` by itself; it is called with `gated: true` (the identical test
-    # job already ran on this commit) and, on a manual dry run, builds both
-    # architectures without pushing so a broken Dockerfile still fails here.
-    needs: [guard, test, build-binaries]
+  docker-build:
+    # Builds both architectures and pushes them by digest only: untagged
+    # candidates, invisible to `docker pull ghcr.io/skegdb/skeg:<anything>`.
+    # docker-publish.yml no longer fires on `v*` by itself; `gated: true`
+    # skips its test job (the identical one ran above on this commit) and a
+    # manual dry run builds without pushing so a broken Dockerfile still
+    # fails here.
+    needs: [guard, test]
     uses: ./.github/workflows/docker-publish.yml
     with:
+      stage: build
       gated: true
       dry_run: ${{ github.event_name != 'push' && github.event.inputs.dry_run != 'false' }}
+
+  # ---- promotion: nothing above this line is public ----
+
+  promote-release:
+    # First public step. Runs only once every build succeeded; on a tag push
+    # it creates the GitHub Release with every tarball at once. On a
+    # publishing dispatch (no tag to release) it is a no-op that still
+    # succeeds, so the chain below keeps a single `needs` shape.
+    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    needs: [guard, test, build-binaries, docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        if: github.event_name == 'push'
+        with:
+          pattern: skeg-${{ github.sha }}-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        if: github.event_name == 'push'
+        with:
+          files: |
+            dist/skeg-*.tar.gz
+            dist/skeg-*.tar.gz.sha256
+
+  docker-promote:
+    # Binds the digests `docker-build` pushed under `:<version>` / `:latest`
+    # (or the dispatch tag). Same call, `stage: promote`: no rebuild.
+    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    needs: [promote-release]
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      stage: promote
+      gated: true
 
   # Custom one-shot brew bump. mislav's action stops working on the
   # second invocation because the version field is already at the
@@ -241,7 +273,7 @@ jobs:
   # ever need touching here.
   bump-homebrew:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
-    needs: [publish-crates, build-binaries]
+    needs: [publish-crates]
     runs-on: ubuntu-latest
     env:
       FORMULA: Formula/skeg.rb

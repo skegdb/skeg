@@ -7,8 +7,9 @@ name: Docker publish
 #   want "what is about to ship" pull this tag)
 # - tag `v*`          → publishes the version tag (e.g. `:0.3.3`) plus
 #   `:latest`. Not a trigger of its own: release.yml calls this workflow
-#   (`workflow_call`) once its test gate and the build-binaries matrix are
-#   green, so an image can never ship while a tarball is failing.
+#   (`workflow_call`) twice - `stage: build` alongside the binary builds,
+#   `stage: promote` only after every artefact of the release succeeded -
+#   so no public tag moves while a tarball or the other image is failing.
 # - manual dispatch   → publishes the user-provided tag (defaults to the
 #   short SHA), useful for back-publishing a stable image for a code state
 #   that has already shipped under crates.io / brew.
@@ -30,6 +31,18 @@ on:
         required: false
         type: boolean
         default: false
+      stage:
+        description: >-
+          all: build, then tag (the standalone behaviour). build: push the
+          per-architecture images by digest only - untagged candidates, not
+          reachable by any public tag - and upload their digests as run
+          artifacts. promote: skip the build and bind the digests uploaded
+          earlier in this run under the real tags. release.yml calls build
+          and promote separately so no tag moves before every artefact of
+          the release succeeded.
+        required: false
+        type: string
+        default: all
   push:
     branches: [release]
     paths:
@@ -151,7 +164,7 @@ jobs:
     needs: [meta, guard, test]
     # `test` may be skipped (gated caller); anything else short of success
     # upstream still blocks the build.
-    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.guard.result == 'success' && needs.test.result != 'failure' }}
+    if: ${{ !cancelled() && inputs.stage != 'promote' && needs.meta.result == 'success' && needs.guard.result == 'success' && needs.test.result != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
@@ -209,8 +222,11 @@ jobs:
   # Bind both architectures under the real tags, so `docker pull ghcr.io/
   # skegdb/skeg:0.7.1` resolves to arm64 or amd64 by itself.
   merge:
-    needs: [meta, build]
-    if: ${{ !inputs.dry_run }}
+    needs: [meta, guard, build]
+    # `build` is skipped on `stage: promote` (its digests were uploaded by
+    # the `stage: build` call earlier in the same run); anything short of
+    # success elsewhere still blocks the tags.
+    if: ${{ !cancelled() && !inputs.dry_run && inputs.stage != 'build' && needs.meta.result == 'success' && needs.guard.result == 'success' && needs.build.result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
