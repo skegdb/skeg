@@ -117,11 +117,15 @@ fn auth_clear(ip: IpAddr) {
         .remove(&ip);
 }
 
-/// Per-connection input-buffer ceiling: one max-size bulk (`MAX_BULK_LEN`) plus
-/// framing headroom. Caps how much a single connection can pin while a frame is
-/// mid-flight, so a desynced or dribbled never-completing frame cannot grow the
-/// buffer without bound (and N connections cannot each pin more than this).
-const MAX_CONN_BUFFER: usize = skeg_resp3::MAX_BULK_LEN + (1 << 20);
+/// Per-connection input-buffer ceiling. The parser only yields a frame once
+/// the whole aggregate is buffered, so this is a *frame* cap, not a bulk cap:
+/// the largest legitimate frame is a `SKEG.VMSET` at its vector cap
+/// (`MAX_VMSET_BYTES`) plus its ids and payload bulks, each bounded by
+/// `MAX_BULK_LEN`, plus framing headroom. Caps how much a single connection
+/// can pin while a frame is mid-flight, so a desynced or dribbled
+/// never-completing frame cannot grow the buffer without bound (and N
+/// connections cannot each pin more than this).
+const MAX_CONN_BUFFER: usize = MAX_VMSET_BYTES + skeg_resp3::MAX_BULK_LEN + (1 << 20);
 
 fn scope_vindex_or_reject(tenant: TenantId, raw_name: &str) -> Result<String, Frame> {
     if raw_name.contains("::") {
@@ -255,6 +259,17 @@ fn read_reserve(buffered: usize) -> usize {
     if buffered == 0 { 4096 } else { 256 * 1024 }
 }
 
+/// Give back the large chunk once the buffer is fully drained. `BytesMut`
+/// keeps its allocation across `split_to`, so without this a connection that
+/// bursted once - or sent a single byte and went quiet - would hold 256 KiB
+/// for its whole life, and `read_reserve`'s idle figure would only be true
+/// for sockets that never sent anything.
+fn trim_idle(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() > 64 * 1024 {
+        *buf = BytesMut::with_capacity(4096);
+    }
+}
+
 const SKEG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default durability for SET / DEL. `Kernel` survives process+kernel crash
@@ -363,6 +378,7 @@ pub async fn handle_connection_resp3(
                 // socket gets a few KiB instead; a pipelined burst still grows
                 // to the large chunk after its first partial read fills the
                 // small reservation and leaves bytes buffered.
+                trim_idle(decoder.buf_mut());
                 let reserve = read_reserve(decoder.buffered());
                 decoder.buf_mut().reserve(reserve);
                 match stream.read_buf(decoder.buf_mut()).await {
@@ -371,7 +387,7 @@ pub async fn handle_connection_resp3(
                         // Bound per-connection buffering. A frame that never
                         // completes (protocol desync, or a bulk whose declared
                         // length is dribbled forever) would otherwise let one
-                        // connection pin ~64 MiB, and N connections N× that.
+                        // connection pin ~129 MiB, and N connections N× that.
                         // One max-size bulk plus headroom is the legitimate
                         // ceiling; past it the peer is misbehaving.
                         if decoder.buffered() > MAX_CONN_BUFFER {
@@ -2096,11 +2112,29 @@ mod tests {
         assert_eq!(super::read_reserve(1), 256 * 1024);
     }
 
-    /// The per-connection ceiling tracks `MAX_BULK_LEN`, not the old 512 MiB
-    /// default - a silent bump of either constant must fail this test.
+    /// The per-connection ceiling tracks the two caps it is built from, not
+    /// the old 512 MiB default - a silent bump of any constant must fail this
+    /// test - and it admits a VMSET at the vector cap with payloads attached.
     #[test]
     fn max_conn_buffer_is_bounded_to_one_frame() {
-        const { assert!(super::MAX_CONN_BUFFER <= 65 * 1024 * 1024) };
+        const { assert!(super::MAX_CONN_BUFFER <= 130 * 1024 * 1024) };
+        const { assert!(super::MAX_CONN_BUFFER > super::MAX_VMSET_BYTES + 1024) };
+    }
+
+    #[test]
+    fn trim_idle_releases_a_drained_burst_buffer() {
+        let mut buf = BytesMut::with_capacity(256 * 1024);
+        super::trim_idle(&mut buf);
+        assert!(buf.capacity() <= 4096, "capacity {}", buf.capacity());
+    }
+
+    #[test]
+    fn trim_idle_keeps_a_mid_frame_buffer() {
+        let mut buf = BytesMut::with_capacity(256 * 1024);
+        buf.extend_from_slice(b"*");
+        super::trim_idle(&mut buf);
+        assert!(buf.capacity() >= 256 * 1024);
+        assert_eq!(&buf[..], b"*");
     }
 
     #[tokio::test]
