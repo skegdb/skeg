@@ -125,6 +125,34 @@ macro_rules! fp {
     };
 }
 
+/// Like [`fp!`], but yields the failure as a VALUE rather than returning it.
+///
+/// For a site that cannot simply leave: the write it guards has already
+/// happened, and something has to be undone before the error goes back to the
+/// caller. `fp!` expands to a `return`, which is exactly the shape that leaves
+/// the mess behind.
+#[macro_export]
+#[cfg(any(test, feature = "failpoints"))]
+macro_rules! fp_check {
+    ($fp:expr, $err:expr) => {
+        if $crate::failpoint::armed($fp) {
+            $err
+        } else {
+            Ok(())
+        }
+    };
+}
+
+/// The disabled expansion: still names the variant.
+#[macro_export]
+#[cfg(not(any(test, feature = "failpoints")))]
+macro_rules! fp_check {
+    ($fp:expr, $err:expr) => {{
+        let _: $crate::failpoint::WriteFailpoint = $fp;
+        Ok(())
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::{WriteFailpoint, arm, armed, disarm, disarm_all};

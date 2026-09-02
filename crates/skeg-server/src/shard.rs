@@ -6217,12 +6217,6 @@ impl ShardSet {
                     {
                         continue;
                     }
-                    crate::fp!(
-                        crate::failpoint::WriteFailpoint::OverlapReplicaWrite,
-                        Err(ShardError::Storage(
-                            "failpoint: overlap replica write refused".to_owned()
-                        ))
-                    );
                     let req = ShardReq::Vset {
                         name: name.to_owned(),
                         id,
@@ -6238,10 +6232,65 @@ impl ShardSet {
                         version: Some(version),
                         payload,
                     };
-                    match self.call(usize::from(second), req).await? {
-                        ShardResp::Done => {}
-                        ShardResp::Err(e) => return Err(ShardError::Storage(e)),
-                        _ => return Err(ShardError::Unavailable),
+                    let outcome = match self.call(usize::from(second), req).await {
+                        Ok(ShardResp::Done) => Ok(()),
+                        Ok(ShardResp::Err(e)) => Err(ShardError::Storage(e)),
+                        Ok(_) => Err(ShardError::Unavailable),
+                        Err(e) => Err(e),
+                    };
+                    // The failpoint sits AFTER the write, because that is the
+                    // half worth testing: a replica that landed and was then
+                    // reported as a failure. `fp_check!`, not `fp!`, for the
+                    // same reason - this site has to undo something before it
+                    // can leave, and `fp!` expands to a bare `return`.
+                    let outcome = outcome.and_then(|()| {
+                        crate::fp_check!(
+                            crate::failpoint::WriteFailpoint::OverlapReplicaWrite,
+                            Err(ShardError::Storage(
+                                "failpoint: overlap replica write refused".to_owned()
+                            ))
+                        )
+                    });
+                    if let Err(e) = outcome {
+                        // The write may have LANDED and still reported a
+                        // failure: the destination stores the vector and then
+                        // the payload blob, and a blob error comes back after
+                        // the row is in; a lost reply looks the same. A
+                        // replica the map does not name is a ghost - `vdel`
+                        // finds a second copy by reading the replica slot, so
+                        // nothing would ever go looking for this one, and the
+                        // deleted row stays searchable.
+                        //
+                        // Take it back out. Best effort, and LOGGED rather
+                        // than returned: the error worth reporting is the one
+                        // that got us here, and an overlap replica is an
+                        // optimisation a re-run recreates.
+                        let undo = ShardReq::Vdel {
+                            name: name.to_owned(),
+                            id,
+                            tenant,
+                            internal: true,
+                            version: Some(version),
+                        };
+                        match self.call(usize::from(second), undo).await {
+                            Ok(ShardResp::Existed(_)) => {}
+                            Ok(ShardResp::Err(err)) => tracing::error!(
+                                index = name,
+                                id,
+                                shard = usize::from(second),
+                                error = %err,
+                                "an overlap replica was written and could not be taken \
+                                 back: it is a copy the owner map does not name"
+                            ),
+                            Ok(_) | Err(_) => tracing::error!(
+                                index = name,
+                                id,
+                                shard = usize::from(second),
+                                "an overlap replica was written and could not be taken \
+                                 back: shard unavailable"
+                            ),
+                        }
+                        return Err(e);
                     }
                     // Still under the stripe: the replica has to be IN the map
                     // before a delete can look for it, or the delete finds

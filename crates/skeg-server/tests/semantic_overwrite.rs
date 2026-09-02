@@ -895,3 +895,52 @@ async fn a_shard_that_cannot_open_its_index_fails_the_owner_map_rebuild() {
         .expect("with the shard readable the write goes through");
     assert_eq!(shards.vget("un", victim).await.unwrap().unwrap(), want);
 }
+
+/// A replica the owner map never names is a ghost. `vdel` finds the second
+/// copy of a row by reading the replica slot, so a copy that is on disk and
+/// not in the map is one nothing will ever remove: the deleted row stays
+/// searchable until the next rebuild.
+///
+/// `overlap` returned before updating the map on every failure of the replica
+/// write - including the ones where the write LANDED. The destination stores
+/// the vector and then writes the payload blob, and a blob failure comes back
+/// as an error after the row is already in; a lost reply does the same.
+#[tokio::test]
+async fn an_overlap_that_fails_after_writing_a_replica_does_not_leave_a_ghost() {
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "gh", N).await;
+    shards.reshard("gh", 0.25, 10, 0).await.expect("reshard");
+
+    arm(WriteFailpoint::OverlapReplicaWrite);
+    let err = shards.overlap("gh", 4.0, 0).await;
+    disarm_all();
+    err.expect_err("the replica write failed, so the overlap must report it");
+
+    // Every row deleted; nothing may survive. A copy the map does not name is
+    // exactly the copy this cannot reach.
+    for id in 0..N {
+        shards.vdel("gh", id, 0).await.expect("delete");
+    }
+    for id in 0..N {
+        let hits = shards
+            .vsearch("gh", vec_for(id), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(
+            !hits.iter().any(|h| h.0 == id),
+            "id {id} outlived its delete: the failed overlap left a copy the \
+             owner map never named, so nothing went looking for it: {hits:?}"
+        );
+    }
+    let held: usize = shards
+        .control_handle()
+        .open_indices()
+        .await
+        .iter()
+        .filter(|s| s.index == "gh")
+        .map(|s| s.vectors)
+        .sum();
+    assert_eq!(held, 0, "and no copy of any row is left on any shard");
+}
