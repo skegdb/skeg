@@ -27,7 +27,9 @@ skeg-server \
 - `--tenant-auth <path>` enables tenant resolution against an `auth.kdb` on
   disk. A client picks its tenant with `HELLO 3 AUTH <user> <pass>` (argon2id).
 - `--tenant-strict` rejects anonymous `HELLO 3` (no AUTH). Without it,
-  anonymous connections map to tenant zero.
+  anonymous connections map to tenant zero, and the server treats the bind
+  as unauthenticated: a non-loopback `--addr` is refused unless
+  `--allow-unauthenticated-network` opts in.
 - `--admin-tenant <name>` (or the `SKEG_ADMIN_TENANT` environment variable)
   names the one tenant allowed to run the quota admin commands below.
 

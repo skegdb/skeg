@@ -12,9 +12,10 @@
 //! - `--admin-tenant <name>` names the tenant allowed to run
 //!   `SKEG.QUOTA.SET/GET` (set per-tenant quotas at runtime)
 //! - `--allow-unauthenticated-network` (env `SKEG_ALLOW_UNAUTHENTICATED_NETWORK`):
-//!   without `--tenant-auth`, this binary wraps the same unauthenticated
-//!   engine as `skeg`/`skeg-resp3`, so a non-loopback `--addr` is refused
-//!   unless this flag opts in. With `--tenant-auth`, auth is present and
+//!   without `--tenant-auth --tenant-strict`, this binary still serves
+//!   anonymous clients (no auth at all, or lenient mode mapping them to
+//!   tenant ZERO), so a non-loopback `--addr` is refused unless this flag
+//!   opts in. With `--tenant-auth --tenant-strict`, auth is enforced and
 //!   this flag has no effect.
 
 use skeg_server::Server;
@@ -42,14 +43,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::parse(std::env::args().skip(1));
     // `--tenant-auth` installs a `TenantBackend` (auth) below; without it
     // this is the same unauthenticated engine as the single-tenant `skeg`
-    // / `skeg-resp3` binaries, so the same non-loopback guard applies.
-    if cfg.tenant_auth.is_none() {
+    // / `skeg-resp3` binaries, so the same non-loopback guard applies. Auth
+    // alone is not enough: lenient mode maps an anonymous HELLO to tenant
+    // ZERO, so only `--tenant-strict` makes the bind authenticated.
+    if cfg.tenant_auth.is_none() || !cfg.tenant_strict {
         match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network)
         {
             Ok(true) => {
                 tracing::warn!(
                     "--allow-unauthenticated-network: {} is reachable over the network with no \
-                     authentication (no --tenant-auth given)",
+                     authentication (no --tenant-auth, or lenient mode without --tenant-strict)",
                     cfg.addr
                 );
             }

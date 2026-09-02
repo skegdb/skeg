@@ -2,8 +2,10 @@
 //! the same unauthenticated engine as the single-tenant `skeg`/`skeg-resp3`
 //! binaries whenever it is run without `--tenant-auth`. It must refuse a
 //! non-loopback `--addr` in that mode, exactly like the single-tenant
-//! binaries (see `crates/skeg-server/tests/unauthenticated_bind.rs`). With
-//! `--tenant-auth` given, auth is present and no check applies.
+//! binaries (see `crates/skeg-server/tests/unauthenticated_bind.rs`).
+//! `--tenant-auth` alone is not enough: in lenient mode an anonymous
+//! `HELLO 3` still maps to tenant ZERO, so the check applies until
+//! `--tenant-strict` actually rejects anonymous clients.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -25,11 +27,25 @@ fn run_and_wait(extra_args: &[&str]) -> (bool, String) {
         .env_remove(skeg_server::ALLOW_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = cmd.spawn().expect("spawn binary");
+    let mut child = cmd.spawn().expect("spawn binary");
+    // A refused bind exits at once. A regression that lets the server start
+    // would otherwise block here forever (it listens until killed), so a
+    // process still alive at the deadline is reported as "started".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let started = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break status.success(),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                break true;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
     let output = child.wait_with_output().expect("wait for output");
     let mut stderr = String::new();
     let _ = std::io::Cursor::new(&output.stderr).read_to_string(&mut stderr);
-    (output.status.success(), stderr)
+    (started, stderr)
 }
 
 #[test]
@@ -42,15 +58,32 @@ fn tenant_binary_without_tenant_auth_refuses_unauthenticated_network_bind() {
     );
 }
 
-#[test]
-fn tenant_binary_with_tenant_auth_does_not_check() {
-    // Cheap to build: an `auth.kdb` is just an `AuthStore::open` + `save`.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let auth_path = dir.path().join("auth.kdb");
+/// Write a one-user `auth.kdb` into `dir` and return its path.
+fn write_auth_store(dir: &std::path::Path) -> std::path::PathBuf {
+    let auth_path = dir.join("auth.kdb");
     let mut store = AuthStore::open(&auth_path).expect("open auth store");
     let hash = hash_password_with(b"pw", Argon2Params::default()).expect("hash password");
     store.upsert("u", TenantId::from_name("acme"), hash);
     store.save().expect("save auth store");
+    auth_path
+}
+
+#[test]
+fn tenant_binary_with_lenient_tenant_auth_refuses_unauthenticated_network_bind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth_path = write_auth_store(dir.path());
+    let (success, stderr) = run_and_wait(&["--tenant-auth", auth_path.to_str().unwrap()]);
+    assert!(!success, "expected non-zero exit; stderr: {stderr}");
+    assert!(
+        stderr.contains("--allow-unauthenticated-network"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn tenant_binary_with_strict_tenant_auth_does_not_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth_path = write_auth_store(dir.path());
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_skeg-server"));
@@ -60,6 +93,7 @@ fn tenant_binary_with_tenant_auth_does_not_check() {
         .arg(data_dir.path())
         .arg("--tenant-auth")
         .arg(&auth_path)
+        .arg("--tenant-strict")
         .env_remove(skeg_server::ALLOW_ENV)
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
