@@ -79,6 +79,12 @@ tempfile = { workspace = true }
 # The crate itself, with failpoints on. An integration test is its own crate
 # and links the library through this entry, so `cargo test -p skeg-server`
 # builds the tested library WITH the failpoints while `cargo build` does not.
+#
+# Feature unification makes that wider than it looks: under `cargo test
+# --workspace` the feature is on for every workspace consumer of this crate,
+# not only for its own tests. Confined to the test profile - a release build
+# resolves without this entry - but it is why `fp!` has to be correct when
+# enabled, not merely absent when not.
 skeg-server = { path = ".", features = ["failpoints"] }
 
 [[bench]]

@@ -32,8 +32,13 @@ promotion happens at the first fold, never at an open. See
 [`docs/adr-vector-version.md`](docs/adr-vector-version.md).
 
 The owner-map rebuild reads the base's version column directly, so a cold start
-is now cheaper WITH versions than it was without them: 73 µs against 0,6 ms over
-200k rows.
+is now cheaper WITH versions than it was without them. Measured 2026-09-02,
+release, 200k rows on a folded base, best of three: 0,6 ms for the live ids
+alone before this change, 2,1 ms through a per-row version lookup (the first
+version of it), 73 µs for the column read that shipped - cheaper than the ids
+alone because it also skips a sort and dedup that only exist to merge layers
+that are not there. `rebuild_owner_maps` end to end, 20k rows over two shards,
+is unchanged at ~0,5 ms.
 
 **Breaking on disk, no downgrade path.** A store created or folded by this
 version does not open on `skeg-vector` 0.1.9 or earlier. It is not limited to

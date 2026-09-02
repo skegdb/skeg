@@ -10,7 +10,7 @@
 
 /// A point in a durable write this crate performs that a test can make fail.
 ///
-/// Always compiled, feature or not, so [`fp!`] type-checks the variant name in
+/// Always compiled, feature or not, so [`crate::fp!`] type-checks the variant name in
 /// every build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteFailpoint {

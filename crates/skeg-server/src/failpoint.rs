@@ -17,7 +17,7 @@
 //!   name is an enum variant: rename the site and the test stops compiling.
 //! - **No external crate.** One `AtomicU64` bitmask and a macro.
 //! - **Absent from a normal build.** Without `cfg(any(test, feature =
-//!   "failpoints"))` the arming state does not exist and [`fp!`] expands to a
+//!   "failpoints"))` the arming state does not exist and [`crate::fp!`] expands to a
 //!   type annotation, so the write path carries no branch at all - and the
 //!   variant name is still checked by the compiler.
 //!

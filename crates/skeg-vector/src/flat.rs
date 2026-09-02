@@ -133,9 +133,14 @@ impl FlatIndex {
 
     /// Insert `vector` under `id`, overwriting any existing vector for `id`.
     ///
-    /// Unversioned, so it writes [`VectorVersion::LEGACY`] and can be
-    /// overwritten by anything. Callers that place rows on more than one shard
-    /// want [`insert_versioned`](Self::insert_versioned).
+    /// # This write can be DROPPED without saying so
+    ///
+    /// Unversioned, so it writes [`VectorVersion::LEGACY`], which loses
+    /// against every allocated version: on a row that
+    /// [`insert_versioned`](Self::insert_versioned) has written, this is
+    /// silently discarded and returns normally. Harmless while an index is
+    /// all-legacy or all-versioned; if a caller mixes the two forms on one
+    /// index, this is the one that loses.
     ///
     /// # Panics
     ///
@@ -204,6 +209,14 @@ impl FlatIndex {
     ///
     /// The quantized form is left intact: the scan skips dead rows, so a
     /// delete needs no rebuild.
+    ///
+    /// # This delete can be DROPPED without saying so
+    ///
+    /// Unversioned, same rule as [`insert`](Self::insert): against a row
+    /// carrying an allocated version it is discarded and returns `false`,
+    /// which is indistinguishable from "it was not live". Use
+    /// [`delete_versioned`](Self::delete_versioned) on an index anything
+    /// versioned writes to.
     pub fn delete(&mut self, id: u64) -> bool {
         self.delete_versioned(id, VectorVersion::LEGACY)
     }

@@ -4294,6 +4294,16 @@ impl DiskVamanaIndex {
     /// delta and is appended to the WAL; [`consolidate`](Self::consolidate)
     /// folds it into the graph.
     ///
+    /// # This write can be DROPPED without saying so
+    ///
+    /// It writes [`VectorVersion::LEGACY`], which loses against every
+    /// allocated version, so on a row that has been written by
+    /// [`insert_versioned`](Self::insert_versioned) it is silently discarded
+    /// and still returns `Ok(())`. Harmless while a store is all-legacy or
+    /// all-versioned, and those are the only two shapes an embedder produces
+    /// today - but if a caller mixes the two forms on one index, this is the
+    /// one that loses. Use `insert_versioned` on anything that also uses it.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the WAL append fails, or `InvalidInput` if
@@ -4420,10 +4430,20 @@ impl DiskVamanaIndex {
     /// Called once per routed vindex per shard at cold start, so the folded
     /// steady state - no runs, no delta, no tombstones, which is what a
     /// restart opens onto - gets a direct path: the base IS the live set and
-    /// its version column is already beside its ids. Going through
-    /// `version_of` for every row instead costs a lookup in each layer per id
-    /// and measured 2,1 ms against 0,6 ms over 200k rows, all of it on the
-    /// readiness barrier.
+    /// its version column is already beside its ids.
+    ///
+    /// Measured 2026-09-02, release, 200k rows on a folded base, best of
+    /// three, all of it on the readiness barrier. Three numbers, because two
+    /// of them were quoted elsewhere as if they were one comparison:
+    ///
+    /// - `live_ids` alone (what the rebuild used to cost): **0,6 ms**
+    /// - through `version_of` per row (the first version of this): **2,1 ms**
+    /// - this direct path: **73 µs**, which is cheaper than the ids alone
+    ///   because it also skips the sort and dedup that exist only to merge
+    ///   layers that are not there.
+    ///
+    /// An implementation measurement, so it expires: re-measure before
+    /// quoting it.
     #[must_use]
     pub fn live_ids_with_versions(&self) -> Vec<(u64, VectorVersion)> {
         if self.tombstones.is_empty()
@@ -4453,6 +4473,14 @@ impl DiskVamanaIndex {
     }
 
     /// Tombstone `id`. Returns `true` if it was live.
+    ///
+    /// # This delete can be DROPPED without saying so
+    ///
+    /// Unversioned, so the same rule as [`insert`](Self::insert): against a
+    /// row carrying an allocated version it is discarded and returns
+    /// `Ok(false)`, which is indistinguishable from "it was not live". Use
+    /// [`delete_versioned`](Self::delete_versioned) on an index anything
+    /// versioned writes to.
     ///
     /// # Errors
     ///
