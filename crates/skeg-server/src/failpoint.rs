@@ -31,7 +31,12 @@
 //! - [`arm_at`] is process-wide but SCOPED TO A KEY - the vindex name - so a
 //!   site inside a shard worker is reachable while two tests naming different
 //!   indexes still cannot see each other. Every test in this repo builds its
-//!   own index under its own name, so that is the whole isolation rule.
+//!   own index under its own name, so that is the whole isolation rule - and
+//!   it is a rule about NAMES, which nothing but convention keeps unique.
+//!   [`arm_at`] therefore refuses to arm a point that is already armed for the
+//!   same key: two tests in one binary sharing a name would otherwise fail
+//!   each other at random, which is the failure mode a per-thread mask exists
+//!   to avoid and this one has to catch instead.
 //!
 //! Both record whether the point actually FIRED, and every test asserts it: an
 //! armed point that never fires makes its test pass for the wrong reason.
@@ -199,6 +204,16 @@ mod armed_at_state {
 
     /// Make `fp` fail wherever it is reached FOR `key`, until it is disarmed.
     /// Clears its fired flag, so [`fired_at`] answers about this arming.
+    ///
+    /// # Panics
+    ///
+    /// If `fp` is ALREADY armed for `key`. The mask is process-wide and the
+    /// key is a plain string, so isolation between two tests in one binary
+    /// rests entirely on their choosing different vindex names. Nothing
+    /// enforces that, and when it is broken the symptom is a test failing
+    /// because of what another test armed - the exact kind of failure that
+    /// gets rerun until it passes. A test that arms in a loop disarms each
+    /// time round, so this is never a legitimate state.
     pub fn arm_at(fp: WriteFailpoint, key: &str) {
         with(|entries| {
             match entries
@@ -206,6 +221,12 @@ mod armed_at_state {
                 .find(|e| e.bit == fp.bit() && e.key == key)
             {
                 Some(e) => {
+                    assert!(
+                        !e.armed,
+                        "{fp:?} is already armed for '{key}': two tests in this \
+                         binary are sharing a failpoint key, so each can make \
+                         the other fail. Give them different index names."
+                    );
                     e.armed = true;
                     e.fired = false;
                 }
@@ -447,5 +468,20 @@ mod tests {
             fired_at(WriteFailpoint::PayloadPrepare, mine),
             "disarming leaves the record of the hit for the assertion that follows"
         );
+        // And arming it again, after the disarm, is the ordinary loop.
+        arm_at(WriteFailpoint::PayloadPrepare, mine);
+        disarm_at(WriteFailpoint::PayloadPrepare, mine);
+    }
+
+    /// The isolation rule is "two tests, two names", and nothing but
+    /// convention keeps it. This is what makes breaking it loud instead of
+    /// making one of the two tests fail for the other one's reason.
+    #[test]
+    #[should_panic(expected = "sharing a failpoint key")]
+    fn arming_a_key_that_is_already_armed_is_refused() {
+        use super::arm_at;
+        let shared = "failpoint-unit-shared";
+        arm_at(WriteFailpoint::VdelBlobDelete, shared);
+        arm_at(WriteFailpoint::VdelBlobDelete, shared);
     }
 }
