@@ -236,6 +236,16 @@ const VAMANA_L_SEARCH: usize = 100;
 // Both variants boxed: DiskVamanaIndex and FlatIndex are each hundreds of bytes,
 // so an unboxed variant would size every VectorBackend to the larger one (clippy
 // large_enum_variant). One heap indirection per vindex, off the hot path.
+/// What a `Vset` did on the answering shard.
+enum VsetOutcome {
+    /// The row was written, so everything hanging off it - its payload
+    /// postings, its blob in the vLog - has to follow.
+    Stored,
+    /// The shard already holds a NEWER copy of this row, so nothing was
+    /// written and nothing must follow.
+    Superseded,
+}
+
 enum VectorBackend {
     Flat(Box<FlatIndex>),
     Disk(Box<DiskVamanaIndex>),
@@ -3570,6 +3580,16 @@ async fn process(
                                 idx.backend.dim(),
                                 vector.len()
                             ))
+                        } else if version.is_some_and(|v| v < idx.backend.version_of(id).get()) {
+                            // A relocation carrying a copy this shard has
+                            // already moved past. The engine would refuse the
+                            // vector by itself; what it cannot refuse is the
+                            // rest of the write. Refusing it HERE is what
+                            // keeps the quota unspent, the payload postings
+                            // untouched and the blob unwritten - the row that
+                            // stands must not end up described by the payload
+                            // of the value it replaced.
+                            Ok(VsetOutcome::Superseded)
                         } else {
                             // Quota: only a NEW id consumes a slot. Reserve
                             // before the insert (race-free under this write
@@ -3623,7 +3643,7 @@ async fn process(
                                     if let Some(blob) = &payload {
                                         idx.payload.upsert(id, parse_fields(blob));
                                     }
-                                    Ok(())
+                                    Ok(VsetOutcome::Stored)
                                 }
                                 Err(e) => {
                                     if was_new && limit.is_some() {
@@ -3636,7 +3656,11 @@ async fn process(
                     };
                     match insert_result {
                         Err(e) => ShardResp::Err(e),
-                        Ok(()) => {
+                        // Not an error. The caller is a relocation and what it
+                        // wants is for the newest copy of the row to be the
+                        // one that stands, which it is.
+                        Ok(VsetOutcome::Superseded) => ShardResp::Done,
+                        Ok(VsetOutcome::Stored) => {
                             // Store the payload blob only when one was supplied;
                             // a payload-less VSET issues no KV write at all.
                             if let Some(blob) = payload {
@@ -6753,6 +6777,66 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    /// A relocation carries the version it READ, and a shard can already hold
+    /// a newer copy of that row: the owner map is derived state and is allowed
+    /// to be behind, so a move can arrive at a destination that has moved on.
+    ///
+    /// The engine refuses the stale vector on its own. What it cannot refuse
+    /// is everything hanging off it - the payload was indexed and written to
+    /// the vLog whether or not the vector was stored, so the row that stood
+    /// ended up described by the payload of the value it had replaced. A wrong
+    /// answer with the right vector attached to it.
+    #[tokio::test]
+    async fn a_stale_internal_write_stores_neither_its_vector_nor_its_payload() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        shards.vindex_create("p", 4, 0, 1).await.unwrap();
+        let newer = vec![1.0f32, 0.0, 0.0, 0.0];
+        let older = vec![0.0f32, 1.0, 0.0, 0.0];
+        let put = |vector: Vec<f32>, version: u64, blob: &'static str| ShardReq::Vset {
+            name: "p".to_owned(),
+            id: 7,
+            vector,
+            tenant: 0,
+            limit: None,
+            internal: true,
+            version: Some(version),
+            payload: Some(Bytes::from_static(blob.as_bytes())),
+        };
+        assert!(matches!(
+            shards
+                .call(0, put(newer.clone(), 9, "{\"tag\":\"new\"}"))
+                .await
+                .unwrap(),
+            ShardResp::Done
+        ));
+        // The straggler: the same row as some earlier read saw it.
+        assert!(matches!(
+            shards
+                .call(0, put(older, 4, "{\"tag\":\"old\"}"))
+                .await
+                .unwrap(),
+            ShardResp::Done,
+        ));
+
+        assert_eq!(
+            shards.vget("p", 7).await.unwrap().unwrap(),
+            newer,
+            "the newer vector must stand"
+        );
+        let hits = shards
+            .vsearch("p", newer, 1, 0, 0, true, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let blob = hits[0].2.clone().expect("the payload comes back");
+        assert_eq!(
+            &blob[..],
+            b"{\"tag\":\"new\"}",
+            "the stale copy's payload replaced the live row's"
+        );
+    }
 
     #[test]
     fn validate_vindex_name_blocks_path_traversal() {
