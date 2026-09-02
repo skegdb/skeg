@@ -2955,6 +2955,21 @@ fn run_shard(
                 error!("shard {shard_id}: reclaiming blobs of resolved '{name}': {e}");
             }
         }
+        // And everything else nothing names any more. Inside the readiness
+        // barrier: the store is quiescent, the registry has just been read,
+        // and no request has had a chance to stage a blob whose commit has
+        // not landed YET - which is the one state this must not mistake for
+        // garbage.
+        if !read_only {
+            let reclaimed = reclaim_orphan_blobs(&vlog, &vindexes).await;
+            if reclaimed > 0 {
+                tracing::info!(
+                    shard = shard_id,
+                    reclaimed,
+                    "reclaimed payload blobs no live row names"
+                );
+            }
+        }
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -3407,22 +3422,158 @@ fn remove_vindex_dir(dir: &Path, name: &str) {
 /// `buffer_unordered` so they share the group committer's flushes - awaiting
 /// each in turn put one record per batch and paid a flush per key (~1.4 ms
 /// each, ~14 s per 10k).
-fn is_payload_blob_key(key: &[u8], tenant: u128, name: &str) -> bool {
-    if key.len() < 16 + PAYLOAD_MARKER.len() || key[..16] != tenant.to_le_bytes() {
-        return false;
+/// A payload blob key, taken apart.
+///
+/// One parser, so "what does this key say" has a single answer. The sweep, the
+/// count and the open-time collection all ask it; three hand-rolled length
+/// arithmetics would be three chances to reclaim a key that is not garbage.
+struct BlobKey<'a> {
+    tenant: u128,
+    /// `None` for the pre-generation key, which names no incarnation.
+    generation: Option<IndexGeneration>,
+    name: &'a [u8],
+    id: u64,
+    /// `None` for the pre-generation key, which names no copy of the row.
+    version: Option<u64>,
+}
+
+fn parse_payload_blob_key(key: &[u8]) -> Option<BlobKey<'_>> {
+    if key.len() <= 16 + PAYLOAD_MARKER.len() {
+        return None;
     }
+    let tenant = u128::from_le_bytes(key[..16].try_into().ok()?);
+    let take_u64 = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8-byte window"));
     let (marker, rest) = key[16..].split_at(PAYLOAD_MARKER.len());
     if marker == PAYLOAD_MARKER {
-        // tenant | marker | name | id
-        return rest.len() == name.len() + 8 && rest.starts_with(name.as_bytes());
+        // tenant | marker | name | id, and a name is never empty.
+        if rest.len() <= 8 {
+            return None;
+        }
+        let (name, id) = rest.split_at(rest.len() - 8);
+        return Some(BlobKey {
+            tenant,
+            generation: None,
+            name,
+            id: take_u64(id),
+            version: None,
+        });
     }
     if marker == PAYLOAD_MARKER_V2 {
-        // tenant | marker | generation | name | id | version. ANY generation:
-        // the name is what is being reclaimed, and the incarnations of it are
-        // exactly what a sweep must not leave behind.
-        return rest.len() == 16 + name.len() + 16 && rest[16..16 + name.len()] == *name.as_bytes();
+        // tenant | marker | generation | name | id | version.
+        if rest.len() <= 16 + 16 {
+            return None;
+        }
+        let generation = IndexGeneration::new(u128::from_le_bytes(rest[..16].try_into().ok()?));
+        let body = &rest[16..];
+        let (name, tail) = body.split_at(body.len() - 16);
+        return Some(BlobKey {
+            tenant,
+            generation: Some(generation),
+            name,
+            id: take_u64(&tail[..8]),
+            version: Some(take_u64(&tail[8..])),
+        });
     }
-    false
+    None
+}
+
+/// Is this a payload blob key of `(tenant, name)`, in ANY generation?
+///
+/// Every incarnation, deliberately: a blob left by an earlier one is precisely
+/// what a sweep of the name must not leave behind.
+fn is_payload_blob_key(key: &[u8], tenant: u128, name: &str) -> bool {
+    parse_payload_blob_key(key).is_some_and(|k| k.tenant == tenant && k.name == name.as_bytes())
+}
+
+/// What one resident index would answer for: its incarnation, and every
+/// `(id, version)` pair it holds live.
+type LiveRows = (IndexGeneration, BTreeSet<(u64, u64)>);
+
+/// Delete every payload blob no live row on this shard names.
+///
+/// Three kinds of garbage end up here, and they are the same kind of garbage:
+///
+/// - a blob STAGED for a write whose commit never landed. Prepare-before-
+///   commit is what makes the pair atomic, and its price is exactly this: a
+///   blob at a version no row ever took.
+/// - a blob a committed overwrite SUPERSEDED, whose post-commit reclamation
+///   did not run - because the process died, or because reporting the failure
+///   would have lied to the client.
+/// - a blob of an earlier INCARNATION of a name, or of an index this shard no
+///   longer has, left by a drop whose sweep did not finish.
+///
+/// None of them can ever be read: a payload lookup is keyed by the index's
+/// generation and the row's live version. Which is why they are collected
+/// HERE, at open, once, and not by any request path - the store is quiescent,
+/// the registry has just been read, and every live row's version is in hand.
+///
+/// One pass over the keyspace, the same cost shape as `count_tenant_keys`.
+async fn reclaim_orphan_blobs(vlog: &VLog, vindexes: &RwLock<VindexSet>) -> u64 {
+    // What each resident index would answer for: its incarnation, and every
+    // (id, version) pair it holds live.
+    let live: HashMap<(u128, Vec<u8>), LiveRows> = {
+        let vs = vindexes.read();
+        vs.iter()
+            .map(|(scoped, arc)| {
+                let g = arc.read();
+                let rows = g
+                    .backend
+                    .live_ids_with_versions()
+                    .into_iter()
+                    .map(|(id, v)| (id, v.get()))
+                    .collect();
+                (
+                    (unscope_key(scoped).0, scoped.as_bytes().to_vec()),
+                    (g.generation, rows),
+                )
+            })
+            .collect()
+    };
+    let victims: Vec<Vec<u8>> = {
+        let mut v = Vec::new();
+        vlog.for_each_key(|k| {
+            let Some(key) = parse_payload_blob_key(k) else {
+                return;
+            };
+            let named = live.get(&(key.tenant, key.name.to_vec()));
+            let alive = match (named, key.generation, key.version) {
+                // No such index here. Nothing on this shard can serve it, in
+                // any generation.
+                (None, _, _) => false,
+                // The pre-generation key, and the index that predates
+                // generations still reads it - for a row that is still live.
+                (Some((generation, rows)), None, _) => {
+                    generation.is_legacy() && rows.iter().any(|&(id, _)| id == key.id)
+                }
+                (Some((generation, rows)), Some(g), Some(version)) => {
+                    *generation == g && rows.contains(&(key.id, version))
+                }
+                (Some(_), Some(_), None) => false,
+            };
+            if !alive {
+                v.push(k.to_vec());
+            }
+        });
+        v
+    };
+    let results: Vec<_> = stream::iter(victims.iter())
+        .map(|key| vlog.del(key, PAYLOAD_DURABILITY))
+        .buffer_unordered(ERASE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut reclaimed = 0u64;
+    for r in results {
+        match r {
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
+            // Best effort by design: this runs inside the readiness barrier
+            // and it is a reclamation, not a repair. A blob that will not go
+            // is disk, not a wrong answer, and refusing to open over it would
+            // trade a leak for an outage.
+            Err(e) => tracing::error!(error = %e, "reclaiming an orphaned payload blob failed"),
+        }
+    }
+    reclaimed
 }
 
 /// Payload blobs the shard holds for `(tenant, name)`, every generation

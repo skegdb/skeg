@@ -469,7 +469,6 @@ async fn vdel_error_at_blob_delete_still_reports_the_delete() {
 /// wrong - nothing reads it - but nothing removes it either, so it is disk a
 /// store pays for for ever. The open that follows is where it goes.
 #[tokio::test]
-#[ignore = "opens in payload: reclaim orphaned blobs at open"]
 async fn a_blob_left_by_a_failed_commit_is_reclaimed_at_the_next_open() {
     let dir = tempfile::TempDir::new().unwrap();
     let name = "or";
