@@ -232,6 +232,23 @@ fn parse_bytes(v: Option<&str>) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// What the governor has to offer, in the same three states the platform
+/// reports and for the same reason: `Unlimited` and `Unreadable` are opposites,
+/// and an `Option` that collapses them lets an unreadable ceiling look like no
+/// ceiling. `Result<Option<u64>, ()>` said it too, in a shape nobody reads
+/// twice the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// A ceiling applies and this much is on offer, the reserve already taken
+    /// out.
+    Room(u64),
+    /// No ceiling applies: nothing to be killed for.
+    Unlimited,
+    /// A ceiling applies and the room left could not be read. A refusal, not a
+    /// licence.
+    Unreadable,
+}
+
 /// Admission control over a single process-wide budget.
 #[derive(Debug)]
 pub struct MemoryGovernor {
@@ -325,6 +342,25 @@ impl MemoryGovernor {
     fn usable(&self) -> Result<Option<u64>, ()> {
         Ok(effective_headroom(self.explicit, self.source.headroom())?
             .map(|l| l.saturating_sub(self.reserve)))
+    }
+
+    /// The margin held back, so an operator can see how much of the ceiling is
+    /// deliberately not for sale.
+    pub fn reserve_bytes(&self) -> u64 {
+        self.reserve
+    }
+
+    /// What the governor believes right now.
+    ///
+    /// Reported, not just enforced. A budget nobody can read is the same
+    /// problem as a governor nobody asks: the operator finds out from the
+    /// refusals, or from the OOM.
+    pub fn budget(&self) -> Budget {
+        match self.usable() {
+            Ok(Some(room)) => Budget::Room(room),
+            Ok(None) => Budget::Unlimited,
+            Err(()) => Budget::Unreadable,
+        }
     }
 
     pub fn reserved_bytes(&self) -> u64 {

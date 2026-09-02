@@ -3557,6 +3557,9 @@ async fn process(
                                 if was_new && limit.is_some() {
                                     quota.sub(tenant, 1);
                                 }
+                                skeg_telemetry::tick_counter(
+                                    skeg_telemetry::Counter::MemoryRefused,
+                                );
                                 return ShardResp::Err(format!(
                                     "BACKPRESSURE out of memory budget: {rejected}"
                                 ));
@@ -3992,6 +3995,10 @@ struct ShardSetInner {
     /// set keeps the map (8B+overhead per id, rebuilt at open from the
     /// shards' live id sets) and point ops stay O(1) instead of broadcast.
     owners: parking_lot::RwLock<HashMap<String, OwnerMap>>,
+    /// Process-wide memory admission. Kept here so `SKEG.STATS` can report the
+    /// budget: a ceiling that is enforced and not readable leaves an operator
+    /// to discover it from the refusals.
+    memory: Arc<crate::memory::MemoryGovernor>,
     /// Serialises catalogue fan-outs (CREATE/DROP). They record an intent,
     /// touch every shard and clear it; two of them interleaving would read and
     /// write that one file underneath each other. It also removes the race
@@ -4334,6 +4341,7 @@ impl ShardSet {
                 root: base_dir.to_path_buf(),
                 routers: parking_lot::RwLock::new(load_routers(base_dir)),
                 owners: parking_lot::RwLock::new(HashMap::new()),
+                memory: memory.clone(),
                 catalog: tokio::sync::Mutex::new(()),
                 owner_locks: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
             }),
@@ -4359,6 +4367,12 @@ impl ShardSet {
             }
         }
         Ok(set)
+    }
+
+    /// The process-wide memory governor, for reporting.
+    #[must_use]
+    pub fn memory(&self) -> &Arc<crate::memory::MemoryGovernor> {
+        &self.inner.memory
     }
 
     /// Number of shards.

@@ -350,10 +350,15 @@ pub enum Counter {
     /// failure count - but each one leaves something behind, and a rising
     /// number means disk that nothing will ever free on its own.
     MaintenanceCleanupFailures = 42,
+    /// Writes refused because the memory budget was gone. Zero on a store with
+    /// no ceiling; a climb is the engine telling a client to slow down, which
+    /// is the signal an operator needs BEFORE the alternative, which is the
+    /// kernel telling the process to stop.
+    MemoryRefused = 43,
 }
 
 impl Counter {
-    pub const COUNT: usize = 43;
+    pub const COUNT: usize = 44;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -397,6 +402,7 @@ impl Counter {
         Counter::RunScanFallback,
         Counter::MaintenanceFailures,
         Counter::MaintenanceCleanupFailures,
+        Counter::MemoryRefused,
         Counter::VacuumSkipped,
     ];
 
@@ -445,6 +451,7 @@ impl Counter {
             Counter::RunScanFallback => "skeg_run_scan_fallback_total",
             Counter::MaintenanceFailures => "skeg_maintenance_failures_total",
             Counter::MaintenanceCleanupFailures => "skeg_maintenance_cleanup_failures_total",
+            Counter::MemoryRefused => "skeg_memory_refused_total",
             Counter::VacuumSkipped => "skeg_vacuum_skipped_total",
         }
     }

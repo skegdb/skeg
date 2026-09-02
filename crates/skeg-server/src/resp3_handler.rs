@@ -1691,6 +1691,35 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
             // Descriptors: one per vlog segment and per vindex segment file,
             // so an operator needs to see headroom BEFORE "too many open
             // files" turns into a failed open.
+            // The memory budget, reported rather than only enforced. A gate
+            // that watched a 256 MiB container survive could not tell whether
+            // the engine had SEEN the limit or got lucky, because nothing
+            // said. Three states, never one number pretending to cover them:
+            // a ceiling with room left, no ceiling at all, and a ceiling whose
+            // room could not be read - which is a refusal, not a licence.
+            let g = shards.memory();
+            let memory = match g.budget() {
+                crate::memory::Budget::Room(usable) => format!(
+                    "# TYPE skeg_memory_budget_state gauge\n\
+                     skeg_memory_budget_state{{state=\"known\"}} 1\n\
+                     # TYPE skeg_memory_headroom_bytes gauge\n\
+                     skeg_memory_headroom_bytes {usable}\n"
+                ),
+                crate::memory::Budget::Unlimited => "# TYPE skeg_memory_budget_state gauge\n\
+                     skeg_memory_budget_state{state=\"unlimited\"} 1\n"
+                    .to_owned(),
+                crate::memory::Budget::Unreadable => "# TYPE skeg_memory_budget_state gauge\n\
+                     skeg_memory_budget_state{state=\"unknown\"} 1\n"
+                    .to_owned(),
+            };
+            let memory = format!(
+                "{memory}# TYPE skeg_memory_reserved_bytes gauge\n\
+                 skeg_memory_reserved_bytes {}\n\
+                 # TYPE skeg_memory_reserve_bytes gauge\n\
+                 skeg_memory_reserve_bytes {}\n",
+                g.reserved_bytes(),
+                g.reserve_bytes(),
+            );
             let (fd_soft, _fd_hard) = skeg_platform::fd_limit();
             let fd_open = skeg_platform::open_fd_count();
             let process = format!(
@@ -1707,7 +1736,7 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
                 )),
             );
             let body = format!(
-                "{cache_line}\n\n{process}\n{}",
+                "{cache_line}\n\n{process}{memory}\n{}",
                 skeg_telemetry::stats::dump_text()
             );
             Frame::Bulk(Bytes::from(body))
@@ -1984,6 +2013,34 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn stats_reports_the_memory_budget() {
+        // A ceiling that is enforced and not readable leaves an operator to
+        // find out from the refusals. The container gate says so directly: it
+        // asks whether the engine SEES the limit, and a store that survives
+        // without reporting one survived without knowing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
+        let Frame::Bulk(body) = skeg_stats(&shards).await else {
+            panic!("a bulk summary");
+        };
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for line in [
+            "skeg_memory_budget_state",
+            "skeg_memory_reserved_bytes",
+            "skeg_memory_reserve_bytes",
+        ] {
+            assert!(text.contains(line), "STATS says nothing about {line}");
+        }
+        // The state is named, not encoded as a number a reader has to decode.
+        assert!(
+            text.contains("state=\"known\"")
+                || text.contains("state=\"unlimited\"")
+                || text.contains("state=\"unknown\""),
+            "the budget state is not one of the three: {text}"
+        );
+    }
 
     #[test]
     fn a_retryable_code_reaches_the_client_as_the_code() {
