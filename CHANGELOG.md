@@ -42,6 +42,75 @@ layout and changes nothing on disk, because serve mode runs over copies an
 operator may have mounted read-only. Directory scanning survives only as
 that one-way migration.
 
+### The catalogue decides what exists, not the resident map (P0)
+
+A vindex can be evicted from RAM without being dropped: its files stay, its
+registry entry stays, and the next access reopens it. `DROP` read absence off
+the resident map, so it answered "not found" for an index that was committed,
+on disk, and about to come back - and a tenant erasure, which built its work
+list the same way, walked past the tenant's own vectors. The KV sweep then
+took their payload blobs, the call reported success, and the vectors stayed on
+disk. The existing erasure test could not see it: it builds a flat index,
+which cannot be evicted, and its final assertion reads `VINDEX.LIST`, which
+walks the same map.
+
+Existence is now decided by the registry. A resident miss reopens through the
+same path a search uses, and only a miss there is a real absence.
+
+An index that is committed but will not OPEN can now be dropped too. Reading
+"cannot open" as "does not exist" left the store with a catalogue row nobody
+could remove. Its payload blobs are reclaimed by matching the key shape
+exactly rather than by asking the index for its live ids - which needs no open
+index, and which also stops `DROP ev` from taking the blobs of `ev2`, whose
+name it prefixes.
+
+`LIST`, `CHECK` and `HEALTH` stop drawing conclusions from the map's silence.
+`LIST` reports committed-but-evicted indexes and ends each line
+`resident=k/n`, where `n` is the store's shard count, so a row whose counts
+were summed over only some shards says so. `CHECK` no longer answers
+`Problems([])` - nothing wrong - about an index it never opened, and an
+unreadable registry is a finding rather than an error that takes the report
+down with it. `HEALTH` no longer answers "no such vindex" for an index
+committed on every shard and merely evicted from all of them; it reports
+`not_assessed` and has a state of its own, `UNASSESSED`, directly under
+`MISSING` because it carries the same information about health: none.
+
+`DROP` now walks the shard's key space to find blobs, so it is O(keyspace) -
+the property `SKEG.COUNT` and the erase sweep already declare. Measured at
+36-68 ns per key, which is +9 to +17 ms across 250k unrelated keys and, by
+extrapolation, under a second at ten million. `LIST` gained a per-shard
+registry read: 27-71 us per shard including the round trip, +0.9 us per index.
+
+### A catalogue fan-out that failed left the store split (P0)
+
+`VINDEX CREATE` and `DROP` reach every shard and each shard commits into its
+own registry. Nothing coordinated them: the first error was returned and the
+shards that had succeeded stayed committed, so the caller got an error
+describing a store it no longer had. Measured on four shards with one unable
+to write: a failed CREATE left the index on three of them accepting writes the
+caller believed impossible, and recreating the name with a different dim then
+took on the shard that had failed while the others refused it - one name, two
+dims, reported by `LIST` as a single agreed row. A failed DROP had already
+removed the data from three shards, leaving the fourth unreachable through
+search, still on disk, still catalogued, and back at the next open.
+
+A name is now recorded at the store root before the fan-out starts and cleared
+before any success is returned, so its presence means exactly "not
+acknowledged". A create that fails is undone at once on the shards that took
+it; anything left is resolved at the next open, before a shard serves
+anything, and the payload blobs and router sidecar go with it.
+
+The record names the operation, because the two do not resolve alike in one
+case: when the fan-out reached no shard at all, a create that succeeded
+unacknowledged must still be undone, but a DROP the store refused has an
+intact index and a caller who was told it failed. On a single-shard store that
+is every failed drop, not a corner.
+
+A read-only open cannot resolve, so it refuses to open a store with an
+unfinished fan-out and names the indexes, rather than serve around a
+half-state. Skipping those names at open is not a guard: the first query
+reopens the index lazily from the registry.
+
 ### A point read could return a stale vector (P0)
 
 `DiskVamanaIndex::get` checked the BASE before the RUNS, under a comment
