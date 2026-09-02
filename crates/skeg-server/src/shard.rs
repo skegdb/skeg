@@ -5631,6 +5631,14 @@ impl ShardSet {
             // tell the client a write failed that is committed and readable -
             // the same mistake as failing a DROP whose registry entry is
             // already published.
+            //
+            // Everything below is post-commit, so the failpoint returns the
+            // SUCCESS the client is owed: it models the process dying here,
+            // not the write failing.
+            crate::fp!(
+                crate::failpoint::WriteFailpoint::OverwriteOldCopyDelete,
+                Ok(())
+            );
             if let Some((old_primary, old_replica, _)) = old {
                 for s in std::iter::once(old_primary).chain(old_replica) {
                     if usize::from(s) != owner {
@@ -6040,6 +6048,20 @@ impl ShardSet {
     /// Rebuild the id -> owner-shard map for every routed vindex by asking
     /// each shard for its live ids. Called once after open.
     ///
+    /// The primary is the copy with the HIGHEST VERSION, not the first one
+    /// seen. It used to be the first, which means the lowest shard number,
+    /// which means a restart promoted whichever copy of a duplicated row
+    /// happened to sit lower - and a duplicate is a normal state here, left by
+    /// a crash mid-move or a cleanup that failed after an overwrite committed
+    /// elsewhere. Half the time the copy it promoted was the one the overwrite
+    /// had replaced, and every read after the restart returned it. Equal
+    /// versions still go to the lowest shard, so a set where nothing is
+    /// versioned reopens exactly as it did.
+    ///
+    /// It also seeds this index's version allocator past everything on disk,
+    /// which is what makes a user write after a restart beat every copy that
+    /// already exists.
+    ///
     /// # Errors
     ///
     /// A shard being unavailable.
@@ -6047,6 +6069,7 @@ impl ShardSet {
         let names: Vec<String> = self.inner.routers.read().keys().cloned().collect();
         for name in names {
             let mut map: OwnerMap = ahash::AHashMap::new();
+            let mut highest = 0u64;
             for shard in 0..self.inner.n {
                 match self
                     .call(shard, ShardReq::LiveIds { name: name.clone() })
@@ -6054,18 +6077,32 @@ impl ShardSet {
                 {
                     ShardResp::Ids(ids) => {
                         for (id, version) in ids {
-                            // First sighting is the primary, a second the
-                            // replica (lowest shard id wins primary - see the
-                            // reshard/overlap note).
-                            map.entry(id)
-                                .and_modify(|e| e.1 = Some(shard as u8))
-                                .or_insert((shard as u8, None, version));
+                            highest = highest.max(version);
+                            match map.entry(id) {
+                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    let (primary, _, live) = *e.get();
+                                    if version > live {
+                                        // The NEWER copy takes the primary
+                                        // slot and demotes the one that was
+                                        // there.
+                                        e.insert((shard as u8, Some(primary), version));
+                                    } else {
+                                        e.get_mut().1 = Some(shard as u8);
+                                    }
+                                }
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert((shard as u8, None, version));
+                                }
+                            }
                         }
                     }
                     ShardResp::Err(_) => {} // shard without this vindex yet
                     _ => return Err(ShardError::Unavailable),
                 }
             }
+            // Past everything on disk, so the next user write to this index
+            // beats every copy the rebuild just saw.
+            self.observe_version(&name, highest);
             self.inner.owners.write().insert(name, map);
         }
         Ok(())

@@ -461,7 +461,6 @@ async fn a_committed_move_with_a_surviving_old_copy(
 /// overwrite replaced, and every read after it returns the old value with a
 /// confident face.
 #[tokio::test]
-#[ignore = "opens in \"shard: rebuild the owner map by max(version)\""]
 async fn a_reopened_set_names_the_newest_copy_primary_not_the_lowest_shard() {
     let dir = tempfile::TempDir::new().unwrap();
     const N: u64 = 200;
@@ -488,7 +487,6 @@ async fn a_reopened_set_names_the_newest_copy_primary_not_the_lowest_shard() {
 /// search that disagree about which copy of a row is live is a wrong answer
 /// that cannot be recognised as one from either side.
 #[tokio::test]
-#[ignore = "opens in \"shard: rebuild the owner map by max(version)\""]
 async fn vget_and_vsearch_agree_on_which_copy_is_live_after_a_reopen() {
     let dir = tempfile::TempDir::new().unwrap();
     const N: u64 = 200;
@@ -602,7 +600,6 @@ async fn a_reshard_that_crashes_after_copy_before_delete_reopens_with_one_winner
 /// surviving old copy is an expected state, not a corrupt one. What must not
 /// happen is a restart promoting it.
 #[tokio::test]
-#[ignore = "opens in \"shard: rebuild the owner map by max(version)\""]
 async fn a_reopen_after_a_failed_old_copy_cleanup_still_names_the_new_copy_primary() {
     use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
     let dir = tempfile::TempDir::new().unwrap();
