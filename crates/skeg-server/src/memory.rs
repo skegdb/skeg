@@ -42,6 +42,9 @@ pub use skeg_platform::Headroom;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 /// 64 MiB: the floor for headroom, and the smallest reserve worth having.
 const MIN_RESERVE: u64 = 64 * 1024 * 1024;
@@ -76,6 +79,51 @@ pub struct PlatformMemory;
 impl MemorySource for PlatformMemory {
     fn headroom(&self) -> Headroom {
         skeg_platform::memory_status().available
+    }
+}
+
+/// A source read at most once per `ttl`, serving the last answer in between.
+///
+/// The real source walks the cgroup chain, reading `/proc/self/cgroup` and two
+/// files per level, on EVERY call. Admission happens per write, so consulting
+/// it directly would put several file reads on the hot path - which the plan
+/// forbids in the same breath as it asks for admission control, and rightly:
+/// a governor that costs more than the work it admits is not a governor.
+///
+/// The staleness this buys is bounded and paid for. Within one window the
+/// budget can be over-admitted by whatever arrives in it, which is why the
+/// governor holds a reserve back: the window is small, the reserve is not.
+/// Outstanding reservations are NOT stale - they are atomic - so a burst
+/// inside one window is still counted against itself.
+#[derive(Debug)]
+pub struct CachedMemory {
+    inner: Arc<dyn MemorySource>,
+    ttl: Duration,
+    /// `Mutex` and not a lock-free cell: the value is two words and the
+    /// contention window is a clock read. A racing pair may both refresh,
+    /// which costs a duplicate read and never a wrong answer.
+    last: Mutex<(Instant, Headroom)>,
+}
+
+impl CachedMemory {
+    #[must_use]
+    pub fn new(inner: Arc<dyn MemorySource>, ttl: Duration) -> Self {
+        let now = inner.headroom();
+        Self {
+            inner,
+            ttl,
+            last: Mutex::new((Instant::now(), now)),
+        }
+    }
+}
+
+impl MemorySource for CachedMemory {
+    fn headroom(&self) -> Headroom {
+        let mut guard = self.last.lock();
+        if guard.0.elapsed() >= self.ttl {
+            *guard = (Instant::now(), self.inner.headroom());
+        }
+        guard.1
     }
 }
 
@@ -165,6 +213,25 @@ fn default_reserve(limit: u64) -> u64 {
     MIN_RESERVE.max(limit / RESERVE_DIVISOR)
 }
 
+/// How long a cgroup reading is reused.
+///
+/// Sized against the reserve it can overshoot, not picked round. At the
+/// fastest ingest measured - about 8,500 rows/s - a hundred milliseconds
+/// admits some 850 rows, which at 1024 dimensions is 3.4 MiB. The smallest
+/// reserve is 64 MiB, so the worst stale window spends about five per cent of
+/// the margin held back for exactly this.
+pub const MEMORY_CACHE_TTL: Duration = Duration::from_millis(100);
+
+/// Parse a byte count an operator set. Empty and unparseable are both "not
+/// set": a typo must not silently become a budget of zero, which would refuse
+/// every write while looking configured.
+fn parse_bytes(v: Option<&str>) -> Option<u64> {
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
 /// Admission control over a single process-wide budget.
 #[derive(Debug)]
 pub struct MemoryGovernor {
@@ -217,6 +284,38 @@ impl MemoryGovernor {
             reserve,
             outstanding: AtomicU64::new(0),
         })
+    }
+
+    /// The one an operator gets: the platform, cached, with the overrides the
+    /// refusal messages promise.
+    ///
+    /// `SKEG_MEMORY_LIMIT_BYTES` is that promise. It was named in two error
+    /// strings and read by nobody, so the escape hatch the governor offered
+    /// when it could not see did not exist.
+    ///
+    /// # Errors
+    /// Propagates [`MemoryGovernor::new`].
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_settings(
+            std::env::var("SKEG_MEMORY_LIMIT_BYTES").ok().as_deref(),
+            std::env::var("SKEG_MEMORY_RESERVE_BYTES").ok().as_deref(),
+        )
+    }
+
+    /// [`MemoryGovernor::from_env`] with the values supplied, so the parsing
+    /// is testable without touching process-wide state.
+    ///
+    /// # Errors
+    /// Propagates [`MemoryGovernor::new`].
+    pub fn from_settings(limit: Option<&str>, reserve: Option<&str>) -> Result<Self, String> {
+        Self::new(
+            Arc::new(CachedMemory::new(
+                Arc::new(PlatformMemory),
+                MEMORY_CACHE_TTL,
+            )),
+            parse_bytes(limit),
+            parse_bytes(reserve),
+        )
     }
 
     /// Headroom the governor will hand out: what is left, less the reserve.
@@ -326,6 +425,68 @@ mod tests {
         fn headroom(&self) -> Headroom {
             self.0
         }
+    }
+
+    /// Counts how often the source underneath was actually asked.
+    #[derive(Debug)]
+    struct Counting(AtomicU64, Headroom);
+
+    impl MemorySource for Counting {
+        fn headroom(&self) -> Headroom {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            self.1
+        }
+    }
+
+    #[test]
+    fn an_operator_override_that_is_not_a_number_is_not_a_budget_of_zero() {
+        // A typo reaching the governor as `Some(0)` would refuse every write
+        // while looking configured - the placebo in reverse.
+        assert_eq!(parse_bytes(Some("1048576")), Some(1_048_576));
+        assert_eq!(parse_bytes(Some("  4096  ")), Some(4096));
+        for bad in ["", "   ", "banana", "-1", "1MiB", "0"] {
+            assert_eq!(parse_bytes(Some(bad)), None, "for {bad:?}");
+        }
+        assert_eq!(parse_bytes(None), None);
+    }
+
+    #[test]
+    fn the_cache_asks_the_source_once_per_window() {
+        // The real source reads several files per call and admission runs per
+        // write. Without this the governor would cost more than the work.
+        let src = Arc::new(Counting(AtomicU64::new(0), Headroom::Known(1_000)));
+        let cache = CachedMemory::new(src.clone(), Duration::from_secs(3600));
+        // One read at construction, so the first answer is never a guess.
+        assert_eq!(src.0.load(Ordering::Acquire), 1);
+        for _ in 0..1_000 {
+            assert_eq!(cache.headroom(), Headroom::Known(1_000));
+        }
+        assert_eq!(
+            src.0.load(Ordering::Acquire),
+            1,
+            "a thousand admissions asked the cgroup more than once"
+        );
+    }
+
+    #[test]
+    fn the_cache_refreshes_after_its_window() {
+        let src = Arc::new(Counting(AtomicU64::new(0), Headroom::Known(1_000)));
+        let cache = CachedMemory::new(src.clone(), Duration::ZERO);
+        cache.headroom();
+        cache.headroom();
+        assert!(
+            src.0.load(Ordering::Acquire) >= 3,
+            "a zero window must not freeze the answer forever"
+        );
+    }
+
+    #[test]
+    fn the_cache_does_not_turn_unknown_into_a_number() {
+        // Unknown is a refusal. A cache that smoothed it into the last known
+        // value would switch the governor off exactly when it cannot see.
+        let src = Arc::new(Counting(AtomicU64::new(0), Headroom::Unknown));
+        let cache = CachedMemory::new(src, Duration::from_secs(3600));
+        assert_eq!(cache.headroom(), Headroom::Unknown);
     }
 
     fn gov(h: Headroom, reserve: u64) -> Arc<MemoryGovernor> {

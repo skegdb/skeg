@@ -1716,8 +1716,25 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
     }
 }
 
+/// Error codes a shard may already carry, which must reach the client intact.
+///
+/// The first word of a RESP error IS the code - `ERR`, `WRONGTYPE`, `LOADING` -
+/// and that is what a client routes on. Prefixing `ERR` in front of a code the
+/// engine chose turns a condition the caller should RETRY into a generic
+/// failure it should not, which is the whole difference between backpressure
+/// and an error.
+const SHARD_ERROR_CODES: &[&str] = &["BACKPRESSURE "];
+
 fn shard_error(e: &crate::shard::ShardError) -> Frame {
     warn!("shard error: {e}");
+    // The payload, not the Display: `Storage` renders as "storage error: ..."
+    // and a code buried behind that prose is not a code. Checked against the
+    // variant so the test cannot pass on a formatting assumption.
+    if let crate::shard::ShardError::Storage(msg) = e
+        && SHARD_ERROR_CODES.iter().any(|c| msg.starts_with(c))
+    {
+        return Frame::Error(msg.clone());
+    }
     Frame::Error(format!("ERR {e}"))
 }
 
@@ -1967,6 +1984,34 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_retryable_code_reaches_the_client_as_the_code() {
+        // ERR in front of BACKPRESSURE tells a client not to retry something
+        // it should retry.
+        let f = shard_error(&crate::shard::ShardError::Storage(
+            "BACKPRESSURE out of memory budget: reserved=1 requested=2 usable=1".to_owned(),
+        ));
+        let Frame::Error(s) = f else {
+            panic!("an error frame");
+        };
+        assert!(s.starts_with("BACKPRESSURE "), "the code was buried: {s}");
+    }
+
+    #[test]
+    fn an_ordinary_error_still_gets_the_generic_code() {
+        let f = shard_error(&crate::shard::ShardError::Storage(
+            "vindex 'x' not found".to_owned(),
+        ));
+        let Frame::Error(s) = f else {
+            panic!("an error frame");
+        };
+        assert!(
+            s.starts_with("ERR "),
+            "an error with no code of its own must get the generic one: {s}"
+        );
+        assert!(s.contains("vindex 'x' not found"), "{s}");
+    }
     use super::{
         AUTH_FAIL_MAX, Command, TenantId, auth_clear, auth_is_blocked, auth_record_failure,
         is_pipelineable, scope_vindex_or_reject,

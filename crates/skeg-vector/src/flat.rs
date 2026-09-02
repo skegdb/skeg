@@ -84,6 +84,13 @@ impl FlatIndex {
 
     /// Number of live vectors.
     #[must_use]
+    /// Heap this index holds. Everything it has, because a flat index keeps
+    /// every vector in RAM and nothing flushes it: unlike the disk backend it
+    /// never gives any of it back, which is why admission must see it.
+    pub fn resident_bytes(&self) -> usize {
+        self.f32_data.len() * std::mem::size_of::<f32>()
+    }
+
     pub fn len(&self) -> usize {
         self.live_count
     }

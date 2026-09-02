@@ -68,13 +68,36 @@ pub fn memory_status() -> MemoryStatus {
         MemoryStatus {
             limit_bytes: None,
             current_bytes: Some(rss_bytes()),
-            // No cgroup accounting on this platform, so the room left is
-            // UNKNOWN - not unlimited. RSS is a signal, not an accounting, and
-            // a budget must not be derived from it. The caller decides what an
-            // unknown budget means; this must not decide it for them by
-            // reporting a number that looks safe.
-            available: cgroup::Headroom::Unknown,
+            // No cgroup sets a limit here, which is what `Unlimited` means -
+            // "nothing to be killed for" - and it is the truth: there is no
+            // ceiling for a governor to respect. It used to report `Unknown`,
+            // reasoning that an unmeasurable platform should not hand back a
+            // number that looks safe. But `Unknown` means a ceiling APPLIES and
+            // could not be read, and a fail-closed caller refused every write
+            // on this platform as a result.
+            //
+            // No number is handed back either way: `Unlimited` is not a size.
+            // An operator who wants a budget where the platform imposes none
+            // sets `SKEG_MEMORY_LIMIT_BYTES`, which is the same lever the
+            // refusal message names. RSS stays a signal and is still not an
+            // accounting: nothing derives a budget from it.
+            available: cgroup::Headroom::Unlimited,
         }
+    }
+}
+
+#[cfg(test)]
+mod platform_headroom_tests {
+    use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_platform_without_cgroups_reports_no_ceiling_not_an_unreadable_one() {
+        // `Unknown` is fail-closed for its callers, so reporting it where no
+        // ceiling exists refuses every write on a machine that has no limit to
+        // respect. Caught by 25 tests at once, which is the good version of
+        // finding out.
+        assert_eq!(memory_status().available, cgroup::Headroom::Unlimited);
     }
 }
 

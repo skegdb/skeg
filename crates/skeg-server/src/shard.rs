@@ -99,6 +99,21 @@ use xxhash_rust::xxh3::xxh3_64;
 /// VSET updates both atomically and a filtered VSEARCH reads a consistent view.
 struct Vindex {
     backend: VectorBackend,
+    /// What this index has promised the process-wide governor for the heap its
+    /// delta is holding. Resized as the delta grows, and released when the
+    /// `Vindex` is dropped.
+    ///
+    /// Held for as long as the memory is, which double-counts against a LIVE
+    /// source: the cgroup already subtracts the delta's allocation from its own
+    /// headroom, and this promises it again. The effect is conservative - the
+    /// delta is admitted up to about half the usable budget instead of all of
+    /// it - and it is the price of a bound that does not depend on how quickly
+    /// `memory.current` catches up. The transient alternative (reserve, insert,
+    /// release) bounds nothing on its own: it leans entirely on the cgroup
+    /// shrinking in time, which under fast ingest is exactly what it does not
+    /// do. Upgrade path, if the halving ever costs: subtract what is
+    /// outstanding from the observed headroom inside the source.
+    memory: Option<crate::memory::MemoryReservation>,
     /// Effective quantization kind exposed to clients. Disk f32/binary requests
     /// use the int8 disk fallback, so this records the tier actually in use.
     kind: u8,
@@ -130,10 +145,56 @@ struct Vindex {
     flush_streak: AtomicU64,
 }
 
+/// Bytes reserved in one step. The delta grows a row at a time and the
+/// governor is an atomic compare-exchange, so asking per row would be correct
+/// and wasteful; a megabyte is about a thousand rows at 256 dimensions.
+const MEMORY_CHUNK: u64 = 1024 * 1024;
+
 impl Vindex {
+    /// Hold a promise covering `want` bytes of delta, rounded up to whole
+    /// chunks. Grows and SHRINKS: a flush that gave the heap back is picked up
+    /// here on the next write, which is the only moment the answer matters.
+    /// An idle index keeps its last promise, which is memory it is not using -
+    /// harmless, because an idle store is not the one under pressure.
+    ///
+    /// Growing takes the new promise BEFORE dropping the old, so a refusal
+    /// leaves the existing one intact. It also means the two overlap for an
+    /// instant; chunking makes that instant rare.
+    fn reserve_memory(
+        &mut self,
+        governor: &Arc<crate::memory::MemoryGovernor>,
+        want: u64,
+    ) -> Result<(), crate::memory::MemoryRejected> {
+        let chunks = want.div_ceil(MEMORY_CHUNK);
+        let need = chunks.saturating_mul(MEMORY_CHUNK);
+        if self.memory.as_ref().is_some_and(|r| r.bytes() == need) {
+            return Ok(()); // the common case: same chunk count as last time
+        }
+        let held = self
+            .memory
+            .as_ref()
+            .map_or(0, crate::memory::MemoryReservation::bytes);
+        if need <= held {
+            // SHRINKING: release first. Taking the smaller promise while still
+            // holding the larger one puts both outstanding for an instant, and
+            // against a tight budget that instant can be refused - turning a
+            // reduction into a rejected write.
+            self.memory = None;
+            if need == 0 {
+                return Ok(());
+            }
+        }
+        // Growing: take the new promise before dropping the old, so a refusal
+        // leaves the existing one intact.
+        let next = governor.try_reserve(need)?;
+        self.memory = Some(next);
+        Ok(())
+    }
+
     fn new(backend: VectorBackend, kind: u8) -> Self {
         Self {
             backend,
+            memory: None,
             kind,
             payload: PayloadIndex::default(),
             payload_loaded: true,
@@ -453,6 +514,22 @@ impl VectorBackend {
         match self {
             VectorBackend::Flat(_) => 0,
             VectorBackend::Disk(i) => i.delta_len(),
+        }
+    }
+
+    /// Heap this index holds: for the disk backend the delta plus any flush
+    /// staging, which a flush gives back; for the flat backend everything,
+    /// which nothing gives back.
+    fn resident_bytes(&self) -> u64 {
+        match self {
+            // A flat index is ALL of it: it keeps every vector in RAM and
+            // nothing flushes it, so it is the case admission most needs to
+            // cover rather than the one it can skip. Reporting zero here
+            // exempted the only backend that never gives anything back - and
+            // did not even exempt it kindly, since a cost that never grows
+            // rounds every insert up to one whole chunk.
+            VectorBackend::Flat(i) => i.resident_bytes() as u64,
+            VectorBackend::Disk(i) => i.resident_bytes() as u64,
         }
     }
 
@@ -2388,6 +2465,7 @@ fn run_shard(
     mmap_tier: bool,
     mmap_graph: bool,
     quota: Arc<crate::quota::TenantVectorQuota>,
+    memory: Arc<crate::memory::MemoryGovernor>,
     disk_counter: skeg_core::SharedTenantDisk,
     // Names whose catalogue fan-out never finished, decided by the coordinator
     // because deciding needs every shard's registry at once. Writable: remove
@@ -2605,6 +2683,7 @@ fn run_shard(
                     let vindexes = vindexes.clone();
                     let dir = dir.clone();
                     let quota = quota.clone();
+                    let memory_task = memory.clone();
                     let vsearch_pool = vsearch_pool.clone();
                     let shard_id_u16 = shard_id as u16;
                     tokio::task::spawn_local(async move {
@@ -2621,6 +2700,7 @@ fn run_shard(
                             read_only,
                             vsearch_pool.as_deref(),
                             &quota,
+                            &memory_task,
                             tier,
                             mmap_tier,
                             mmap_graph,
@@ -2993,6 +3073,7 @@ async fn process(
     read_only: bool,
     vsearch_pool: Option<&VsearchPool>,
     quota: &Arc<crate::quota::TenantVectorQuota>,
+    memory: &Arc<crate::memory::MemoryGovernor>,
     tier: QuantKind,
     mmap_tier: bool,
     mmap_graph: bool,
@@ -3461,6 +3542,24 @@ async fn process(
                                 && quota.try_add(tenant, 1, max).is_err()
                             {
                                 return ShardResp::Err("tenant vector quota exceeded".to_owned());
+                            }
+                            // Memory admission, same shape as the quota above
+                            // and for the same reason: refuse BEFORE storing,
+                            // under this write lock, so a refusal leaves
+                            // nothing behind. The cost is what the delta will
+                            // hold - f32 per dimension - and it is charged
+                            // against a promise covering the whole delta, not
+                            // this row, so the bound is on the buffer rather
+                            // than on the request.
+                            let want = idx.backend.resident_bytes()
+                                + (vector.len() * std::mem::size_of::<f32>()) as u64;
+                            if let Err(rejected) = idx.reserve_memory(memory, want) {
+                                if was_new && limit.is_some() {
+                                    quota.sub(tenant, 1);
+                                }
+                                return ShardResp::Err(format!(
+                                    "BACKPRESSURE out of memory budget: {rejected}"
+                                ));
                             }
                             match idx.backend.insert(id, &vector) {
                                 Ok(()) => {
@@ -4029,6 +4128,31 @@ impl ShardSet {
         mmap_tier: bool,
         mmap_graph: bool,
     ) -> std::io::Result<Self> {
+        let memory =
+            Arc::new(crate::memory::MemoryGovernor::from_env().map_err(std::io::Error::other)?);
+        Self::open_full_with_memory(
+            base_dir, n_shards, read_only, tier, workers, mmap_tier, mmap_graph, memory,
+        )
+    }
+
+    /// [`ShardSet::open_mode_full_mmap`] with the memory governor supplied, so a
+    /// test can hand it a budget it controls instead of the machine's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the layout refuses, a shard fails to open, or a
+    /// worker thread cannot be spawned.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_full_with_memory(
+        base_dir: &Path,
+        n_shards: usize,
+        read_only: bool,
+        tier: QuantKind,
+        workers: usize,
+        mmap_tier: bool,
+        mmap_graph: bool,
+        memory: Arc<crate::memory::MemoryGovernor>,
+    ) -> std::io::Result<Self> {
         // The store declares its own shape, and this is the ONE place that
         // asks. A caller's `n_shards` is a request, not an authority: if the
         // manifest disagrees, or the directories disagree with the manifest,
@@ -4144,6 +4268,7 @@ impl ShardSet {
             let in_flight = in_flight.clone();
             let (tx, rx) = tokio::sync::mpsc::channel::<ShardMsg>(SHARD_INBOX_CAPACITY);
             let quota = quota.clone();
+            let memory = memory.clone();
             let disk_counter = disk_counter.clone();
             let ready_tx = ready_tx.clone();
             let handle = std::thread::Builder::new()
@@ -4159,6 +4284,7 @@ impl ShardSet {
                         mmap_tier,
                         mmap_graph,
                         quota,
+                        memory,
                         disk_counter,
                         in_flight,
                         ready_tx,
@@ -8189,6 +8315,113 @@ mod tests {
         assert!(
             ctl.open_indices().await.iter().any(|s| s.index == "ev"),
             "reopened index is resident again"
+        );
+    }
+
+    /// A source whose headroom the test dictates.
+    #[derive(Debug)]
+    struct FixedHeadroom(u64);
+
+    impl crate::memory::MemorySource for FixedHeadroom {
+        fn headroom(&self) -> crate::memory::Headroom {
+            crate::memory::Headroom::Known(self.0)
+        }
+    }
+
+    fn shards_with_budget(dir: &std::path::Path, n: usize, headroom: u64) -> ShardSet {
+        // Reserve 0: the test is about the budget being reached, not about the
+        // margin held back, and a default reserve larger than the budget would
+        // refuse the very first write for a different reason.
+        let gov =
+            crate::memory::MemoryGovernor::new(Arc::new(FixedHeadroom(headroom)), None, Some(0))
+                .expect("a governor over a fixed headroom");
+        ShardSet::open_full_with_memory(
+            dir,
+            n,
+            false,
+            QuantKind::TurboQuant { bits: 2 },
+            0,
+            false,
+            false,
+            Arc::new(gov),
+        )
+        .expect("a store")
+    }
+
+    /// The governor is built, tested, and asked by nobody: the write path never
+    /// consults it. Measured in a 256 MiB container - 90,200 rows acknowledged,
+    /// then OOMKilled, exit 137, not one write refused.
+    ///
+    /// A store whose whole budget is smaller than the vectors it is being sent
+    /// must refuse, and say so, rather than accept until the kernel intervenes.
+    #[tokio::test]
+    async fn a_write_is_refused_once_the_memory_budget_is_gone() {
+        let dir = TempDir::new().unwrap();
+        // 1 MiB of headroom against 1 KiB rows: the budget is reached in about
+        // a thousand rows, long before any test timeout.
+        let shards = shards_with_budget(dir.path(), 2, 1024 * 1024);
+        shards.vindex_create("m", 256, 4, 1).await.unwrap();
+
+        let mut accepted = 0u64;
+        let mut refusal = None;
+        for id in 0..20_000u64 {
+            match shards.vset("m", id, vec![0.5f32; 256], 0, None, None).await {
+                Ok(()) => accepted += 1,
+                Err(e) => {
+                    refusal = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = refusal.unwrap_or_else(|| {
+            panic!("{accepted} rows went in under a 1 MiB budget and none was refused")
+        });
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memory"),
+            "the refusal must name the budget, got: {msg}"
+        );
+        assert!(
+            accepted > 0,
+            "the budget refused the very first row: the test measures nothing"
+        );
+    }
+
+    /// A flat index is the case admission most needs to cover, not the one it
+    /// can skip: it holds every vector in RAM and nothing ever flushes it, so
+    /// it only grows. Reporting it as costing nothing exempted the one backend
+    /// that can never give anything back.
+    #[tokio::test]
+    async fn a_flat_index_is_admitted_against_the_budget_too() {
+        let dir = TempDir::new().unwrap();
+        let shards = shards_with_budget(dir.path(), 2, 8 * 1024 * 1024);
+        // backend 0 = flat, entirely resident.
+        shards.vindex_create("f", 256, 0, 0).await.unwrap();
+
+        let mut accepted = 0u64;
+        let mut refusal = None;
+        for id in 0..20_000u64 {
+            match shards.vset("f", id, vec![0.5f32; 256], 0, None, None).await {
+                Ok(()) => accepted += 1,
+                Err(e) => {
+                    refusal = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(
+            refusal.is_some(),
+            "{accepted} rows went into a flat index under the budget and none \
+             was refused"
+        );
+        // Not just "refused": refused after holding a useful amount. The first
+        // version of this test asserted only that something was refused, and
+        // passed while admitting ONE row per shard - the flat index reported
+        // no cost, so every insert asked for a whole chunk.
+        assert!(
+            accepted > 1_000,
+            "only {accepted} rows fit in an 8 MiB budget: admission is not \
+             tracking what the index actually holds"
         );
     }
 

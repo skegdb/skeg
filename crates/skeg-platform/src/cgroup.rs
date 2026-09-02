@@ -148,10 +148,16 @@ pub enum Headroom {
     Known(u64),
     /// No cgroup on the chain sets a memory limit: nothing to be killed for.
     Unlimited,
-    /// A limit exists and the room left could not be computed - usage
-    /// unreadable, or no cgroup accounting on this platform at all. NOT a
-    /// synonym for `Unlimited`, and the caller has to decide what to do about
-    /// it rather than being handed a number that looks safe.
+    /// A limit APPLIES and the room left could not be computed: the chain says
+    /// there is a ceiling, and `memory.current` would not read.
+    ///
+    /// Not a synonym for `Unlimited`, and not a home for "this platform has no
+    /// cgroups". That clause used to be here, and it overlapped `Unlimited`'s
+    /// own definition - no cgroup sets a limit, nothing to be killed for -
+    /// which is exactly what a platform without cgroups is. A fail-closed
+    /// caller reading that state refused every write on macOS, which is not a
+    /// safety property: a governor cannot bound what no ceiling constrains, and
+    /// refusing everything is broken rather than careful.
     #[default]
     Unknown,
 }
