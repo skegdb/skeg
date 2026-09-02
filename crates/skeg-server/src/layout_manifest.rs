@@ -138,7 +138,7 @@ impl LayoutManifest {
         match skeg_platform::read_small_bytes(&path) {
             Ok(bytes) => {
                 let m = Self::decode(&bytes, root)?;
-                m.check_directories(root)?;
+                m.check_directories(root, mode)?;
                 if let OpenMode::ReadWrite { requested_shards } = mode
                     && requested_shards != m.shard_count
                 {
@@ -210,22 +210,32 @@ impl LayoutManifest {
     /// The manifest and the directories are two statements about one fact. If
     /// they disagree the only safe move is to refuse: picking a winner is how
     /// a store gets served with a shard missing.
-    fn check_directories(&self, root: &Path) -> io::Result<()> {
-        for i in 0..self.shard_count.get() {
-            let d = root.join(format!("shard-{i}"));
-            // A store whose shards have not been created yet is legitimate -
-            // the manifest is written BEFORE them, deliberately, so a crash
-            // between the two leaves a declared layout rather than a guessed
-            // one. Only a PARTIAL set is a contradiction.
-            if !d.is_dir() && i > 0 && root.join("shard-0").is_dir() {
-                return Err(invalid(format!(
-                    "{} declares {} shards but {} is missing: refusing to \
-                     serve around a hole",
-                    root.join(FILE).display(),
-                    self.shard_count,
-                    d.display()
-                )));
-            }
+    fn check_directories(&self, root: &Path, mode: OpenMode) -> io::Result<()> {
+        let ids = scan_shard_ids(root)?;
+        if ids.is_empty() {
+            // A writable new store publishes its manifest before it creates
+            // the shard directories. Only that construction window is empty;
+            // a read-only store with no shards has nothing it can serve.
+            return match mode {
+                OpenMode::ReadWrite { .. } => Ok(()),
+                OpenMode::ReadOnly => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} declares {} shards but none exist",
+                        root.join(FILE).display(),
+                        self.shard_count
+                    ),
+                )),
+            };
+        }
+        let count = self.shard_count.get();
+        if ids.len() != count || ids.iter().copied().ne(0..count) {
+            return Err(invalid(format!(
+                "{} declares {} shards but disk contains {ids:?}: refusing \
+                 to serve a different set",
+                root.join(FILE).display(),
+                self.shard_count
+            )));
         }
         Ok(())
     }
@@ -335,23 +345,7 @@ fn fresh_uuid() -> io::Result<[u8; 16]> {
 /// through [`LayoutManifest::open_or_migrate`], so there is exactly one place
 /// that decides how many shards a store has.
 fn scan_shard_count(root: &Path) -> io::Result<ShardCount> {
-    let mut ids: Vec<usize> = Vec::new();
-    for e in std::fs::read_dir(root)? {
-        // NOT `.flatten()`: swallowing an unreadable entry lets discovery
-        // conclude the layout simply HAS fewer shards, which is the exact
-        // failure this function exists to refuse.
-        let e = e?;
-        let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if let Some(rest) = name.strip_prefix("shard-")
-            && let Ok(id) = rest.parse::<usize>()
-            && e.path().is_dir()
-        {
-            ids.push(id);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
+    let ids = scan_shard_ids(root)?;
     let Some(&highest) = ids.last() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -370,4 +364,44 @@ fn scan_shard_count(root: &Path) -> io::Result<ShardCount> {
         )));
     }
     ShardCount::checked(highest + 1, &root.display().to_string())
+}
+
+/// Sorted, unique numeric shard directory ids. Both declared layouts and the
+/// legacy migration path use this scanner so they cannot disagree about what
+/// is on disk.
+fn scan_shard_ids(root: &Path) -> io::Result<Vec<usize>> {
+    let mut ids: Vec<usize> = Vec::new();
+    for e in std::fs::read_dir(root)? {
+        // NOT `.flatten()`: swallowing an unreadable entry lets discovery
+        // conclude the layout simply HAS fewer shards, which is the exact
+        // failure this function exists to refuse.
+        let e = e?;
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(rest) = name.strip_prefix("shard-") {
+            let id = rest.parse::<usize>().map_err(|_| {
+                invalid(format!(
+                    "{} uses the reserved shard namespace but is not a \
+                     numeric shard directory",
+                    e.path().display()
+                ))
+            })?;
+            if name != format!("shard-{id}") {
+                return Err(invalid(format!(
+                    "{} is not the canonical name shard-{id}",
+                    e.path().display()
+                )));
+            }
+            if !e.path().is_dir() {
+                return Err(invalid(format!(
+                    "{} names shard {id} but is not a directory",
+                    e.path().display()
+                )));
+            }
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }

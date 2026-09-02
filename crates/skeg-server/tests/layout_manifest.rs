@@ -214,6 +214,76 @@ fn a_manifest_that_contradicts_the_directories_refuses() {
 }
 
 #[test]
+fn a_manifest_cannot_hide_a_missing_shard_zero() {
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(4)).unwrap();
+    for i in 1..4 {
+        std::fs::create_dir_all(dir.path().join(format!("shard-{i}"))).unwrap();
+    }
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("a manifest cannot make a set without shard-0 complete");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_manifest_cannot_hide_an_extra_shard() {
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(4)).unwrap();
+    for i in 0..=4 {
+        std::fs::create_dir_all(dir.path().join(format!("shard-{i}"))).unwrap();
+    }
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("a shard outside the declared range must not be ignored");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_noncanonical_shard_alias_refuses() {
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(1)).unwrap();
+    std::fs::create_dir_all(dir.path().join("shard-00")).unwrap();
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("shard-00 must not impersonate canonical shard-0");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_malformed_reserved_shard_name_refuses() {
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(1)).unwrap();
+    std::fs::create_dir_all(dir.path().join("shard-0")).unwrap();
+    std::fs::create_dir_all(dir.path().join("shard-garbage")).unwrap();
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("a malformed name in the shard namespace must not be ignored");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_shard_path_that_is_not_a_directory_refuses_as_corrupt() {
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(1)).unwrap();
+    std::fs::write(dir.path().join("shard-0"), b"not a shard directory").unwrap();
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("a regular file cannot satisfy a declared shard");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_manifest_without_shard_directories_is_not_a_read_only_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    LayoutManifest::open_or_migrate(dir.path(), rw(4)).unwrap();
+
+    let err = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly)
+        .expect_err("a declared but empty layout has nothing to serve");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
 fn an_empty_read_only_directory_refuses() {
     // Nothing to serve, and nothing to deduce. The old code called this one
     // shard and started.
@@ -330,7 +400,10 @@ fn a_shard_count_at_the_bound_is_still_accepted() {
     bytes[40..44].copy_from_slice(&sum.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
 
-    let m = LayoutManifest::open_or_migrate(dir.path(), OpenMode::ReadOnly).unwrap();
+    // This test isolates the numeric bound. A manifest with no shard
+    // directories is valid only during writable store construction; a
+    // read-only open correctly refuses it because there is nothing to serve.
+    let m = LayoutManifest::open_or_migrate(dir.path(), rw(MAX_SHARDS)).unwrap();
     assert_eq!(m.shard_count().get(), MAX_SHARDS);
 }
 
