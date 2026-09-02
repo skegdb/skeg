@@ -24,11 +24,15 @@ services:
     container_name: skeg
     restart: unless-stopped
     ports:
-      - "7379:7379"   # native protocol (skeg-py, skeg-ollama, skeg-client-rs)
+      # Loopback-only: this image has no authentication, so the port is
+      # published on the host loopback rather than all interfaces.
+      - "127.0.0.1:7379:7379"   # native protocol (skeg-py, skeg-ollama, skeg-client-rs)
     volumes:
       - skeg-data:/var/lib/skeg
     environment:
       SKEG_ADDR: 0.0.0.0:7379
+      # No auth in this image; required to bind 0.0.0.0 inside the container.
+      SKEG_ALLOW_UNAUTHENTICATED_NETWORK: "1"
       SKEG_DATA_DIR: /var/lib/skeg
       RUST_LOG: info
 
@@ -40,11 +44,12 @@ services:
   #   entrypoint: ["/usr/local/bin/skeg-resp3"]
   #   restart: unless-stopped
   #   ports:
-  #     - "6379:6379"
+  #     - "127.0.0.1:6379:6379"
   #   volumes:
   #     - skeg-data:/var/lib/skeg
   #   environment:
   #     SKEG_ADDR: 0.0.0.0:6379
+  #     SKEG_ALLOW_UNAUTHENTICATED_NETWORK: "1"
   #     SKEG_DATA_DIR: /var/lib/skeg
 
   ollama:

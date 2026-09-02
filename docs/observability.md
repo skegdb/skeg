@@ -8,8 +8,11 @@ v0.3.6, how to wire it up, and what is coming next.
 
 ```bash
 # Start skeg with the Prometheus exporter on port 9090.
+# skeg has no authentication, so a non-loopback --addr needs the explicit
+# opt-in below (or bind --addr 127.0.0.1:7379 instead).
 skeg --mode serve --tier pq:128:256 --data-dir /var/skeg \
-     --addr 0.0.0.0:7379 --metrics-port 9090
+     --addr 0.0.0.0:7379 --metrics-port 9090 \
+     --allow-unauthenticated-network
 
 # Scrape it.
 curl http://127.0.0.1:9090/metrics
