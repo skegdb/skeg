@@ -329,9 +329,28 @@ mod tests {
     }
 
     #[test]
-    fn an_enormous_file_is_refused_without_reading_it() {
+    fn an_enormous_file_is_refused_by_its_size_before_it_is_read() {
+        // `is_err()` alone said nothing here: a file of zeros fails the magic
+        // check too, so the test passed with the size bound deleted outright -
+        // verified by removing it. What the name claims is that the refusal
+        // happens WITHOUT reading the file, and the only way to see that from
+        // outside is WHICH check fired: the size gate returns `Other`, every
+        // parse failure returns `InvalidData`.
+        //
+        // A file cannot be both oversized and otherwise valid - `MAX_BYTES` is
+        // computed as the largest a valid one can be - so the order of the two
+        // checks is the whole property.
         let dir = TempDir::new().unwrap();
         std::fs::write(path(dir.path()), vec![0u8; (MAX_BYTES + 1) as usize]).unwrap();
-        assert!(pending(dir.path()).is_err());
+        let err = pending(dir.path()).unwrap_err();
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "refused by parsing it, which means it was read: {err}"
+        );
+        assert!(
+            err.to_string().contains(&MAX_BYTES.to_string()),
+            "the refusal must name the bound it hit: {err}"
+        );
     }
 }
