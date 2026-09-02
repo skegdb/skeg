@@ -1009,10 +1009,11 @@ enum ShardResp {
     Graph(Vec<(u64, u32)>, Vec<(u64, u64)>),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
-    /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
-    /// hits. `payload` is `Some` only when the request set `want_payload`;
-    /// otherwise always `None`, so the non-payload path encodes identically.
-    Vsearch(Vec<(u64, f32, Option<Bytes>)>),
+    /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload,
+    /// version)` hits. `payload` is `Some` only when the request set
+    /// `want_payload`; otherwise always `None`, so the non-payload path
+    /// encodes identically.
+    Vsearch(Vec<VsearchHit>),
     /// Evict result: `true` if an entry was present and removed, `false` if it
     /// was already absent (evicted or never open) on this shard.
     Evicted(bool),
@@ -3951,6 +3952,11 @@ async fn process(
             }
             // The walk runs under the write lock; the guard is dropped before
             // any payload `await`, on both routes.
+            //
+            // Cloned because the pooled route MOVES `arc` into the worker
+            // closure, and the versions have to be read from the same entry
+            // after the walk.
+            let versioned = arc.clone();
             let hits = match vsearch_pool {
                 Some(pool) => {
                     let walk_name = name.clone();
@@ -3972,10 +3978,26 @@ async fn process(
                 // Fetch a payload per local hit; some get trimmed by the global
                 // top-k merge, but k is small. Route the final-k by id if it
                 // ever bites.
-                Ok(hits) => match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
-                    Ok(out) => ShardResp::Vsearch(out),
-                    Err(e) => ShardResp::Err(e),
-                },
+                Ok(hits) => {
+                    // One lookup per local hit, k of them, off the walk and
+                    // before any await: the merge upstream cannot rank two
+                    // copies of an id without them.
+                    let versions: Vec<u64> = {
+                        let idx = versioned.read();
+                        hits.iter()
+                            .map(|&(id, _)| idx.backend.version_of(id).get())
+                            .collect()
+                    };
+                    match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+                        Ok(out) => ShardResp::Vsearch(
+                            out.into_iter()
+                                .zip(versions)
+                                .map(|((id, score, blob), version)| (id, score, blob, version))
+                                .collect(),
+                        ),
+                        Err(e) => ShardResp::Err(e),
+                    }
+                }
             }
         }
 
@@ -4063,6 +4085,12 @@ async fn process(
 /// the batch was collected, which is what the destination stores and what
 /// tells the mover the row has been written again since.
 type MoveRow = (u64, Vec<f32>, Option<Bytes>, u8, u64);
+
+/// One hit from one shard's fragment of a search: `(id, cosine, payload,
+/// version)`. The version is read from the shard that produced the hit, and it
+/// is what the global merge uses to tell two copies of one id apart - the
+/// owner map cannot, when it is the thing that is out of date.
+type VsearchHit = (u64, f32, Option<Bytes>, u64);
 
 /// id -> (primary shard, optional replica shard, version) for one routed
 /// vindex.
@@ -6475,12 +6503,13 @@ impl ShardSet {
         }
         // Hits carry the shard that produced them, so the dedup below can
         // prefer the COMMITTED copy rather than the best-scoring one.
-        let mut merged: Vec<(u64, f32, Option<Bytes>, usize)> = Vec::new();
+        // (id, cosine, payload, answering shard, version)
+        let mut merged: Vec<(u64, f32, Option<Bytes>, usize, u64)> = Vec::new();
         let mut first_err = None;
         for (shard, rx) in pending {
             match rx.await.map_err(|_| ShardError::Unavailable)? {
                 ShardResp::Vsearch(hits) => {
-                    merged.extend(hits.into_iter().map(|(id, s, p)| (id, s, p, shard)));
+                    merged.extend(hits.into_iter().map(|(id, s, p, v)| (id, s, p, shard, v)));
                 }
                 ShardResp::Err(e) => {
                     first_err.get_or_insert(e);
@@ -6526,28 +6555,43 @@ impl ShardSet {
             owners.get(name).map(|m| {
                 merged
                     .iter()
-                    .filter_map(|&(id, _, _, _)| m.get(&id).map(|&(p, _, _)| (id, p)))
+                    .filter_map(|&(id, _, _, _, _)| m.get(&id).map(|&(p, _, _)| (id, p)))
                     .collect()
             })
         };
         merged.sort_unstable_by(|a, b| {
-            let live = |h: &(u64, f32, Option<Bytes>, usize)| {
+            let live = |h: &(u64, f32, Option<Bytes>, usize, u64)| {
                 owner_of
                     .as_ref()
                     .and_then(|m| m.get(&h.0))
                     .is_some_and(|&p| usize::from(p) == h.3)
             };
-            // Live copy first for the same id; then by score, as before.
-            live(b).cmp(&live(a)).then_with(|| b.1.total_cmp(&a.1))
+            // NEWEST COPY FIRST, by the version each shard reported for the
+            // row it answered with. The owner map was the only tie-break here
+            // and it is derived state: when it is the thing that is stale -
+            // a restart mid-reshard, a rebuild that has not run yet - it
+            // points at the copy an overwrite replaced, and search then agrees
+            // with the point read on the wrong value. The version comes from
+            // the shard that holds the row and cannot be behind it.
+            //
+            // The map still decides what the version cannot: a boundary
+            // replica is the SAME copy in a second place, same version, and
+            // the primary is the one to return.
+            b.4.cmp(&a.4)
+                .then_with(|| live(b).cmp(&live(a)))
+                // Then by score, as before.
+                .then_with(|| b.1.total_cmp(&a.1))
         });
         let mut seen = ahash::AHashSet::new();
-        merged.retain(|&(id, _, _, _)| seen.insert(id));
+        merged.retain(|&(id, _, _, _, _)| seen.insert(id));
         // Scores decide the ranking, so restore that order once one hit per
         // id survives: the pass above only chose WHICH copy of an id to keep.
         merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
-        let merged: Vec<(u64, f32, Option<Bytes>)> =
-            merged.into_iter().map(|(id, s, p, _)| (id, s, p)).collect();
+        let merged: Vec<(u64, f32, Option<Bytes>)> = merged
+            .into_iter()
+            .map(|(id, s, p, _, _)| (id, s, p))
+            .collect();
         // Shard 0 by convention: a scattered op belongs to no single shard.
         skeg_telemetry::record_op(skeg_telemetry::Op::VSearch, 0, started.elapsed());
         Ok(merged)

@@ -655,3 +655,42 @@ async fn a_reopen_after_a_failed_old_copy_cleanup_still_names_the_new_copy_prima
         "a restart handed back the value the overwrite replaced"
     );
 }
+
+/// The owner map is derived state, and there is a window on every restart
+/// where it does not exist yet: it is rebuilt on the first point op, and a
+/// search does not perform one. Until then the merge had nothing to prefer by
+/// and fell back to the score - so a query resembling the copy an overwrite
+/// replaced got that copy back, at 1.0, from a store that had committed the
+/// replacement.
+///
+/// The version comes from the shard holding the row, so it cannot be behind
+/// the row the way the map can.
+#[tokio::test]
+async fn a_search_before_the_owner_map_is_rebuilt_still_returns_the_newest_copy() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "nm", N).await;
+    shards.reshard("nm", 0.25, 10, 0).await.expect("reshard");
+    let (victim, _, committed) =
+        a_committed_move_with_a_surviving_old_copy(dir.path(), &shards, "nm", N).await;
+    let replaced = vec_for(victim);
+    drop(shards);
+
+    // Reopened and untouched: no point op has run, so no owner map exists.
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    let hits = shards
+        .vsearch("nm", replaced.clone(), 10, 0, 0, false, None)
+        .await
+        .unwrap();
+    let &(_, score, _) = hits
+        .iter()
+        .find(|h| h.0 == victim)
+        .unwrap_or_else(|| panic!("id {victim} must be in the results at all: {hits:?}"));
+    assert!(
+        score < 0.9,
+        "search returned the STALE copy for id {victim} (score {score}): the \
+         committed copy is in the other cluster and cannot score that high"
+    );
+    // And the point read, which does rebuild the map, agrees.
+    assert_eq!(shards.vget("nm", victim).await.unwrap().unwrap(), committed);
+}
