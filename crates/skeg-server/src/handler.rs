@@ -366,4 +366,60 @@ mod tests {
         assert_eq!(native_vindex_kind_is_allowed(VERSION_V2, 3), Ok(()));
         assert_eq!(native_vindex_kind_is_allowed(VERSION_V2, 5), Ok(()));
     }
+
+    /// Feed one encoded request through the real dispatcher and return the
+    /// response frame. The native path has no tenant of its own - it is always
+    /// tenant 0 with the client's raw name - so this is the door where a
+    /// crafted scope prefix used to walk straight in.
+    async fn native_roundtrip(shards: &ShardSet, request: Bytes) -> Frame {
+        let mut parser = FrameParser::new();
+        let mut buf = BytesMut::from(&request[..]);
+        let frame = parser
+            .feed(&mut buf)
+            .expect("the request must parse")
+            .expect("one whole frame");
+        let response = dispatch(&frame, shards).await.expect("a response");
+        let mut parser = FrameParser::new();
+        let mut buf = BytesMut::from(&response[..]);
+        parser
+            .feed(&mut buf)
+            .expect("the response must parse")
+            .expect("one whole frame")
+    }
+
+    /// `[u8 code][u8 len][msg]` - the shape `encode_err` writes.
+    fn err_message(frame: &Frame) -> String {
+        assert_eq!(frame.header.op, skeg_proto::Op::Err, "expected an error");
+        let n = frame.payload[1] as usize;
+        String::from_utf8_lossy(&frame.payload[2..2 + n]).into_owned()
+    }
+
+    #[tokio::test]
+    #[ignore = "red until the create door refuses '::' (fix/tenant-carried-not-parsed)"]
+    async fn a_native_create_cannot_spell_another_tenants_scope() {
+        // `VINDEX.CREATE "<32 hex of B>::x"` over the binary protocol. There is
+        // no AUTH here and never was: the handler passes the raw name to
+        // `vindex_create` with tenant 0, so the refusal has to live at the
+        // ShardSet door or it does not exist for this protocol at all.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let squat = format!("{}::x", "2a".repeat(16));
+
+        let frame = native_roundtrip(
+            &shards,
+            skeg_proto::encode_vindex_create(7, &squat, 8, 0, 0),
+        )
+        .await;
+        let msg = err_message(&frame);
+        assert!(
+            msg.contains("must not contain '::'"),
+            "the native door must refuse the scope separator, got: {msg}"
+        );
+
+        let rows = shards.vindex_list().await.unwrap();
+        assert!(
+            !rows.iter().any(|r| r.name == squat),
+            "the refused name must not exist: {rows:?}"
+        );
+    }
 }
