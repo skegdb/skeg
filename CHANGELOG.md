@@ -38,14 +38,18 @@ because a container needs to bind all interfaces to be reachable through
 
 ### One RESP3 connection is bounded to one legitimate frame
 
-`MAX_BULK_LEN` drops from Redis's 512 MiB default to 64 MiB, the largest
-frame the server has any reason to accept (`SKEG.VMSET` is already capped
-there). A single connection could pin ~513 MiB of decoder buffer before the
-memory governor ever saw the request - more than the 256 MiB cgroup the
-engine is gated under. The 256 KiB read reservation is now taken only while
-a frame is mid-flight; an idle socket holds a few KiB, so a thousand idle
-connections no longer reserve ~256 MiB for nothing. Still open: the native
-protocol handler and a connection/buffer budget owned by the governor.
+`MAX_BULK_LEN` drops from Redis's 512 MiB default to 64 MiB: no KV value,
+vector or payload has a legitimate reason to arrive in a bigger bulk. The
+per-connection ceiling is a *frame* cap (the parser yields a frame only once
+the whole aggregate is buffered), so it is sized from both limits a
+`SKEG.VMSET` can reach at once - 64 MiB of vectors plus a 64 MiB bulk of
+ids/payloads, ~129 MiB - where it used to be ~513 MiB, more than the
+256 MiB cgroup the engine is gated under. The 256 KiB read reservation is
+now taken only while a frame is mid-flight and given back once the buffer
+drains; a socket that never sent a byte, or that finished its last frame,
+holds 4 KiB. Still open: the native protocol handler and a connection/buffer
+budget owned by the governor - a thousand connections each mid-frame can
+still pin a thousand ceilings.
 
 ### `skeg-multi-tenant` embeds the workspace engine
 
@@ -61,8 +65,8 @@ rigging chain is moved to `skeg-rigging` / `skeg-rigging-skeg` 0.1.3 and
 that the resolved graph holds exactly one `skeg-vector`, the workspace one,
 and that a tenant written through `MultiTenantRoot` reopens with
 `skeg_vector::DiskVamanaIndex` directly. Still duplicated: `skeg-resp3`
-(0.1.3 through `skeg-rigging-net-resp3`, 0.2.5 here) - a transport crate,
-pinned exactly upstream; not the engine.
+(`^0.1.3` through `skeg-rigging-net-resp3`, 0.2.5 here - the caret cannot
+reach a 0.2) - a transport crate, not the engine.
 
 `skeg-multi-tenant` 0.1.0 -> 0.1.1.
 
