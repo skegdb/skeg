@@ -242,6 +242,19 @@ fn anon_forgery_error() -> Frame {
     )
 }
 
+/// How much spare decoder capacity to reserve before the next socket read.
+///
+/// A few KiB while idle or between frames (`buffered == 0`): an accepted-but-
+/// silent connection must not pin real memory just for existing, and the
+/// connection semaphore's default limit means there can be hundreds of these
+/// at once. Once a frame is mid-flight (`buffered > 0` - a partial read left
+/// bytes the decoder hasn't parsed yet), reserve the large chunk so a
+/// pipelined burst still buffers many frames per syscall instead of
+/// serializing one-frame-per-read.
+fn read_reserve(buffered: usize) -> usize {
+    if buffered == 0 { 4096 } else { 256 * 1024 }
+}
+
 const SKEG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default durability for SET / DEL. `Kernel` survives process+kernel crash
@@ -343,14 +356,22 @@ pub async fn handle_connection_resp3(
                 // Pull a large chunk per syscall so a pipelined burst buffers
                 // many frames at once (the default 4 KiB spare = one ~4 KiB VSET
                 // frame, which would serialize the pipeline one-frame-per-read).
-                decoder.buf_mut().reserve(256 * 1024);
+                // But only once a frame is actually mid-flight: reserving the
+                // large chunk unconditionally means an idle connection - most
+                // of them, under the connection semaphore's default limit -
+                // pins that capacity for nothing. An idle or between-frames
+                // socket gets a few KiB instead; a pipelined burst still grows
+                // to the large chunk after its first partial read fills the
+                // small reservation and leaves bytes buffered.
+                let reserve = read_reserve(decoder.buffered());
+                decoder.buf_mut().reserve(reserve);
                 match stream.read_buf(decoder.buf_mut()).await {
                     Ok(0) => break,
                     Ok(_) => {
                         // Bound per-connection buffering. A frame that never
                         // completes (protocol desync, or a bulk whose declared
                         // length is dribbled forever) would otherwise let one
-                        // connection pin ~512 MiB, and N connections N× that.
+                        // connection pin ~64 MiB, and N connections N× that.
                         // One max-size bulk plus headroom is the legitimate
                         // ceiling; past it the peer is misbehaving.
                         if decoder.buffered() > MAX_CONN_BUFFER {
@@ -2059,6 +2080,28 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
+
+    /// An idle or between-frames socket (`buffered == 0`) must not pin more
+    /// than a few KiB of decoder capacity - the connection semaphore's
+    /// default limit means hundreds of these can be idle at once.
+    #[test]
+    fn read_reserve_idle_is_small() {
+        assert!(super::read_reserve(0) <= 4096);
+    }
+
+    /// Once a frame is mid-flight, reserve the large chunk so a pipelined
+    /// burst still buffers many frames per syscall.
+    #[test]
+    fn read_reserve_mid_frame_is_large() {
+        assert_eq!(super::read_reserve(1), 256 * 1024);
+    }
+
+    /// The per-connection ceiling tracks `MAX_BULK_LEN`, not the old 512 MiB
+    /// default - a silent bump of either constant must fail this test.
+    #[test]
+    fn max_conn_buffer_is_bounded_to_one_frame() {
+        const { assert!(super::MAX_CONN_BUFFER <= 65 * 1024 * 1024) };
+    }
 
     #[tokio::test]
     async fn a_vmset_over_the_cap_is_refused_before_its_vectors_are_parsed() {

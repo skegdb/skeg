@@ -15,8 +15,13 @@ use crate::frame::Frame;
 /// Max child count for an aggregate (array/map/set/push). Caps the worst-case
 /// pre-allocation a malicious client can force. Redis uses similar limits.
 pub const MAX_AGGREGATE_LEN: usize = 1_048_576;
-/// Max bulk/verbatim payload size. Matches Redis `proto-max-bulk-len` default.
-pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+/// Max bulk/verbatim payload size. A single RESP3 connection can pin this
+/// many bytes in the decoder buffer before the memory governor is ever
+/// consulted (CWE-400), so it is capped to the largest frame skeg has any
+/// legitimate reason to accept rather than mirroring Redis's 512 MiB
+/// `proto-max-bulk-len` default. No documented or tested code path (KV value,
+/// vector, or SKEG.VMSET batch) needs more than 64 MiB in a single frame.
+pub const MAX_BULK_LEN: usize = 64 * 1024 * 1024;
 /// Max aggregate nesting depth. Bounds the recursive descent so a stream of
 /// nested aggregate headers (e.g. `*1\r\n` repeated) cannot overflow the stack
 /// and abort the process. Redis uses 128.
@@ -509,6 +514,30 @@ mod tests {
             parse_frame(b"$-2\r\n").unwrap_err(),
             ParseError::InvalidLength(-2)
         ));
+    }
+
+    #[test]
+    fn max_bulk_len_is_64_mib() {
+        // A silent bump back toward the old 512 MiB default must fail this test.
+        assert_eq!(MAX_BULK_LEN, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bulk_length_over_max_errors() {
+        let header = format!("${}\r\n", MAX_BULK_LEN + 1);
+        assert!(matches!(
+            parse_frame(header.as_bytes()).unwrap_err(),
+            ParseError::BulkTooLarge(len) if len == MAX_BULK_LEN + 1
+        ));
+    }
+
+    #[test]
+    fn bulk_length_at_max_is_not_rejected_as_too_large() {
+        // Only the header is sent; the body is intentionally absent, so the
+        // length check must pass and the parser must report "incomplete"
+        // rather than the too-large error.
+        let header = format!("${}\r\n", MAX_BULK_LEN);
+        assert_eq!(parse_frame(header.as_bytes()).unwrap(), None);
     }
 
     #[test]
