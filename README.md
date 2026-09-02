@@ -38,16 +38,20 @@ sits in RAM, so memory grows far more slowly than the corpus it serves.
 
 ```sh
 docker run -d --name skeg -p 127.0.0.1:6379:6379 -v skeg-data:/var/lib/skeg \
+  -e SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1 \
   --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest \
   --addr 0.0.0.0:6379
 ```
 
 `--addr` is not optional here: that binary defaults to `127.0.0.1:6379`, which
-inside a container only the container can reach. The port is published on the
-host's loopback interface only because this server has no authentication -
-anyone who can reach it can read, write and drop indices. For network
-exposure, put `skeg-server-tenant` (with `--tenant-auth`/`--tenant-strict`) or
-an authenticating proxy in front instead of publishing the port directly.
+inside a container only the container can reach. This server has no
+authentication - anyone who can reach it can read, write and drop indices -
+so binding `0.0.0.0` needs the explicit opt-in above; the same command
+without it fails fast with an operator-facing message instead of starting
+unprotected. The port is then published on the host's loopback interface
+only. For network exposure, put `skeg-server-tenant` (with
+`--tenant-auth`/`--tenant-strict`) or an authenticating proxy in front
+instead of publishing the port directly.
 
 It is a Redis server, so any Redis client works:
 

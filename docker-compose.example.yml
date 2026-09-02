@@ -48,7 +48,7 @@ services:
   #   volumes:
   #     - skeg-data:/var/lib/skeg
   #   environment:
-  #     SKEG_ADDR: 0.0.0.0:6379
+  #     SKEG_RESP3_ADDR: 0.0.0.0:6379
   #     SKEG_ALLOW_UNAUTHENTICATED_NETWORK: "1"
   #     SKEG_DATA_DIR: /var/lib/skeg
 

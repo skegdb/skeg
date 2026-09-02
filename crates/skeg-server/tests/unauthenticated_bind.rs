@@ -8,6 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use skeg_server::ALLOW_ENV;
+
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
@@ -27,18 +29,16 @@ fn run_and_wait(bin_exe: &str, extra_args: &[&str]) -> (bool, String) {
         .arg("--data-dir")
         .arg(dir.path())
         .args(extra_args)
+        .env_remove(ALLOW_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn binary");
-    let status = child.wait().expect("wait on child");
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr piped")
-        .read_to_string(&mut stderr)
-        .expect("read stderr");
-    (status.success(), stderr)
+    // `Command::output()` reads both pipes to completion before waiting on
+    // the child, so it can't deadlock if the child fills a pipe buffer -
+    // unlike `spawn` + `wait()` + read-after-wait, which can hang forever
+    // if stdout/stderr fill up while the parent is blocked in `wait()`.
+    let output = cmd.output().expect("run binary");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.success(), stderr)
 }
 
 /// Spawn `bin_exe --addr 0.0.0.0:0 --allow-unauthenticated-network`
@@ -53,6 +53,7 @@ fn assert_starts_with_flag(bin_exe: &str) {
         .arg("--data-dir")
         .arg(dir.path())
         .arg("--allow-unauthenticated-network")
+        .env_remove(ALLOW_ENV)
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

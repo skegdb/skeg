@@ -47,13 +47,14 @@ VOLUME ["/var/lib/skeg"]
 # RESP3 / Redis-compat on 6379 if user runs `--entrypoint skeg-resp3`.
 EXPOSE 7379 6379
 
-# Listen on all interfaces so the container is reachable from the host.
-# Override with `-e SKEG_ADDR=...` for custom bind. This image has no
-# authentication, so binding 0.0.0.0 needs the opt-in below; the operator
-# is relied on to publish the port on the host loopback only
+# Listen on all interfaces so the container is reachable from the host via
+# `-p`. This image has no authentication, so the server refuses to start
+# unless the operator explicitly opts in with
+# `-e SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1` on the `docker run` command -
+# see the README quickstart. Override SKEG_ADDR for a custom bind. The
+# operator is relied on to publish the port on the host loopback only
 # (`-p 127.0.0.1:7379:7379`) or otherwise keep the container network-isolated.
 ENV SKEG_ADDR=0.0.0.0:7379 \
-    SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1 \
     SKEG_DATA_DIR=/var/lib/skeg \
     RUST_LOG=info
 
