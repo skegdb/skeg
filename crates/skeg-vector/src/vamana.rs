@@ -4390,6 +4390,17 @@ impl DiskVamanaIndex {
         VectorVersion::new(self.known_version(id))
     }
 
+    /// Every live id with its version. What an owner-map rebuild needs: the id
+    /// says which shards hold a row, the version says which of them holds the
+    /// copy to serve.
+    #[must_use]
+    pub fn live_ids_with_versions(&self) -> Vec<(u64, VectorVersion)> {
+        self.live_ids()
+            .into_iter()
+            .map(|id| (id, self.version_of(id)))
+            .collect()
+    }
+
     /// Turn the inline auto-flush on (default) or off. With it off, the delta
     /// grows unbounded until the caller drives [`flush_begin`](Self::flush_begin)
     /// / [`flush_finish`](Self::flush_finish) off-thread. Meant for the server.
