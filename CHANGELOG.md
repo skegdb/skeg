@@ -9,6 +9,44 @@ repository.
 
 ## [Unreleased]
 
+### A release is one gated transaction
+
+`release.yml` used to run `publish-crates` and `build-binaries` side by
+side, both waiting only on the tag-ancestry guard: a crate could reach
+crates.io - irreversibly - while a binary build was failing. And
+`docker-publish.yml` answered `v*` tags on its own, without that guard, so
+a tag the release workflow rejected still produced `:<version>` and
+`:latest` images.
+
+Now: guard -> test (fmt, clippy, serial workspace suite) -> build-binaries
+and the Dockerfile check -> publish-crates -> homebrew. Nothing irreversible
+runs before every build is green. The Docker workflow carries its own copy
+of the ancestry guard, because workflows cannot depend on each other's
+jobs. Not in this change: SHA-pinned actions, SBOM, provenance, cargo-deny.
+
+### The single-tenant servers refuse a network bind without an opt-in
+
+`skeg` and `skeg-resp3` have no authentication. They now refuse any
+non-loopback `--addr` (including `0.0.0.0` and `::`) unless
+`--allow-unauthenticated-network` (env `SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1`)
+is given, and log a warning at startup when it is. The quickstart publishes
+the container port on the host loopback only (`-p 127.0.0.1:6379:6379`);
+the image itself keeps `0.0.0.0` inside the container and sets the opt-in,
+because a container needs to bind all interfaces to be reachable through
+`-p` at all. For network exposure use `skeg-server-tenant` with
+`--tenant-auth`/`--tenant-strict`, or an authenticating proxy.
+
+### One RESP3 connection is bounded to one legitimate frame
+
+`MAX_BULK_LEN` drops from Redis's 512 MiB default to 64 MiB, the largest
+frame the server has any reason to accept (`SKEG.VMSET` is already capped
+there). A single connection could pin ~513 MiB of decoder buffer before the
+memory governor ever saw the request - more than the 256 MiB cgroup the
+engine is gated under. The 256 KiB read reservation is now taken only while
+a frame is mid-flight; an idle socket holds a few KiB, so a thousand idle
+connections no longer reserve ~256 MiB for nothing. Still open: the native
+protocol handler and a connection/buffer budget owned by the governor.
+
 ### `skeg-multi-tenant` embeds the workspace engine
 
 The crate reaches its vector engine through `skeg-rigging-skeg`, which
