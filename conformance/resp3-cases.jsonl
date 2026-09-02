@@ -77,7 +77,9 @@
 {"id": "vset.arity", "cmd": ["SKEG.VSET", "cfidxi8", "4"], "want": {"error_contains": "want name id vector [PAYLOAD blob]"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
 {"id": "vset.dim.mismatch", "cmd": ["SKEG.VSET", "cfidxi8", "4", "f32:[1,0,0]"], "want": {"error_contains": "ERR"}}
 {"id": "vset.bad.id", "cmd": ["SKEG.VSET", "cfidxi8", "abc", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "id"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
-{"id": "vmset.bulk", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]", "p10", "11", "f32:[0,1,0,0,0,0,0,0]", "p11", "12", "f32:[0,0,1,0,0,0,0,0]", ""], "want": {"integer": 3}}
+{"id": "vmset.bulk", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]", "p10", "11", "f32:[0,1,0,0,0,0,0,0]", "p11", "12", "f32:[0,0,1,0,0,0,0,0]", ""], "want": {"array_len": 3, "items": [{"simple": "OK"}, {"simple": "OK"}, {"simple": "OK"}]}}
+{"id": "vmset.per_item_errors", "cmd": ["SKEG.VMSET", "cfidxf32", "13", "f32:[0,0,0,1,0,0,0,0]", "p13", "14", "f32:[1,1]", "p14", "15", "f32:[0,0,0,0,1,0,0,0]", "p15"], "want": {"array_len": 3, "items": [{"simple": "OK"}, {"error_contains": "dim 8 but vector has 2"}, {"simple": "OK"}]}}
+{"id": "vmset.sibling_of_a_failed_item_is_stored", "cmd": ["SKEG.VGET", "cfidxf32", "15"], "want": {"bulk": "f32:[0,0,0,0,1,0,0,0]"}}
 {"id": "vmset.arity", "cmd": ["SKEG.VMSET", "cfidxf32", "10", "f32:[1,0,0,0,0,0,0,0]"], "want": {"error_contains": "want name (id vector payload)+"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
 {"id": "vsearch.flat.pairs", "cmd": ["SKEG.VSEARCH", "cfidxi8", "2", "32", "f32:[1,0.5,0,0,0,0,0,0]"], "want": {"array_len": 4, "items": [{"bulk": "1"}, {"double": true}, {"bulk": "2"}, {"double": true}]}, "note": "query separates every candidate: ties have no defined order"}
 {"id": "vsearch.withpayload.triples", "cmd": ["SKEG.VSEARCH", "cfidxi8", "1", "32", "f32:[0,0,1,0,0,0,0,0]", "WITHPAYLOAD"], "want": {"array_len": 3, "items": [{"bulk": "3"}, {"double": true}, {"bulk": "hello"}]}}

@@ -6567,11 +6567,24 @@ impl ShardSet {
     /// the group committer and flush in batches instead of one fsync-barrier per
     /// vector. This is the whole bulk-ingest win (100k: ~770s serial -> ~34s).
     ///
-    /// One result PER ITEM, in request order.
+    /// One result PER ITEM, in REQUEST order, and every item is attempted.
     ///
-    /// STUB ORDERING: the body still uses a `JoinSet` and still stops at the
-    /// first failure, so the vector returned is short and its order is
-    /// completion order. Opened in "vmset: one result per item".
+    /// A bulk write of n items is n writes. Reporting one outcome for all of
+    /// them can only say "some prefix worked", and the client cannot tell
+    /// which prefix - so it either re-sends rows that are already durable or
+    /// drops rows that are not. Nothing here is atomic across items and
+    /// nothing pretends to be: quota, admission and the dimension check are
+    /// already decided per item, and making the batch atomic across shards
+    /// would take a two-phase commit for a command whose whole reason to
+    /// exist is throughput.
+    ///
+    /// The failure that made this urgent is worse than a vague reply. The
+    /// previous body awaited a `JoinSet` with `??`, and a `JoinSet` ABORTS its
+    /// outstanding tasks when it is dropped - including a task that had
+    /// already committed its write and had not yet published the row in the
+    /// owner map. That row is durable, acknowledged by the engine, and
+    /// unreachable: an acknowledged write lost because a SIBLING was
+    /// malformed.
     pub async fn vmset(
         &self,
         name: &str,
@@ -6579,22 +6592,37 @@ impl ShardSet {
         tenant: u128,
         limit: Option<u64>,
     ) -> Vec<Result<(), ShardError>> {
+        let n = items.len();
+        // Still concurrent, which is the whole point of the command: the
+        // per-vector blob writes accumulate in the group committer and flush
+        // in batches instead of one barrier per vector (100k: ~770s serial ->
+        // ~34s). Only the ORDER is restored, by carrying the index with the
+        // task rather than by waiting for each in turn.
         let mut set = tokio::task::JoinSet::new();
-        for (id, vector, payload) in items {
+        for (i, (id, vector, payload)) in items.into_iter().enumerate() {
             let this = self.clone();
             let name = name.to_owned();
-            set.spawn(async move { this.vset(&name, id, vector, tenant, limit, payload).await });
+            set.spawn(async move {
+                (
+                    i,
+                    this.vset(&name, id, vector, tenant, limit, payload).await,
+                )
+            });
         }
-        let mut out = Vec::new();
+        let mut out: Vec<Option<Result<(), ShardError>>> = (0..n).map(|_| None).collect();
         while let Some(joined) = set.join_next().await {
-            let r = joined.unwrap_or(Err(ShardError::Unavailable));
-            let failed = r.is_err();
-            out.push(r);
-            if failed {
-                break;
+            match joined {
+                Ok((i, r)) => out[i] = Some(r),
+                // A task that panicked names no item, so nothing can be said
+                // about a specific one. The `None`s below become
+                // `Unavailable`, which is the honest answer for an item whose
+                // outcome nobody observed.
+                Err(e) => tracing::error!(index = name, error = %e, "a VMSET item task failed"),
             }
         }
-        out
+        out.into_iter()
+            .map(|r| r.unwrap_or(Err(ShardError::Unavailable)))
+            .collect()
     }
 
     /// How many payload blobs the store still holds for `name`, summed over

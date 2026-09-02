@@ -517,7 +517,6 @@ async fn a_blob_left_by_a_failed_commit_is_reclaimed_at_the_next_open() {
 /// A bulk write of n items is n writes. One reply for all of them can only say
 /// "some prefix worked", and the client cannot tell which prefix.
 #[tokio::test]
-#[ignore = "opens in vmset: one result per item"]
 async fn vmset_reports_one_result_per_item() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
@@ -550,7 +549,6 @@ async fn vmset_reports_one_result_per_item() {
 /// tasks whose write had already committed but whose owner map had not been
 /// published, which loses an acknowledged row silently.
 #[tokio::test]
-#[ignore = "opens in vmset: one result per item"]
 async fn vmset_does_not_abort_its_siblings() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
