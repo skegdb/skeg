@@ -493,7 +493,11 @@ fn the_inline_fold_does_not_tear_the_live_base() {
     // The invariant is the same either way: whatever the fold does, the base
     // that was committed before it must still be readable.
     let _ = i.consolidate();
-    std::fs::set_permissions(&vbin, saved).unwrap();
+    // Best effort: a fold that succeeded installed a NEW generation and
+    // reclaimed the superseded slot, so this file is legitimately gone. This
+    // step only exists so the frozen file cannot outlive the test; it is not
+    // the invariant, which is asserted below.
+    let _ = std::fs::set_permissions(&vbin, saved);
     drop(i);
 
     // THE ASSERTION: a fold that could not complete must leave a base that
