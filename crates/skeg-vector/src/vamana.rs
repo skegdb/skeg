@@ -1443,26 +1443,119 @@ const VECTORS_FILE: &str = "vectors.bin";
 const DELTA_LOG_FILE: &str = "delta.log";
 /// V2 vector WAL header.
 const DELTA_WAL_V2_MAGIC: &[u8] = b"SKWL\x02";
+/// V3 vector WAL header: every record carries the row's
+/// [`VectorVersion`], and an insert carries a [`PayloadRef`].
+const DELTA_WAL_V3_MAGIC: &[u8] = b"SKWL\x03";
 
-/// V1 is headerless. V2 has per-record CRC32C.
+/// What an insert record says about the row's payload blob.
+///
+/// RESERVED by this commit and always written as `Unchanged`. The vector /
+/// payload transaction is the next piece of work and it needs a commit point
+/// that names the blob; putting the field in the record now means that change
+/// does not have to bump the format again, and a decoder that already accepts
+/// all three tags is what turns it into a pure behaviour change.
+///
+/// A delete carries no reference: the row is gone, and so is anything hanging
+/// off it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PayloadRef {
+    /// The record says nothing about the payload: whatever the row had, it
+    /// keeps. Every record this version writes.
+    #[default]
+    Unchanged,
+    /// The row has no payload any more.
+    Cleared,
+    /// The row's payload is the blob at this sequence.
+    Blob(u64),
+}
+
+impl PayloadRef {
+    const TAG_UNCHANGED: u8 = 0;
+    const TAG_CLEARED: u8 = 1;
+    const TAG_BLOB: u8 = 2;
+
+    /// Encoded length: the tag, plus a sequence for a blob.
+    const fn encoded_len(self) -> usize {
+        match self {
+            PayloadRef::Unchanged | PayloadRef::Cleared => 1,
+            PayloadRef::Blob(_) => 1 + 8,
+        }
+    }
+
+    fn encode(self, out: &mut Vec<u8>) {
+        match self {
+            PayloadRef::Unchanged => out.push(Self::TAG_UNCHANGED),
+            PayloadRef::Cleared => out.push(Self::TAG_CLEARED),
+            PayloadRef::Blob(seq) => {
+                out.push(Self::TAG_BLOB);
+                out.extend_from_slice(&seq.to_le_bytes());
+            }
+        }
+    }
+
+    /// Decode from the head of `bytes`, returning the reference and how many
+    /// bytes it took.
+    ///
+    /// `Ok(None)` means TRUNCATED - the record is short, which a crash during
+    /// the final append produces and the caller treats as "no complete record
+    /// here". `Err` means CORRUPT - a tag naming nothing, which a short record
+    /// cannot produce and a guess would silently mis-decode.
+    fn decode(bytes: &[u8]) -> io::Result<Option<(Self, usize)>> {
+        let Some(&tag) = bytes.first() else {
+            return Ok(None);
+        };
+        match tag {
+            Self::TAG_UNCHANGED => Ok(Some((PayloadRef::Unchanged, 1))),
+            Self::TAG_CLEARED => Ok(Some((PayloadRef::Cleared, 1))),
+            Self::TAG_BLOB => match bytes.get(1..9) {
+                Some(w) => Ok(Some((
+                    PayloadRef::Blob(u64::from_le_bytes(
+                        w.try_into().expect("8-byte window by construction"),
+                    )),
+                    9,
+                ))),
+                None => Ok(None),
+            },
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown vector WAL payload reference {other}"),
+            )),
+        }
+    }
+}
+
+/// V1 is headerless. V2 has per-record CRC32C. V3 adds the row version and the
+/// payload reference to every record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeltaWalFormat {
     LegacyV1,
     FramedV2,
+    V3Versioned,
 }
 
 #[derive(Debug)]
 enum DeltaWalOp {
-    Insert { id: u64, vector: Vec<f32> },
-    Delete { id: u64 },
+    Insert {
+        id: u64,
+        version: VectorVersion,
+        payload_ref: PayloadRef,
+        vector: Vec<f32>,
+    },
+    Delete {
+        id: u64,
+        version: VectorVersion,
+    },
 }
 
 impl DeltaWalFormat {
     fn detect(bytes: &[u8]) -> io::Result<(Self, &[u8])> {
+        if bytes.starts_with(DELTA_WAL_V3_MAGIC) {
+            return Ok((Self::V3Versioned, &bytes[DELTA_WAL_V3_MAGIC.len()..]));
+        }
         if bytes.starts_with(DELTA_WAL_V2_MAGIC) {
             return Ok((Self::FramedV2, &bytes[DELTA_WAL_V2_MAGIC.len()..]));
         }
-        // Never parse a malformed V2 header as V1.
+        // Never parse a malformed V2/V3 header as V1.
         if bytes.starts_with(b"SKWL") || bytes.first().is_some_and(|b| *b > 1) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1471,17 +1564,66 @@ impl DeltaWalFormat {
         }
         Ok((Self::LegacyV1, bytes))
     }
+
+    /// The header this format writes at the head of a fresh file.
+    fn magic(self) -> &'static [u8] {
+        match self {
+            Self::LegacyV1 => b"",
+            Self::FramedV2 => DELTA_WAL_V2_MAGIC,
+            Self::V3Versioned => DELTA_WAL_V3_MAGIC,
+        }
+    }
+
+    /// Bytes before the operation-specific part: the opcode and the id, plus
+    /// the version in V3.
+    const fn record_head(self) -> usize {
+        match self {
+            Self::LegacyV1 | Self::FramedV2 => 1 + 8,
+            Self::V3Versioned => 1 + 8 + 8,
+        }
+    }
+
+    /// Trailing per-record checksum, absent in the headerless V1.
+    const fn checksum_len(self) -> usize {
+        match self {
+            Self::LegacyV1 => 0,
+            Self::FramedV2 | Self::V3Versioned => 4,
+        }
+    }
 }
 
-fn wal_record_body_len(op: u8, dim: usize) -> io::Result<usize> {
+/// Length of the record body starting at `tail`, or `None` when `tail` is too
+/// short to tell - a torn final append, which the caller stops at.
+///
+/// Only V3 needs to look past the opcode: an insert's payload reference is
+/// variable-length, so the length of the record is not a function of `dim`
+/// alone any more.
+fn wal_record_body_len(
+    format: DeltaWalFormat,
+    op: u8,
+    dim: usize,
+    tail: &[u8],
+) -> io::Result<Option<usize>> {
+    let too_large = || io::Error::new(io::ErrorKind::InvalidData, "vector WAL record too large");
+    let head = format.record_head();
     match op {
-        0 => 1usize
-            .checked_add(8)
-            .and_then(|n| dim.checked_mul(4).and_then(|v| n.checked_add(v)))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "vector WAL record too large")
-            }),
-        1 => Ok(1 + 8),
+        0 => {
+            let vector_bytes = dim.checked_mul(4).ok_or_else(too_large)?;
+            let ref_len = if format == DeltaWalFormat::V3Versioned {
+                match PayloadRef::decode(tail.get(head..).unwrap_or(&[]))? {
+                    Some((_, n)) => n,
+                    None => return Ok(None),
+                }
+            } else {
+                0
+            };
+            Ok(Some(
+                head.checked_add(ref_len)
+                    .and_then(|n| n.checked_add(vector_bytes))
+                    .ok_or_else(too_large)?,
+            ))
+        }
+        1 => Ok(Some(head)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown vector WAL operation {op}"),
@@ -1489,17 +1631,38 @@ fn wal_record_body_len(op: u8, dim: usize) -> io::Result<usize> {
     }
 }
 
-fn decode_wal_op(body: &[u8]) -> DeltaWalOp {
+fn decode_wal_op(format: DeltaWalFormat, body: &[u8]) -> DeltaWalOp {
     let id = u64::from_le_bytes(body[1..9].try_into().expect("record body length checked"));
+    let head = format.record_head();
+    // V1 and V2 rows predate versioning: they come back as legacy, which loses
+    // against every allocated version and ties with itself.
+    let version = if format == DeltaWalFormat::V3Versioned {
+        VectorVersion::new(u64::from_le_bytes(
+            body[9..17].try_into().expect("record body length checked"),
+        ))
+    } else {
+        VectorVersion::LEGACY
+    };
     match body[0] {
-        0 => DeltaWalOp::Insert {
-            id,
-            vector: body[9..]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        },
-        1 => DeltaWalOp::Delete { id },
+        0 => {
+            let (payload_ref, ref_len) = if format == DeltaWalFormat::V3Versioned {
+                PayloadRef::decode(&body[head..])
+                    .expect("payload reference validated before decoding")
+                    .expect("record body length checked")
+            } else {
+                (PayloadRef::Unchanged, 0)
+            };
+            DeltaWalOp::Insert {
+                id,
+                version,
+                payload_ref,
+                vector: body[head + ref_len..]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            }
+        }
+        1 => DeltaWalOp::Delete { id, version },
         _ => unreachable!("operation byte validated before decoding"),
     }
 }
@@ -1514,18 +1677,17 @@ fn decode_wal_payload(
     let mut pos = 0;
     while pos < payload.len() {
         let op = payload[pos];
-        let body_len = wal_record_body_len(op, dim)?;
-        let record_len = match format {
-            DeltaWalFormat::LegacyV1 => body_len,
-            DeltaWalFormat::FramedV2 => body_len.checked_add(4).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "vector WAL record too large")
-            })?,
+        let Some(body_len) = wal_record_body_len(format, op, dim, &payload[pos..])? else {
+            break; // torn final append: not enough bytes to even size the record
         };
+        let record_len = body_len.checked_add(format.checksum_len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "vector WAL record too large")
+        })?;
         if payload.len() - pos < record_len {
             break; // crash during the final append: no complete record to apply
         }
         let body = &payload[pos..pos + body_len];
-        if format == DeltaWalFormat::FramedV2 {
+        if format.checksum_len() != 0 {
             let stored = u32::from_le_bytes(
                 payload[pos + body_len..pos + record_len]
                     .try_into()
@@ -1539,7 +1701,7 @@ fn decode_wal_payload(
                 ));
             }
         }
-        ops.push(decode_wal_op(body));
+        ops.push(decode_wal_op(format, body));
         pos += record_len;
     }
     Ok(ops)
@@ -1550,38 +1712,66 @@ fn decode_wal(bytes: &[u8], dim: usize) -> io::Result<(DeltaWalFormat, Vec<Delta
     Ok((format, decode_wal_payload(format, payload, dim)?))
 }
 
-fn encode_wal_body(op: &DeltaWalOp) -> Vec<u8> {
+/// Encode `op` in `format`.
+///
+/// A store still on V1 or V2 keeps being appended to in its own format, so a
+/// version written into one is DROPPED until the store is promoted. That is
+/// deliberate: promotion happens where the whole file is rewritten - a fold or
+/// a WAL compaction - and never at open, which is only asked to read.
+fn encode_wal_body(format: DeltaWalFormat, op: &DeltaWalOp) -> Vec<u8> {
+    let versioned = format == DeltaWalFormat::V3Versioned;
     match op {
-        DeltaWalOp::Insert { id, vector } => {
-            let mut body = Vec::with_capacity(1 + 8 + vector.len() * 4);
+        DeltaWalOp::Insert {
+            id,
+            version,
+            payload_ref,
+            vector,
+        } => {
+            let ref_len = if versioned {
+                payload_ref.encoded_len()
+            } else {
+                0
+            };
+            let mut body = Vec::with_capacity(format.record_head() + ref_len + vector.len() * 4);
             body.push(0);
             body.extend_from_slice(&id.to_le_bytes());
+            if versioned {
+                body.extend_from_slice(&version.get().to_le_bytes());
+                payload_ref.encode(&mut body);
+            }
             for &x in vector {
                 body.extend_from_slice(&x.to_le_bytes());
             }
             body
         }
-        DeltaWalOp::Delete { id } => {
-            let mut body = Vec::with_capacity(9);
+        DeltaWalOp::Delete { id, version } => {
+            let mut body = Vec::with_capacity(format.record_head());
             body.push(1);
             body.extend_from_slice(&id.to_le_bytes());
+            if versioned {
+                body.extend_from_slice(&version.get().to_le_bytes());
+            }
             body
         }
     }
 }
 
 fn encode_wal_record(format: DeltaWalFormat, op: &DeltaWalOp) -> Vec<u8> {
-    let mut record = encode_wal_body(op);
-    if format == DeltaWalFormat::FramedV2 {
+    let mut record = encode_wal_body(format, op);
+    if format.checksum_len() != 0 {
         record.extend_from_slice(&crc32c(&record).to_le_bytes());
     }
     record
 }
 
+/// Write a whole WAL from scratch. This is the ONE place a fresh file is
+/// created, so it is also where the format a store writes in is decided:
+/// everything written from now on is V3.
 fn write_framed_wal(path: &Path, ops: &[DeltaWalOp]) -> io::Result<()> {
-    let mut bytes = DELTA_WAL_V2_MAGIC.to_vec();
+    const FORMAT: DeltaWalFormat = DeltaWalFormat::V3Versioned;
+    let mut bytes = FORMAT.magic().to_vec();
     for op in ops {
-        bytes.extend_from_slice(&encode_wal_record(DeltaWalFormat::FramedV2, op));
+        bytes.extend_from_slice(&encode_wal_record(FORMAT, op));
     }
     std::fs::write(path, bytes)
 }
@@ -3244,12 +3434,23 @@ pub struct DiskVamanaIndex {
     dir: PathBuf,
     /// Streaming inserts since open / last consolidation: external id -> f32.
     delta: AHashMap<u64, Vec<f32>>,
+    /// The version of each `delta` row, kept beside it rather than inside it
+    /// so the f32 buffers stay contiguous `Vec<f32>` values the fold and the
+    /// flat scan can hand out by slice.
+    ///
+    /// INVARIANT: the same key set as `delta`. Every mutation of either goes
+    /// through `apply_insert` / `apply_delete`, which touch both.
+    delta_ver: AHashMap<u64, u64>,
     /// Staging buffer for an in-flight OFF-THREAD flush: the delta entries moved
     /// aside by `flush_begin` while their run is built off-thread. Searched with
     /// precedence `delta > flushing > runs > base`, so the batch stays visible
     /// during the build; `flush_finish` clears it once the run is spliced in.
     /// Empty except during an off-thread flush.
     flushing: AHashMap<u64, Vec<f32>>,
+    /// Versions of the `flushing` rows. Same key set, same reason as
+    /// `delta_ver`: a row moved aside by a flush must not lose its version on
+    /// the way into a run.
+    flushing_ver: AHashMap<u64, u64>,
     /// Bumped every time the WAL is REPLACED rather than appended to.
     ///
     /// A background fold captures a byte offset into the WAL at `begin` and
@@ -3261,8 +3462,17 @@ pub struct DiskVamanaIndex {
     /// When true (default), `insert` flushes the delta into a run inline once it
     /// fills. A server turns this off and flushes off-thread instead.
     auto_flush: bool,
-    /// Tombstoned external ids (covers both main and delta).
-    tombstones: AHashSet<u64>,
+    /// Tombstoned external ids (covers both main and delta), each with the
+    /// version of the delete that created it.
+    ///
+    /// The version is what keeps a straggler from resurrecting the row: an
+    /// insert older than the tombstone is dropped rather than applied. It is
+    /// LOST at a fold, which drops the tombstone along with the rows it
+    /// masked, so there is then nothing left for a straggler to lose against.
+    /// Accepted: the stripe lock on the shard side is what stops a straggler
+    /// arriving that late, and persisting a tombstone version would mean
+    /// keeping every delete for ever.
+    tombstones: AHashMap<u64, u64>,
     live_count: usize,
     /// Append-only log of delta mutations, replayed on `open` so streaming
     /// inserts/deletes survive a restart. `consolidate` truncates it.
@@ -3452,10 +3662,12 @@ impl DiskVamanaIndex {
             last_vacuum_seq: u64::MAX,
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
+            delta_ver: AHashMap::new(),
             flushing: AHashMap::new(),
+            flushing_ver: AHashMap::new(),
             wal_epoch: 0,
             auto_flush: true,
-            tombstones: AHashSet::new(),
+            tombstones: AHashMap::new(),
             live_count,
             delta_log,
             wal_format,
@@ -3473,32 +3685,79 @@ impl DiskVamanaIndex {
     fn replay_wal_ops(&mut self, ops: Vec<DeltaWalOp>) {
         for op in ops {
             match op {
-                DeltaWalOp::Insert { id, vector } => self.apply_insert(id, vector),
-                DeltaWalOp::Delete { id } => {
-                    self.apply_delete(id);
+                DeltaWalOp::Insert {
+                    id,
+                    version,
+                    payload_ref,
+                    vector,
+                } => {
+                    // Reserved by the format, unused until the payload commit
+                    // point lands. Named rather than swallowed by `..` so the
+                    // day it means something the compiler points here.
+                    let _ = payload_ref;
+                    self.apply_insert(id, version, vector);
+                }
+                DeltaWalOp::Delete { id, version } => {
+                    self.apply_delete(id, version);
                 }
             }
         }
     }
 
+    /// The newest version this index knows for `id` across every in-RAM layer,
+    /// as a raw counter. `0` for a row it has never seen, or one written
+    /// before versions existed.
+    fn known_version(&self, id: u64) -> u64 {
+        let mut v = 0u64;
+        if let Some(&d) = self.delta_ver.get(&id) {
+            v = v.max(d);
+        }
+        if let Some(&d) = self.flushing_ver.get(&id) {
+            v = v.max(d);
+        }
+        if let Some(&d) = self.tombstones.get(&id) {
+            v = v.max(d);
+        }
+        v
+    }
+
     /// Apply an insert to the in-RAM delta (no WAL write).
-    fn apply_insert(&mut self, id: u64, vector: Vec<f32>) {
+    ///
+    /// A write OLDER than what this index already knows for the row is
+    /// DROPPED. That is the whole invariant: a copy that only relocates a row
+    /// carries the version it read, so it cannot land on top of a user write
+    /// that replaced the row while it was in flight. Equal versions apply,
+    /// which is what keeps legacy (version 0) stores on last-write-wins.
+    fn apply_insert(&mut self, id: u64, version: VectorVersion, vector: Vec<f32>) {
+        if version.get() < self.known_version(id) {
+            return;
+        }
         let was_live = self.is_live(id);
         self.tombstones.remove(&id);
         self.delta.insert(id, vector);
+        self.delta_ver.insert(id, version.get());
         if !was_live {
             self.live_count += 1;
         }
     }
 
     /// Apply a delete to the in-RAM state (no WAL write). Returns prior liveness.
-    fn apply_delete(&mut self, id: u64) -> bool {
+    ///
+    /// A delete older than the row's known version is dropped, same rule and
+    /// same reason as an insert: it is the far side of a move whose row has
+    /// already been written again.
+    fn apply_delete(&mut self, id: u64, version: VectorVersion) -> bool {
+        if version.get() < self.known_version(id) {
+            return false;
+        }
         let was_live = self.is_live(id);
         self.delta.remove(&id);
+        self.delta_ver.remove(&id);
         // Drop from the flush staging too, so a deleted id in an in-flight flush
         // is not flat-scanned as live (the run copy is tombstone-masked).
         self.flushing.remove(&id);
-        self.tombstones.insert(id);
+        self.flushing_ver.remove(&id);
+        self.tombstones.insert(id, version.get());
         if was_live {
             self.live_count -= 1;
         }
@@ -3698,7 +3957,7 @@ impl DiskVamanaIndex {
 
     /// True if `id` currently resolves to a live vector.
     fn is_live(&self, id: u64) -> bool {
-        !self.tombstones.contains(&id)
+        !self.tombstones.contains_key(&id)
             && (self.delta.contains_key(&id)
                 || self.flushing.contains_key(&id)
                 || self.base.id_to_main_row.contains_key(&id)
@@ -3726,7 +3985,7 @@ impl DiskVamanaIndex {
             .chain(self.runs.iter().flat_map(|r| r.ids.iter().copied()))
             .chain(self.delta.keys().copied())
             .chain(self.flushing.keys().copied())
-            .filter(|id| !self.tombstones.contains(id))
+            .filter(|id| !self.tombstones.contains_key(id))
             .collect();
         // A delta overwrite of a main id appears in both sources; dedup.
         out.sort_unstable();
@@ -3868,7 +4127,7 @@ impl DiskVamanaIndex {
         } else {
             let mut seen: AHashSet<u64> = AHashSet::new();
             for &id in ids {
-                if self.tombstones.contains(&id) || !seen.insert(id) {
+                if self.tombstones.contains_key(&id) || !seen.insert(id) {
                     continue;
                 }
                 if let Some(v) = self.delta.get(&id) {
@@ -3935,14 +4194,34 @@ impl DiskVamanaIndex {
     /// than panics because the caller is a server thread holding other
     /// vindexes: a bad dimension from one client must not take them down.
     pub fn insert(&mut self, id: u64, vector: &[f32]) -> io::Result<()> {
+        self.insert_versioned(id, vector, VectorVersion::LEGACY)
+    }
+
+    /// The one write path into the delta. See [`insert`](Self::insert) for
+    /// what an insert does; this also says WHICH copy of the row it is.
+    fn insert_at(
+        &mut self,
+        id: u64,
+        vector: &[f32],
+        version: VectorVersion,
+        payload_ref: PayloadRef,
+    ) -> io::Result<()> {
         if vector.len() != self.dim {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("vector has {} dims, index has {}", vector.len(), self.dim),
             ));
         }
+        // A stale write is dropped BEFORE the append, not after. Appending a
+        // record the replay would discard costs a file write now and a decode
+        // on every restart, to reach the same answer.
+        if version.get() < self.known_version(id) {
+            return Ok(());
+        }
         let op = DeltaWalOp::Insert {
             id,
+            version,
+            payload_ref,
             vector: vector.to_vec(),
         };
         let rec = encode_wal_record(self.wal_format, &op);
@@ -3977,10 +4256,7 @@ impl DiskVamanaIndex {
         vector: &[f32],
         version: VectorVersion,
     ) -> io::Result<()> {
-        // Not yet: the version is accepted and ignored until
-        // "vector: version the delta WAL (V3, payload_ref reserved)".
-        let _ = version;
-        self.insert(id, vector)
+        self.insert_at(id, vector, version, PayloadRef::Unchanged)
     }
 
     /// Tombstone `id` at `version`, dropping the delete when a newer copy of
@@ -3990,9 +4266,13 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if the WAL append fails.
     pub fn delete_versioned(&mut self, id: u64, version: VectorVersion) -> io::Result<bool> {
-        // Not yet: see `insert_versioned`.
-        let _ = version;
-        self.delete(id)
+        if version.get() < self.known_version(id) {
+            return Ok(false);
+        }
+        let op = DeltaWalOp::Delete { id, version };
+        let rec = encode_wal_record(self.wal_format, &op);
+        self.delta_log.write_all(&rec)?;
+        Ok(self.apply_delete(id, version))
     }
 
     /// The newest version this index knows for `id`, across every layer:
@@ -4000,9 +4280,7 @@ impl DiskVamanaIndex {
     /// versioning.
     #[must_use]
     pub fn version_of(&self, id: u64) -> VectorVersion {
-        // Not yet: see `insert_versioned`.
-        let _ = id;
-        VectorVersion::LEGACY
+        VectorVersion::new(self.known_version(id))
     }
 
     /// Turn the inline auto-flush on (default) or off. With it off, the delta
@@ -4018,10 +4296,7 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if the WAL append fails.
     pub fn delete(&mut self, id: u64) -> io::Result<bool> {
-        let op = DeltaWalOp::Delete { id };
-        let rec = encode_wal_record(self.wal_format, &op);
-        self.delta_log.write_all(&rec)?;
-        Ok(self.apply_delete(id))
+        self.delete_versioned(id, VectorVersion::LEGACY)
     }
 
     /// The current f32 vector for `id`, or `None` if absent/tombstoned.
@@ -4030,7 +4305,7 @@ impl DiskVamanaIndex {
     ///
     /// Returns an I/O error if a main-vector read from disk fails.
     pub fn get(&self, id: u64) -> io::Result<Option<Vec<f32>>> {
-        if self.tombstones.contains(&id) {
+        if self.tombstones.contains_key(&id) {
             return Ok(None);
         }
         if let Some(v) = self.delta.get(&id) {
@@ -4406,7 +4681,7 @@ impl DiskVamanaIndex {
             let mut seed_rows: Vec<VecId> = vec![seg.medoid];
             for &id in seeds {
                 if let Some(&r) = seg.id_to_main_row.get(&id)
-                    && !self.tombstones.contains(&id)
+                    && !self.tombstones.contains_key(&id)
                 {
                     seed_rows.push(r);
                 }
@@ -4463,7 +4738,7 @@ impl DiskVamanaIndex {
                 let mut all: Vec<(f32, VecId)> = (0..seg.main_n)
                     .filter(|&r| {
                         let id = seg.ids[r as usize];
-                        !self.tombstones.contains(&id)
+                        !self.tombstones.contains_key(&id)
                             && !self.delta.contains_key(&id)
                             && !self.flushing.contains_key(&id)
                             // Superseded by a newer run: physically present,
@@ -4503,7 +4778,7 @@ impl DiskVamanaIndex {
                 // clustered matches, a navigate-all walk recovers scattered ones.
                 let admit = |row: VecId| -> bool {
                     let id = seg.ids[row as usize];
-                    !self.tombstones.contains(&id)
+                    !self.tombstones.contains_key(&id)
                         && !self.delta.contains_key(&id)
                         && !self.flushing.contains_key(&id)
                         && matches.is_none_or(|m| m(id))
@@ -4576,7 +4851,7 @@ impl DiskVamanaIndex {
             }
             let seg = segs[seg_idx];
             let id = seg.ids[row as usize];
-            if self.tombstones.contains(&id)
+            if self.tombstones.contains_key(&id)
                 || self.delta.contains_key(&id)
                 || self.flushing.contains_key(&id)
             {
@@ -4891,6 +5166,7 @@ impl DiskVamanaIndex {
         self.runs.push(run.base);
         self.run_dirs.push(seq);
         self.delta.clear();
+        self.delta_ver.clear();
         Ok(())
     }
 
@@ -5010,7 +5286,7 @@ impl DiskVamanaIndex {
         for (ri, run) in self.runs.iter().enumerate().rev() {
             for row in 0..run.main_n {
                 let id = run.ids[row as usize];
-                if self.tombstones.contains(&id) || !seen.insert(id) {
+                if self.tombstones.contains_key(&id) || !seen.insert(id) {
                     continue;
                 }
                 out.push((id, ri + 1, row));
@@ -5018,7 +5294,7 @@ impl DiskVamanaIndex {
         }
         for row in 0..self.base.main_n {
             let id = self.base.ids[row as usize];
-            if self.tombstones.contains(&id) || !seen.insert(id) {
+            if self.tombstones.contains_key(&id) || !seen.insert(id) {
                 continue;
             }
             out.push((id, 0, row));
@@ -5397,6 +5673,7 @@ impl DiskVamanaIndex {
         // a different inode than the one the rewrite had installed.
         self.base = built.base;
         self.delta.clear();
+        self.delta_ver.clear();
         self.tombstones.clear();
         // Base PLUS whatever runs survived the bounded discard. It used to be
         // the base alone, which was right only while every run was thrown
@@ -5419,7 +5696,13 @@ impl DiskVamanaIndex {
             }
             live.len()
         };
-        self.wal_format = DeltaWalFormat::FramedV2;
+        // The WAL format is NOT set here. It used to be pinned to V2
+        // unconditionally, after the `if runs_retired` above - so a fold that
+        // could not retire its runs, and therefore deliberately left the WAL
+        // alone, still declared the file to be V2 and went on appending
+        // CRC-framed records to a headerless V1 one. `replace_wal` is what
+        // rewrites the file and it sets the format itself, on the only path
+        // where the file really did change.
         *self.tq1 = Default::default();
         self.ivf = None;
         self.replay_wal_ops(suffix_ops);
@@ -5452,7 +5735,7 @@ impl DiskVamanaIndex {
         for (ri, run) in self.runs.iter().enumerate() {
             for row in 0..run.main_n {
                 let id = run.ids[row as usize];
-                if self.tombstones.contains(&id)
+                if self.tombstones.contains_key(&id)
                     || self.delta.contains_key(&id)
                     || self.flushing.contains_key(&id)
                 {
@@ -5610,7 +5893,7 @@ impl DiskVamanaIndex {
             let run = &self.runs[ri];
             for row in 0..run.main_n {
                 let id = run.ids[row as usize];
-                if self.tombstones.contains(&id) || !seen.insert(id) {
+                if self.tombstones.contains_key(&id) || !seen.insert(id) {
                     continue;
                 }
                 survivors.push((ri, row));
@@ -5796,6 +6079,7 @@ impl DiskVamanaIndex {
             return Ok(None);
         }
         self.flushing = std::mem::take(&mut self.delta);
+        self.flushing_ver = std::mem::take(&mut self.delta_ver);
         let mut vectors: Vec<f32> = Vec::with_capacity(self.flushing.len() * self.dim);
         let mut ids: Vec<u64> = Vec::with_capacity(self.flushing.len());
         for (&id, v) in &self.flushing {
@@ -5844,6 +6128,7 @@ impl DiskVamanaIndex {
         self.runs.push(built.run);
         self.run_dirs.push(seq);
         self.flushing.clear();
+        self.flushing_ver.clear();
         // The splice above is the commit and cannot fail, so the only thing
         // left to report is whatever the WAL replacement left behind.
         Ok(wal)
@@ -5857,9 +6142,18 @@ impl DiskVamanaIndex {
     /// check is retained as a fail-closed guard. Moving rows between the two
     /// maps does not change logical cardinality.
     pub fn flush_abort(&mut self) {
+        let mut staged_ver = std::mem::take(&mut self.flushing_ver);
         for (id, vector) in std::mem::take(&mut self.flushing) {
-            if !self.tombstones.contains(&id) {
-                self.delta.entry(id).or_insert(vector);
+            if !self.tombstones.contains_key(&id) {
+                // A write that arrived after `flush_begin` is newer than the
+                // staged copy and keeps its place - version included, which is
+                // why the two maps move together rather than through
+                // `entry().or_insert()` on one of them.
+                let version = staged_ver.remove(&id).unwrap_or(0);
+                if !self.delta.contains_key(&id) {
+                    self.delta.insert(id, vector);
+                    self.delta_ver.insert(id, version);
+                }
             }
         }
     }
@@ -5915,12 +6209,17 @@ impl DiskVamanaIndex {
     /// renamed, then the append handle is reopened on the new inode.
     fn compact_wal(&mut self) -> FinishResult {
         let mut ops: Vec<DeltaWalOp> = Vec::with_capacity(self.tombstones.len() + self.delta.len());
-        for &id in &self.tombstones {
-            ops.push(DeltaWalOp::Delete { id });
+        for (&id, &version) in &self.tombstones {
+            ops.push(DeltaWalOp::Delete {
+                id,
+                version: VectorVersion::new(version),
+            });
         }
         for (&id, v) in &self.delta {
             ops.push(DeltaWalOp::Insert {
                 id,
+                version: VectorVersion::new(self.delta_ver.get(&id).copied().unwrap_or(0)),
+                payload_ref: PayloadRef::Unchanged,
                 vector: v.clone(),
             });
         }
@@ -5960,7 +6259,11 @@ impl DiskVamanaIndex {
         // reopen. And the epoch did not move, so a fold building at that moment
         // compared its offset against a file that had been replaced under it.
         self.delta_log = new_log;
-        self.wal_format = DeltaWalFormat::FramedV2;
+        // THE PROMOTION POINT. `write_framed_wal` above produced a V3 file, so
+        // from here this index appends versioned records - and a store that
+        // opened as V1 or V2 is upgraded by the first thing that rewrites its
+        // WAL whole (a flush's compaction, or a fold), never by an open.
+        self.wal_format = DeltaWalFormat::V3Versioned;
         // The file is a new one: every recorded offset into the old is void.
         self.wal_epoch = self.wal_epoch.wrapping_add(1);
         // Post-commit: making the rename itself durable. A failure here means
@@ -6005,7 +6308,7 @@ impl DiskVamanaIndex {
         let mut dead_count = 0usize;
         for row in 0..n {
             let id = self.base.ids[row];
-            if self.tombstones.contains(&id) || shadowed.contains(&id) {
+            if self.tombstones.contains_key(&id) || shadowed.contains(&id) {
                 dead[row] = true;
                 dead_count += 1;
             }
@@ -6059,7 +6362,7 @@ impl DiskVamanaIndex {
         for run in &self.runs {
             present.extend(run.ids.iter().copied());
         }
-        self.tombstones.retain(|id| present.contains(id));
+        self.tombstones.retain(|id, _| present.contains(id));
         // Everything after `install_base_generation` here is in-memory and
         // infallible, so this job has no post-commit failure to report.
         Ok(FinishOutcome::Committed)
@@ -7347,11 +7650,11 @@ mod tests {
         }
         let mut wal = std::fs::read(&wal_path).unwrap();
         assert!(
-            wal.starts_with(b"SKWL\x02"),
+            wal.starts_with(DELTA_WAL_V3_MAGIC),
             "new vector WALs are framed and versioned"
         );
         // Corrupt the first record; id 8 must not be silently skipped.
-        wal[DELTA_WAL_V2_MAGIC.len() + 9] ^= 0x01;
+        wal[DELTA_WAL_V3_MAGIC.len() + 9] ^= 0x01;
         std::fs::write(wal_path, wal).unwrap();
 
         let Err(err) = DiskVamanaIndex::open(tmp.path()) else {
@@ -7370,7 +7673,7 @@ mod tests {
             disk.insert(2, &[2.0; 4]).unwrap();
         }
         let mut wal = std::fs::read(&wal_path).unwrap();
-        assert!(wal.starts_with(b"SKWL\x02"));
+        assert!(wal.starts_with(DELTA_WAL_V3_MAGIC));
         wal.truncate(wal.len() - 3);
         std::fs::write(wal_path, wal).unwrap();
 
@@ -7402,7 +7705,7 @@ mod tests {
         assert!(
             std::fs::read(wal_path)
                 .unwrap()
-                .starts_with(DELTA_WAL_V2_MAGIC),
+                .starts_with(DELTA_WAL_V3_MAGIC),
             "a successful consolidate migrates the legacy WAL"
         );
     }
@@ -7507,11 +7810,11 @@ mod tests {
                 .unwrap();
         }
         disk.consolidate().unwrap().expect_clean();
-        // Consolidation leaves only the V2 header.
+        // Consolidation leaves only the V3 header.
         let wal = std::fs::read(tmp.path().join("delta.log")).unwrap();
         assert_eq!(
-            wal, DELTA_WAL_V2_MAGIC,
-            "consolidation leaves a V2 WAL header with no records"
+            wal, DELTA_WAL_V3_MAGIC,
+            "consolidation leaves a V3 WAL header with no records"
         );
         let reopened = DiskVamanaIndex::open(tmp.path()).unwrap();
         assert_eq!(reopened.len(), n + 20);

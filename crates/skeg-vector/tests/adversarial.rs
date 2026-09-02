@@ -553,7 +553,6 @@ fn create_empty_refuses_a_dir_that_already_holds_an_index() {
 /// wrote after looks like from here - must not become the value the index
 /// serves, and must not become it at the next restart either.
 #[test]
-#[ignore = "opens in \"vector: version the delta WAL (V3, payload_ref reserved)\""]
 fn a_wal_replay_of_an_older_insert_does_not_overwrite_a_newer_one() {
     let d = tempfile::TempDir::new().unwrap();
     let mut i = idx(d.path());
@@ -585,7 +584,6 @@ fn a_wal_replay_of_an_older_insert_does_not_overwrite_a_newer_one() {
 /// other and an older insert cannot undo it. This is the shape that resurrects
 /// a deleted row - an overlap replicating a row a concurrent delete removed.
 #[test]
-#[ignore = "opens in \"vector: version the delta WAL (V3, payload_ref reserved)\""]
 fn a_delete_at_version_n_is_not_undone_by_an_insert_at_version_n_minus_one() {
     let d = tempfile::TempDir::new().unwrap();
     let mut i = idx(d.path());
@@ -655,7 +653,6 @@ fn versions_survive_a_flush_a_run_merge_and_a_fold() {
 /// The V3 promotion happens at the fold, never at open: opening must not
 /// rewrite a file it was only asked to read.
 #[test]
-#[ignore = "opens in \"vector: version the delta WAL (V3, payload_ref reserved)\""]
 fn a_v2_store_opens_and_upgrades_to_v3_on_the_first_fold() {
     for (name, magic, framed) in [("v1", &b""[..], false), ("v2", &b"SKWL\x02"[..], true)] {
         let d = tempfile::TempDir::new().unwrap();
@@ -713,7 +710,6 @@ fn a_v2_store_opens_and_upgrades_to_v3_on_the_first_fold() {
 /// one never happened. Half-applying it (an id with no vector, a version with
 /// no id) would be worse than losing it.
 #[test]
-#[ignore = "opens in \"vector: version the delta WAL (V3, payload_ref reserved)\""]
 fn a_truncated_v3_record_is_ignored_not_half_applied() {
     // Every prefix length of the second record, so the cut lands inside the id,
     // inside the version, inside the payload_ref tag and inside the vector.

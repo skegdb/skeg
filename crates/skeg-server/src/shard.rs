@@ -7805,7 +7805,7 @@ mod tests {
         }
         let wal_path = base.join("shard-0/vindex-idx/delta.log");
         let mut wal = fs::read(&wal_path).unwrap();
-        assert!(wal.starts_with(b"SKWL\x02"));
+        assert!(wal.starts_with(b"SKWL\x03"));
         *wal.last_mut().unwrap() ^= 0x01;
         fs::write(wal_path, wal).unwrap();
 
