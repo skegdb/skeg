@@ -794,3 +794,48 @@ fn a_fold_that_cannot_write_versions_bin_does_not_commit_a_new_generation() {
         );
     }
 }
+
+/// `live_ids_with_versions` has two paths - a direct read of the base's own
+/// column in the folded steady state, and the general one across every layer -
+/// and they have to give the same answer. Two paths that agree today and
+/// diverge later is how a cold start starts naming the wrong primary.
+#[test]
+fn live_ids_with_versions_agrees_across_the_layer_shapes() {
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    let general = |i: &DiskVamanaIndex| {
+        let mut want: Vec<(u64, VectorVersion)> = i
+            .live_ids()
+            .into_iter()
+            .map(|id| (id, i.version_of(id)))
+            .collect();
+        want.sort_unstable();
+        want
+    };
+    let taken = |i: &DiskVamanaIndex| {
+        let mut got = i.live_ids_with_versions();
+        got.sort_unstable();
+        got
+    };
+
+    for id in 0..40 {
+        i.insert_versioned(id, &v(id), VectorVersion::new(70 + id))
+            .unwrap();
+    }
+    // Delta only.
+    assert_eq!(taken(&i), general(&i));
+    flush(&mut i, d.path());
+    for id in 40..60 {
+        i.insert_versioned(id, &v(id), VectorVersion::new(70 + id))
+            .unwrap();
+    }
+    i.delete_versioned(3, VectorVersion::new(500)).unwrap();
+    // A run, a delta and a tombstone at once.
+    assert_eq!(taken(&i), general(&i));
+    assert!(!taken(&i).iter().any(|&(id, _)| id == 3));
+
+    fold(&mut i, d.path());
+    // Folded: the direct path.
+    assert_eq!(taken(&i), general(&i));
+    assert_eq!(taken(&i).len(), 59);
+}

@@ -4393,8 +4393,29 @@ impl DiskVamanaIndex {
     /// Every live id with its version. What an owner-map rebuild needs: the id
     /// says which shards hold a row, the version says which of them holds the
     /// copy to serve.
+    ///
+    /// Called once per routed vindex per shard at cold start, so the folded
+    /// steady state - no runs, no delta, no tombstones, which is what a
+    /// restart opens onto - gets a direct path: the base IS the live set and
+    /// its version column is already beside its ids. Going through
+    /// `version_of` for every row instead costs a lookup in each layer per id
+    /// and measured 2,1 ms against 0,6 ms over 200k rows, all of it on the
+    /// readiness barrier.
     #[must_use]
     pub fn live_ids_with_versions(&self) -> Vec<(u64, VectorVersion)> {
+        if self.tombstones.is_empty()
+            && self.delta.is_empty()
+            && self.flushing.is_empty()
+            && self.runs.is_empty()
+        {
+            return self
+                .base
+                .ids
+                .iter()
+                .zip(&self.base.versions)
+                .map(|(&id, &v)| (id, VectorVersion::new(v)))
+                .collect();
+        }
         self.live_ids()
             .into_iter()
             .map(|id| (id, self.version_of(id)))
