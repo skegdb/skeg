@@ -15,6 +15,7 @@ use fixedbitset::FixedBitSet;
 use ordered_float::OrderedFloat;
 use skeg_simd::cosine_f32;
 
+use crate::VectorVersion;
 use crate::quant::{QuantKind, QuantizedVectors};
 
 /// Candidate fan-out: re-rank `max(k * FANOUT, MIN_RERANK)` quantized hits.
@@ -34,6 +35,10 @@ pub struct FlatIndex {
     f32_data: Vec<f32>,
     /// External id per row.
     ids: Vec<u64>,
+    /// [`VectorVersion`] per row, parallel to `ids`. A tombstoned row KEEPS
+    /// its version: that is what stops a straggler insert - an overlap replica
+    /// written from a copy read before the delete - from bringing it back.
+    versions: Vec<u64>,
     /// Id -> row, for overwrite and delete.
     id_to_row: AHashMap<u64, usize>,
     /// Row liveness; a cleared bit is a tombstone.
@@ -62,6 +67,7 @@ impl FlatIndex {
             kind,
             f32_data: Vec::new(),
             ids: Vec::new(),
+            versions: Vec::new(),
             id_to_row: AHashMap::new(),
             live: FixedBitSet::new(),
             live_count: 0,
@@ -103,13 +109,37 @@ impl FlatIndex {
 
     /// Insert `vector` under `id`, overwriting any existing vector for `id`.
     ///
+    /// Unversioned, so it writes [`VectorVersion::LEGACY`] and can be
+    /// overwritten by anything. Callers that place rows on more than one shard
+    /// want [`insert_versioned`](Self::insert_versioned).
+    ///
     /// # Panics
     ///
     /// Panics if `vector.len()` does not equal the index dimension.
     pub fn insert(&mut self, id: u64, vector: &[f32]) {
+        self.insert_versioned(id, vector, VectorVersion::LEGACY);
+    }
+
+    /// Insert `vector` under `id` at `version`, DROPPING the write when a
+    /// newer copy of the row is already here.
+    ///
+    /// The same rule as the disk backend, and the same reason: a copy that
+    /// only relocates a row carries the version it read, so it must not land
+    /// on top of the user write that replaced the row while it was in flight.
+    /// Equal versions apply, which keeps an unversioned index on
+    /// last-write-wins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vector.len()` does not equal the index dimension.
+    pub fn insert_versioned(&mut self, id: u64, vector: &[f32], version: VectorVersion) {
         assert_eq!(vector.len(), self.dim, "vector dim mismatch");
+        if version.get() < self.known_version(id) {
+            return;
+        }
         if let Some(&row) = self.id_to_row.get(&id) {
             self.f32_data[row * self.dim..(row + 1) * self.dim].copy_from_slice(vector);
+            self.versions[row] = version.get();
             if !self.live.contains(row) {
                 self.live.insert(row);
                 self.live_count += 1;
@@ -118,6 +148,7 @@ impl FlatIndex {
             let row = self.ids.len();
             self.f32_data.extend_from_slice(vector);
             self.ids.push(id);
+            self.versions.push(version.get());
             self.id_to_row.insert(id, row);
             self.live.grow(row + 1);
             self.live.insert(row);
@@ -127,18 +158,62 @@ impl FlatIndex {
         self.block_codes_tq4 = None; // and the interleaved cache too
     }
 
+    /// The version this index holds for `id`, live or tombstoned;
+    /// [`VectorVersion::LEGACY`] for an id it has never seen.
+    #[must_use]
+    pub fn version_of(&self, id: u64) -> VectorVersion {
+        VectorVersion::new(self.known_version(id))
+    }
+
+    fn known_version(&self, id: u64) -> u64 {
+        self.id_to_row.get(&id).map_or(0, |&row| self.versions[row])
+    }
+
     /// Tombstone the vector for `id`. Returns `true` if it was live.
     ///
     /// The quantized form is left intact: the scan skips dead rows, so a
     /// delete needs no rebuild.
     pub fn delete(&mut self, id: u64) -> bool {
-        match self.id_to_row.get(&id) {
-            Some(&row) if self.live.contains(row) => {
-                self.live.set(row, false);
-                self.live_count -= 1;
-                true
+        self.delete_versioned(id, VectorVersion::LEGACY)
+    }
+
+    /// Tombstone `id` at `version`, dropping the delete when a newer copy of
+    /// the row is already here. Returns `true` if it was live.
+    ///
+    /// A VERSIONED delete of an id this index has never seen still records the
+    /// tombstone, as a dead row carrying that version: without it, a replica
+    /// written from a copy read before the delete would arrive at a shard that
+    /// has nothing to lose against and resurrect the row. A legacy delete of
+    /// an unknown id stays a plain no-op - version 0 could not win that
+    /// comparison anyway, and allocating a row for it would be pure waste.
+    pub fn delete_versioned(&mut self, id: u64, version: VectorVersion) -> bool {
+        if version.get() < self.known_version(id) {
+            return false;
+        }
+        match self.id_to_row.get(&id).copied() {
+            Some(row) => {
+                self.versions[row] = version.get();
+                if self.live.contains(row) {
+                    self.live.set(row, false);
+                    self.live_count -= 1;
+                    true
+                } else {
+                    false
+                }
             }
-            _ => false,
+            None => {
+                if !version.is_legacy() {
+                    let row = self.ids.len();
+                    self.f32_data.extend(std::iter::repeat_n(0.0f32, self.dim));
+                    self.ids.push(id);
+                    self.versions.push(version.get());
+                    self.id_to_row.insert(id, row);
+                    self.live.grow(row + 1); // grown, never set: born dead
+                    self.quant = None;
+                    self.block_codes_tq4 = None;
+                }
+                false
+            }
         }
     }
 
@@ -195,6 +270,19 @@ impl FlatIndex {
             .enumerate()
             .filter(|&(row, _)| self.live.contains(row))
             .map(|(_, &id)| id)
+            .collect()
+    }
+
+    /// Every live id with its version. What an owner-map rebuild needs: the id
+    /// says which rows exist, the version says which copy of a row is the one
+    /// to serve.
+    #[must_use]
+    pub fn live_ids_with_versions(&self) -> Vec<(u64, VectorVersion)> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|&(row, _)| self.live.contains(row))
+            .map(|(row, &id)| (id, VectorVersion::new(self.versions[row])))
             .collect()
     }
 
@@ -716,5 +804,54 @@ mod tests {
             assert_eq!(hits[0].0, probe as u64, "binary search missed exact match");
             assert!((hits[0].1 - 1.0).abs() < 1e-4);
         }
+    }
+
+    /// The flat backend answers the same three questions the disk one does,
+    /// and it has to answer them the same way: a shard does not know which
+    /// backend it holds when it relocates a row.
+    #[test]
+    fn an_older_copy_never_wins_against_a_newer_one() {
+        let mut index = FlatIndex::new(4, QuantKind::F32);
+        index.insert_versioned(1, &[1.0; 4], VectorVersion::new(5));
+        // The straggler: the same row as some earlier write saw it.
+        index.insert_versioned(1, &[9.0; 4], VectorVersion::new(3));
+        assert_eq!(index.get(1), Some(vec![1.0; 4]), "the newer copy stands");
+        assert_eq!(index.version_of(1), VectorVersion::new(5));
+
+        // An equal version applies: that is what leaves an unversioned index
+        // on last-write-wins.
+        index.insert_versioned(1, &[7.0; 4], VectorVersion::new(5));
+        assert_eq!(index.get(1), Some(vec![7.0; 4]));
+
+        // A delete is a write like any other, in both directions.
+        assert!(index.delete_versioned(1, VectorVersion::new(9)));
+        index.insert_versioned(1, &[9.0; 4], VectorVersion::new(8));
+        assert!(index.get(1).is_none(), "the delete stands");
+        assert_eq!(index.len(), 0);
+        index.insert_versioned(1, &[2.0; 4], VectorVersion::new(10));
+        assert_eq!(index.get(1), Some(vec![2.0; 4]), "and is overtaken in turn");
+
+        // A versioned delete of an id this index has never held still records
+        // the tombstone, or a replica written from a copy read before the
+        // delete would arrive with nothing to lose against.
+        assert!(!index.delete_versioned(42, VectorVersion::new(20)));
+        index.insert_versioned(42, &[3.0; 4], VectorVersion::new(19));
+        assert!(
+            index.get(42).is_none(),
+            "the straggler must not resurrect it"
+        );
+        assert_eq!(
+            index.live_ids_with_versions(),
+            vec![(1, VectorVersion::new(10))]
+        );
+    }
+
+    /// A legacy delete of an unknown id stays what it was: nothing.
+    #[test]
+    fn a_legacy_delete_of_an_unknown_id_allocates_nothing() {
+        let mut index = FlatIndex::new(4, QuantKind::F32);
+        assert!(!index.delete(7));
+        assert_eq!(index.resident_bytes(), 0);
+        assert!(index.live_ids().is_empty());
     }
 }
