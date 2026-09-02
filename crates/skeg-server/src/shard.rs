@@ -1227,6 +1227,29 @@ const PAYLOAD_MARKER_V2: &[u8; 3] = b"\x00vq";
 /// device-wide barrier on macOS, ~7 ms) making the payload STRONGER than its own
 /// vector and turning a 100k bulk load into ~13 min (31 s without it). Group
 /// commit can't amortise it because VSETs serialise on the per-vindex lock.
+///
+/// # What that buys, exactly
+///
+/// A vector and its payload are ONE write, and the WAL record is its commit
+/// point. The blob is staged first, at the key of the version the write is
+/// about to take, which no live row carries - so it is unreachable until the
+/// record lands, and reachable the instant it does.
+///
+/// **Process death** - a kill, a panic, an OOM - is therefore atomic on the
+/// pair WITH NO FSYNC. Both halves are in the kernel; the record either
+/// reached the file or it did not, and the blob cannot be read until it does.
+/// A restart sees the old row with the old payload, or the new row with the
+/// new payload, and never a mixture.
+///
+/// **Power loss** can reach exactly ONE skew, and it is the survivable one.
+/// The device can commit neither half, the blob only, or both - "record only"
+/// is not an ordering the write path can produce. So the worst a power cut
+/// leaves is a vector whose payload blob did not survive: never a vector
+/// wearing the payload of the value it replaced, and never a payload with no
+/// vector. That row reads back with no payload, and the open-time reclamation
+/// has nothing to collect for it.
+///
+/// See `docs/adr-payload-transaction.md`.
 const PAYLOAD_DURABILITY: Durability = Durability::Relaxed;
 
 /// Which INCARNATION of a vindex name a payload blob belongs to.

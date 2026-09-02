@@ -9,6 +9,48 @@ repository.
 
 ## [Unreleased]
 
+### A vector and its payload are one write
+
+`SKEG.VSET name id vector payload` published the vector first and its blob
+afterwards, so a failure in between was reported to the client as a failed
+write while the vector stood: a search returned a row the client had been told
+did not exist, carrying no payload or the payload of the value it had just
+replaced. `SKEG.VDEL` had the same shape - the tombstone is durable before the
+blob is reclaimed, and a failure reclaiming it reported a delete that had
+happened as one that had not.
+
+The order is now stage, commit, reclaim. A blob's key carries the index's
+GENERATION and the row's VERSION, so a blob belongs to one copy of one
+incarnation of a row; it is staged at the key of the version the write is about
+to take, which no live row carries and nothing can read; the WAL record that
+publishes the row names it, and IS the commit point; everything after that logs
+and cannot fail the call. For the crash class `Relaxed` covers - process death -
+the pair is now atomic with no fsync. Under power loss exactly one skew is
+reachable, a vector whose blob did not survive, and never the reverse. See
+[`docs/adr-payload-transaction.md`](docs/adr-payload-transaction.md).
+
+The generation also closes a hole a comment used to document: a vindex name is
+reusable, the drop's blob sweep runs after the catalogue has already stopped
+naming the index, and a failure there left blobs that the next index of the
+same name served as its own. Blobs no live row names - staged for a commit that
+never landed, superseded by one that did, or left by an unfinished drop - are
+collected in one pass at open, inside the readiness barrier.
+
+**On disk.** The vindex registry becomes `SVI3`, sixteen bytes wider per
+record; `SVI2` still reads, and an index recorded by it reads as the LEGACY
+generation and keeps reading its blobs at the pre-generation key, so a store
+written before this opens and answers as it did. `payload.idx` becomes version
+2 and carries the generation; a version 1 file is refused and rebuilt from the
+log. An older engine does not open an `SVI3` registry - it already could not
+open this version's stores, see the WAL note below.
+
+**Breaking on the wire.** `SKEG.VMSET` replies with an ARRAY of n - `+OK` or
+that item's own error, in request order - instead of one integer. It also
+stopped aborting siblings: the previous body awaited a `JoinSet` with `??`, and
+a `JoinSet` cancels its outstanding tasks when it is dropped, so one malformed
+item could cancel a sibling that had already committed its write and had not
+yet published the row. That row was durable, acknowledged and unreachable.
+
 ### A vector row says which copy of it is live
 
 A vector id can have more than one physical copy at once - mid-reshard, as a
