@@ -55,6 +55,12 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 # flag stays parseable but logs a warning instead of binding.
 default = ["metrics-http", "tracing-otlp"]
 avx512 = ["skeg-vector/avx512"]
+# Typed write-path failpoints (see `src/failpoint.rs`). Off in a normal
+# build: `fp!` then expands to a type annotation and the write path carries
+# no branch. Turned on for this crate's own tests through the dev-dependency
+# below, which is how `tests/*.rs` - separate crates, so `cfg(test)` does not
+# reach the library - get to arm them.
+failpoints = ["skeg-vector/failpoints"]
 metrics-http = ["skeg-telemetry/http"]
 # OpenTelemetry tracing exporter. When this feature is on AND the env
 # var `SKEG_TRACE_OTLP_ENDPOINT` is set, spans flow to the configured
@@ -70,6 +76,16 @@ tracing-otlp = [
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+# The crate itself, with failpoints on. An integration test is its own crate
+# and links the library through this entry, so `cargo test -p skeg-server`
+# builds the tested library WITH the failpoints while `cargo build` does not.
+#
+# Feature unification makes that wider than it looks: under `cargo test
+# --workspace` the feature is on for every workspace consumer of this crate,
+# not only for its own tests. Confined to the test profile - a release build
+# resolves without this entry - but it is why `fp!` has to be correct when
+# enabled, not merely absent when not.
+skeg-server = { path = ".", features = ["failpoints"] }
 
 [[bench]]
 name = "tracing_overhead"

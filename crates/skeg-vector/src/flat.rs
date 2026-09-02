@@ -15,7 +15,14 @@ use fixedbitset::FixedBitSet;
 use ordered_float::OrderedFloat;
 use skeg_simd::cosine_f32;
 
+use crate::VectorVersion;
 use crate::quant::{QuantKind, QuantizedVectors};
+
+/// What one entry of the absent-id tombstone map costs: the id and its
+/// version. Approximate - a hash map has per-bucket overhead on top - but the
+/// point of counting it is that the number is not ZERO, which is what a
+/// structure nothing reports looks like to memory admission.
+const TOMBSTONE_BYTES: usize = 8 + 8;
 
 /// Candidate fan-out: re-rank `max(k * FANOUT, MIN_RERANK)` quantized hits.
 const RERANK_FANOUT: usize = 8;
@@ -34,6 +41,26 @@ pub struct FlatIndex {
     f32_data: Vec<f32>,
     /// External id per row.
     ids: Vec<u64>,
+    /// [`VectorVersion`] per row, parallel to `ids`. A tombstoned row KEEPS
+    /// its version: that is what stops a straggler insert - an overlap replica
+    /// written from a copy read before the delete - from bringing it back.
+    versions: Vec<u64>,
+    /// Versions of ids this index was told to DELETE and has never held.
+    ///
+    /// A row was the obvious place to record one and it was the wrong place: a
+    /// dead row costs `dim` f32 plus an id, a version, a map entry and a
+    /// liveness bit, nothing ever reclaims it, and every routed `VDEL` carries
+    /// a real version - so `SKEG.VDEL idx <random id>` in a loop grew the
+    /// index without bound. Measured at 768 dimensions: 10 000 of them cost
+    /// 30,7 MB with zero live rows. It also invalidated the quantised tier on
+    /// every call, forcing a requantisation for a delete that removed nothing.
+    ///
+    /// The version is the only part the guard needs, so only the version is
+    /// kept - 16 bytes, counted by [`resident_bytes`](Self::resident_bytes) -
+    /// and it is released the moment the row it stood for actually arrives.
+    /// Still unbounded in principle; two orders of magnitude smaller, and
+    /// visible to whoever is looking at memory.
+    absent_tombstones: AHashMap<u64, u64>,
     /// Id -> row, for overwrite and delete.
     id_to_row: AHashMap<u64, usize>,
     /// Row liveness; a cleared bit is a tombstone.
@@ -62,6 +89,8 @@ impl FlatIndex {
             kind,
             f32_data: Vec::new(),
             ids: Vec::new(),
+            versions: Vec::new(),
+            absent_tombstones: AHashMap::new(),
             id_to_row: AHashMap::new(),
             live: FixedBitSet::new(),
             live_count: 0,
@@ -89,6 +118,7 @@ impl FlatIndex {
     /// never gives any of it back, which is why admission must see it.
     pub fn resident_bytes(&self) -> usize {
         self.f32_data.len() * std::mem::size_of::<f32>()
+            + self.absent_tombstones.len() * TOMBSTONE_BYTES
     }
 
     pub fn len(&self) -> usize {
@@ -103,13 +133,46 @@ impl FlatIndex {
 
     /// Insert `vector` under `id`, overwriting any existing vector for `id`.
     ///
+    /// # This write can be DROPPED without saying so
+    ///
+    /// Unversioned, so it writes [`VectorVersion::LEGACY`], which loses
+    /// against every allocated version: on a row that
+    /// [`insert_versioned`](Self::insert_versioned) has written, this is
+    /// silently discarded and returns normally. Harmless while an index is
+    /// all-legacy or all-versioned; if a caller mixes the two forms on one
+    /// index, this is the one that loses.
+    ///
     /// # Panics
     ///
     /// Panics if `vector.len()` does not equal the index dimension.
     pub fn insert(&mut self, id: u64, vector: &[f32]) {
+        self.insert_versioned(id, vector, VectorVersion::LEGACY);
+    }
+
+    /// Insert `vector` under `id` at `version`, DROPPING the write when a
+    /// newer copy of the row is already here.
+    ///
+    /// The same rule as the disk backend, and the same reason: a copy that
+    /// only relocates a row carries the version it read, so it must not land
+    /// on top of the user write that replaced the row while it was in flight.
+    /// Equal versions apply, which keeps an unversioned index on
+    /// last-write-wins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vector.len()` does not equal the index dimension.
+    pub fn insert_versioned(&mut self, id: u64, vector: &[f32], version: VectorVersion) {
         assert_eq!(vector.len(), self.dim, "vector dim mismatch");
+        if version.get() < self.known_version(id) {
+            return;
+        }
+        // The row is arriving, so the stand-in for it is no longer needed.
+        // This is the only thing that reclaims one, and it is what keeps a
+        // deleted-then-rewritten id from paying for both.
+        self.absent_tombstones.remove(&id);
         if let Some(&row) = self.id_to_row.get(&id) {
             self.f32_data[row * self.dim..(row + 1) * self.dim].copy_from_slice(vector);
+            self.versions[row] = version.get();
             if !self.live.contains(row) {
                 self.live.insert(row);
                 self.live_count += 1;
@@ -118,6 +181,7 @@ impl FlatIndex {
             let row = self.ids.len();
             self.f32_data.extend_from_slice(vector);
             self.ids.push(id);
+            self.versions.push(version.get());
             self.id_to_row.insert(id, row);
             self.live.grow(row + 1);
             self.live.insert(row);
@@ -127,18 +191,67 @@ impl FlatIndex {
         self.block_codes_tq4 = None; // and the interleaved cache too
     }
 
+    /// The version this index holds for `id`, live or tombstoned;
+    /// [`VectorVersion::LEGACY`] for an id it has never seen.
+    #[must_use]
+    pub fn version_of(&self, id: u64) -> VectorVersion {
+        VectorVersion::new(self.known_version(id))
+    }
+
+    fn known_version(&self, id: u64) -> u64 {
+        match self.id_to_row.get(&id) {
+            Some(&row) => self.versions[row],
+            None => self.absent_tombstones.get(&id).copied().unwrap_or(0),
+        }
+    }
+
     /// Tombstone the vector for `id`. Returns `true` if it was live.
     ///
     /// The quantized form is left intact: the scan skips dead rows, so a
     /// delete needs no rebuild.
+    ///
+    /// # This delete can be DROPPED without saying so
+    ///
+    /// Unversioned, same rule as [`insert`](Self::insert): against a row
+    /// carrying an allocated version it is discarded and returns `false`,
+    /// which is indistinguishable from "it was not live". Use
+    /// [`delete_versioned`](Self::delete_versioned) on an index anything
+    /// versioned writes to.
     pub fn delete(&mut self, id: u64) -> bool {
-        match self.id_to_row.get(&id) {
-            Some(&row) if self.live.contains(row) => {
-                self.live.set(row, false);
-                self.live_count -= 1;
-                true
+        self.delete_versioned(id, VectorVersion::LEGACY)
+    }
+
+    /// Tombstone `id` at `version`, dropping the delete when a newer copy of
+    /// the row is already here. Returns `true` if it was live.
+    ///
+    /// A VERSIONED delete of an id this index has never seen still records the
+    /// tombstone, as a version in `absent_tombstones`: without it, a replica
+    /// written from a copy read before the delete would arrive at a shard that
+    /// has nothing to lose against and resurrect the row. A legacy delete of
+    /// an unknown id records nothing - version 0 could not win that comparison
+    /// anyway.
+    pub fn delete_versioned(&mut self, id: u64, version: VectorVersion) -> bool {
+        if version.get() < self.known_version(id) {
+            return false;
+        }
+        match self.id_to_row.get(&id).copied() {
+            Some(row) => {
+                self.versions[row] = version.get();
+                if self.live.contains(row) {
+                    self.live.set(row, false);
+                    self.live_count -= 1;
+                    true
+                } else {
+                    false
+                }
             }
-            _ => false,
+            None => {
+                // The VERSION, not a row. See `absent_tombstones`.
+                if !version.is_legacy() {
+                    self.absent_tombstones.insert(id, version.get());
+                }
+                false
+            }
         }
     }
 
@@ -195,6 +308,30 @@ impl FlatIndex {
             .enumerate()
             .filter(|&(row, _)| self.live.contains(row))
             .map(|(_, &id)| id)
+            .collect()
+    }
+
+    /// The highest version this index has ever recorded, TOMBSTONES INCLUDED.
+    /// A tombstoned row keeps its version, so a dead row can still be the
+    /// high-water mark - and an allocator seeded below it would hand the next
+    /// write to that id a version the tombstone beats.
+    #[must_use]
+    pub fn max_version(&self) -> VectorVersion {
+        let rows = self.versions.iter().copied().max().unwrap_or(0);
+        let absent = self.absent_tombstones.values().copied().max().unwrap_or(0);
+        VectorVersion::new(rows.max(absent))
+    }
+
+    /// Every live id with its version. What an owner-map rebuild needs: the id
+    /// says which rows exist, the version says which copy of a row is the one
+    /// to serve.
+    #[must_use]
+    pub fn live_ids_with_versions(&self) -> Vec<(u64, VectorVersion)> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|&(row, _)| self.live.contains(row))
+            .map(|(row, &id)| (id, VectorVersion::new(self.versions[row])))
             .collect()
     }
 
@@ -716,5 +853,116 @@ mod tests {
             assert_eq!(hits[0].0, probe as u64, "binary search missed exact match");
             assert!((hits[0].1 - 1.0).abs() < 1e-4);
         }
+    }
+
+    /// The flat backend answers the same three questions the disk one does,
+    /// and it has to answer them the same way: a shard does not know which
+    /// backend it holds when it relocates a row.
+    #[test]
+    fn an_older_copy_never_wins_against_a_newer_one() {
+        let mut index = FlatIndex::new(4, QuantKind::F32);
+        index.insert_versioned(1, &[1.0; 4], VectorVersion::new(5));
+        // The straggler: the same row as some earlier write saw it.
+        index.insert_versioned(1, &[9.0; 4], VectorVersion::new(3));
+        assert_eq!(index.get(1), Some(vec![1.0; 4]), "the newer copy stands");
+        assert_eq!(index.version_of(1), VectorVersion::new(5));
+
+        // An equal version applies: that is what leaves an unversioned index
+        // on last-write-wins.
+        index.insert_versioned(1, &[7.0; 4], VectorVersion::new(5));
+        assert_eq!(index.get(1), Some(vec![7.0; 4]));
+
+        // A delete is a write like any other, in both directions.
+        assert!(index.delete_versioned(1, VectorVersion::new(9)));
+        index.insert_versioned(1, &[9.0; 4], VectorVersion::new(8));
+        assert!(index.get(1).is_none(), "the delete stands");
+        assert_eq!(index.len(), 0);
+        index.insert_versioned(1, &[2.0; 4], VectorVersion::new(10));
+        assert_eq!(index.get(1), Some(vec![2.0; 4]), "and is overtaken in turn");
+
+        // A versioned delete of an id this index has never held still records
+        // the tombstone, or a replica written from a copy read before the
+        // delete would arrive with nothing to lose against.
+        assert!(!index.delete_versioned(42, VectorVersion::new(20)));
+        index.insert_versioned(42, &[3.0; 4], VectorVersion::new(19));
+        assert!(
+            index.get(42).is_none(),
+            "the straggler must not resurrect it"
+        );
+        assert_eq!(
+            index.live_ids_with_versions(),
+            vec![(1, VectorVersion::new(10))]
+        );
+    }
+
+    /// A legacy delete of an unknown id stays what it was: nothing.
+    #[test]
+    fn a_legacy_delete_of_an_unknown_id_allocates_nothing() {
+        let mut index = FlatIndex::new(4, QuantKind::F32);
+        assert!(!index.delete(7));
+        assert_eq!(index.resident_bytes(), 0);
+        assert!(index.live_ids().is_empty());
+    }
+
+    /// A delete of an id this index has never held must not allocate vector
+    /// storage. It used to allocate a whole dead ROW - `dim` f32 plus the id,
+    /// version, map entry and liveness bit - which nothing ever reclaims and
+    /// which `SKEG.VDEL idx <random>` in a loop turns into unbounded growth.
+    /// Measured at 768 dimensions: 10 000 such deletes cost 30,7 MB with zero
+    /// live rows, and the RAM report showed none of it, since it counted live
+    /// rows only.
+    ///
+    /// What is kept instead is the one thing the row was there for - the
+    /// version, so a replica written from a copy read before the delete cannot
+    /// resurrect the row - at 16 bytes rather than 3 072, and counted.
+    #[test]
+    fn deleting_ids_this_index_never_held_allocates_no_vector_storage() {
+        const DIM: usize = 768;
+        const N: u64 = 10_000;
+        let mut index = FlatIndex::new(DIM, QuantKind::F32);
+        index.insert_versioned(1, &vec![1.0; DIM], VectorVersion::new(1));
+        let before = index.resident_bytes();
+
+        for id in 0..N {
+            assert!(!index.delete_versioned(1_000_000 + id, VectorVersion::new(id + 1)));
+        }
+        assert_eq!(index.len(), 1, "no delete of an absent id removed anything");
+
+        let grew = index.resident_bytes() - before;
+        // Exactly the tombstones, and nothing that scales with `dim`.
+        assert_eq!(
+            grew,
+            N as usize * TOMBSTONE_BYTES,
+            "an absent-id delete allocated more than its version"
+        );
+        // For scale: a dead row each would have been this.
+        assert!(
+            grew * 100 < N as usize * DIM * 4,
+            "two orders of magnitude under a dead row per delete"
+        );
+        // And it is COUNTED, not invisible - which is the whole point of the
+        // number memory admission and `SKEG.STATS` read.
+        assert!(grew > 0);
+
+        // The guard the tombstone exists for still holds: id 1_000_005 was
+        // deleted at version 6, so a straggler at 5 loses.
+        index.insert_versioned(1_000_005, &vec![2.0; DIM], VectorVersion::new(5));
+        assert!(
+            index.get(1_000_005).is_none(),
+            "a straggler older than the tombstone must not resurrect the row"
+        );
+        assert_eq!(
+            index.resident_bytes() - before,
+            N as usize * TOMBSTONE_BYTES,
+            "a straggler that loses must not allocate either"
+        );
+        // ...and a newer write does land, and reclaims the tombstone with it.
+        index.insert_versioned(1_000_005, &vec![2.0; DIM], VectorVersion::new(9_999_999));
+        assert_eq!(index.get(1_000_005), Some(vec![2.0; DIM]));
+        assert_eq!(
+            index.resident_bytes(),
+            before + (N as usize - 1) * TOMBSTONE_BYTES + DIM * 4,
+            "the tombstone is released when the row it stood for arrives"
+        );
     }
 }

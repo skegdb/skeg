@@ -78,7 +78,7 @@ use skeg_core::{Durability, VLog};
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{
     ConsolidateBuilt, ConsolidateJob, DeletePatchBuilt, DeletePatchJob, DiskVamanaIndex, FlatIndex,
-    FlushBuilt, FlushJob, IvfBuilt, IvfJob, QuantKind, RunMergeBuilt, RunMergeJob,
+    FlushBuilt, FlushJob, IvfBuilt, IvfJob, QuantKind, RunMergeBuilt, RunMergeJob, VectorVersion,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Semaphore, oneshot};
@@ -236,6 +236,16 @@ const VAMANA_L_SEARCH: usize = 100;
 // Both variants boxed: DiskVamanaIndex and FlatIndex are each hundreds of bytes,
 // so an unboxed variant would size every VectorBackend to the larger one (clippy
 // large_enum_variant). One heap indirection per vindex, off the hot path.
+/// What a `Vset` did on the answering shard.
+enum VsetOutcome {
+    /// The row was written, so everything hanging off it - its payload
+    /// postings, its blob in the vLog - has to follow.
+    Stored,
+    /// The shard already holds a NEWER copy of this row, so nothing was
+    /// written and nothing must follow.
+    Superseded,
+}
+
 enum VectorBackend {
     Flat(Box<FlatIndex>),
     Disk(Box<DiskVamanaIndex>),
@@ -268,7 +278,14 @@ impl VectorBackend {
     /// process RSS sample.
     fn approx_ram_bytes(&self) -> u64 {
         match self {
-            VectorBackend::Flat(_) => self.len() as u64 * self.dim() as u64 * 4,
+            // The index's OWN number, not live rows times dim. A flat index
+            // never gives a row back: a deleted row keeps its f32, and the
+            // versions of ids it was told to delete and never held are held
+            // too. Multiplying the LIVE count by `dim` reported none of that,
+            // so a workload of deletes grew the process while `SKEG.STATS`,
+            // the tiering controller and memory admission all read a number
+            // that was going down.
+            VectorBackend::Flat(i) => i.resident_bytes() as u64,
             VectorBackend::Disk(i) => i.resident_bytes() as u64,
         }
     }
@@ -293,7 +310,11 @@ impl VectorBackend {
     /// vs 1.00 for a bulk build at 100k. Bulk-building beats incremental on both
     /// recall and bulk-load speed; incremental insert is kept for an explicit
     /// streaming path only.
-    fn insert(&mut self, id: u64, vector: &[f32]) -> std::io::Result<()> {
+    ///
+    /// `version` says WHICH copy of the row this is. A write older than the
+    /// copy the backend already holds is dropped by the backend itself, which
+    /// is what stops a relocation republishing a value a user write replaced.
+    fn insert(&mut self, id: u64, vector: &[f32], version: VectorVersion) -> std::io::Result<()> {
         match self {
             VectorBackend::Flat(i) => {
                 // `FlatIndex::insert` panics on a dim mismatch and its
@@ -306,22 +327,50 @@ impl VectorBackend {
                         format!("vector has {} dims, index has {}", vector.len(), i.dim()),
                     ));
                 }
-                i.insert(id, vector);
+                i.insert_versioned(id, vector, version);
                 Ok(())
             }
             VectorBackend::Disk(i) => {
                 // Append only. The geometric fold (delta >= built size) runs
                 // OFF-THREAD in the background maintenance loop (with the cheap
                 // consolidate_begin), so ingest never blocks the shard on a fold.
-                i.insert(id, vector)
+                i.insert_versioned(id, vector, version)
             }
         }
     }
 
-    fn delete(&mut self, id: u64) -> std::io::Result<bool> {
+    fn delete(&mut self, id: u64, version: VectorVersion) -> std::io::Result<bool> {
         match self {
-            VectorBackend::Flat(i) => Ok(i.delete(id)),
-            VectorBackend::Disk(i) => i.delete(id),
+            VectorBackend::Flat(i) => Ok(i.delete_versioned(id, version)),
+            VectorBackend::Disk(i) => i.delete_versioned(id, version),
+        }
+    }
+
+    /// The newest version this shard holds for `id`, live or tombstoned.
+    fn version_of(&self, id: u64) -> VectorVersion {
+        match self {
+            VectorBackend::Flat(i) => i.version_of(id),
+            VectorBackend::Disk(i) => i.version_of(id),
+        }
+    }
+
+    /// Every live id with the version of the copy this shard holds. What an
+    /// owner-map rebuild needs: the ids say which shards hold a row, the
+    /// versions say which of them holds the one to serve.
+    fn live_ids_with_versions(&self) -> Vec<(u64, VectorVersion)> {
+        match self {
+            VectorBackend::Flat(i) => i.live_ids_with_versions(),
+            VectorBackend::Disk(i) => i.live_ids_with_versions(),
+        }
+    }
+
+    /// The highest version this shard has recorded for the index, tombstones
+    /// included. Separate from the live ids because a DELETED row can be the
+    /// high-water mark and is in no list of live ones.
+    fn max_version(&self) -> VectorVersion {
+        match self {
+            VectorBackend::Flat(i) => i.max_version(),
+            VectorBackend::Disk(i) => i.max_version(),
         }
     }
 
@@ -770,6 +819,18 @@ enum ShardReq {
         /// its delete credited one back, leaking the counter downward once per
         /// moved row - so a tenant ended up counted below its own contents.
         internal: bool,
+        /// Which copy of the row this is.
+        ///
+        /// `Some` when the coordinator knows: a user write ALLOCATES one under
+        /// the id's stripe, and a write that only relocates a row - a reshard
+        /// move, a boundary replica - CARRIES the version it read, so it
+        /// cannot land on top of the user write that replaced the row while it
+        /// was in flight.
+        ///
+        /// `None` on the hash-placed path, where a row never moves between
+        /// shards and the answering shard's own counter is the whole truth: it
+        /// allocates one past whatever it already holds for the id.
+        version: Option<u64>,
         /// Optional opaque payload blob stored alongside the vector. `None`
         /// leaves the write path byte-identical to a payload-less VSET.
         payload: Option<Bytes>,
@@ -799,6 +860,15 @@ enum ShardReq {
     LiveIds {
         name: String,
     },
+    /// Is `id` still the exact row a relocation read - live here, and at
+    /// `version`? The one question the owner map cannot answer: a successful
+    /// delete REMOVES the map entry, and an absent entry is also the normal
+    /// state of a row that has never moved. The tombstone is here.
+    StillCurrent {
+        name: String,
+        id: u64,
+        version: u64,
+    },
     /// Boundary rows for the targeted overlap: live rows whose margin
     /// between the two nearest centroids is below `tau` - returned with
     /// vector, payload and the SECOND-nearest shard they replicate to.
@@ -825,6 +895,10 @@ enum ShardReq {
         /// already been credited. The row is not leaving the tenant, so
         /// crediting again would drop the counter for a row that still exists.
         internal: bool,
+        /// Which copy of the row this removes. Same rule as `Vset`: allocated
+        /// for a user delete, carried for the far side of a move or a replica,
+        /// `None` on the hash-placed path.
+        version: Option<u64>,
     },
     Vsearch {
         name: String,
@@ -950,19 +1024,23 @@ enum ShardResp {
     VindexList(Vec<VindexRow>),
     /// Flattened row-major sample rows plus their dim.
     Sample(Vec<f32>, u32),
-    /// A reshard batch: (id, vector, payload, owner) plus the resume cursor
-    /// (`None` when the shard is exhausted).
-    Moves(Vec<(u64, Vec<f32>, Option<Bytes>, u8)>, Option<u64>),
-    /// Live ids on this shard.
-    Ids(Vec<u64>),
+    /// A reshard batch: (id, vector, payload, owner, version) plus the resume
+    /// cursor (`None` when the shard is exhausted). The version travels with
+    /// the row: it is what the mover writes at the destination, and what tells
+    /// it the row has moved on since the batch was collected.
+    Moves(Vec<MoveRow>, Option<u64>),
+    /// Answer to `LiveIds`. See [`LiveIdsAnswer`]: "this shard does not have
+    /// the index" and "this shard cannot read the index" are separate states.
+    LiveIds(LiveIdsAnswer),
     /// Graph sample: (id, degree) nodes and (from, to) edges.
     Graph(Vec<(u64, u32)>, Vec<(u64, u64)>),
     /// VGET result: the stored f32 vector, or `None` if absent.
     Vector(Option<Vec<f32>>),
-    /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload)`
-    /// hits. `payload` is `Some` only when the request set `want_payload`;
-    /// otherwise always `None`, so the non-payload path encodes identically.
-    Vsearch(Vec<(u64, f32, Option<Bytes>)>),
+    /// VSEARCH result for this shard's fragment: `(vec_id, cosine, payload,
+    /// version)` hits. `payload` is `Some` only when the request set
+    /// `want_payload`; otherwise always `None`, so the non-payload path
+    /// encodes identically.
+    Vsearch(Vec<VsearchHit>),
     /// Evict result: `true` if an entry was present and removed, `false` if it
     /// was already absent (evicted or never open) on this shard.
     Evicted(bool),
@@ -2776,6 +2854,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::SampleVectors { .. }
         | ShardReq::CollectMoves { .. }
         | ShardReq::LiveIds { .. }
+        | ShardReq::StillCurrent { .. }
         | ShardReq::CollectBoundary { .. }
         | ShardReq::GraphSample { .. }
         | ShardReq::VindexCreate { .. }
@@ -3509,6 +3588,7 @@ async fn process(
             tenant,
             limit,
             internal,
+            version,
             payload,
         } => {
             // Outer read to look up the entry; clone the Arc and drop the
@@ -3529,6 +3609,16 @@ async fn process(
                                 idx.backend.dim(),
                                 vector.len()
                             ))
+                        } else if version.is_some_and(|v| v < idx.backend.version_of(id).get()) {
+                            // A relocation carrying a copy this shard has
+                            // already moved past. The engine would refuse the
+                            // vector by itself; what it cannot refuse is the
+                            // rest of the write. Refusing it HERE is what
+                            // keeps the quota unspent, the payload postings
+                            // untouched and the blob unwritten - the row that
+                            // stands must not end up described by the payload
+                            // of the value it replaced.
+                            Ok(VsetOutcome::Superseded)
                         } else {
                             // Quota: only a NEW id consumes a slot. Reserve
                             // before the insert (race-free under this write
@@ -3536,6 +3626,15 @@ async fn process(
                             // storing; an overwrite never touches the quota.
                             // `internal` first: a moved or replicated row is
                             // new to THIS shard and not to the tenant.
+                            // `None` means nobody upstream is tracking this
+                            // row's versions - the hash-placed path, where the
+                            // row never moves - so this shard allocates one
+                            // past whatever it holds. Never zero: a legacy
+                            // version would tie with the copy already here and
+                            // hand the decision back to write order.
+                            let version = VectorVersion::new(
+                                version.unwrap_or_else(|| idx.backend.version_of(id).next().get()),
+                            );
                             let was_new = !internal && !idx.backend.contains(id);
                             if was_new
                                 && let Some(max) = limit
@@ -3564,7 +3663,7 @@ async fn process(
                                     "BACKPRESSURE out of memory budget: {rejected}"
                                 ));
                             }
-                            match idx.backend.insert(id, &vector) {
+                            match idx.backend.insert(id, &vector, version) {
                                 Ok(()) => {
                                     // Index the payload's fields when one is
                                     // supplied; an overwrite with a fresh payload
@@ -3573,7 +3672,7 @@ async fn process(
                                     if let Some(blob) = &payload {
                                         idx.payload.upsert(id, parse_fields(blob));
                                     }
-                                    Ok(())
+                                    Ok(VsetOutcome::Stored)
                                 }
                                 Err(e) => {
                                     if was_new && limit.is_some() {
@@ -3586,7 +3685,11 @@ async fn process(
                     };
                     match insert_result {
                         Err(e) => ShardResp::Err(e),
-                        Ok(()) => {
+                        // Not an error. The caller is a relocation and what it
+                        // wants is for the newest copy of the row to be the
+                        // one that stands, which it is.
+                        Ok(VsetOutcome::Superseded) => ShardResp::Done,
+                        Ok(VsetOutcome::Stored) => {
                             // Store the payload blob only when one was supplied;
                             // a payload-less VSET issues no KV write at all.
                             if let Some(blob) = payload {
@@ -3664,14 +3767,15 @@ async fn process(
                         let idx = arc.read();
                         let mut ids = idx.backend.live_ids();
                         ids.sort_unstable();
-                        let mut out: Vec<(u64, Vec<f32>, Option<Bytes>, u8)> = Vec::new();
+                        let mut out: Vec<MoveRow> = Vec::new();
                         let mut cursor = None;
                         for &id in ids.iter().filter(|&&i| i > after) {
                             match idx.backend.get(id) {
                                 Ok(Some(v)) => {
                                     let owner = centroids.assign(&v) as u8;
                                     if owner != own {
-                                        out.push((id, v, None, owner));
+                                        let version = idx.backend.version_of(id).get();
+                                        out.push((id, v, None, owner, version));
                                     }
                                 }
                                 Ok(None) => {}
@@ -3686,7 +3790,7 @@ async fn process(
                         }
                         (out, cursor)
                     };
-                    for (id, _, payload, _) in &mut batch {
+                    for (id, _, payload, _, _) in &mut batch {
                         let key = payload_key(tenant, &name, *id);
                         match vlog.tenant(tenant).get(&key).await {
                             Ok(b) => *payload = b,
@@ -3715,7 +3819,7 @@ async fn process(
                         let idx = arc.read();
                         let mut ids = idx.backend.live_ids();
                         ids.sort_unstable();
-                        let mut out: Vec<(u64, Vec<f32>, Option<Bytes>, u8)> = Vec::new();
+                        let mut out: Vec<MoveRow> = Vec::new();
                         let mut cursor = None;
                         for &id in ids.iter().filter(|&&i| i > after) {
                             match idx.backend.get(id) {
@@ -3736,7 +3840,8 @@ async fn process(
                                         }
                                     }
                                     if best.0 - second.0 < tau {
-                                        out.push((id, v, None, second.1 as u8));
+                                        let version = idx.backend.version_of(id).get();
+                                        out.push((id, v, None, second.1 as u8, version));
                                     }
                                 }
                                 Ok(None) => {}
@@ -3751,7 +3856,7 @@ async fn process(
                         }
                         (out, cursor)
                     };
-                    for (id, _, payload, _) in &mut batch {
+                    for (id, _, payload, _, _) in &mut batch {
                         let key = payload_key(tenant, &name, *id);
                         match vlog.tenant(tenant).get(&key).await {
                             Ok(b) => *payload = b,
@@ -3767,8 +3872,49 @@ async fn process(
         ShardReq::LiveIds { name } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
+                Some(arc) => {
+                    let idx = arc.read();
+                    ShardResp::LiveIds(LiveIdsAnswer::Held {
+                        ids: idx
+                            .backend
+                            .live_ids_with_versions()
+                            .into_iter()
+                            .map(|(id, v)| (id, v.get()))
+                            .collect(),
+                        high_water: idx.backend.max_version().get(),
+                    })
+                }
+                // Absent, or present and unopenable? The CATALOGUE decides,
+                // the same way a drop decides it. `get_or_reopen` gives the
+                // same `None` for both.
+                None => match read_registry(dir) {
+                    Ok(entries) if entries.iter().any(|e| e.name == name) => {
+                        ShardResp::LiveIds(LiveIdsAnswer::Unreadable(format!(
+                            "vindex '{name}' is registered on this shard and did not open"
+                        )))
+                    }
+                    Ok(_) => ShardResp::LiveIds(LiveIdsAnswer::Absent),
+                    Err(e) => ShardResp::LiveIds(LiveIdsAnswer::Unreadable(format!(
+                        "vindex registry unreadable, so whether '{name}' is here is unknown: {e}"
+                    ))),
+                },
+            }
+        }
+        ShardReq::StillCurrent { name, id, version } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
-                Some(arc) => ShardResp::Ids(arc.read().backend.live_ids()),
+                Some(arc) => {
+                    let idx = arc.read();
+                    // Live AND unchanged. Not "version has not advanced": a
+                    // fold drops a tombstone along with the rows it masked, so
+                    // a deleted row can read back as version 0 - lower than
+                    // what the mover carries, not higher. Liveness is the
+                    // question, and the version answers the other half.
+                    ShardResp::Existed(
+                        idx.backend.contains(id) && idx.backend.version_of(id).get() == version,
+                    )
+                }
             }
         }
         ShardReq::GraphSample { name, count } => {
@@ -3794,6 +3940,7 @@ async fn process(
             id,
             tenant,
             internal,
+            version,
         } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
@@ -3803,7 +3950,10 @@ async fn process(
                     // lock; the blob in the vLog is reclaimed by the await below.
                     let result = {
                         let mut g = arc.write();
-                        let r = g.backend.delete(id);
+                        let version = VectorVersion::new(
+                            version.unwrap_or_else(|| g.backend.version_of(id).next().get()),
+                        );
+                        let r = g.backend.delete(id, version);
                         if matches!(r, Ok(true)) {
                             g.payload.remove(id);
                         }
@@ -3864,6 +4014,11 @@ async fn process(
             }
             // The walk runs under the write lock; the guard is dropped before
             // any payload `await`, on both routes.
+            //
+            // Cloned because the pooled route MOVES `arc` into the worker
+            // closure, and the versions have to be read from the same entry
+            // after the walk.
+            let versioned = arc.clone();
             let hits = match vsearch_pool {
                 Some(pool) => {
                     let walk_name = name.clone();
@@ -3885,10 +4040,26 @@ async fn process(
                 // Fetch a payload per local hit; some get trimmed by the global
                 // top-k merge, but k is small. Route the final-k by id if it
                 // ever bites.
-                Ok(hits) => match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
-                    Ok(out) => ShardResp::Vsearch(out),
-                    Err(e) => ShardResp::Err(e),
-                },
+                Ok(hits) => {
+                    // One lookup per local hit, k of them, off the walk and
+                    // before any await: the merge upstream cannot rank two
+                    // copies of an id without them.
+                    let versions: Vec<u64> = {
+                        let idx = versioned.read();
+                        hits.iter()
+                            .map(|&(id, _)| idx.backend.version_of(id).get())
+                            .collect()
+                    };
+                    match attach_payloads(vlog, tenant, &name, hits, want_payload).await {
+                        Ok(out) => ShardResp::Vsearch(
+                            out.into_iter()
+                                .zip(versions)
+                                .map(|((id, score, blob), version)| (id, score, blob, version))
+                                .collect(),
+                        ),
+                        Err(e) => ShardResp::Err(e),
+                    }
+                }
             }
         }
 
@@ -3971,8 +4142,50 @@ async fn process(
 
 // ── ShardSet ──────────────────────────────────────────────────────────────────
 
-/// id -> (primary shard, optional replica shard) for one routed vindex.
-type OwnerMap = ahash::AHashMap<u64, (u8, Option<u8>)>;
+/// One row a reshard or an overlap is relocating: `(id, vector, payload,
+/// destination shard, version)`. The version is the copy the SOURCE held when
+/// the batch was collected, which is what the destination stores and what
+/// tells the mover the row has been written again since.
+type MoveRow = (u64, Vec<f32>, Option<Bytes>, u8, u64);
+
+/// What a shard has to say when asked to enumerate an index.
+///
+/// `get_or_reopen` answers `None` for two completely different states - a name
+/// this shard never had, and a name it has whose files will not open (it logs
+/// the I/O error and swallows it) - and a plain error string flattened them
+/// back together at the caller. Only one of the two has a safe answer, so they
+/// are different variants.
+enum LiveIdsAnswer {
+    /// Not in this shard's registry. Normal: a routed index need not exist on
+    /// every shard, and a create can still be in flight.
+    Absent,
+    /// Registered here and it did not open. The shard HAS rows and cannot say
+    /// which, so nothing derived from this answer can be trusted.
+    Unreadable(String),
+    /// Live ids with the version of the copy held here, plus this shard's
+    /// high-water version for the index - which the live rows do not give,
+    /// since a tombstone can hold it.
+    Held {
+        ids: Vec<(u64, u64)>,
+        high_water: u64,
+    },
+}
+
+/// One hit from one shard's fragment of a search: `(id, cosine, payload,
+/// version)`. The version is read from the shard that produced the hit, and it
+/// is what the global merge uses to tell two copies of one id apart - the
+/// owner map cannot, when it is the thing that is out of date.
+type VsearchHit = (u64, f32, Option<Bytes>, u64);
+
+/// id -> (primary shard, optional replica shard, version) for one routed
+/// vindex.
+///
+/// The version is the version of the PRIMARY copy: what the map is asserting
+/// is "shard p holds copy v of this row, and it is the live one". It is
+/// derived, never persisted - a rebuild reads it back off the shards - and it
+/// is what lets a relocation tell "this row is where I left it" from "this row
+/// has been written again since I read it".
+type OwnerMap = ahash::AHashMap<u64, (u8, Option<u8>, u64)>;
 
 struct ShardSetInner {
     senders: Vec<Sender<ShardMsg>>,
@@ -3995,6 +4208,19 @@ struct ShardSetInner {
     /// set keeps the map (8B+overhead per id, rebuilt at open from the
     /// shards' live id sets) and point ops stay O(1) instead of broadcast.
     owners: parking_lot::RwLock<HashMap<String, OwnerMap>>,
+    /// Per-vindex version allocator, so a user write gets a version that beats
+    /// every copy of the row anywhere in the set.
+    ///
+    /// It has to be here rather than on a shard: a shard's own counter only
+    /// knows the copies IT holds, and a row that moves to a shard which has
+    /// never seen it would be handed a version below the one it already
+    /// carried. Seeded past the highest version observed whenever the owner
+    /// map is rebuilt, and floored by the version already recorded for the row
+    /// on every allocation, so a value read off disk can never be reissued.
+    ///
+    /// Derived state, like `owners`: dropped with the index and rebuilt on
+    /// demand.
+    versions: parking_lot::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>,
     /// Process-wide memory admission. Kept here so `SKEG.STATS` can report the
     /// budget: a ceiling that is enforced and not readable leaves an operator
     /// to discover it from the refusals.
@@ -4341,6 +4567,7 @@ impl ShardSet {
                 root: base_dir.to_path_buf(),
                 routers: parking_lot::RwLock::new(load_routers(base_dir)),
                 owners: parking_lot::RwLock::new(HashMap::new()),
+                versions: parking_lot::RwLock::new(HashMap::new()),
                 memory: memory.clone(),
                 catalog: tokio::sync::Mutex::new(()),
                 owner_locks: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
@@ -4848,12 +5075,19 @@ impl ShardSet {
         Ok(())
     }
 
-    /// Remove a vindex's semantic-router sidecar and its in-RAM router + owner
-    /// map. Idempotent (absent sidecar is fine). A failed removal of a present
-    /// sidecar is an error - a dropped index must not leave routing behind.
+    /// Remove a vindex's semantic-router sidecar and its in-RAM router, owner
+    /// map and version allocator. Idempotent (absent sidecar is fine). A
+    /// failed removal of a present sidecar is an error - a dropped index must
+    /// not leave routing behind.
     fn drop_router_state(&self, name: &str) -> Result<(), ShardError> {
         self.inner.routers.write().remove(name);
         self.inner.owners.write().remove(name);
+        // The allocator goes with them: a recreated name starts from nothing
+        // on disk, and a counter left over from the old index would hand its
+        // first row a version far above anything the new one holds. Harmless
+        // in itself, but it is derived state describing data nobody has, which
+        // is exactly what the owner map is dropped here for.
+        self.inner.versions.write().remove(name);
         let path = crate::router::router_path(&self.inner.root, name);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -5118,7 +5352,8 @@ impl ShardSet {
         Ok(ids
             .iter()
             .map(|&id| {
-                owned.and_then(|m| m.get(&id).copied()).unwrap_or_else(|| {
+                let placement = owned.and_then(|m| m.get(&id).map(|&(p, r, _)| (p, r)));
+                placement.unwrap_or_else(|| {
                     // Unrouted vindex: placement is computable from the id.
                     #[allow(clippy::cast_possible_truncation)] // n <= 255 shards
                     (shard_for(&id.to_le_bytes(), self.inner.n) as u8, None)
@@ -5213,7 +5448,7 @@ impl ShardSet {
             if let Some(map) = self.inner.owners.read().get(name) {
                 let bad = map
                     .values()
-                    .filter(|(p, r)| {
+                    .filter(|(p, r, _)| {
                         usize::from(*p) >= self.inner.n
                             || r.is_some_and(|s| usize::from(s) >= self.inner.n)
                     })
@@ -5496,6 +5731,10 @@ impl ShardSet {
                 .read()
                 .get(name)
                 .and_then(|m| m.get(&id).copied());
+            // Allocated UNDER THE STRIPE, and floored by the version the map
+            // already records for this row: strictly greater than every copy
+            // that exists, so the write cannot lose to one of them.
+            let version = self.next_version(name, old.map_or(0, |(_, _, v)| v));
             let req = ShardReq::Vset {
                 name: name.to_owned(),
                 id,
@@ -5505,6 +5744,7 @@ impl ShardSet {
                 // An overwrite of a row the tenant already owns changes no
                 // cardinality, wherever the old copy happened to live.
                 internal: old.is_some(),
+                version: Some(version),
                 payload,
             };
             match self.call(owner, req).await? {
@@ -5521,14 +5761,22 @@ impl ShardSet {
                 .write()
                 .entry(name.to_owned())
                 .or_default()
-                .insert(id, (owner as u8, None));
+                .insert(id, (owner as u8, None, version));
             // Cleanup, after the fact. A failure here leaves a stale duplicate
             // on a shard the map no longer points at: search dedups it and the
             // next overwrite of this id removes it. Reporting an error would
             // tell the client a write failed that is committed and readable -
             // the same mistake as failing a DROP whose registry entry is
             // already published.
-            if let Some((old_primary, old_replica)) = old {
+            //
+            // Everything below is post-commit, so the failpoint returns the
+            // SUCCESS the client is owed: it models the process dying here,
+            // not the write failing.
+            crate::fp!(
+                crate::failpoint::WriteFailpoint::OverwriteOldCopyDelete,
+                Ok(())
+            );
+            if let Some((old_primary, old_replica, _)) = old {
                 for s in std::iter::once(old_primary).chain(old_replica) {
                     if usize::from(s) != owner {
                         match self
@@ -5540,6 +5788,11 @@ impl ShardSet {
                                     tenant,
                                     // The row moved; it did not leave.
                                     internal: true,
+                                    // At the version of the copy that
+                                    // replaced it, so the tombstone stands
+                                    // against anything older that is still in
+                                    // flight towards this shard.
+                                    version: Some(version),
                                 },
                             )
                             .await
@@ -5581,6 +5834,9 @@ impl ShardSet {
             // Hash placement never moves a row, so the shard's own `was_new`
             // is the whole truth here.
             internal: false,
+            // And so is the shard's own version counter: an id maps to exactly
+            // one shard, for ever, so nothing else can hold a copy of it.
+            version: None,
             payload,
         };
         match self.call(shard, req).await? {
@@ -5760,15 +6016,71 @@ impl ShardSet {
                     ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                     _ => return Err(ShardError::Unavailable),
                 };
-                for (id, vector, payload, owner) in batch {
-                    let already_there = self
+                for (id, vector, payload, owner, version) in batch {
+                    // The version the source held when the batch was
+                    // collected. It travels with the row and is what the
+                    // destination stores, so a copy of this row written since
+                    // then - by a user write that raced this move - stays the
+                    // newer one everywhere.
+                    self.observe_version(name, version);
+                    // ONE ROW, under the same stripe a routed point op takes.
+                    //
+                    // Not the batch: a batch spans shard calls for other ids,
+                    // and holding one id's stripe across them would serialise
+                    // the whole reshard behind it. Per row is enough, because
+                    // the thing being made atomic is exactly what a vset on
+                    // this id also does - decide where the live copy is, and
+                    // publish that decision.
+                    let _stripe = self.owner_stripe(name, id).lock().await;
+                    // Re-read UNDER the stripe. Everything above was decided
+                    // from a batch collected before this lock existed.
+                    let current = self
                         .inner
                         .owners
                         .read()
                         .get(name)
-                        .and_then(|m| m.get(&id).copied())
-                        .is_some_and(|(p, _)| p == owner);
+                        .and_then(|m| m.get(&id).copied());
+                    if current.is_some_and(|(_, _, live)| live > version) {
+                        // A user write replaced this row while the batch was
+                        // in flight, and was acknowledged. What this loop
+                        // holds is the value that write REPLACED: writing it
+                        // to the new owner and pointing the map at it is how
+                        // an acknowledged write used to disappear. Its own
+                        // cleanup removes the source copy.
+                        continue;
+                    }
+                    // And ask the SOURCE whether the row is still the row that
+                    // was read. The map cannot answer that: a successful
+                    // `vdel` REMOVES the entry, so a deleted row looks exactly
+                    // like a row that has never moved - which is most rows on
+                    // a first reshard - and the guard above does not fire.
+                    // Writing it to its new owner then republishes a delete
+                    // the client was told had happened, and the destination
+                    // has no tombstone to lose against because the tombstone
+                    // is here.
+                    //
+                    // One extra round trip per moved row, under the stripe the
+                    // delete also takes, so the answer cannot go stale between
+                    // the question and the write.
+                    let req = ShardReq::StillCurrent {
+                        name: name.to_owned(),
+                        id,
+                        version,
+                    };
+                    match self.call(source, req).await? {
+                        ShardResp::Existed(true) => {}
+                        ShardResp::Existed(false) => continue,
+                        ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                        _ => return Err(ShardError::Unavailable),
+                    }
+                    let already_there = current.is_some_and(|(p, _, _)| p == owner);
                     if !already_there {
+                        crate::fp!(
+                            crate::failpoint::WriteFailpoint::ReshardDestinationWrite,
+                            Err(ShardError::Storage(
+                                "failpoint: reshard destination write refused".to_owned()
+                            ))
+                        );
                         let req = ShardReq::Vset {
                             name: name.to_owned(),
                             id,
@@ -5777,6 +6089,7 @@ impl ShardSet {
                             limit: None,
                             // A reshard move: the row arrives, it is not new.
                             internal: true,
+                            version: Some(version),
                             payload,
                         };
                         match self.call(usize::from(owner), req).await? {
@@ -5787,6 +6100,12 @@ impl ShardSet {
                     }
                     // Swallowing this Vdel's response would count the row moved
                     // while its stale source copy survives (review finding).
+                    crate::fp!(
+                        crate::failpoint::WriteFailpoint::ReshardSourceDelete,
+                        Err(ShardError::Storage(
+                            "failpoint: reshard source delete refused".to_owned()
+                        ))
+                    );
                     match self
                         .call(
                             source,
@@ -5798,6 +6117,12 @@ impl ShardSet {
                                 // destination does not charge is what leaked
                                 // the counter downward once per moved row.
                                 internal: true,
+                                // The version this move read. A source copy
+                                // that has been written again since carries a
+                                // higher one, and the delete then does not
+                                // apply - which is what stops a move removing
+                                // a row it never actually copied.
+                                version: Some(version),
                             },
                         )
                         .await?
@@ -5811,7 +6136,7 @@ impl ShardSet {
                         .write()
                         .entry(name.to_owned())
                         .or_default()
-                        .insert(id, (owner, None));
+                        .insert(id, (owner, None, version));
                     moved += 1;
                 }
                 match cursor {
@@ -5863,17 +6188,33 @@ impl ShardSet {
                     ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                     _ => return Err(ShardError::Unavailable),
                 };
-                for (id, vector, payload, second) in batch {
-                    // Only rows whose PRIMARY lives here replicate from here
-                    // (the same row seen via its replica must not re-replicate).
-                    let primary_here = self
+                for (id, vector, payload, second, version) in batch {
+                    self.observe_version(name, version);
+                    // Per row, same stripe, same reason as the reshard: the
+                    // window this closes is one await wide and it is where a
+                    // deleted row came back. The delete took both copies and
+                    // the map entry while the replica was in flight, and the
+                    // replica then landed on a shard nothing was left to clean
+                    // up - reachable by search, invisible to the map.
+                    let _stripe = self.owner_stripe(name, id).lock().await;
+                    let current = self
                         .inner
                         .owners
                         .read()
                         .get(name)
-                        .and_then(|m| m.get(&id).copied())
-                        .is_some_and(|(p, _)| usize::from(p) == source);
-                    if !primary_here || usize::from(second) == source {
+                        .and_then(|m| m.get(&id).copied());
+                    // No entry means the row was deleted while the batch was
+                    // in flight; a higher version means it was rewritten, and
+                    // this copy is the value that write replaced. Only rows
+                    // whose PRIMARY still lives here replicate from here (the
+                    // same row seen via its replica must not re-replicate).
+                    let Some((primary, _, live)) = current else {
+                        continue;
+                    };
+                    if live > version
+                        || usize::from(primary) != source
+                        || usize::from(second) == source
+                    {
                         continue;
                     }
                     let req = ShardReq::Vset {
@@ -5885,13 +6226,75 @@ impl ShardSet {
                         // A boundary replica: a second physical copy of one
                         // logical row.
                         internal: true,
+                        // Carried, not allocated: a replica is the SAME copy
+                        // of the row, in a second place. Allocating here would
+                        // make the replica outrank its own primary.
+                        version: Some(version),
                         payload,
                     };
-                    match self.call(usize::from(second), req).await? {
-                        ShardResp::Done => {}
-                        ShardResp::Err(e) => return Err(ShardError::Storage(e)),
-                        _ => return Err(ShardError::Unavailable),
+                    let outcome = match self.call(usize::from(second), req).await {
+                        Ok(ShardResp::Done) => Ok(()),
+                        Ok(ShardResp::Err(e)) => Err(ShardError::Storage(e)),
+                        Ok(_) => Err(ShardError::Unavailable),
+                        Err(e) => Err(e),
+                    };
+                    // The failpoint sits AFTER the write, because that is the
+                    // half worth testing: a replica that landed and was then
+                    // reported as a failure. `fp_check!`, not `fp!`, for the
+                    // same reason - this site has to undo something before it
+                    // can leave, and `fp!` expands to a bare `return`.
+                    let outcome = outcome.and_then(|()| {
+                        crate::fp_check!(
+                            crate::failpoint::WriteFailpoint::OverlapReplicaWrite,
+                            Err(ShardError::Storage(
+                                "failpoint: overlap replica write refused".to_owned()
+                            ))
+                        )
+                    });
+                    if let Err(e) = outcome {
+                        // The write may have LANDED and still reported a
+                        // failure: the destination stores the vector and then
+                        // the payload blob, and a blob error comes back after
+                        // the row is in; a lost reply looks the same. A
+                        // replica the map does not name is a ghost - `vdel`
+                        // finds a second copy by reading the replica slot, so
+                        // nothing would ever go looking for this one, and the
+                        // deleted row stays searchable.
+                        //
+                        // Take it back out. Best effort, and LOGGED rather
+                        // than returned: the error worth reporting is the one
+                        // that got us here, and an overlap replica is an
+                        // optimisation a re-run recreates.
+                        let undo = ShardReq::Vdel {
+                            name: name.to_owned(),
+                            id,
+                            tenant,
+                            internal: true,
+                            version: Some(version),
+                        };
+                        match self.call(usize::from(second), undo).await {
+                            Ok(ShardResp::Existed(_)) => {}
+                            Ok(ShardResp::Err(err)) => tracing::error!(
+                                index = name,
+                                id,
+                                shard = usize::from(second),
+                                error = %err,
+                                "an overlap replica was written and could not be taken \
+                                 back: it is a copy the owner map does not name"
+                            ),
+                            Ok(_) | Err(_) => tracing::error!(
+                                index = name,
+                                id,
+                                shard = usize::from(second),
+                                "an overlap replica was written and could not be taken \
+                                 back: shard unavailable"
+                            ),
+                        }
+                        return Err(e);
                     }
+                    // Still under the stripe: the replica has to be IN the map
+                    // before a delete can look for it, or the delete finds
+                    // nothing to remove and the copy outlives the row.
                     if let Some(m) = self.inner.owners.write().get_mut(name)
                         && let Some(e) = m.get_mut(&id)
                     {
@@ -5911,6 +6314,20 @@ impl ShardSet {
     /// Rebuild the id -> owner-shard map for every routed vindex by asking
     /// each shard for its live ids. Called once after open.
     ///
+    /// The primary is the copy with the HIGHEST VERSION, not the first one
+    /// seen. It used to be the first, which means the lowest shard number,
+    /// which means a restart promoted whichever copy of a duplicated row
+    /// happened to sit lower - and a duplicate is a normal state here, left by
+    /// a crash mid-move or a cleanup that failed after an overwrite committed
+    /// elsewhere. Half the time the copy it promoted was the one the overwrite
+    /// had replaced, and every read after the restart returned it. Equal
+    /// versions still go to the lowest shard, so a set where nothing is
+    /// versioned reopens exactly as it did.
+    ///
+    /// It also seeds this index's version allocator past everything on disk,
+    /// which is what makes a user write after a restart beat every copy that
+    /// already exists.
+    ///
     /// # Errors
     ///
     /// A shard being unavailable.
@@ -5918,25 +6335,59 @@ impl ShardSet {
         let names: Vec<String> = self.inner.routers.read().keys().cloned().collect();
         for name in names {
             let mut map: OwnerMap = ahash::AHashMap::new();
+            let mut highest = 0u64;
             for shard in 0..self.inner.n {
                 match self
                     .call(shard, ShardReq::LiveIds { name: name.clone() })
                     .await?
                 {
-                    ShardResp::Ids(ids) => {
-                        for id in ids {
-                            // First sighting is the primary, a second the
-                            // replica (lowest shard id wins primary - see the
-                            // reshard/overlap note).
-                            map.entry(id)
-                                .and_modify(|e| e.1 = Some(shard as u8))
-                                .or_insert((shard as u8, None));
+                    ShardResp::LiveIds(LiveIdsAnswer::Held { ids, high_water }) => {
+                        // The shard's own high-water, not the maximum over the
+                        // live ids: a row deleted right after it was written
+                        // leaves its version only in a tombstone, and seeding
+                        // the allocator below that hands the next write to
+                        // that id a version the tombstone beats - a write
+                        // acknowledged and dropped.
+                        highest = highest.max(high_water);
+                        for (id, version) in ids {
+                            match map.entry(id) {
+                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    let (primary, _, live) = *e.get();
+                                    if version > live {
+                                        // The NEWER copy takes the primary
+                                        // slot and demotes the one that was
+                                        // there.
+                                        e.insert((shard as u8, Some(primary), version));
+                                    } else {
+                                        e.get_mut().1 = Some(shard as u8);
+                                    }
+                                }
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert((shard as u8, None, version));
+                                }
+                            }
                         }
                     }
-                    ShardResp::Err(_) => {} // shard without this vindex yet
+                    // A shard that genuinely does not have the index yet.
+                    ShardResp::LiveIds(LiveIdsAnswer::Absent) => {}
+                    // One that has it and cannot read it. Building the map
+                    // without its rows leaves the allocator seeded BELOW the
+                    // versions that shard holds, and the next user write to
+                    // one of them is refused as superseded at the
+                    // destination - a `+OK` for a write that never happened.
+                    // There is no answer here that is better than refusing.
+                    ShardResp::LiveIds(LiveIdsAnswer::Unreadable(e)) => {
+                        return Err(ShardError::Storage(format!(
+                            "owner map for '{name}' cannot be rebuilt: {e}"
+                        )));
+                    }
+                    ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                     _ => return Err(ShardError::Unavailable),
                 }
             }
+            // Past everything on disk, so the next user write to this index
+            // beats every copy the rebuild just saw.
+            self.observe_version(&name, highest);
             self.inner.owners.write().insert(name, map);
         }
         Ok(())
@@ -5985,6 +6436,39 @@ impl ShardSet {
     /// index name in too keeps equal ids across different indexes - and
     /// adversarial id distributions - from serialising on the same stripe
     /// (review P2).
+    /// This vindex's version allocator, created empty on first use.
+    fn version_counter(&self, name: &str) -> Arc<std::sync::atomic::AtomicU64> {
+        if let Some(c) = self.inner.versions.read().get(name) {
+            return c.clone();
+        }
+        self.inner
+            .versions
+            .write()
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            .clone()
+    }
+
+    /// Allocate the version of a user write to `name`, never below `at_least`.
+    ///
+    /// The floor is what makes this safe without a durable counter: `at_least`
+    /// is the version the caller already knows for the row, so a value read
+    /// off disk can never be reissued even if the allocator was seeded from a
+    /// map that had not seen it. The result is strictly greater, so a user
+    /// write always beats every copy of the row that already exists.
+    fn next_version(&self, name: &str, at_least: u64) -> u64 {
+        use std::sync::atomic::Ordering;
+        let c = self.version_counter(name);
+        c.fetch_max(at_least, Ordering::SeqCst);
+        c.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Raise the allocator's floor to a version seen on disk.
+    fn observe_version(&self, name: &str, version: u64) {
+        self.version_counter(name)
+            .fetch_max(version, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn owner_stripe(&self, name: &str, id: u64) -> &tokio::sync::Mutex<()> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -5998,7 +6482,7 @@ impl ShardSet {
     /// map is unknown; any shard answers None, hash picks one).
     fn point_shard(&self, name: &str, id: u64) -> usize {
         if let Some(m) = self.inner.owners.read().get(name)
-            && let Some(&(s, _)) = m.get(&id)
+            && let Some(&(s, _, _)) = m.get(&id)
         {
             return usize::from(s);
         }
@@ -6027,6 +6511,17 @@ impl ShardSet {
             None
         };
         let shard = self.point_shard(name, id);
+        // A user delete allocates, exactly like a user write: the tombstone
+        // has to beat every copy of the row that exists, including one a
+        // concurrent relocation is still carrying.
+        let known = self
+            .inner
+            .owners
+            .read()
+            .get(name)
+            .and_then(|m| m.get(&id).map(|&(_, _, v)| v))
+            .unwrap_or(0);
+        let version = self.next_version(name, known);
         let req = ShardReq::Vdel {
             name: name.to_owned(),
             id,
@@ -6034,6 +6529,7 @@ impl ShardSet {
             // The row really is leaving the tenant: this is the one delete
             // that credits the quota.
             internal: false,
+            version: Some(version),
         };
         let existed = match self.call(shard, req).await? {
             ShardResp::Existed(b) => b,
@@ -6047,7 +6543,7 @@ impl ShardSet {
             .owners
             .read()
             .get(name)
-            .and_then(|m| m.get(&id).and_then(|&(_, r)| r));
+            .and_then(|m| m.get(&id).and_then(|&(_, r, _)| r));
         if let Some(rep) = replica {
             // A failed replica delete must not report success and drop the map
             // entry: that would leave a resurrectable ghost (review finding).
@@ -6062,6 +6558,8 @@ impl ShardSet {
                         // Crediting again would drop the counter by two for one
                         // logical row.
                         internal: true,
+                        // The same delete, in a second place: one version.
+                        version: Some(version),
                     },
                 )
                 .await?
@@ -6182,12 +6680,13 @@ impl ShardSet {
         }
         // Hits carry the shard that produced them, so the dedup below can
         // prefer the COMMITTED copy rather than the best-scoring one.
-        let mut merged: Vec<(u64, f32, Option<Bytes>, usize)> = Vec::new();
+        // (id, cosine, payload, answering shard, version)
+        let mut merged: Vec<(u64, f32, Option<Bytes>, usize, u64)> = Vec::new();
         let mut first_err = None;
         for (shard, rx) in pending {
             match rx.await.map_err(|_| ShardError::Unavailable)? {
                 ShardResp::Vsearch(hits) => {
-                    merged.extend(hits.into_iter().map(|(id, s, p)| (id, s, p, shard)));
+                    merged.extend(hits.into_iter().map(|(id, s, p, v)| (id, s, p, shard, v)));
                 }
                 ShardResp::Err(e) => {
                     first_err.get_or_insert(e);
@@ -6233,28 +6732,51 @@ impl ShardSet {
             owners.get(name).map(|m| {
                 merged
                     .iter()
-                    .filter_map(|&(id, _, _, _)| m.get(&id).map(|&(p, _)| (id, p)))
+                    .filter_map(|&(id, _, _, _, _)| m.get(&id).map(|&(p, _, _)| (id, p)))
                     .collect()
             })
         };
         merged.sort_unstable_by(|a, b| {
-            let live = |h: &(u64, f32, Option<Bytes>, usize)| {
+            let live = |h: &(u64, f32, Option<Bytes>, usize, u64)| {
                 owner_of
                     .as_ref()
                     .and_then(|m| m.get(&h.0))
                     .is_some_and(|&p| usize::from(p) == h.3)
             };
-            // Live copy first for the same id; then by score, as before.
-            live(b).cmp(&live(a)).then_with(|| b.1.total_cmp(&a.1))
+            // NEWEST COPY FIRST, by the version each shard reported for the
+            // row it answered with. The owner map was the only tie-break here
+            // and it is derived state: when it is the thing that is stale -
+            // a restart mid-reshard, a rebuild that has not run yet - it
+            // points at the copy an overwrite replaced, and search then agrees
+            // with the point read on the wrong value.
+            //
+            // The version is read on the shard that holds the row, but AFTER
+            // the walk and under a separate lock, so it is the shard's current
+            // version and not necessarily the version of the copy that
+            // produced the hit: a write landing in between reports the newer
+            // one. That decides which SHARD wins the merge for an id, never
+            // which id is returned, and it errs towards the shard that has
+            // just been written - which is the one a point read would pick.
+            // What it is not is a snapshot.
+            //
+            // The map still decides what the version cannot: a boundary
+            // replica is the SAME copy in a second place, same version, and
+            // the primary is the one to return.
+            b.4.cmp(&a.4)
+                .then_with(|| live(b).cmp(&live(a)))
+                // Then by score, as before.
+                .then_with(|| b.1.total_cmp(&a.1))
         });
         let mut seen = ahash::AHashSet::new();
-        merged.retain(|&(id, _, _, _)| seen.insert(id));
+        merged.retain(|&(id, _, _, _, _)| seen.insert(id));
         // Scores decide the ranking, so restore that order once one hit per
         // id survives: the pass above only chose WHICH copy of an id to keep.
         merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
-        let merged: Vec<(u64, f32, Option<Bytes>)> =
-            merged.into_iter().map(|(id, s, p, _)| (id, s, p)).collect();
+        let merged: Vec<(u64, f32, Option<Bytes>)> = merged
+            .into_iter()
+            .map(|(id, s, p, _, _)| (id, s, p))
+            .collect();
         // Shard 0 by convention: a scattered op belongs to no single shard.
         skeg_telemetry::record_op(skeg_telemetry::Op::VSearch, 0, started.elapsed());
         Ok(merged)
@@ -6484,6 +7006,105 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    /// A relocation carries the version it READ, and a shard can already hold
+    /// a newer copy of that row: the owner map is derived state and is allowed
+    /// to be behind, so a move can arrive at a destination that has moved on.
+    ///
+    /// The engine refuses the stale vector on its own. What it cannot refuse
+    /// is everything hanging off it - the payload was indexed and written to
+    /// the vLog whether or not the vector was stored, so the row that stood
+    /// ended up described by the payload of the value it had replaced. A wrong
+    /// answer with the right vector attached to it.
+    #[tokio::test]
+    async fn a_stale_internal_write_stores_neither_its_vector_nor_its_payload() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        shards.vindex_create("p", 4, 0, 1).await.unwrap();
+        let newer = vec![1.0f32, 0.0, 0.0, 0.0];
+        let older = vec![0.0f32, 1.0, 0.0, 0.0];
+        let put = |vector: Vec<f32>, version: u64, blob: &'static str| ShardReq::Vset {
+            name: "p".to_owned(),
+            id: 7,
+            vector,
+            tenant: 0,
+            limit: None,
+            internal: true,
+            version: Some(version),
+            payload: Some(Bytes::from_static(blob.as_bytes())),
+        };
+        assert!(matches!(
+            shards
+                .call(0, put(newer.clone(), 9, "{\"tag\":\"new\"}"))
+                .await
+                .unwrap(),
+            ShardResp::Done
+        ));
+        // The straggler: the same row as some earlier read saw it.
+        assert!(matches!(
+            shards
+                .call(0, put(older, 4, "{\"tag\":\"old\"}"))
+                .await
+                .unwrap(),
+            ShardResp::Done,
+        ));
+
+        assert_eq!(
+            shards.vget("p", 7).await.unwrap().unwrap(),
+            newer,
+            "the newer vector must stand"
+        );
+        let hits = shards
+            .vsearch("p", newer, 1, 0, 0, true, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let blob = hits[0].2.clone().expect("the payload comes back");
+        assert_eq!(
+            &blob[..],
+            b"{\"tag\":\"new\"}",
+            "the stale copy's payload replaced the live row's"
+        );
+    }
+
+    /// The client-reachable half of the same defect: `SKEG.VDEL` on a flat
+    /// vindex with an id nobody ever inserted. Every routed delete carries a
+    /// real version, so this used to allocate a dead row per call - unbounded
+    /// growth from one command, and the reported RAM counted live rows only,
+    /// so nothing anywhere showed it.
+    #[tokio::test]
+    async fn deleting_unknown_ids_on_a_flat_vindex_does_not_grow_the_reported_ram() {
+        const DIM: u32 = 256;
+        const N: u64 = 5_000;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        // backend byte 0 = flat.
+        shards.vindex_create("f", DIM, 0, 0).await.unwrap();
+        shards
+            .vset("f", 1, vec![1.0; DIM as usize], 0, None, None)
+            .await
+            .unwrap();
+        let reported = |stats: &[IndexStat]| -> usize {
+            stats
+                .iter()
+                .filter(|s| s.index == "f")
+                .map(|s| s.resident_bytes)
+                .sum()
+        };
+        let before = reported(&shards.control_handle().open_indices().await);
+
+        for id in 0..N {
+            assert!(!shards.vdel("f", 1_000_000 + id, 0).await.unwrap());
+        }
+        let after = reported(&shards.control_handle().open_indices().await);
+        assert!(
+            after - before < N as usize * 32,
+            "{N} deletes of ids the index never held grew it by {} bytes \
+             (a dead row each would be {})",
+            after - before,
+            N as usize * DIM as usize * 4
+        );
+    }
 
     #[test]
     fn validate_vindex_name_blocks_path_traversal() {
@@ -7805,7 +8426,7 @@ mod tests {
         }
         let wal_path = base.join("shard-0/vindex-idx/delta.log");
         let mut wal = fs::read(&wal_path).unwrap();
-        assert!(wal.starts_with(b"SKWL\x02"));
+        assert!(wal.starts_with(b"SKWL\x03"));
         *wal.last_mut().unwrap() ^= 0x01;
         fs::write(wal_path, wal).unwrap();
 
@@ -9835,7 +10456,7 @@ mod tests {
             let mut g = arc.write();
             for id in 100_000u64..(100_000 + FLUSH_ROWS as u64 + 50) {
                 let v = tvec(id);
-                g.backend.insert(id, &v).unwrap();
+                g.backend.insert(id, &v, VectorVersion::LEGACY).unwrap();
             }
         }
         let d = vdir.clone();
@@ -10058,7 +10679,9 @@ mod tests {
                 let mut g = arc.write();
                 for _ in 0..(SMALL_FLUSH + 20) {
                     let v = small(next_id + 1);
-                    g.backend.insert(next_id, &v).unwrap();
+                    g.backend
+                        .insert(next_id, &v, VectorVersion::LEGACY)
+                        .unwrap();
                     next_id += 1;
                 }
             }
@@ -10947,7 +11570,10 @@ mod tests {
         // Delete a fifth of the base, then L3: dead base rows reclaimed in place.
         for id in 0u64..1000 {
             assert!(
-                arc.write().backend.delete(id).unwrap(),
+                arc.write()
+                    .backend
+                    .delete(id, VectorVersion::LEGACY)
+                    .unwrap(),
                 "deleting a live base id"
             );
         }

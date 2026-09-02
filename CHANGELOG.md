@@ -9,6 +9,46 @@ repository.
 
 ## [Unreleased]
 
+### A vector row says which copy of it is live
+
+A vector id can have more than one physical copy at once - mid-reshard, as a
+boundary replica, as the leftover of an overwrite whose cleanup failed - and
+which one was LIVE was inferred from position: the higher LSM layer, the lower
+shard number, the order a map happened to be iterated in. Position is not
+identity, and three losses followed, all silent. A `reshard` republished rows a
+concurrent `VSET` had replaced (63 of 240 on the run that pinned it), acking the
+overwrite and then undoing it. An `overlap` replicated rows a concurrent `VDEL`
+had removed, leaving a searchable copy no map pointed at. And a restart promoted
+whichever copy of a duplicated row sat on the lower shard, so `VGET` and
+`VSEARCH` agreed on the value the overwrite had replaced.
+
+Every row now carries a version: allocated by the write that creates it, carried
+unchanged by anything that only relocates it, higher wins, and equal versions
+fall back to the old positional rule so nothing changes for data at rest. It is
+persisted in the delta WAL (`SKWL\x03`, which also reserves a payload reference
+for the next change) and in a `versions.bin` column per segment, published by
+the same rename as the graph. V1 and V2 WALs still open and read as legacy;
+promotion happens at the first fold, never at an open. See
+[`docs/adr-vector-version.md`](docs/adr-vector-version.md).
+
+The owner-map rebuild reads the base's version column directly, so a cold start
+is now cheaper WITH versions than it was without them. Measured 2026-09-02,
+release, 200k rows on a folded base, best of three: 0,6 ms for the live ids
+alone before this change, 2,1 ms through a per-row version lookup (the first
+version of it), 73 µs for the column read that shipped - cheaper than the ids
+alone because it also skips a sort and dedup that only exist to merge layers
+that are not there. `rebuild_owner_maps` end to end, 20k rows over two shards,
+is unchanged at ~0,5 ms.
+
+**Breaking on disk, no downgrade path.** A store created or folded by this
+version does not open on `skeg-vector` 0.1.9 or earlier. It is not limited to
+stores that have been folded: the WAL header is written at CREATION, so every
+disk vindex created by this version is already `SKWL\x03`, and the published
+engine's header check REFUSES an unknown `SKWL` version rather than ignoring
+the file - the open fails. `versions.bin` is harmless by comparison; an older
+engine never looks for it. Rolling back means restoring a copy taken before the
+upgrade.
+
 ### `create_empty` refuses a directory that already holds an index
 
 `DiskVamanaIndex::create_empty_with_tier` called `create_dir_all` and then

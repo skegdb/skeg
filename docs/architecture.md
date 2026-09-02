@@ -42,6 +42,17 @@ by a coarse k-means index to the query-nearest cells that hold matches, then a
 short list is re-ranked, so the cost stays sub-linear as the corpus grows. See
 [`filtered-search.md`](filtered-search.md).
 
+## One copy of a row is the live one, and it says so
+
+A vector id can sit on two shards at once - mid-reshard, as a boundary replica,
+or as the leftover of an overwrite whose cleanup failed - and the engine used to
+decide which copy was live from where it sat. Every row now carries a version:
+allocated by the write that created it, carried unchanged by anything that only
+moves it, higher wins. Search, point reads, folds and a restart all resolve a
+duplicate the same way, and a relocation cannot republish a value a concurrent
+write has already replaced. See
+[`adr-vector-version.md`](adr-vector-version.md).
+
 ## Memory follows the workload
 
 With `--tier-mmap` the quantized codes are backed by a file, so the OS reclaims

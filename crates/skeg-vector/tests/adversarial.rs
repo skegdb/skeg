@@ -5,7 +5,7 @@
 //! a wrong answer with a confident face", so every assertion below is about
 //! what a client observes, never about internal structure.
 
-use skeg_vector::{DiskVamanaIndex, QuantKind};
+use skeg_vector::{DiskVamanaIndex, QuantKind, VectorVersion};
 
 const TIER: QuantKind = QuantKind::TurboQuant { bits: 2 };
 const DIM: usize = 16;
@@ -539,4 +539,307 @@ fn create_empty_refuses_a_dir_that_already_holds_an_index() {
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
     let reopened = DiskVamanaIndex::open(&dir).unwrap();
     assert_eq!(reopened.len(), 1, "the existing index must be untouched");
+}
+
+// ── the vector version invariant ──────────────────────────────────────────────
+//
+// A row can exist in more than one place at once, and until now "which copy is
+// live" was inferred from position: a higher LSM layer, a lower shard number,
+// the order a map happened to be iterated in. Position is not identity. These
+// pin the fact that replaces it.
+
+/// A straggler must lose. An older copy of a row arriving after a newer one -
+/// which is exactly what a reshard move that read before an overwrite and
+/// wrote after looks like from here - must not become the value the index
+/// serves, and must not become it at the next restart either.
+#[test]
+fn a_wal_replay_of_an_older_insert_does_not_overwrite_a_newer_one() {
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    let newer = vec_at(7, 0);
+    let older = vec_at(7, 1);
+    i.insert_versioned(7, &newer, VectorVersion::new(5))
+        .unwrap();
+    i.insert_versioned(7, &older, VectorVersion::new(3))
+        .unwrap();
+    assert_eq!(
+        i.get(7).unwrap().unwrap(),
+        newer,
+        "an older version must not overwrite a newer one"
+    );
+    assert_eq!(i.version_of(7), VectorVersion::new(5));
+    drop(i);
+
+    // And the WAL holds both records, so the replay decides it again.
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    assert_eq!(
+        i.get(7).unwrap().unwrap(),
+        newer,
+        "the replay must reach the same verdict as the live write path"
+    );
+    assert_eq!(i.version_of(7), VectorVersion::new(5));
+}
+
+/// The same rule with the operations swapped: a delete is a write like any
+/// other and an older insert cannot undo it. This is the shape that resurrects
+/// a deleted row - an overlap replicating a row a concurrent delete removed.
+#[test]
+fn a_delete_at_version_n_is_not_undone_by_an_insert_at_version_n_minus_one() {
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    i.insert_versioned(9, &v(9), VectorVersion::new(4)).unwrap();
+    assert!(i.delete_versioned(9, VectorVersion::new(9)).unwrap());
+    // The straggler.
+    i.insert_versioned(9, &v(9), VectorVersion::new(8)).unwrap();
+    assert!(i.get(9).unwrap().is_none(), "the delete must stand");
+    assert_eq!(i.len(), 0);
+    drop(i);
+
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    assert!(
+        i.get(9).unwrap().is_none(),
+        "and must still stand after a restart"
+    );
+    assert_eq!(i.len(), 0);
+}
+
+/// The version is a property of the ROW, so every operation that rewrites a
+/// segment has to carry it: a flush into a run, a runs-only merge, a fold into
+/// a new base, and the reopen that follows. A version dropped anywhere along
+/// that chain silently reverts the row to legacy and hands the tie-break back
+/// to position.
+#[test]
+fn versions_survive_a_flush_a_run_merge_and_a_fold() {
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    let ver = |id: u64| VectorVersion::new(1000 + id);
+    for id in 0..64 {
+        i.insert_versioned(id, &v(id), ver(id)).unwrap();
+    }
+    flush(&mut i, d.path());
+    for id in 64..128 {
+        i.insert_versioned(id, &v(id), ver(id)).unwrap();
+    }
+    flush(&mut i, d.path());
+    assert!(i.run_count() >= 2, "two runs, so the merge has work");
+
+    if let Some(j) = i.merge_runs_begin().unwrap() {
+        let b = j.build(d.path()).unwrap();
+        i.merge_runs_finish(b).unwrap().expect_clean();
+    }
+    for id in 0..128 {
+        assert_eq!(i.version_of(id), ver(id), "id {id} after the run merge");
+    }
+
+    fold(&mut i, d.path());
+    for id in 0..128 {
+        assert_eq!(i.version_of(id), ver(id), "id {id} after the fold");
+    }
+    drop(i);
+
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    for id in 0..128 {
+        assert_eq!(i.version_of(id), ver(id), "id {id} after the reopen");
+        assert_eq!(i.get(id).unwrap().unwrap(), v(id), "id {id} value");
+    }
+}
+
+/// Write one record of each legacy WAL encoding by hand and make the engine
+/// read it. A format bump that cannot open what is already on disk is not a
+/// bump, it is a wipe - and the rows come back as legacy versions, which is
+/// what makes the upgrade a no-op on data at rest.
+///
+/// The V3 promotion happens at the fold, never at open: opening must not
+/// rewrite a file it was only asked to read.
+#[test]
+fn a_v2_store_opens_and_upgrades_to_v3_on_the_first_fold() {
+    for (name, magic, framed) in [("v1", &b""[..], false), ("v2", &b"SKWL\x02"[..], true)] {
+        let d = tempfile::TempDir::new().unwrap();
+        {
+            let _ = idx(d.path()); // graph, vectors, CURRENT
+        }
+        // Hand-built legacy WAL: [op=0][id u64][dim f32] (+ crc32c for V2).
+        let mut wal = magic.to_vec();
+        for id in 0..8u64 {
+            let mut body = vec![0u8];
+            body.extend_from_slice(&id.to_le_bytes());
+            for x in v(id) {
+                body.extend_from_slice(&x.to_le_bytes());
+            }
+            if framed {
+                let c = crc32c::crc32c(&body);
+                body.extend_from_slice(&c.to_le_bytes());
+            }
+            wal.extend_from_slice(&body);
+        }
+        std::fs::write(d.path().join("delta.log"), &wal).unwrap();
+
+        let mut i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+        assert_eq!(i.len(), 8, "{name}: every legacy record must replay");
+        for id in 0..8 {
+            assert_eq!(i.get(id).unwrap().unwrap(), v(id), "{name}: id {id}");
+            assert_eq!(
+                i.version_of(id),
+                VectorVersion::LEGACY,
+                "{name}: a legacy record carries no version"
+            );
+        }
+        // Opening READ the file; it must not have rewritten it.
+        assert_eq!(
+            std::fs::read(d.path().join("delta.log")).unwrap(),
+            wal,
+            "{name}: open must not rewrite the WAL"
+        );
+
+        fold(&mut i, d.path());
+        let after = std::fs::read(d.path().join("delta.log")).unwrap();
+        assert_eq!(
+            &after[..5],
+            b"SKWL\x03",
+            "{name}: the fold is where the WAL becomes versioned"
+        );
+        for id in 0..8 {
+            assert_eq!(i.get(id).unwrap().unwrap(), v(id), "{name}: id {id} folded");
+        }
+    }
+}
+
+/// A crash during the final append leaves a partial record. The decoder must
+/// stop at it - the records before it are complete and durable, the partial
+/// one never happened. Half-applying it (an id with no vector, a version with
+/// no id) would be worse than losing it.
+#[test]
+fn a_truncated_v3_record_is_ignored_not_half_applied() {
+    // Every prefix length of the second record, so the cut lands inside the id,
+    // inside the version, inside the payload_ref tag and inside the vector.
+    let full_len = 1 + 8 + 8 + 1 + DIM * 4 + 4;
+    for cut in 1..full_len {
+        let d = tempfile::TempDir::new().unwrap();
+        {
+            let _ = idx(d.path());
+        }
+        let rec = |id: u64| {
+            let mut body = vec![0u8];
+            body.extend_from_slice(&id.to_le_bytes());
+            body.extend_from_slice(&(100 + id).to_le_bytes());
+            body.push(0); // payload_ref: Unchanged
+            for x in v(id) {
+                body.extend_from_slice(&x.to_le_bytes());
+            }
+            let c = crc32c::crc32c(&body);
+            body.extend_from_slice(&c.to_le_bytes());
+            body
+        };
+        let mut wal = b"SKWL\x03".to_vec();
+        wal.extend_from_slice(&rec(1));
+        wal.extend_from_slice(&rec(2)[..cut]);
+        std::fs::write(d.path().join("delta.log"), &wal).unwrap();
+
+        let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+        assert_eq!(
+            i.get(1).unwrap().unwrap(),
+            v(1),
+            "cut {cut}: the complete record must apply"
+        );
+        assert_eq!(i.version_of(1), VectorVersion::new(101), "cut {cut}");
+        assert!(
+            i.get(2).unwrap().is_none(),
+            "cut {cut}: the torn record must not apply at all"
+        );
+        assert_eq!(i.len(), 1, "cut {cut}");
+    }
+}
+
+/// The version column is part of the generation, not a sidecar bolted on
+/// beside it: a build that cannot write it must not publish the generation.
+/// The trap being avoided is the one `load_attr` fell into - a sidecar that is
+/// silently dropped when it does not fit, so the index comes back serving
+/// zeros with a clean bill of health.
+#[test]
+fn a_fold_that_cannot_write_versions_bin_does_not_commit_a_new_generation() {
+    use skeg_vector::failpoint::{WriteFailpoint, arm, disarm_all, fired};
+
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    for id in 0..64 {
+        i.insert_versioned(id, &v(id), VectorVersion::new(500 + id))
+            .unwrap();
+    }
+    let job = i
+        .consolidate_begin()
+        .unwrap()
+        .expect("there is work to fold");
+    arm(WriteFailpoint::VersionsSidecarWrite);
+    let built = job.build(d.path());
+    disarm_all();
+    assert!(
+        fired(WriteFailpoint::VersionsSidecarWrite),
+        "the failpoint never fired, so this test proved nothing"
+    );
+    assert!(
+        built.is_err(),
+        "a fold that cannot write the version column must fail, not publish"
+    );
+
+    // Nothing committed: the live index is untouched and every row is readable.
+    for id in 0..64 {
+        assert_eq!(i.get(id).unwrap().unwrap(), v(id), "id {id}");
+        assert_eq!(i.version_of(id), VectorVersion::new(500 + id), "id {id}");
+    }
+    // And it comes back the same way.
+    drop(i);
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    for id in 0..64 {
+        assert_eq!(i.get(id).unwrap().unwrap(), v(id), "id {id} after reopen");
+        assert_eq!(
+            i.version_of(id),
+            VectorVersion::new(500 + id),
+            "id {id} after reopen"
+        );
+    }
+}
+
+/// `live_ids_with_versions` has two paths - a direct read of the base's own
+/// column in the folded steady state, and the general one across every layer -
+/// and they have to give the same answer. Two paths that agree today and
+/// diverge later is how a cold start starts naming the wrong primary.
+#[test]
+fn live_ids_with_versions_agrees_across_the_layer_shapes() {
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    let general = |i: &DiskVamanaIndex| {
+        let mut want: Vec<(u64, VectorVersion)> = i
+            .live_ids()
+            .into_iter()
+            .map(|id| (id, i.version_of(id)))
+            .collect();
+        want.sort_unstable();
+        want
+    };
+    let taken = |i: &DiskVamanaIndex| {
+        let mut got = i.live_ids_with_versions();
+        got.sort_unstable();
+        got
+    };
+
+    for id in 0..40 {
+        i.insert_versioned(id, &v(id), VectorVersion::new(70 + id))
+            .unwrap();
+    }
+    // Delta only.
+    assert_eq!(taken(&i), general(&i));
+    flush(&mut i, d.path());
+    for id in 40..60 {
+        i.insert_versioned(id, &v(id), VectorVersion::new(70 + id))
+            .unwrap();
+    }
+    i.delete_versioned(3, VectorVersion::new(500)).unwrap();
+    // A run, a delta and a tombstone at once.
+    assert_eq!(taken(&i), general(&i));
+    assert!(!taken(&i).iter().any(|&(id, _)| id == 3));
+
+    fold(&mut i, d.path());
+    // Folded: the direct path.
+    assert_eq!(taken(&i), general(&i));
+    assert_eq!(taken(&i).len(), 59);
 }

@@ -12,6 +12,7 @@
 
 pub mod bind_policy;
 pub mod catalog_intent;
+pub mod failpoint;
 pub mod handler;
 pub mod layout_manifest;
 pub mod memory;

@@ -14,6 +14,10 @@ categories = ["database", "algorithms"]
 
 [features]
 avx512 = ["skeg-simd/avx512"]
+# Typed failpoints for the WAL / sidecar write window (see `src/failpoint.rs`).
+# Off in a normal build; on for this crate's tests through the dev-dependency
+# on itself below.
+failpoints = []
 
 [dependencies]
 skeg-simd = { path = "../skeg-simd", version = "0.1.5" }
@@ -32,6 +36,16 @@ tracing = { workspace = true }
 crc32c = { workspace = true }
 
 [dev-dependencies]
+# The crate itself, with failpoints on: `tests/*.rs` are separate crates, so
+# `cfg(test)` never reaches the library and a feature is the only way in.
+#
+# Feature unification makes that wider than it looks: under `cargo test
+# --workspace` the feature is on for every workspace consumer of this crate -
+# skeg-server included - not only for its own tests. Confined to the test
+# profile, and the reason `fp!` has to be correct when enabled rather than
+# merely absent when not.
+skeg-vector = { path = ".", features = ["failpoints"] }
+crc32c = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
