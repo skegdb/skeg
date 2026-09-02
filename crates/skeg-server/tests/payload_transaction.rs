@@ -591,3 +591,136 @@ async fn vmset_does_not_abort_its_siblings() {
         }
     }
 }
+
+// ── Whose blobs are these? ───────────────────────────────────────────────────
+
+/// The scoped map key the RESP3 handler builds for `(tenant, index)`: the
+/// tenant's 16 bytes in `to_le_bytes` order as hex, `::`, then the name.
+/// Written out here rather than imported because the point of these two tests
+/// is that a NAME can spell one of these without meaning it.
+fn scope_key_of(tenant: u128, index: &str) -> String {
+    let mut s = String::with_capacity(32 + 2 + index.len());
+    for b in tenant.to_le_bytes() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.push_str("::");
+    s.push_str(index);
+    s
+}
+
+/// `payload_of`, for a tenant other than zero.
+async fn payload_of_as(shards: &ShardSet, tenant: u128, name: &str, id: u64) -> Option<Bytes> {
+    let hits = shards
+        .vsearch(name, vec_for(id), 64, 0, tenant, true, None)
+        .await
+        .expect("vsearch");
+    hits.into_iter().find(|h| h.0 == id).and_then(|h| h.2)
+}
+
+/// A vindex name is a client-chosen string, and `[A-Za-z0-9._:-]` is legal - so
+/// a client on tenant 0 can name an index exactly like the scoped map key of
+/// some OTHER tenant. It is still tenant 0's index: it was created by tenant 0,
+/// its blobs are written under tenant 0, and every read of them uses tenant 0.
+///
+/// Anything that recovers the owner by RE-READING the name disagrees, and the
+/// disagreement is not an error - it is a lookup that misses. The reclamation
+/// at open then finds blobs it believes belong to no index here and deletes
+/// them, leaving rows whose payload is gone with nothing said about it.
+///
+/// Deterministic, no interleaving, one restart. The native protocol uses tenant
+/// 0 and the raw name, so it is exposed by default.
+#[tokio::test]
+async fn a_name_shaped_like_a_scope_key_keeps_its_blobs_at_open() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Tenant 0's index, named like tenant 1's scope key.
+    let name = scope_key_of(1, "x");
+    {
+        let shards = open(dir.path());
+        create(&shards, &name).await;
+        for id in 1..=5u64 {
+            shards
+                .vset(
+                    &name,
+                    id,
+                    vec_for(id),
+                    0,
+                    None,
+                    Some(blob(&format!("p={id}"))),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            shards.payload_blobs_held(0, &name).await.unwrap(),
+            5,
+            "fixture: the blobs must be stored before the reopen"
+        );
+    }
+
+    let shards = open(dir.path());
+    assert_eq!(
+        shards.payload_blobs_held(0, &name).await.unwrap(),
+        5,
+        "the open reclaimed the blobs of a live index because its NAME parses \
+         as another tenant's"
+    );
+    for id in 1..=5u64 {
+        assert_eq!(
+            vector_of(&shards, &name, id).await,
+            Some(vec_for(id)),
+            "id {id}: the vector"
+        );
+        assert_eq!(
+            payload_of(&shards, &name, id).await,
+            Some(blob(&format!("p={id}"))),
+            "id {id}: a live row lost its payload, silently"
+        );
+    }
+}
+
+/// The control, and the reason the one above is a bug rather than a rule: a
+/// REAL tenant-scoped index - created by that tenant, read by that tenant -
+/// keeps its blobs across the same restart. Without this the fix could be
+/// "stop reclaiming anything" and both tests would pass.
+#[tokio::test]
+async fn a_tenant_scoped_index_keeps_its_blobs_at_open() {
+    const TENANT: u128 = 0x2a;
+    let dir = tempfile::TempDir::new().unwrap();
+    let name = scope_key_of(TENANT, "ti");
+    {
+        let shards = open(dir.path());
+        create(&shards, &name).await;
+        for id in 1..=5u64 {
+            shards
+                .vset(
+                    &name,
+                    id,
+                    vec_for(id),
+                    TENANT,
+                    None,
+                    Some(blob(&format!("p={id}"))),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            shards.payload_blobs_held(TENANT, &name).await.unwrap(),
+            5,
+            "fixture: the blobs must be stored before the reopen"
+        );
+    }
+
+    let shards = open(dir.path());
+    assert_eq!(
+        shards.payload_blobs_held(TENANT, &name).await.unwrap(),
+        5,
+        "a tenant's own index lost its blobs at open"
+    );
+    for id in 1..=5u64 {
+        assert_eq!(
+            payload_of_as(&shards, TENANT, &name, id).await,
+            Some(blob(&format!("p={id}"))),
+            "id {id}"
+        );
+    }
+}

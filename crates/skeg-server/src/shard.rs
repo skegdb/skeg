@@ -3541,7 +3541,27 @@ type LiveRows = (IndexGeneration, BTreeSet<(u64, u64)>);
 async fn reclaim_orphan_blobs(vlog: &VLog, vindexes: &RwLock<VindexSet>) -> u64 {
     // What each resident index would answer for: its incarnation, and every
     // (id, version) pair it holds live.
-    let live: HashMap<(u128, Vec<u8>), LiveRows> = {
+    //
+    // Keyed by the NAME, and the incarnation is checked against the
+    // GENERATION. Not by the tenant, and above all not by a tenant recovered
+    // from the name: a vindex name is a client-chosen string, `:` is a legal
+    // character in one, and `scope_key` leaves a tenant-0 name untouched - so
+    // a client on tenant 0 can call its index `<32 hex>::x` and have
+    // `unscope_key` read it back as some other tenant's. That index is still
+    // tenant 0's: created by tenant 0, blobs written under tenant 0, every
+    // read of them using tenant 0. Only the recovery disagreed, and it
+    // disagreed by MISSING - the lookup found no index of that name under that
+    // tenant, so every one of its blobs fell into the "nothing here names
+    // this" branch and was deleted, leaving live rows with no payload and
+    // nothing said about it.
+    //
+    // The name alone identifies the index: a shard holds at most one per
+    // scoped name, because that is the key of the map being read here. The
+    // generation then pins WHICH incarnation of it, and a generation is minted
+    // by the server, never spelled by a client. The tenant adds nothing those
+    // two do not already decide, and it is the only part of the key a name can
+    // lie about.
+    let live: HashMap<Vec<u8>, LiveRows> = {
         let vs = vindexes.read();
         vs.iter()
             .map(|(scoped, arc)| {
@@ -3552,10 +3572,7 @@ async fn reclaim_orphan_blobs(vlog: &VLog, vindexes: &RwLock<VindexSet>) -> u64 
                     .into_iter()
                     .map(|(id, v)| (id, v.get()))
                     .collect();
-                (
-                    (unscope_key(scoped).0, scoped.as_bytes().to_vec()),
-                    (g.generation, rows),
-                )
+                (scoped.as_bytes().to_vec(), (g.generation, rows))
             })
             .collect()
     };
@@ -3565,7 +3582,7 @@ async fn reclaim_orphan_blobs(vlog: &VLog, vindexes: &RwLock<VindexSet>) -> u64 
             let Some(key) = parse_payload_blob_key(k) else {
                 return;
             };
-            let named = live.get(&(key.tenant, key.name.to_vec()));
+            let named = live.get(key.name);
             let alive = match (named, key.generation, key.version) {
                 // No such index here. Nothing on this shard can serve it, in
                 // any generation.
