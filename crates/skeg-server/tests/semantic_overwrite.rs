@@ -834,3 +834,64 @@ async fn a_reshard_must_not_republish_a_row_a_concurrent_vdel_removed() {
         &undone[..undone.len().min(8)]
     );
 }
+
+/// The version allocator is only as good as the rebuild that seeds it, and the
+/// rebuild used to treat a shard that could not open its index as a shard that
+/// did not have it. `get_or_reopen` returns `None` for both - it logs the I/O
+/// error and swallows it - so `LiveIds` answered "not found" either way.
+///
+/// The consequence is worse than an incomplete map. That shard contributes no
+/// high-water version either, so the allocator is seeded BELOW the versions it
+/// holds, and the next user write to one of its rows gets a version the copy
+/// there beats: the destination refuses it as superseded, which is correct,
+/// and the client is told `+OK` for a write that never happened.
+///
+/// Absent and unreadable are different states and only one of them has a safe
+/// answer.
+#[tokio::test]
+async fn a_shard_that_cannot_open_its_index_fails_the_owner_map_rebuild() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "un", N).await;
+    shards.reshard("un", 0.25, 10, 0).await.expect("reshard");
+    let victim = victim_on(&shards, "un", N, 1).await;
+    drop(shards);
+
+    // A reopen with the directory already blocked is refused at startup -
+    // `recover_vindexes` fails the whole open, which is the right answer and
+    // not the window here. The reachable one is an index that becomes
+    // unreadable AFTER the shard is serving: evicted from RAM, so the next
+    // access goes through `get_or_reopen`, and that is the path that logs the
+    // I/O error and returns the same `None` as a name nobody ever created.
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    shards.control_handle().evict(0, "un").await.unwrap();
+    let blocked = vindex_dir(dir.path(), 1, "un");
+    let saved = block(&blocked);
+    let err = shards
+        .vset("un", victim, other_cluster(victim), 0, None, None)
+        .await
+        .expect_err(
+            "a write whose index cannot be enumerated on one shard must be refused, \
+             not acknowledged against a map built from the shards that answered",
+        );
+    let err = format!("{err}");
+    assert!(
+        err.contains("un"),
+        "the error must name the index it is about: {err}"
+    );
+    // A read is refused for the same reason, rather than answering from a map
+    // that is missing a shard's rows.
+    shards
+        .vget("un", victim)
+        .await
+        .expect_err("and so is a read that routes through the same map");
+
+    // Restored, it serves again - the refusal is about the state, not a latch.
+    std::fs::set_permissions(&blocked, saved).unwrap();
+    let want = other_cluster(victim);
+    shards
+        .vset("un", victim, want.clone(), 0, None, None)
+        .await
+        .expect("with the shard readable the write goes through");
+    assert_eq!(shards.vget("un", victim).await.unwrap().unwrap(), want);
+}

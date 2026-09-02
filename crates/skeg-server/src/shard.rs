@@ -1029,10 +1029,9 @@ enum ShardResp {
     /// the row: it is what the mover writes at the destination, and what tells
     /// it the row has moved on since the batch was collected.
     Moves(Vec<MoveRow>, Option<u64>),
-    /// Live ids on this shard, each with the version of the copy held here,
-    /// plus this shard's HIGH-WATER version for the index - which the live
-    /// rows do not give, since a tombstone can hold it.
-    Ids(Vec<(u64, u64)>, u64),
+    /// Answer to `LiveIds`. See [`LiveIdsAnswer`]: "this shard does not have
+    /// the index" and "this shard cannot read the index" are separate states.
+    LiveIds(LiveIdsAnswer),
     /// Graph sample: (id, degree) nodes and (from, to) edges.
     Graph(Vec<(u64, u32)>, Vec<(u64, u64)>),
     /// VGET result: the stored f32 vector, or `None` if absent.
@@ -3873,18 +3872,32 @@ async fn process(
         ShardReq::LiveIds { name } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
-                None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
                     let idx = arc.read();
-                    ShardResp::Ids(
-                        idx.backend
+                    ShardResp::LiveIds(LiveIdsAnswer::Held {
+                        ids: idx
+                            .backend
                             .live_ids_with_versions()
                             .into_iter()
                             .map(|(id, v)| (id, v.get()))
                             .collect(),
-                        idx.backend.max_version().get(),
-                    )
+                        high_water: idx.backend.max_version().get(),
+                    })
                 }
+                // Absent, or present and unopenable? The CATALOGUE decides,
+                // the same way a drop decides it. `get_or_reopen` gives the
+                // same `None` for both.
+                None => match read_registry(dir) {
+                    Ok(entries) if entries.iter().any(|e| e.name == name) => {
+                        ShardResp::LiveIds(LiveIdsAnswer::Unreadable(format!(
+                            "vindex '{name}' is registered on this shard and did not open"
+                        )))
+                    }
+                    Ok(_) => ShardResp::LiveIds(LiveIdsAnswer::Absent),
+                    Err(e) => ShardResp::LiveIds(LiveIdsAnswer::Unreadable(format!(
+                        "vindex registry unreadable, so whether '{name}' is here is unknown: {e}"
+                    ))),
+                },
             }
         }
         ShardReq::StillCurrent { name, id, version } => {
@@ -4134,6 +4147,29 @@ async fn process(
 /// the batch was collected, which is what the destination stores and what
 /// tells the mover the row has been written again since.
 type MoveRow = (u64, Vec<f32>, Option<Bytes>, u8, u64);
+
+/// What a shard has to say when asked to enumerate an index.
+///
+/// `get_or_reopen` answers `None` for two completely different states - a name
+/// this shard never had, and a name it has whose files will not open (it logs
+/// the I/O error and swallows it) - and a plain error string flattened them
+/// back together at the caller. Only one of the two has a safe answer, so they
+/// are different variants.
+enum LiveIdsAnswer {
+    /// Not in this shard's registry. Normal: a routed index need not exist on
+    /// every shard, and a create can still be in flight.
+    Absent,
+    /// Registered here and it did not open. The shard HAS rows and cannot say
+    /// which, so nothing derived from this answer can be trusted.
+    Unreadable(String),
+    /// Live ids with the version of the copy held here, plus this shard's
+    /// high-water version for the index - which the live rows do not give,
+    /// since a tombstone can hold it.
+    Held {
+        ids: Vec<(u64, u64)>,
+        high_water: u64,
+    },
+}
 
 /// One hit from one shard's fragment of a search: `(id, cosine, payload,
 /// version)`. The version is read from the shard that produced the hit, and it
@@ -6256,7 +6292,7 @@ impl ShardSet {
                     .call(shard, ShardReq::LiveIds { name: name.clone() })
                     .await?
                 {
-                    ShardResp::Ids(ids, high_water) => {
+                    ShardResp::LiveIds(LiveIdsAnswer::Held { ids, high_water }) => {
                         // The shard's own high-water, not the maximum over the
                         // live ids: a row deleted right after it was written
                         // leaves its version only in a tombstone, and seeding
@@ -6283,7 +6319,20 @@ impl ShardSet {
                             }
                         }
                     }
-                    ShardResp::Err(_) => {} // shard without this vindex yet
+                    // A shard that genuinely does not have the index yet.
+                    ShardResp::LiveIds(LiveIdsAnswer::Absent) => {}
+                    // One that has it and cannot read it. Building the map
+                    // without its rows leaves the allocator seeded BELOW the
+                    // versions that shard holds, and the next user write to
+                    // one of them is refused as superseded at the
+                    // destination - a `+OK` for a write that never happened.
+                    // There is no answer here that is better than refusing.
+                    ShardResp::LiveIds(LiveIdsAnswer::Unreadable(e)) => {
+                        return Err(ShardError::Storage(format!(
+                            "owner map for '{name}' cannot be rebuilt: {e}"
+                        )));
+                    }
+                    ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                     _ => return Err(ShardError::Unavailable),
                 }
             }
