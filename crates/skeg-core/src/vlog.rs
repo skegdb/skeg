@@ -280,19 +280,28 @@ impl VLog {
     /// Returns an error on IO failure, if a writer holds the store open, or if
     /// the directory does not exist.
     pub async fn open_read_only(dir: &Path) -> Result<Self> {
+        Self::open_read_only_with_shared_disk(dir, new_shared_disk()).await
+    }
+
+    /// Open read-only while sharing recovered tenant disk accounting across a
+    /// shard set. Read-only handles take shared locks, never repair a torn
+    /// tail, and reject every mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure, if a writer holds the store open, or
+    /// if the directory does not exist.
+    pub async fn open_read_only_with_shared_disk(
+        dir: &Path,
+        tenant_disk: SharedTenantDisk,
+    ) -> Result<Self> {
         if !dir.is_dir() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("read-only open of a missing store: {}", dir.display()),
             )));
         }
-        Self::open_shared_mode(
-            dir,
-            MAX_SEGMENT_SIZE,
-            Arc::new(Mutex::new(AHashMap::new())),
-            true,
-        )
-        .await
+        Self::open_shared_mode(dir, MAX_SEGMENT_SIZE, tenant_disk, true).await
     }
 
     /// Open sharing `tenant_disk` across a shard set, so the disk quota is global
@@ -315,7 +324,9 @@ impl VLog {
         tenant_disk: Arc<Mutex<AHashMap<u128, u64>>>,
         read_only: bool,
     ) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        if !read_only {
+            std::fs::create_dir_all(dir)?;
+        }
         // Take the store lock before touching any segment: recovery can truncate
         // a torn tail, so even opening must be single-process. A read-only open
         // takes the shared lock instead: it never truncates, and many readers

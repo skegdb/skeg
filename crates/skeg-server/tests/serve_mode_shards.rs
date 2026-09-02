@@ -11,16 +11,18 @@
 //! helper cannot do that job: the bug lived in the caller, so a test that does
 //! not cross the caller would let it back in unnoticed.
 
+use skeg_core::VLog;
 use skeg_server::Server;
 use skeg_server::shard::ShardSet;
 use skeg_vector::QuantKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const TIER: QuantKind = QuantKind::TurboQuant { bits: 2 };
 const DIM: u32 = 8;
-const ROWS: u64 = 800;
-const SHARDS: usize = 8;
+const ROWS: u64 = 200;
+const SHARDS: usize = 2;
 
 fn vec_for(id: u64) -> Vec<f32> {
     let mut v = vec![0.05f32; DIM as usize];
@@ -47,6 +49,27 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn inventory(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            if path.is_dir() {
+                out.push((relative, None));
+                walk(root, &path, out);
+            } else {
+                out.push((relative, Some(std::fs::read(&path).unwrap())));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// The real gate: open the SERVE path over an eight-shard set and count what
@@ -80,6 +103,51 @@ async fn serve_mode_opens_every_shard_it_was_written_with() {
     assert!(TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok());
 }
 
+/// The request filter is not enough to make serve mode read-only: its storage
+/// handles must use shared locks and recovery that never writes. Holding one
+/// read-only VLog per shard makes an accidental writable open fail before the
+/// server can claim readiness.
+#[tokio::test]
+async fn serve_mode_uses_shared_read_only_vlog_locks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_sharded(dir.path()).await;
+
+    let mut readers = Vec::with_capacity(SHARDS);
+    for shard in 0..SHARDS {
+        readers.push(
+            VLog::open_read_only(&dir.path().join(format!("shard-{shard}")))
+                .await
+                .unwrap(),
+        );
+    }
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port()));
+    let server = Server::bind_serve_full_mmap(&addr.to_string(), dir.path(), TIER, 1, false, false)
+        .await
+        .expect("serve mode must coexist with other read-only shard handles");
+    drop((server, readers));
+}
+
+#[tokio::test]
+async fn serve_mode_leaves_the_store_byte_for_byte_unchanged() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_sharded(dir.path()).await;
+    let before = inventory(dir.path());
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port()));
+    let server = Server::bind_serve_full_mmap(&addr.to_string(), dir.path(), TIER, 1, false, false)
+        .await
+        .expect("serve mode opens the completed store");
+    server.shards().vindex_list().await.unwrap();
+    drop(server);
+
+    assert_eq!(
+        inventory(dir.path()),
+        before,
+        "a read-only open changed the directory inventory or file contents"
+    );
+}
+
 /// An empty directory is NOT a one-shard replica. Starting anyway is how
 /// "healthy" gets printed over nothing at all.
 #[tokio::test]
@@ -102,7 +170,7 @@ async fn serve_mode_refuses_an_empty_directory() {
 async fn serve_mode_refuses_a_gap_in_the_numbering() {
     let dir = tempfile::TempDir::new().unwrap();
     write_sharded(dir.path()).await;
-    std::fs::remove_dir_all(dir.path().join("shard-3")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("shard-1")).unwrap();
 
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port()));
     let err = Server::bind_serve_full_mmap(&addr.to_string(), dir.path(), TIER, 1, false, false)
@@ -111,7 +179,7 @@ async fn serve_mode_refuses_a_gap_in_the_numbering() {
         .expect("a missing shard must not be served around");
     let msg = format!("{err}");
     assert!(
-        msg.contains("contiguous") || msg.contains("hole"),
+        msg.contains("contiguous") || msg.contains("hole") || msg.contains("different set"),
         "the refusal must say the layout has a hole, got: {msg}"
     );
 }

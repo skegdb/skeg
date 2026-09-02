@@ -2423,7 +2423,12 @@ fn run_shard(
     };
 
     rt.block_on(async move {
-        let vlog = match VLog::open_with_shared_disk(&dir, disk_counter).await {
+        let opened = if read_only {
+            VLog::open_read_only_with_shared_disk(&dir, disk_counter).await
+        } else {
+            VLog::open_with_shared_disk(&dir, disk_counter).await
+        };
+        let vlog = match opened {
             Ok(v) => v,
             Err(e) => {
                 // Report the failure so `ShardSet::open` aborts startup instead
