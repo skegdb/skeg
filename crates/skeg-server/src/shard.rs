@@ -1146,6 +1146,72 @@ const PAYLOAD_MARKER: &[u8; 3] = b"\x00vp";
 /// commit can't amortise it because VSETs serialise on the per-vindex lock.
 const PAYLOAD_DURABILITY: Durability = Durability::Relaxed;
 
+/// Which INCARNATION of a vindex name a payload blob belongs to.
+///
+/// A vindex name is reusable: dropping `notes` and creating `notes` again is a
+/// perfectly ordinary thing to do, and the blob keys of the two are otherwise
+/// identical - same tenant, same name, same ids. The drop sweeps the old
+/// blobs, but the sweep is best-effort and runs AFTER the catalogue has
+/// already stopped naming the index, so a crash (or a failure) in between
+/// leaves blobs that the next incarnation then serves as its own.
+///
+/// This is the fact that makes the two incarnations different things: minted
+/// once by the coordinator at `VINDEX.CREATE`, broadcast to every shard,
+/// persisted in the registry, and carried in every blob key.
+///
+/// [`LEGACY`](IndexGeneration::LEGACY) - zero - is what an index recorded by
+/// the older `SVI2` registry reads as. Those keep the pre-generation blob key,
+/// so a store written before this existed opens and answers exactly as it did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct IndexGeneration(u128);
+
+impl IndexGeneration {
+    /// An index recorded before generations existed.
+    pub const LEGACY: IndexGeneration = IndexGeneration(0);
+
+    /// A generation from its raw value.
+    #[must_use]
+    pub const fn new(v: u128) -> Self {
+        Self(v)
+    }
+
+    /// The raw value, for encoding.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+
+    /// True for an index that predates generations.
+    #[must_use]
+    pub const fn is_legacy(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::fmt::Display for IndexGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "g{:032x}", self.0)
+    }
+}
+
+/// The vLog key holding the payload blob of one COPY of one row.
+///
+/// STUB. Opened in "vindex: a persistent generation per incarnation" (the
+/// generation) and "payload: one commit point for vector and blob" (the row
+/// version). Until then it answers with the pre-generation key, which is what
+/// the tests naming those two commits are red about.
+#[cfg_attr(not(test), allow(dead_code))]
+fn payload_blob_key(
+    tenant: u128,
+    generation: IndexGeneration,
+    name: &str,
+    id: u64,
+    version: u64,
+) -> Vec<u8> {
+    let _ = (generation, version);
+    payload_key(tenant, name, id)
+}
+
 fn payload_key(tenant: u128, name: &str, id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(16 + 3 + name.len() + 8);
     k.extend_from_slice(&tenant.to_le_bytes());
@@ -1494,12 +1560,20 @@ struct RegistryEntry {
     /// Effective VINDEX wire kind. `None` denotes the legacy registry format,
     /// which did not persist a per-index tier.
     kind: Option<u8>,
+    /// Which incarnation of this name the entry records.
+    ///
+    /// STUB: always [`IndexGeneration::LEGACY`] until "vindex: a persistent
+    /// generation per incarnation" writes and reads the field.
+    generation: IndexGeneration,
 }
 
 /// Rewrite the versioned registry: `[SVI2][u32 count]` then
 /// `[u16 nlen][name][u32 dim][u8 kind]` per disk-backed VINDEX.
 #[allow(clippy::cast_possible_truncation)] // index names are short, dims fit u32
-fn write_registry(dir: &Path, entries: &[(&str, usize, u8)]) -> std::io::Result<()> {
+fn write_registry(
+    dir: &Path,
+    entries: &[(&str, usize, u8, IndexGeneration)],
+) -> std::io::Result<()> {
     let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
     // Refuse BEFORE publishing. The reader enforces the same bound, and a file
     // the writer is willing to produce but the reader will not accept is the
@@ -1515,7 +1589,10 @@ fn write_registry(dir: &Path, entries: &[(&str, usize, u8)]) -> std::io::Result<
     let count =
         u32::try_from(entries.len()).map_err(|_| bad("entry count overflows u32".to_owned()))?;
     buf.extend_from_slice(&count.to_le_bytes());
-    for (name, dim, kind) in entries {
+    for (name, dim, kind, generation) in entries {
+        // STUB: the generation is not persisted yet. Named rather than
+        // swallowed by `_`, so the commit that writes it has one place to look.
+        let _ = generation;
         // Checked, not `as`: a silent truncation writes a length that does not
         // match the bytes beside it, and the reader then walks off into the
         // next record.
@@ -1652,7 +1729,12 @@ fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
         } else {
             None
         };
-        out.push(RegistryEntry { name, dim, kind });
+        out.push(RegistryEntry {
+            name,
+            dim,
+            kind,
+            generation: IndexGeneration::LEGACY,
+        });
     }
     if pos != bytes.len() {
         return Err(bad(format!(
@@ -1712,16 +1794,24 @@ fn persist_registry_removing(
             return Err(e);
         }
     };
-    let mut by_name: BTreeMap<String, (usize, u8)> = existing
+    let mut by_name: BTreeMap<String, (usize, u8, IndexGeneration)> = existing
         .into_iter()
-        .map(|entry| (entry.name, (entry.dim, entry.kind.unwrap_or(1))))
+        .map(|entry| {
+            (
+                entry.name,
+                (entry.dim, entry.kind.unwrap_or(1), entry.generation),
+            )
+        })
         .collect();
     {
         let vs = vindexes.read();
         for (name, entry) in vs.iter() {
             let vindex = entry.read();
             if let VectorBackend::Disk(i) = &vindex.backend {
-                by_name.insert(name.clone(), (i.dim(), vindex.kind));
+                by_name.insert(
+                    name.clone(),
+                    (i.dim(), vindex.kind, IndexGeneration::LEGACY),
+                );
             }
         }
     }
@@ -1733,9 +1823,9 @@ fn persist_registry_removing(
         by_name.remove(gone);
     }
     by_name.retain(|name, _| dir.join(format!("vindex-{name}")).exists());
-    let entries: Vec<(&str, usize, u8)> = by_name
+    let entries: Vec<(&str, usize, u8, IndexGeneration)> = by_name
         .iter()
-        .map(|(name, (dim, kind))| (name.as_str(), *dim, *kind))
+        .map(|(name, (dim, kind, generation))| (name.as_str(), *dim, *kind, *generation))
         .collect();
     write_registry(dir, &entries)
 }
@@ -5850,31 +5940,55 @@ impl ShardSet {
     /// CONCURRENTLY, so the per-vector durable payload-blob writes accumulate in
     /// the group committer and flush in batches instead of one fsync-barrier per
     /// vector. This is the whole bulk-ingest win (100k: ~770s serial -> ~34s).
-    /// Returns the count inserted; fails on the first item's error.
     ///
-    /// # Errors
+    /// One result PER ITEM, in request order.
     ///
-    /// Returns an error if any item fails (missing index, dim mismatch, quota, or
-    /// an unavailable shard).
+    /// STUB ORDERING: the body still uses a `JoinSet` and still stops at the
+    /// first failure, so the vector returned is short and its order is
+    /// completion order. Opened in "vmset: one result per item".
     pub async fn vmset(
         &self,
         name: &str,
         items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
         tenant: u128,
         limit: Option<u64>,
-    ) -> Result<usize, ShardError> {
+    ) -> Vec<Result<(), ShardError>> {
         let mut set = tokio::task::JoinSet::new();
         for (id, vector, payload) in items {
             let this = self.clone();
             let name = name.to_owned();
             set.spawn(async move { this.vset(&name, id, vector, tenant, limit, payload).await });
         }
-        let mut count = 0;
+        let mut out = Vec::new();
         while let Some(joined) = set.join_next().await {
-            joined.map_err(|_| ShardError::Unavailable)??;
-            count += 1;
+            let r = joined.unwrap_or(Err(ShardError::Unavailable));
+            let failed = r.is_err();
+            out.push(r);
+            if failed {
+                break;
+            }
         }
-        Ok(count)
+        out
+    }
+
+    /// How many payload blobs the store still holds for `name`, summed over
+    /// every shard and every generation of the name.
+    ///
+    /// The blobs are KV keys under a reserved marker, so nothing on the vector
+    /// side can see them: a blob whose row is gone is invisible to `VINDEX
+    /// LIST`, to `SKEG.STATS` and to the index's own length. This is the one
+    /// number that says whether the reclamation paths - the drop sweep, the
+    /// post-commit cleanup, the open-time collection of what a failed commit
+    /// staged - are actually doing their job.
+    ///
+    /// STUB: always zero. Opened in "payload: reclaim orphaned blobs at open".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable.
+    pub async fn payload_blobs_held(&self, tenant: u128, name: &str) -> Result<u64, ShardError> {
+        let _ = (tenant, name);
+        Ok(0)
     }
 
     /// Vectors currently reserved by `tenant` against its quota (0 if
@@ -8349,8 +8463,10 @@ mod tests {
             .map(|i| format!("{i:02}{}", "n".repeat(253)))
             .collect();
         assert!(names.iter().all(|n| n.len() == 255));
-        let entries: Vec<(&str, usize, u8)> =
-            names.iter().map(|n| (n.as_str(), 1024usize, 2u8)).collect();
+        let entries: Vec<(&str, usize, u8, IndexGeneration)> = names
+            .iter()
+            .map(|n| (n.as_str(), 1024usize, 2u8, IndexGeneration::LEGACY))
+            .collect();
 
         write_registry(dir.path(), &entries).unwrap();
         let size = fs::metadata(dir.path().join(VINDEX_REGISTRY))
@@ -8372,8 +8488,10 @@ mod tests {
         let names: Vec<String> = (0..=MAX_VINDEXES_PER_SHARD)
             .map(|i| format!("n{i}"))
             .collect();
-        let entries: Vec<(&str, usize, u8)> =
-            names.iter().map(|n| (n.as_str(), 8usize, 2u8)).collect();
+        let entries: Vec<(&str, usize, u8, IndexGeneration)> = names
+            .iter()
+            .map(|n| (n.as_str(), 8usize, 2u8, IndexGeneration::LEGACY))
+            .collect();
         let err = write_registry(dir.path(), &entries).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
@@ -8389,8 +8507,10 @@ mod tests {
         let names: Vec<String> = (0..MAX_VINDEXES_PER_SHARD)
             .map(|i| format!("{i:04}{}", "x".repeat(251)))
             .collect();
-        let entries: Vec<(&str, usize, u8)> =
-            names.iter().map(|n| (n.as_str(), 1024usize, 2u8)).collect();
+        let entries: Vec<(&str, usize, u8, IndexGeneration)> = names
+            .iter()
+            .map(|n| (n.as_str(), 1024usize, 2u8, IndexGeneration::LEGACY))
+            .collect();
         write_registry(dir.path(), &entries).expect("the largest legal catalogue must write");
         assert_eq!(
             read_registry(dir.path()).expect("and must read back").len(),
@@ -8398,14 +8518,131 @@ mod tests {
         );
     }
 
+    /// A blob key names one COPY of one row of one incarnation of one name.
+    /// Two of those differing must give two different keys, or a blob is
+    /// served for a row that never wrote it.
+    #[test]
+    #[ignore = "opens in vindex: a persistent generation per incarnation"]
+    fn payload_key_is_injective_across_generations() {
+        let g1 = IndexGeneration::new(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let g2 = IndexGeneration::new(0x1111_2222_3333_4444_5555_6666_7777_8889);
+        let keys = [
+            ("generation", payload_blob_key(0, g1, "n", 7, 3)),
+            ("other generation", payload_blob_key(0, g2, "n", 7, 3)),
+            (
+                "legacy generation",
+                payload_blob_key(0, IndexGeneration::LEGACY, "n", 7, 3),
+            ),
+            ("row version", payload_blob_key(0, g1, "n", 7, 4)),
+            ("id", payload_blob_key(0, g1, "n", 8, 3)),
+            ("name", payload_blob_key(0, g1, "nn", 7, 3)),
+            // The name is variable-length and everything after it is not, so
+            // the two halves of a longer name must not be readable as a
+            // shorter name plus a different id.
+            ("name prefix", payload_blob_key(0, g1, "n\u{0}", 7, 3)),
+            ("tenant", payload_blob_key(1, g1, "n", 7, 3)),
+            ("pre-generation key", payload_key(0, "n", 7)),
+        ];
+        for (i, (what, a)) in keys.iter().enumerate() {
+            for (other, b) in keys.iter().skip(i + 1) {
+                assert_ne!(a, b, "{what} and {other} share a blob key");
+            }
+        }
+    }
+
+    /// The registry carries the generation from now on, and a file written
+    /// before it did reads as the legacy one - not as an error, and not as a
+    /// generation some other index could also mint.
+    #[test]
+    #[ignore = "opens in vindex: a persistent generation per incarnation"]
+    fn registry_v2_reads_as_the_legacy_generation() {
+        let dir = TempDir::new().unwrap();
+        let g = IndexGeneration::new(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10);
+        write_registry(dir.path(), &[("alpha", 64usize, 2u8, g)]).unwrap();
+        let back = read_registry(dir.path()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].generation, g,
+            "the registry must carry the generation it was given"
+        );
+
+        // A V2 file, byte for byte as the previous version wrote it.
+        let mut buf = b"SVI2".to_vec();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(5u16).to_le_bytes());
+        buf.extend_from_slice(b"alpha");
+        buf.extend_from_slice(&64u32.to_le_bytes());
+        buf.push(2);
+        fs::write(dir.path().join(VINDEX_REGISTRY), &buf).unwrap();
+        let back = read_registry(dir.path()).unwrap();
+        assert_eq!(back.len(), 1, "a V2 registry still reads");
+        assert_eq!(back[0].name, "alpha");
+        assert_eq!(back[0].dim, 64);
+        assert_eq!(back[0].kind, Some(2));
+        assert_eq!(
+            back[0].generation,
+            IndexGeneration::LEGACY,
+            "an index recorded before generations existed has none"
+        );
+    }
+
+    /// A store written before the generation key existed keeps its blobs where
+    /// it left them. The index reads as the legacy generation, and the legacy
+    /// generation reads the legacy key.
+    ///
+    /// Not a red test: it is the compatibility half of the same commit, and it
+    /// has to be green before AND after.
+    #[tokio::test]
+    async fn legacy_blobs_stay_readable_after_the_generation_key_lands() {
+        let dir = TempDir::new().unwrap();
+        {
+            let shards = ShardSet::open(dir.path(), 1).unwrap();
+            shards.vindex_create("lg", 64, 0, 1).await.unwrap();
+            shards.vset("lg", 1, tvec(1), 0, None, None).await.unwrap();
+        }
+        // Downgrade the catalogue to what the previous version wrote: same
+        // entry, no generation. The index now predates generations.
+        let sdir = dir.path().join("shard-0");
+        let entry = read_registry(&sdir).unwrap().remove(0);
+        let mut buf = b"SVI2".to_vec();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(entry.name.as_bytes());
+        buf.extend_from_slice(&(entry.dim as u32).to_le_bytes());
+        buf.push(entry.kind.unwrap_or(1));
+        fs::write(sdir.join(VINDEX_REGISTRY), &buf).unwrap();
+
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        // The blob exactly where the previous version would have put it.
+        shards
+            .set(&payload_key(0, "lg", 1), b"colour=red", Durability::Relaxed)
+            .await
+            .unwrap();
+        let hits = shards
+            .vsearch("lg", tvec(1), 8, 0, 0, true, None)
+            .await
+            .unwrap();
+        let hit = hits.iter().find(|h| h.0 == 1).expect("the row is there");
+        assert_eq!(
+            hit.2.as_deref(),
+            Some(&b"colour=red"[..]),
+            "a legacy index stopped finding the blobs it already had"
+        );
+    }
+
     #[test]
     fn the_registry_round_trips_every_entry_it_was_given() {
         let dir = TempDir::new().unwrap();
-        let entries = [("alpha", 64usize, 1u8), ("beta", 1024, 2), ("gamma", 8, 4)];
+        let g = IndexGeneration::LEGACY;
+        let entries = [
+            ("alpha", 64usize, 1u8, g),
+            ("beta", 1024, 2, g),
+            ("gamma", 8, 4, g),
+        ];
         write_registry(dir.path(), &entries).unwrap();
         let back = read_registry(dir.path()).unwrap();
         assert_eq!(back.len(), 3);
-        for (i, (name, dim, kind)) in entries.iter().enumerate() {
+        for (i, (name, dim, kind, _)) in entries.iter().enumerate() {
             assert_eq!(&back[i].name, name);
             assert_eq!(back[i].dim, *dim);
             assert_eq!(back[i].kind, Some(*kind));
@@ -10179,6 +10416,15 @@ mod tests {
         assert!(shards.del(b"dk", Durability::Kernel).await.unwrap());
         assert!(!shards.del(b"dk", Durability::Kernel).await.unwrap());
         assert!(shards.get(b"dk").await.unwrap().is_none());
+    }
+
+    /// Every item of a VMSET succeeded, and how many there were - the shape
+    /// the call had before it started answering per item.
+    fn all_ok(results: Vec<Result<(), ShardError>>) -> usize {
+        for (i, r) in results.iter().enumerate() {
+            r.as_ref().unwrap_or_else(|e| panic!("vmset item {i}: {e}"));
+        }
+        results.len()
     }
 
     /// Deterministic 64-dim test vector.
@@ -12031,7 +12277,7 @@ mod tests {
             (2u64, tvec(2), Some(Bytes::from_static(b"user=alice"))),
             (3u64, tvec(3), None),
         ];
-        let n = shards.vmset("idx", items, 0, None).await.unwrap();
+        let n = all_ok(shards.vmset("idx", items, 0, None).await);
         assert_eq!(n, 3, "all three items inserted");
 
         // Every vector is searchable.
@@ -12072,7 +12318,7 @@ mod tests {
                 (id, tvec(id), Some(Bytes::copy_from_slice(pl)))
             })
             .collect();
-        let cnt = shards.vmset("idx", items, 0, None).await.unwrap();
+        let cnt = all_ok(shards.vmset("idx", items, 0, None).await);
         assert_eq!(cnt, n as usize, "all items inserted");
 
         // Every even id must find ITSELF (its exact vector) under `p = yes`.
@@ -12120,7 +12366,7 @@ mod tests {
                     (i, tvec16(i), Some(Bytes::copy_from_slice(pl)))
                 })
                 .collect();
-            shards.vmset("idx", items, 0, None).await.unwrap();
+            all_ok(shards.vmset("idx", items, 0, None).await);
             id = end;
             // Fold mid-load, several times, with writes still arriving after
             // each one - that ordering is the whole point.

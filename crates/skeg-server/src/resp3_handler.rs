@@ -1157,12 +1157,15 @@ async fn skeg_vmset(
         Err(e) => return e,
     };
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
-    match shards
+    let results = shards
         .vmset(&scoped, items, tenant_u128(tenant), limit)
-        .await
-    {
-        Ok(n) => Frame::Integer(n as i64),
-        Err(e) => shard_error(&e),
+        .await;
+    // STUB WIRE: still the count, still the first error. The per-item array
+    // arrives with "vmset: one result per item", together with the conformance
+    // case that pins it.
+    match results.iter().find_map(|r| r.as_ref().err()) {
+        Some(e) => shard_error(e),
+        None => Frame::Integer(results.len() as i64),
     }
 }
 

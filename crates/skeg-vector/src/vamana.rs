@@ -4376,6 +4376,37 @@ impl DiskVamanaIndex {
         self.insert_at(id, vector, version, PayloadRef::Unchanged)
     }
 
+    /// [`insert_versioned`](Self::insert_versioned), naming what this write
+    /// does to the row's payload blob.
+    ///
+    /// The record IS the commit point of the pair: the caller stages the blob
+    /// first, then appends this, and after it the row and its payload are
+    /// either both there or neither is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the WAL append fails, or `InvalidInput` if
+    /// `vector.len()` does not equal the index dimension.
+    pub fn insert_with_payload(
+        &mut self,
+        id: u64,
+        vector: &[f32],
+        version: VectorVersion,
+        payload_ref: PayloadRef,
+    ) -> io::Result<()> {
+        self.insert_at(id, vector, version, payload_ref)
+    }
+
+    /// What the newest record for `id` said about its payload blob.
+    ///
+    /// STUB: always [`PayloadRef::Unchanged`]. Opened in "payload: one commit
+    /// point for vector and blob".
+    #[must_use]
+    pub fn payload_ref_of(&self, id: u64) -> PayloadRef {
+        let _ = id;
+        PayloadRef::Unchanged
+    }
+
     /// Tombstone `id` at `version`, dropping the delete when a newer copy of
     /// the row is already known. Returns `true` if the row was live.
     ///
