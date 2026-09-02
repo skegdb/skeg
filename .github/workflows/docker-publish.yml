@@ -72,6 +72,25 @@ jobs:
           fi
           echo "ok: tag reachable from release"
 
+  # Same gate as release.yml's `test` job (duplicated for the same reason as
+  # `guard`): an image is a shipped artefact like a crate, so nothing is
+  # pushed to ghcr.io - `:<version>`, `:latest`, `:release-edge`, or a manual
+  # tag - unless fmt, clippy and the workspace suite are green on this commit.
+  # `release` gets no ci.yml run of its own, so this is the only test gate
+  # `release-edge` ever sees.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --release --locked -- --test-threads=1
+
   # Tags are derived once and shared: the per-architecture builds push by
   # digest and carry no tags of their own, so a half-finished matrix can
   # never leave a tag pointing at one architecture.
@@ -110,7 +129,7 @@ jobs:
   # One native runner per architecture: cross-building Rust under QEMU turns a
   # few minutes into the better part of an hour.
   build:
-    needs: [meta, guard]
+    needs: [meta, guard, test]
     strategy:
       fail-fast: false
       matrix:
