@@ -407,6 +407,14 @@ fn a_shard_count_at_the_bound_is_still_accepted() {
     assert_eq!(m.shard_count().get(), MAX_SHARDS);
 }
 
+// A supported shard must have its own operational identity. Telemetry aliases
+// ids above its fixed capacity with a mask, so accepting more shards would
+// make distinct workers indistinguishable precisely when an operator needs to
+// diagnose one of them. The server also creates one OS thread, runtime,
+// channel and VLog per accepted shard; this is an operational ceiling, not
+// merely a parser-safety bound. Make divergence a build failure.
+const _: () = assert!(MAX_SHARDS <= skeg_telemetry::MAX_SHARDS);
+
 #[test]
 fn a_layout_that_is_a_directory_is_an_error_not_a_migration() {
     // The absent-manifest branch is reached on NotFound. Any other I/O error

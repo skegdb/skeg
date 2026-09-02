@@ -45,9 +45,11 @@ const KNOWN_FLAGS: u64 = 0;
 /// not a layout, it is a fork bomb with a valid checksum. And the checksum is
 /// no defence: anyone who can write the file can recompute it.
 ///
-/// 4096 is far above any real deployment (the production workload runs 8) and
-/// far below anything that hurts.
-pub const MAX_SHARDS: usize = 4096;
+/// The operational ceiling is the number of distinct per-shard telemetry
+/// identities. Above it metrics alias shard ids, while the server would still
+/// allocate one OS thread, current-thread runtime, channel and VLog per shard.
+/// A topology the process cannot observe unambiguously is not supported.
+pub const MAX_SHARDS: usize = skeg_telemetry::MAX_SHARDS;
 
 /// What the store declares about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
