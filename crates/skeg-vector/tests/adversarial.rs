@@ -517,3 +517,26 @@ fn the_inline_fold_does_not_tear_the_live_base() {
         );
     }
 }
+
+/// `create_empty` on a directory that already holds an index used to succeed
+/// and write an empty graph, vectors, CURRENT and WAL over it: an embedder
+/// that "creates" on every open (the rigging adapter does, whenever its
+/// sidecar is missing) silently wiped a populated index. A directory with a
+/// tier file or a CURRENT pointer is an index, and creating over it is an
+/// error, not a reset.
+#[test]
+fn create_empty_refuses_a_dir_that_already_holds_an_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("idx");
+    let mut i = idx(&dir);
+    i.insert(7, &v(7)).unwrap();
+    drop(i);
+
+    let err = match DiskVamanaIndex::create_empty_with_tier(&dir, DIM, 64, TIER) {
+        Ok(_) => panic!("create over an index must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+    let reopened = DiskVamanaIndex::open(&dir).unwrap();
+    assert_eq!(reopened.len(), 1, "the existing index must be untouched");
+}
