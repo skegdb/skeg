@@ -3537,7 +3537,28 @@ type LiveRows = (IndexGeneration, BTreeSet<(u64, u64)>);
 /// HERE, at open, once, and not by any request path - the store is quiescent,
 /// the registry has just been read, and every live row's version is in hand.
 ///
-/// One pass over the keyspace, the same cost shape as `count_tenant_keys`.
+/// # Cost
+///
+/// One pass over the WHOLE keyspace of the shard, unconditional and with no
+/// ceiling - the same shape `count_tenant_keys` and the DROP sweep already
+/// declare, but this one runs at every open rather than when an operator asks
+/// for it. It is proportional to the number of KV keys the shard holds, not to
+/// the number of blobs or of orphans, so a store with a large keyspace and no
+/// vindexes pays for it too.
+///
+/// Measured 2026-09-03, release, macOS arm64, by an auditor isolating the pass
+/// behind an env var: at 20k blobs the difference is UNDER THE NOISE (best of
+/// three, 2,81 s with against 3,02 s without) and at 80k a single pair gives
+/// +220 ms on a 14,1 s open. Neither of those opens is anywhere near the
+/// 14 ms / 2,1 s cold-start budget to begin with - the cost is dominated by
+/// pre-existing vLog recovery - which is the reason the pass does not show up,
+/// not a reason to think it is free. Do not extrapolate from these two points:
+/// they were taken on a store whose open is already an order of magnitude over
+/// budget, and the slope has not been measured.
+///
+/// If it ever does hurt, the answer is the same one the DROP sweep's bench
+/// records: an index on blob keys, not a return to walking `live_ids` - that
+/// path cannot see an index which will not open.
 async fn reclaim_orphan_blobs(vlog: &VLog, vindexes: &RwLock<VindexSet>) -> u64 {
     // What each resident index would answer for: its incarnation, and every
     // (id, version) pair it holds live.

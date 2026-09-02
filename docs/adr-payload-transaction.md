@@ -111,6 +111,23 @@ just been read, every live row's version is in hand, and no request has yet
 staged a blob whose commit has not landed - which is the one state this must not
 mistake for garbage.
 
+A blob is kept when the index of its NAME is resident, its generation is that
+index's, and its `(id, version)` is live. The name and the generation are both
+facts the server holds; the tenant in the key is deliberately not consulted,
+because a vindex name is a client-chosen string that can spell another tenant's
+scope key, and recovering an owner by re-reading one deleted the blobs of a live
+index.
+
+**The pass is O(the shard's whole keyspace), unconditional and uncapped.** It is
+proportional to the KV keys the shard holds, not to the blobs or the orphans.
+Measured 2026-09-03 (release, macOS arm64, isolated behind an env var): under
+the noise at 20k blobs, +220 ms on a 14,1 s open at 80k. Both of those opens are
+already far outside the 14 ms / 2,1 s cold-start budget for reasons that predate
+this - the vLog recovery - so the pass is invisible rather than free, and the
+slope between those two points has not been measured. If it ever matters, the
+answer is an index on blob keys, not a return to walking `live_ids`: that cannot
+see an index which will not open.
+
 ## Compatibility
 
 A store written before generations existed reads as `IndexGeneration::LEGACY` -
