@@ -2181,42 +2181,33 @@ fn recover_vindexes(
     // Names this shard resolved. Their payload blobs are KV keys and can only
     // be reclaimed once the VLog is usable, which is the caller's scope.
     let mut resolved = Vec::new();
-    // Names the coordinator decided about, before any shard started. In a
-    // writable open they are the ones to REMOVE - the undo of a create that
-    // did not reach everywhere, or the completion of a drop that did not. In a
-    // read-only open nothing is resolved because nothing is written, so the
-    // same list is the one to DECLINE to serve: the same refusal to publish a
-    // half-state. Deciding needs every shard's registry at once, which is why
-    // it is not decided here; see `ShardSet::open_mode_full_mmap`.
-    if !read_only {
-        for name in in_flight {
-            if read_registry(dir)?.iter().any(|e| &e.name == name) {
-                tracing::warn!(
-                    shard = shard_id,
-                    index = name,
-                    "resolving an unfinished catalogue operation by removing the index"
-                );
-                persist_registry_removing(dir, &RwLock::new(VindexSet::new()), Some(name))?;
-                remove_vindex_dir(dir, name);
-                resolved.push(name.clone());
-            }
+    // Names the coordinator decided to REMOVE, before any shard started: the
+    // undo of a create that did not reach everywhere, or the completion of a
+    // drop that did not. Deciding needs every shard's registry at once, which
+    // is why it is not decided here; see `ShardSet::open_mode_full_mmap`. A
+    // read-only open never arrives here with a non-empty list - it refuses to
+    // open at all rather than serve around a half-state.
+    debug_assert!(!read_only || in_flight.is_empty());
+    for name in in_flight {
+        if read_registry(dir)?.iter().any(|e| &e.name == name) {
+            tracing::warn!(
+                shard = shard_id,
+                index = name,
+                "resolving an unfinished catalogue operation by removing the index"
+            );
+            persist_registry_removing(dir, &RwLock::new(VindexSet::new()), Some(name))?;
+            remove_vindex_dir(dir, name);
         }
+        // Recorded whether or not the entry was still there. A crash between
+        // that removal and the caller's blob sweep leaves exactly the state
+        // where it is not, and a sweep conditional on it would then find
+        // nothing to do and orphan those blobs for good.
+        resolved.push(name.clone());
     }
     // Fail-closed: a registry that will not parse refuses the shard open. The
     // alternative is opening a store with an unknown number of its indexes
     // missing, which is precisely how serve mode served an eighth of one.
     for entry in read_registry(dir)? {
-        if in_flight.contains(&entry.name) {
-            // Read-only: undecided, so not served. Said out loud, because an
-            // index silently missing from serve mode is indistinguishable from
-            // one that was never there.
-            tracing::warn!(
-                shard = shard_id,
-                index = %entry.name,
-                "not serving a vindex whose catalogue operation never finished;                  open the store writable to resolve it"
-            );
-            continue;
-        }
         let open_tier = entry.kind.and_then(QuantKind::from_wire).unwrap_or(tier);
         let kind = entry
             .kind
@@ -2854,7 +2845,19 @@ async fn drop_vindex(
         // a same-named create, and owed an ORPHAN line in HEALTH.
         remove_vindex_dir(dir, name);
     }
-    sweep_payload_blobs(vlog, tenant, name).await?;
+    // Same rule as the directory removal above, and for the same reason: the
+    // commit record is published, so this is cleanup after the fact. Returning
+    // an error here told the caller a drop had failed when the catalogue had
+    // already forgotten the index, inviting a retry of something that has
+    // happened. A blob left behind is reclaimable garbage, like an orphan
+    // directory - and unlike a drop the caller now believes did not occur.
+    if let Err(e) = sweep_payload_blobs(vlog, tenant, name).await {
+        tracing::error!(
+            index = name,
+            error = %e,
+            "vindex dropped but its payload blobs were not reclaimed"
+        );
+    }
     Ok(true)
 }
 
@@ -3179,7 +3182,11 @@ async fn process(
                         shards_resident: 0,
                         shards_total: 1, // placeholder; the coordinator sets it
                         dim: e.dim as u32,
-                        kind: e.kind.unwrap_or(1),
+                        // Resolved the way the open resolves it. A hardcoded
+                        // fallback made the same index report one kind while
+                        // evicted and another while resident, on any registry
+                        // entry old enough to predate the kind byte.
+                        kind: e.kind.unwrap_or_else(|| tier.to_wire().unwrap_or(1)),
                         backend: 1,
                         n_vectors: 0,
                         delta: 0,
@@ -4069,12 +4076,8 @@ impl ShardSet {
         //
         // In a read-only open nothing is decided or written; the list is every
         // in-flight name, and the shards decline to serve them.
-        let in_flight: Vec<String> = if read_only {
-            crate::catalog_intent::pending(base_dir)?
-                .into_iter()
-                .map(|(_, name)| name)
-                .collect()
-        } else {
+        let mut blocked: Vec<String> = Vec::new();
+        let in_flight: Vec<String> = {
             let mut remove = Vec::new();
             for (op, name) in crate::catalog_intent::pending(base_dir)? {
                 let mut listed = 0usize;
@@ -4089,23 +4092,47 @@ impl ShardSet {
                         listed += 1;
                     }
                 }
-                let resolve = listed > 0
-                    && match op {
-                        crate::catalog_intent::Op::Create => true,
-                        crate::catalog_intent::Op::Drop => listed < n_shards,
-                    };
-                if resolve {
-                    tracing::warn!(
-                        index = %name,
-                        listed_on = listed,
-                        of = n_shards,
-                        "resolving an unfinished catalogue operation by removing the index"
-                    );
+                // A drop the store refused on EVERY shard removed nothing and
+                // left its index whole. Everything else needs finishing.
+                let settled = op == crate::catalog_intent::Op::Drop && listed == n_shards;
+                if !settled {
+                    if listed > 0 {
+                        tracing::warn!(
+                            index = %name,
+                            listed_on = listed,
+                            of = n_shards,
+                            "resolving an unfinished catalogue operation by removing the index"
+                        );
+                        // An index still catalogued somewhere is a half-state a
+                        // reader cannot fix, which is what a read-only open
+                        // refuses over. At `listed == 0` there is nothing left
+                        // to serve, so nothing to refuse.
+                        blocked.push(name.clone());
+                    }
+                    // Kept even at `listed == 0`, where no catalogue entry is
+                    // left to remove: a crash between that removal and the blob
+                    // sweep leaves exactly this state, and dropping it here
+                    // orphans those blobs for good.
                     remove.push(name);
                 }
             }
             remove
         };
+        // A read-only open can DECIDE - reading registries writes nothing - but
+        // it cannot act, so it refuses rather than serve around a half-state.
+        //
+        // Skipping those names at open was tried and is NOT a guard: the first
+        // query reopens the index lazily from the registry, so the store served
+        // it anyway. Measured, `resident=0` right after the open and fifteen
+        // rows out of the next search. A guard that reads as protection and is
+        // not one is worse than no guard.
+        if read_only && !blocked.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "read-only open refused: {} has unfinished catalogue operations on {}; open it writable once to resolve them",
+                base_dir.display(),
+                blocked.join(", ")
+            )));
+        }
 
         for id in 0..n_shards {
             let dir = base_dir.join(format!("shard-{id}"));
@@ -4783,9 +4810,18 @@ impl ShardSet {
         let mut max_run_rows = 0u64;
         let mut present: Vec<usize> = Vec::new();
         let mut assessed = 0usize;
+        // Shards that could not answer. CHECK names them; this used to collapse
+        // them into `Unavailable`, so the one command an operator runs to find
+        // out what is wrong went dark on the shard that was wrong.
+        let mut unlisted: Vec<String> = Vec::new();
         for shard in 0..self.inner.n {
-            let ShardResp::VindexList(rows) = self.call(shard, ShardReq::VindexList).await? else {
-                return Err(ShardError::Unavailable);
+            let rows = match self.call(shard, ShardReq::VindexList).await? {
+                ShardResp::VindexList(rows) => rows,
+                ShardResp::Err(e) => {
+                    unlisted.push(format!("shard {shard} cannot be listed: {e}"));
+                    continue;
+                }
+                _ => return Err(ShardError::Unavailable),
             };
             let Some(row) = rows.iter().find(|r| r.name == name) else {
                 continue;
@@ -4819,7 +4855,7 @@ impl ShardSet {
         // An index absent everywhere is not healthy - it is missing. Saying
         // OK over nothing is exactly the class of lie this command exists to
         // stop telling.
-        if present.is_empty() {
+        if present.is_empty() && unlisted.is_empty() {
             return Err(ShardError::Storage(format!("no such vindex '{name}'")));
         }
         // ONE ordered state, worst-wins: MISSING > UNASSESSED > PARTIAL >
@@ -4836,7 +4872,7 @@ impl ShardSet {
         let unassessed = present.len() - assessed;
         let state = if assessed == 0 {
             "UNASSESSED"
-        } else if partial || unassessed > 0 {
+        } else if partial || unassessed > 0 || !unlisted.is_empty() {
             "PARTIAL"
         } else if worst_debt >= 0.25 {
             "CRITICAL"
@@ -4846,6 +4882,7 @@ impl ShardSet {
             "OK"
         };
         out.push(format!("state {state}"));
+        out.extend(unlisted.iter().cloned());
         if unassessed > 0 {
             out.push(format!(
                 "not_assessed {unassessed} of {} shards holding it (evicted; any \
@@ -8427,6 +8464,158 @@ mod tests {
                 "shard {shard} disagrees about the dim of a freshly created index"
             );
         }
+    }
+
+    /// Recovery removes the registry entry and the directory, then sweeps the
+    /// blobs. A crash in that gap leaves the entry already gone, so the NEXT
+    /// open counts zero shards holding the name, decides there is nothing to
+    /// do, clears the record - and the blobs are orphaned for good. The sweep
+    /// must not be conditional on the entry still being there.
+    #[tokio::test]
+    async fn blobs_survive_a_crash_between_removing_the_index_and_sweeping_them() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 3).unwrap();
+        shards.vindex_create("gone", 4, 1, 1).await.unwrap();
+        for id in 0u64..15 {
+            shards
+                .vset(
+                    "gone",
+                    id,
+                    vec![id as f32, 1.0, 1.0, 1.0],
+                    0,
+                    None,
+                    Some(Bytes::from_static(b"payload")),
+                )
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("gone").await.unwrap();
+        let mut observable: Vec<u64> = Vec::new();
+        for id in 0u64..15 {
+            if shards
+                .get(&payload_key(0, "gone", id))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                observable.push(id);
+            }
+        }
+        assert!(!observable.is_empty(), "fixture: some blob is observable");
+        drop(shards);
+
+        // The state a crash mid-recovery leaves: the record still standing, the
+        // catalogue entries and directories already gone, the blobs untouched.
+        crate::catalog_intent::record(dir.path(), crate::catalog_intent::Op::Drop, "gone").unwrap();
+        for shard in 0..3 {
+            let sdir = dir.path().join(format!("shard-{shard}"));
+            persist_registry_removing(&sdir, &RwLock::new(VindexSet::new()), Some("gone")).unwrap();
+            remove_vindex_dir(&sdir, "gone");
+        }
+
+        let reopened = ShardSet::open(dir.path(), 3).unwrap();
+        for id in observable {
+            assert_eq!(
+                reopened.get(&payload_key(0, "gone", id)).await.unwrap(),
+                None,
+                "blob {id} was orphaned by a crash mid-recovery"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a store left genuinely half-dropped
+    /// cannot be made consistent by a reader, so a read-only open refuses and
+    /// names what is wrong instead of serving around it.
+    #[tokio::test]
+    async fn serve_mode_refuses_a_store_with_a_half_finished_fanout() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 3).unwrap();
+        shards.vindex_create("half", 4, 1, 1).await.unwrap();
+        for id in 0u64..12 {
+            shards
+                .vset("half", id, vec![id as f32, 1.0, 1.0, 1.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("half").await.unwrap();
+
+        set_shard_writable(dir.path(), 0, false);
+        assert!(
+            shards.vindex_drop("half", 0).await.is_err(),
+            "fixture: shard 0 cannot commit, the other two do"
+        );
+        set_shard_writable(dir.path(), 0, true);
+        assert_eq!(
+            registry_dim(dir.path(), 0, "half"),
+            Some(4),
+            "fixture: exactly one shard still holds it"
+        );
+        drop(shards);
+
+        let msg = match ShardSet::open_mode(dir.path(), 3, true, QuantKind::TurboQuant { bits: 2 })
+        {
+            Ok(_) => panic!("a reader must not serve around a half-finished fan-out"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("half"),
+            "the refusal must name the index: {msg}"
+        );
+    }
+
+    /// A read-only open cannot resolve, but it can DECIDE - reading registries
+    /// writes nothing. Declining to serve every in-flight name hides an index a
+    /// refused drop left whole, which is a healthy index missing from serve mode
+    /// for no reason.
+    #[tokio::test]
+    async fn serve_mode_still_serves_an_index_whose_drop_was_refused() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 3).unwrap();
+        shards.vindex_create("kept", 4, 1, 1).await.unwrap();
+        for id in 0u64..15 {
+            shards
+                .vset("kept", id, vec![id as f32, 1.0, 1.0, 1.0], 0, None, None)
+                .await
+                .unwrap();
+        }
+        shards.vindex_consolidate("kept").await.unwrap();
+        for shard in 0..3 {
+            set_shard_writable(dir.path(), shard, false);
+        }
+        assert!(
+            shards.vindex_drop("kept", 0).await.is_err(),
+            "fixture: no shard can commit the removal"
+        );
+        for shard in 0..3 {
+            set_shard_writable(dir.path(), shard, true);
+        }
+        drop(shards);
+        eprintln!(
+            "SONDA intent dopo il drop rifiutato: {:?}",
+            crate::catalog_intent::pending(dir.path())
+        );
+
+        let serve =
+            ShardSet::open_mode(dir.path(), 3, true, QuantKind::TurboQuant { bits: 2 }).unwrap();
+        eprintln!(
+            "SONDA residente subito dopo l'apertura: {:?}",
+            serve
+                .vindex_list()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| format!("{} resident={}", r.name, r.shards_resident))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serve
+                .vsearch("kept", vec![1.0; 4], 15, 0, 0, false, None)
+                .await
+                .unwrap()
+                .len(),
+            15,
+            "serve mode hid an index that a refused drop left whole"
+        );
     }
 
     /// A DROP refused by EVERY shard removed nothing, and the caller was told

@@ -48,8 +48,11 @@ const MAGIC: &str = "SCI1";
 /// Same bound the registry uses. A store with more names in flight than it can
 /// hold indexes is not in a state worth parsing further.
 const MAX_NAMES: usize = MAX_VINDEXES_PER_SHARD;
-/// magic line + one 255-byte name per line + the crc line.
-const MAX_BYTES: u64 = (5 + MAX_NAMES * 256 + 14) as u64;
+/// magic line, then one line per entry - the longest operation word, a space, a
+/// 255-byte name and a newline - then the crc line. Budgeted for the operation
+/// word too: without it a legitimately full file parsed as oversized.
+const MAX_LINE: usize = "create".len() + 1 + 255 + 1;
+const MAX_BYTES: u64 = (MAGIC.len() + 1 + MAX_NAMES * MAX_LINE + "crc=".len() + 8 + 1) as u64;
 
 fn path(root: &Path) -> PathBuf {
     root.join(FILE)
