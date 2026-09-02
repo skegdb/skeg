@@ -19,16 +19,25 @@ a tag the release workflow rejected still produced `:<version>` and
 `:latest` images.
 
 Now: guard -> test (fmt, clippy, serial workspace suite) -> build-binaries
-and the Dockerfile check -> publish-crates -> homebrew. Nothing irreversible
-runs before every build is green. The Docker workflow carries its own copy
-of the ancestry guard *and* of the test job, because workflows cannot
-depend on each other's jobs: `:<version>`, `:latest` and `:release-edge`
-are pushed only once the same gate is green on that commit (`release` has
-no CI run of its own, so this is the only test `release-edge` ever sees).
-The ancestry guard also covers manual dispatches that publish - `dry_run:
-false` in the release workflow, `also_latest` in the Docker one - so a
-dispatch from a feature branch cannot push a crate or move `:latest`. Not
-in this change: SHA-pinned actions, SBOM, provenance, cargo-deny.
+-> docker -> publish-crates -> homebrew, one workflow. The Docker workflow
+no longer answers `v*` on its own: `release.yml` calls it after every
+`build-binaries` target succeeded, so `:<version>` and `:latest` cannot
+ship while a tarball is failing, and crates.io (irreversible) waits for the
+image too. What is *not* atomic: a failure in `publish-crates` or the
+Homebrew bump leaves the GitHub Release, the tarballs and the image already
+published - those steps are re-runnable, but the release is visible before
+they finish.
+
+Off the tag path, the Docker workflow keeps its own copy of the ancestry
+guard and of the test job (workflows cannot share jobs): `:release-edge`
+and any manual image dispatch are pushed only once fmt, clippy and the
+suite are green on that commit (`release` has no CI run of its own, so
+this is the only test `release-edge` ever sees). The ancestry guard runs on
+every manual dispatch that publishes - `dry_run: false` in the release
+workflow, any Docker dispatch (each one pushes at least its custom tag and
+`sha-*`) - so a dispatch from a feature branch cannot push a crate or an
+image. Not in this change: SHA-pinned actions, SBOM, provenance,
+cargo-deny.
 
 ### The single-tenant servers refuse a network bind without an opt-in
 
