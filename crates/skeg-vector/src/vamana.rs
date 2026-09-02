@@ -4441,6 +4441,14 @@ impl DiskVamanaIndex {
     /// covers because a fold has taken it into a segment. The reach is the
     /// delta and its flush staging - the window a crash leaves behind, which
     /// is the window a recovery has to reconcile.
+    ///
+    /// # No production reader yet
+    ///
+    /// The server derives a blob's key from the row's live version, not from
+    /// this, so today the only callers are the tests that pin the round trip.
+    /// Nothing has ever depended on a stored `Cleared` being true - it has
+    /// only had to be written - so the first real reader must treat the
+    /// records already on disk as unverified rather than as evidence.
     #[must_use]
     pub fn payload_ref_of(&self, id: u64) -> PayloadRef {
         self.payload_refs.get(&id).copied().unwrap_or_default()

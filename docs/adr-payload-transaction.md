@@ -161,6 +161,16 @@ partway.
   payload reference, so the answer goes back to `Unchanged`. That is the honest
   reach: the window a crash leaves behind is the window a recovery has to
   reconcile.
+- **Nothing reads `payload_ref` today, and a future reader must not trust the
+  records already written.** The field is encoded, replayed and readable, and
+  its only callers are the tests that pin the round trip. The commit-point
+  property does not come from it - it comes from the versioned key plus the
+  live row's version, which is why the per-segment column was rejected above.
+  So `Blob(v)` against `Cleared` currently has NO observable effect anywhere,
+  which means the two have never been distinguished by anything that could have
+  caught them being wrong. Whoever writes the first real reader has to treat
+  existing records as unverified: `Cleared` in particular has never had to be
+  true, only written.
 - **Both point paths take the row stripe now, routed or not.** A VSET stopped
   being one shard message the moment it staged, committed and reclaimed with
   awaits in between, and a shard runs its requests concurrently.
