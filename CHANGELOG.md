@@ -9,6 +9,32 @@ repository.
 
 ## [Unreleased]
 
+### A vector row says which copy of it is live
+
+A vector id can have more than one physical copy at once - mid-reshard, as a
+boundary replica, as the leftover of an overwrite whose cleanup failed - and
+which one was LIVE was inferred from position: the higher LSM layer, the lower
+shard number, the order a map happened to be iterated in. Position is not
+identity, and three losses followed, all silent. A `reshard` republished rows a
+concurrent `VSET` had replaced (63 of 240 on the run that pinned it), acking the
+overwrite and then undoing it. An `overlap` replicated rows a concurrent `VDEL`
+had removed, leaving a searchable copy no map pointed at. And a restart promoted
+whichever copy of a duplicated row sat on the lower shard, so `VGET` and
+`VSEARCH` agreed on the value the overwrite had replaced.
+
+Every row now carries a version: allocated by the write that creates it, carried
+unchanged by anything that only relocates it, higher wins, and equal versions
+fall back to the old positional rule so nothing changes for data at rest. It is
+persisted in the delta WAL (`SKWL\x03`, which also reserves a payload reference
+for the next change) and in a `versions.bin` column per segment, published by
+the same rename as the graph. V1 and V2 WALs still open and read as legacy;
+promotion happens at the first fold, never at an open. See
+[`docs/adr-vector-version.md`](docs/adr-vector-version.md).
+
+The owner-map rebuild reads the base's version column directly, so a cold start
+is now cheaper WITH versions than it was without them: 73 µs against 0,6 ms over
+200k rows.
+
 ### `create_empty` refuses a directory that already holds an index
 
 `DiskVamanaIndex::create_empty_with_tier` called `create_dir_all` and then
