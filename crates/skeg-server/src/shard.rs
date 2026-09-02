@@ -5886,14 +5886,40 @@ impl ShardSet {
                     // then - by a user write that raced this move - stays the
                     // newer one everywhere.
                     self.observe_version(name, version);
-                    let already_there = self
+                    // ONE ROW, under the same stripe a routed point op takes.
+                    //
+                    // Not the batch: a batch spans shard calls for other ids,
+                    // and holding one id's stripe across them would serialise
+                    // the whole reshard behind it. Per row is enough, because
+                    // the thing being made atomic is exactly what a vset on
+                    // this id also does - decide where the live copy is, and
+                    // publish that decision.
+                    let _stripe = self.owner_stripe(name, id).lock().await;
+                    // Re-read UNDER the stripe. Everything above was decided
+                    // from a batch collected before this lock existed.
+                    let current = self
                         .inner
                         .owners
                         .read()
                         .get(name)
-                        .and_then(|m| m.get(&id).copied())
-                        .is_some_and(|(p, _, _)| p == owner);
+                        .and_then(|m| m.get(&id).copied());
+                    if current.is_some_and(|(_, _, live)| live > version) {
+                        // A user write replaced this row while the batch was
+                        // in flight, and was acknowledged. What this loop
+                        // holds is the value that write REPLACED: writing it
+                        // to the new owner and pointing the map at it is how
+                        // an acknowledged write used to disappear. Its own
+                        // cleanup removes the source copy.
+                        continue;
+                    }
+                    let already_there = current.is_some_and(|(p, _, _)| p == owner);
                     if !already_there {
+                        crate::fp!(
+                            crate::failpoint::WriteFailpoint::ReshardDestinationWrite,
+                            Err(ShardError::Storage(
+                                "failpoint: reshard destination write refused".to_owned()
+                            ))
+                        );
                         let req = ShardReq::Vset {
                             name: name.to_owned(),
                             id,
@@ -5913,6 +5939,12 @@ impl ShardSet {
                     }
                     // Swallowing this Vdel's response would count the row moved
                     // while its stale source copy survives (review finding).
+                    crate::fp!(
+                        crate::failpoint::WriteFailpoint::ReshardSourceDelete,
+                        Err(ShardError::Storage(
+                            "failpoint: reshard source delete refused".to_owned()
+                        ))
+                    );
                     match self
                         .call(
                             source,
@@ -5997,18 +6029,39 @@ impl ShardSet {
                 };
                 for (id, vector, payload, second, version) in batch {
                     self.observe_version(name, version);
-                    // Only rows whose PRIMARY lives here replicate from here
-                    // (the same row seen via its replica must not re-replicate).
-                    let primary_here = self
+                    // Per row, same stripe, same reason as the reshard: the
+                    // window this closes is one await wide and it is where a
+                    // deleted row came back. The delete took both copies and
+                    // the map entry while the replica was in flight, and the
+                    // replica then landed on a shard nothing was left to clean
+                    // up - reachable by search, invisible to the map.
+                    let _stripe = self.owner_stripe(name, id).lock().await;
+                    let current = self
                         .inner
                         .owners
                         .read()
                         .get(name)
-                        .and_then(|m| m.get(&id).copied())
-                        .is_some_and(|(p, _, _)| usize::from(p) == source);
-                    if !primary_here || usize::from(second) == source {
+                        .and_then(|m| m.get(&id).copied());
+                    // No entry means the row was deleted while the batch was
+                    // in flight; a higher version means it was rewritten, and
+                    // this copy is the value that write replaced. Only rows
+                    // whose PRIMARY still lives here replicate from here (the
+                    // same row seen via its replica must not re-replicate).
+                    let Some((primary, _, live)) = current else {
+                        continue;
+                    };
+                    if live > version
+                        || usize::from(primary) != source
+                        || usize::from(second) == source
+                    {
                         continue;
                     }
+                    crate::fp!(
+                        crate::failpoint::WriteFailpoint::OverlapReplicaWrite,
+                        Err(ShardError::Storage(
+                            "failpoint: overlap replica write refused".to_owned()
+                        ))
+                    );
                     let req = ShardReq::Vset {
                         name: name.to_owned(),
                         id,
@@ -6029,6 +6082,9 @@ impl ShardSet {
                         ShardResp::Err(e) => return Err(ShardError::Storage(e)),
                         _ => return Err(ShardError::Unavailable),
                     }
+                    // Still under the stripe: the replica has to be IN the map
+                    // before a delete can look for it, or the delete finds
+                    // nothing to remove and the copy outlives the row.
                     if let Some(m) = self.inner.owners.write().get_mut(name)
                         && let Some(e) = m.get_mut(&id)
                     {
