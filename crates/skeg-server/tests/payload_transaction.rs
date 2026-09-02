@@ -67,6 +67,17 @@ async fn create(shards: &ShardSet, name: &str) {
         .expect("vindex create");
 }
 
+/// `create`, for a name the SERVER scoped to a tenant. The raw-name door
+/// refuses `::`, so a legitimately scoped index can only be created through
+/// the pre-scoped entry - which is what the RESP3 layer uses once it has an
+/// authenticated tenant to scope with.
+async fn create_scoped(shards: &ShardSet, name: &str) {
+    shards
+        .vindex_create_scoped(name, DIM as u32, 0, 1)
+        .await
+        .expect("scoped vindex create");
+}
+
 /// The payload a search reports for `id`, or `None`.
 ///
 /// Read back through the SEARCH path rather than the KV key, deliberately: the
@@ -617,65 +628,44 @@ async fn payload_of_as(shards: &ShardSet, tenant: u128, name: &str, id: u64) -> 
     hits.into_iter().find(|h| h.0 == id).and_then(|h| h.2)
 }
 
-/// A vindex name is a client-chosen string, and `[A-Za-z0-9._:-]` is legal - so
-/// a client on tenant 0 can name an index exactly like the scoped map key of
-/// some OTHER tenant. It is still tenant 0's index: it was created by tenant 0,
-/// its blobs are written under tenant 0, and every read of them uses tenant 0.
+/// A vindex name used to be a client-chosen string in which `[A-Za-z0-9._:-]`
+/// was legal, so a client on tenant 0 could name an index exactly like the
+/// scoped map key of some OTHER tenant. It was still tenant 0's index - created
+/// by tenant 0, blobs written under tenant 0, every read of them using tenant
+/// 0 - but anything that recovered the owner by RE-READING the name disagreed,
+/// and the disagreement was not an error, it was a lookup that missed. The
+/// reclamation at open then found blobs it believed belonged to no index here
+/// and deleted them, leaving live rows with no payload and nothing said.
 ///
-/// Anything that recovers the owner by RE-READING the name disagrees, and the
-/// disagreement is not an error - it is a lookup that misses. The reclamation
-/// at open then finds blobs it believes belong to no index here and deletes
-/// them, leaving rows whose payload is gone with nothing said about it.
-///
-/// Deterministic, no interleaving, one restart. The native protocol uses tenant
-/// 0 and the raw name, so it is exposed by default.
+/// That shape is now refused at the door, which is the only fix that holds for
+/// the four other sites reading the same name (erase, warm-up, sweeps, stats).
+/// So this pins the refusal instead of the recovery: nothing can create the
+/// lookalike, on any protocol, so the reclamation can never meet it. The
+/// control below still covers the case that CAN occur - a genuinely scoped
+/// index, whose owner really is the one the key names.
 #[tokio::test]
-async fn a_name_shaped_like_a_scope_key_keeps_its_blobs_at_open() {
+async fn a_name_shaped_like_a_scope_key_cannot_be_created() {
     let dir = tempfile::TempDir::new().unwrap();
     // Tenant 0's index, named like tenant 1's scope key.
     let name = scope_key_of(1, "x");
-    {
-        let shards = open(dir.path());
-        create(&shards, &name).await;
-        for id in 1..=5u64 {
-            shards
-                .vset(
-                    &name,
-                    id,
-                    vec_for(id),
-                    0,
-                    None,
-                    Some(blob(&format!("p={id}"))),
-                )
-                .await
-                .unwrap();
-        }
-        assert_eq!(
-            shards.payload_blobs_held(0, &name).await.unwrap(),
-            5,
-            "fixture: the blobs must be stored before the reopen"
-        );
-    }
-
     let shards = open(dir.path());
-    assert_eq!(
-        shards.payload_blobs_held(0, &name).await.unwrap(),
-        5,
-        "the open reclaimed the blobs of a live index because its NAME parses \
-         as another tenant's"
+    let err = shards
+        .vindex_create(&name, DIM as u32, 0, 1)
+        .await
+        .expect_err("a raw name shaped like another tenant's scope key must be refused");
+    assert!(
+        err.to_string().contains("must not contain '::'"),
+        "the refusal must name the separator, got: {err}"
     );
-    for id in 1..=5u64 {
-        assert_eq!(
-            vector_of(&shards, &name, id).await,
-            Some(vec_for(id)),
-            "id {id}: the vector"
-        );
-        assert_eq!(
-            payload_of(&shards, &name, id).await,
-            Some(blob(&format!("p={id}"))),
-            "id {id}: a live row lost its payload, silently"
-        );
-    }
+    assert!(
+        shards
+            .vindex_list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.name != name),
+        "the refused name must not exist"
+    );
 }
 
 /// The control, and the reason the one above is a bug rather than a rule: a
@@ -689,7 +679,7 @@ async fn a_tenant_scoped_index_keeps_its_blobs_at_open() {
     let name = scope_key_of(TENANT, "ti");
     {
         let shards = open(dir.path());
-        create(&shards, &name).await;
+        create_scoped(&shards, &name).await;
         for id in 1..=5u64 {
             shards
                 .vset(

@@ -395,7 +395,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "red until the create door refuses '::' (fix/tenant-carried-not-parsed)"]
     async fn a_native_create_cannot_spell_another_tenants_scope() {
         // `VINDEX.CREATE "<32 hex of B>::x"` over the binary protocol. There is
         // no AUTH here and never was: the handler passes the raw name to

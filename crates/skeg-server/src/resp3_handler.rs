@@ -856,7 +856,13 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
         Ok(s) => s,
         Err(e) => return e,
     };
-    match shards.vindex_create(&scoped, dim, kind, backend).await {
+    // `scoped` came out of `scope_vindex_or_reject`, which refused the
+    // separator in the raw name and then wrote the prefix itself, so this is
+    // the pre-scoped door rather than the raw one.
+    match shards
+        .vindex_create_scoped(&scoped, dim, kind, backend)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }

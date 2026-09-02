@@ -47,7 +47,6 @@ fn vec_for(id: u64) -> Vec<f32> {
 }
 
 #[tokio::test]
-#[ignore = "red until the create door refuses '::' (fix/tenant-carried-not-parsed)"]
 async fn a_raw_vindex_name_carrying_the_scope_separator_is_refused() {
     // The ShardSet door: what the native protocol and every admin helper
     // reach. `vindex_create` takes a RAW name here, so `::` in it can only
@@ -73,7 +72,6 @@ async fn a_raw_vindex_name_carrying_the_scope_separator_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "red until the create door refuses '::' (fix/tenant-carried-not-parsed)"]
 async fn a_tenant_erase_cannot_be_aimed_by_a_squatted_name() {
     // The P1 in full. Tenant 0 owns a legitimate index; it then tries to
     // create the map key tenant B's own index would use. Before the create
@@ -123,7 +121,6 @@ async fn a_tenant_erase_cannot_be_aimed_by_a_squatted_name() {
 }
 
 #[tokio::test]
-#[ignore = "red until the create door refuses '::' (fix/tenant-carried-not-parsed)"]
 async fn a_registry_key_that_does_not_round_trip_is_an_open_error() {
     // Fail closed on the way out, too. A key that `scope_key(unscope_key(k))`
     // does not reproduce cannot have been written by this server, so nothing
