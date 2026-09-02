@@ -1603,7 +1603,7 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "proptest",
- "skeg-platform 0.1.6",
+ "skeg-platform",
  "skeg-proto",
  "skeg-telemetry",
  "smallvec",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-multi-tenant"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "skeg-resp3 0.1.3",
@@ -1625,21 +1625,9 @@ dependencies = [
  "skeg-rigging-net-resp3",
  "skeg-rigging-skeg",
  "skeg-tenant",
+ "skeg-vector",
  "tempfile",
  "thiserror",
-]
-
-[[package]]
-name = "skeg-platform"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c91697adc382f2d5a7c667b0c8f7ea9064c7abb1b355e81138be80c77a807f"
-dependencies = [
- "libc",
- "memmap2",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1687,9 +1675,9 @@ dependencies = [
 
 [[package]]
 name = "skeg-rigging"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79487bda89b3ac20166d9a1ed97ce0704386b831c27e57a537a0a85b51f20a7e"
+checksum = "28b8390fd8072e39592599d478cfe3f4c6a7a1eab9090ebd7be66caba854c835"
 dependencies = [
  "bytes",
  "thiserror",
@@ -1697,9 +1685,9 @@ dependencies = [
 
 [[package]]
 name = "skeg-rigging-net"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b140126805b5a2bf095d18fc30559d2c1e327bc89d7f9063cd88ad72a23035b"
+checksum = "b6271bbe847ee13c84bddaade95fec13dbc863e161c3ffc493874d6ac510f267"
 dependencies = [
  "bytes",
  "crc32c",
@@ -1712,9 +1700,9 @@ dependencies = [
 
 [[package]]
 name = "skeg-rigging-net-resp3"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a12cdb246c62f556451546092425b9b007280f3d0e2de5df86f0b9fd299fd56c"
+checksum = "5dae0b4991843027d03535f91d2c326bb18bea007aed2ede340e504463027dc8"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -1728,16 +1716,16 @@ dependencies = [
 
 [[package]]
 name = "skeg-rigging-skeg"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b93704ba1c3c1733f7de64d17388e96a39c294e1743580c788d55716bcdacff"
+checksum = "8974fc5e9747b9f1f116b5f987712c6577256fb069270548f3e3449d3c18d2b6"
 dependencies = [
  "bytes",
  "parking_lot",
  "serde",
  "serde_json",
  "skeg-rigging",
- "skeg-vector 0.1.3",
+ "skeg-vector",
  "thiserror",
 ]
 
@@ -1754,11 +1742,11 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "skeg-core",
- "skeg-platform 0.1.6",
+ "skeg-platform",
  "skeg-proto",
  "skeg-resp3 0.2.5",
  "skeg-telemetry",
- "skeg-vector 0.1.9",
+ "skeg-vector",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
@@ -1775,24 +1763,15 @@ name = "skeg-server-tenant"
 version = "0.2.4"
 dependencies = [
  "parking_lot",
- "skeg-platform 0.1.6",
+ "skeg-platform",
  "skeg-server",
  "skeg-tenant",
- "skeg-vector 0.1.9",
+ "skeg-vector",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "skeg-simd"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b98d246da2988a7573cb06f55217d38c919f151226782d58b4082d45fff51e6"
-dependencies = [
- "thiserror",
 ]
 
 [[package]]
@@ -1835,26 +1814,6 @@ dependencies = [
 
 [[package]]
 name = "skeg-vector"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8548cfa631099f8c1df114f22887c20268e79e00ed5479a15328ba8d204a460d"
-dependencies = [
- "ahash",
- "bytemuck",
- "fixedbitset",
- "ordered-float",
- "parking_lot",
- "rand",
- "rayon",
- "skeg-platform 0.1.3",
- "skeg-simd 0.1.4",
- "smallvec",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "skeg-vector"
 version = "0.1.9"
 dependencies = [
  "ahash",
@@ -1868,8 +1827,8 @@ dependencies = [
  "proptest",
  "rand",
  "rayon",
- "skeg-platform 0.1.6",
- "skeg-simd 0.1.6",
+ "skeg-platform",
+ "skeg-simd",
  "skeg-telemetry",
  "smallvec",
  "tempfile",

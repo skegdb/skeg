@@ -9,6 +9,25 @@ repository.
 
 ## [Unreleased]
 
+### `skeg-multi-tenant` embeds the workspace engine
+
+The crate reaches its vector engine through `skeg-rigging-skeg`, which
+depends on `skeg-vector = "0.1"` from crates.io. That resolved to
+`skeg-vector 0.1.3` next to the workspace's `0.1.9`: two engines in one
+build, and the multi-tenant one was never the one this repository tests.
+
+A `[patch.crates-io]` entry now points that dependency at
+`crates/skeg-vector` (and `skeg-simd`, `skeg-platform` with it); the
+rigging chain is moved to `skeg-rigging` / `skeg-rigging-skeg` 0.1.3 and
+`skeg-rigging-net` / `-resp3` 0.1.1. `tests/engine_alignment.rs` asserts
+that the resolved graph holds exactly one `skeg-vector`, the workspace one,
+and that a tenant written through `MultiTenantRoot` reopens with
+`skeg_vector::DiskVamanaIndex` directly. Still duplicated: `skeg-resp3`
+(0.1.3 through `skeg-rigging-net-resp3`, 0.2.5 here) - a transport crate,
+pinned exactly upstream; not the engine.
+
+`skeg-multi-tenant` 0.1.0 -> 0.1.1.
+
 ### The on-disk layout is declared, not deduced
 
 A store now carries a `LAYOUT` file at its root stating what it is: format

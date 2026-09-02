@@ -121,6 +121,15 @@ panic = "abort"
 inherits = "release"
 debug = true
 
+# skeg-rigging-skeg (crates.io, used by skeg-multi-tenant) depends on
+# `skeg-vector = "0.1"`. Without this patch the registry copy is resolved
+# next to the workspace one and the multi-tenant crate embeds an engine
+# this workspace never built or tested. Same for the crates it drags in.
+[patch.crates-io]
+skeg-vector = { path = "crates/skeg-vector" }
+skeg-simd = { path = "crates/skeg-simd" }
+skeg-platform = { path = "crates/skeg-platform" }
+
 # Loopback / cross-repo integration tests live in the skeg-testing
 # repository (https://github.com/skegdb/skeg-testing). This workspace
 # is fully self-contained.
