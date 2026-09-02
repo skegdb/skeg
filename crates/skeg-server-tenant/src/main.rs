@@ -11,6 +11,11 @@
 //! - `--tenant-strict` rejects anonymous HELLO 3 (no AUTH)
 //! - `--admin-tenant <name>` names the tenant allowed to run
 //!   `SKEG.QUOTA.SET/GET` (set per-tenant quotas at runtime)
+//! - `--allow-unauthenticated-network` (env `SKEG_ALLOW_UNAUTHENTICATED_NETWORK`):
+//!   without `--tenant-auth`, this binary wraps the same unauthenticated
+//!   engine as `skeg`/`skeg-resp3`, so a non-loopback `--addr` is refused
+//!   unless this flag opts in. With `--tenant-auth`, auth is present and
+//!   this flag has no effect.
 
 use skeg_server::Server;
 use skeg_vector::QuantKind;
@@ -35,6 +40,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = Config::parse(std::env::args().skip(1));
+    // `--tenant-auth` installs a `TenantBackend` (auth) below; without it
+    // this is the same unauthenticated engine as the single-tenant `skeg`
+    // / `skeg-resp3` binaries, so the same non-loopback guard applies.
+    if cfg.tenant_auth.is_none() {
+        match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network)
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    "--allow-unauthenticated-network: {} is reachable over the network with no \
+                     authentication (no --tenant-auth given)",
+                    cfg.addr
+                );
+            }
+            Ok(false) => {}
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        }
+    }
     if cfg.workers > 0 {
         tracing::info!(
             "--workers {}: VSEARCH dispatched to tokio blocking pool",
@@ -130,6 +155,12 @@ struct Config {
     tenant_auth: Option<String>,
     tenant_strict: bool,
     admin_tenant: Option<String>,
+    /// Opt-in to binding a non-loopback `--addr` when no `--tenant-auth` is
+    /// given (i.e. this binary is running as an unauthenticated engine,
+    /// same as `skeg`/`skeg-resp3`). See
+    /// `skeg_server::check_unauthenticated_bind`. Env var
+    /// `SKEG_ALLOW_UNAUTHENTICATED_NETWORK`.
+    allow_unauthenticated_network: bool,
 }
 
 impl Config {
@@ -157,6 +188,10 @@ impl Config {
                 Ok("1") | Ok("true") | Ok("on")
             ),
             admin_tenant: std::env::var("SKEG_ADMIN_TENANT").ok(),
+            allow_unauthenticated_network: matches!(
+                std::env::var("SKEG_ALLOW_UNAUTHENTICATED_NETWORK").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            ),
         };
         let args: Vec<String> = args.collect();
         let mut i = 0;
@@ -211,6 +246,10 @@ impl Config {
                         cfg.admin_tenant = Some(v.clone());
                     }
                     i += 2;
+                }
+                "--allow-unauthenticated-network" => {
+                    cfg.allow_unauthenticated_network = true;
+                    i += 1;
                 }
                 _ => i += 1,
             }

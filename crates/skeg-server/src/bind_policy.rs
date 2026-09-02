@@ -16,20 +16,37 @@ pub const ALLOW_ENV: &str = "SKEG_ALLOW_UNAUTHENTICATED_NETWORK";
 /// Check whether `addr` may be bound given the current `allow_network`
 /// opt-in.
 ///
-/// - If `addr` fails to parse as a `SocketAddr`, returns `Ok(false)` - the
-///   real bind call will report the parse/connect error with better
-///   context than this pure check could.
-/// - Loopback addresses (`127.0.0.1`, `::1`, ...) always return `Ok(false)`:
-///   no opt-in was needed, so the caller should not warn.
-/// - Any other address (including the unspecified `0.0.0.0` / `::`, which
-///   is not loopback) returns `Ok(true)` when `allow_network` is `true` -
-///   the bind is allowed, but the caller should warn that it is
+/// - `addr` is first tried as a `SocketAddr` literal. When that fails (e.g.
+///   a hostname like `localhost:7379`, or a non-canonical numeric form like
+///   `0:7379` or `0x00000000:7379`, both of which `tokio::net::ToSocketAddrs`
+///   happily resolves and the real bind call would accept), it falls back
+///   to `std::net::ToSocketAddrs` resolution so those forms can't slip past
+///   the loopback check. If resolution also fails, returns `Ok(false)` -
+///   the real bind call will report the error with better context than
+///   this pure check could.
+/// - The loopback test is applied to every resolved address: if any of
+///   them is non-loopback, the whole `addr` is treated as non-loopback.
+///   Note this is conservative for IPv4-mapped IPv6 addresses:
+///   `[::ffff:127.0.0.1]` is refused (without the opt-in) even though it
+///   maps to a loopback IPv4 address, because `Ipv6Addr::is_loopback`
+///   returns `false` for it.
+/// - All-loopback resolutions always return `Ok(false)`: no opt-in was
+///   needed, so the caller should not warn.
+/// - Otherwise, returns `Ok(true)` when `allow_network` is `true` - the
+///   bind is allowed, but the caller should warn that it is
 ///   unauthenticated - otherwise `Err` with an operator-facing message.
 pub fn check_unauthenticated_bind(addr: &str, allow_network: bool) -> Result<bool, String> {
-    let Ok(sock_addr) = addr.parse::<std::net::SocketAddr>() else {
-        return Ok(false);
+    let resolved: Vec<std::net::SocketAddr> = match addr.parse::<std::net::SocketAddr>() {
+        Ok(sock_addr) => vec![sock_addr],
+        Err(_) => {
+            use std::net::ToSocketAddrs;
+            match addr.to_socket_addrs() {
+                Ok(iter) => iter.collect(),
+                Err(_) => return Ok(false),
+            }
+        }
     };
-    if sock_addr.ip().is_loopback() {
+    if resolved.iter().all(|a| a.ip().is_loopback()) {
         return Ok(false);
     }
     if allow_network {
@@ -101,6 +118,30 @@ mod tests {
     fn unparseable_addr_is_deferred_to_bind() {
         assert_eq!(check_unauthenticated_bind("not-an-addr", false), Ok(false));
         assert_eq!(check_unauthenticated_bind("not-an-addr", true), Ok(false));
+    }
+
+    #[test]
+    fn hostname_loopback_is_ok() {
+        // "localhost" isn't a `SocketAddr` literal, so this exercises the
+        // `ToSocketAddrs` resolution fallback; every resolved address
+        // (127.0.0.1 and/or ::1) is loopback.
+        assert_eq!(
+            check_unauthenticated_bind("localhost:7379", false),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn non_canonical_unspecified_form_is_refused_without_flag() {
+        // "0" is not a `SocketAddr` literal but resolves (via getaddrinfo)
+        // to 0.0.0.0 - the same non-loopback "all interfaces" address as
+        // "0.0.0.0", just spelled differently. Must not bypass the check.
+        assert!(check_unauthenticated_bind("0:7379", false).is_err());
+    }
+
+    #[test]
+    fn non_canonical_unspecified_form_is_ok_with_flag() {
+        assert_eq!(check_unauthenticated_bind("0:7379", true), Ok(true));
     }
 
     #[test]

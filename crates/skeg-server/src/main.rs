@@ -154,6 +154,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing()?;
 
     let cfg = Config::parse(args.into_iter());
+    match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network) {
+        Ok(true) => {
+            tracing::warn!(
+                "--allow-unauthenticated-network: {} is reachable over the network with no \
+                 authentication",
+                cfg.addr
+            );
+        }
+        Ok(false) => {}
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
     if cfg.speed {
         // Latch the opt-in into skeg-vector's process-wide flag. Has to
         // happen before the first search, which is what `Server::bind*`
@@ -181,20 +195,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(port) = cfg.metrics_port {
         spawn_metrics_exporter(port);
-    }
-    match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network) {
-        Ok(true) => {
-            tracing::warn!(
-                "--allow-unauthenticated-network: {} is reachable over the network with no \
-                 authentication",
-                cfg.addr
-            );
-        }
-        Ok(false) => {}
-        Err(msg) => {
-            eprintln!("{msg}");
-            std::process::exit(1);
-        }
     }
     let data_dir = std::path::Path::new(&cfg.data_dir);
     let server = if cfg.serve {
