@@ -278,7 +278,14 @@ impl VectorBackend {
     /// process RSS sample.
     fn approx_ram_bytes(&self) -> u64 {
         match self {
-            VectorBackend::Flat(_) => self.len() as u64 * self.dim() as u64 * 4,
+            // The index's OWN number, not live rows times dim. A flat index
+            // never gives a row back: a deleted row keeps its f32, and the
+            // versions of ids it was told to delete and never held are held
+            // too. Multiplying the LIVE count by `dim` reported none of that,
+            // so a workload of deletes grew the process while `SKEG.STATS`,
+            // the tiering controller and memory admission all read a number
+            // that was going down.
+            VectorBackend::Flat(i) => i.resident_bytes() as u64,
             VectorBackend::Disk(i) => i.resident_bytes() as u64,
         }
     }
@@ -6951,6 +6958,45 @@ mod tests {
             &blob[..],
             b"{\"tag\":\"new\"}",
             "the stale copy's payload replaced the live row's"
+        );
+    }
+
+    /// The client-reachable half of the same defect: `SKEG.VDEL` on a flat
+    /// vindex with an id nobody ever inserted. Every routed delete carries a
+    /// real version, so this used to allocate a dead row per call - unbounded
+    /// growth from one command, and the reported RAM counted live rows only,
+    /// so nothing anywhere showed it.
+    #[tokio::test]
+    async fn deleting_unknown_ids_on_a_flat_vindex_does_not_grow_the_reported_ram() {
+        const DIM: u32 = 256;
+        const N: u64 = 5_000;
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        // backend byte 0 = flat.
+        shards.vindex_create("f", DIM, 0, 0).await.unwrap();
+        shards
+            .vset("f", 1, vec![1.0; DIM as usize], 0, None, None)
+            .await
+            .unwrap();
+        let reported = |stats: &[IndexStat]| -> usize {
+            stats
+                .iter()
+                .filter(|s| s.index == "f")
+                .map(|s| s.resident_bytes)
+                .sum()
+        };
+        let before = reported(&shards.control_handle().open_indices().await);
+
+        for id in 0..N {
+            assert!(!shards.vdel("f", 1_000_000 + id, 0).await.unwrap());
+        }
+        let after = reported(&shards.control_handle().open_indices().await);
+        assert!(
+            after - before < N as usize * 32,
+            "{N} deletes of ids the index never held grew it by {} bytes \
+             (a dead row each would be {})",
+            after - before,
+            N as usize * DIM as usize * 4
         );
     }
 
