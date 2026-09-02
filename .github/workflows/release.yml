@@ -61,10 +61,15 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # `--all-features` is stricter than the CI lint (it also compiles the
+        # avx512, metrics-http, tracing-otlp and live-attach code); `--locked`
+        # keeps it on the committed lockfile like every other gate here.
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo test
-        # Serial: the parallel test suite hits EMFILE on the runner.
-        run: cargo test --workspace --locked -- --test-threads=1
+        # `--release --locked` mirrors ci.yml. Serial because the parallel
+        # workspace suite exhausted the file-descriptor budget locally
+        # (EMFILE); lift once the suite owns its FD budget.
+        run: cargo test --workspace --release --locked -- --test-threads=1
 
   publish-crates:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
