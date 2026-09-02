@@ -9,6 +9,26 @@ repository.
 
 ## [Unreleased]
 
+### `create_empty` refuses a directory that already holds an index
+
+`DiskVamanaIndex::create_empty_with_tier` called `create_dir_all` and then
+wrote an empty graph, vectors, `CURRENT` and WAL over whatever was there.
+The server guards its own call site; embedders did not. `skeg-rigging-skeg`
+0.1.3's `Tenant::open` decided whether a tenant existed from its metadata
+sidecar, which only `flush` writes, so a tenant that inserted and never
+flushed lost its vectors on the next open (reproduced: one vector, then
+none). A tier file or a `CURRENT` pointer now makes `create_empty` fail
+with `AlreadyExists`: a repeat of that mistake by any caller is an error,
+not a silent wipe. `skeg-multi-tenant` requires `skeg-rigging-skeg` 0.1.4,
+which reopens such an index and writes the sidecar at create, and pins
+the scenario in `tests/reopen_without_flush.rs`.
+
+The `open_scoped` perf gate timed the creation of a new tenant per
+iteration; a durable create is four fsyncs (~10 ms on APFS) and could
+never meet 5 ms - which is also why the gate only turned red once the
+crate embedded the workspace engine instead of the fsync-less 0.1.3. It
+now creates in the warm-up and times the reopen.
+
 ### A release is one gated transaction
 
 `release.yml` used to run `publish-crates` and `build-binaries` side by
