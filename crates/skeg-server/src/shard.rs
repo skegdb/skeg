@@ -292,7 +292,10 @@ async fn stage_payload_blob(
     vlog.tenant(scope.tenant)
         .set(&scope.key(id, version), blob, PAYLOAD_DURABILITY)
         .await
-        .map(|()| true)
+        .map(|()| {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::PayloadBlobsStaged);
+            true
+        })
         .map_err(|e| format!("vset payload failed: {e}"))
 }
 
@@ -2986,6 +2989,10 @@ fn run_shard(
         if !read_only {
             let reclaimed = reclaim_orphan_blobs(&vlog, &vindexes).await;
             if reclaimed > 0 {
+                skeg_telemetry::add_counter(
+                    skeg_telemetry::Counter::PayloadBlobsReclaimedAtOpen,
+                    reclaimed,
+                );
                 tracing::info!(
                     shard = shard_id,
                     reclaimed,
@@ -4254,6 +4261,9 @@ async fn process(
                 None => match admitted.previous.filter(|&v| v != admitted.version) {
                     Some(old) => match read_payload_blob(vlog, scope, id, old).await {
                         Ok(Some(blob)) => {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::PayloadBlobsCarriedForward,
+                            );
                             stage_payload_blob(vlog, scope, id, admitted.version, &blob).await
                         }
                         Ok(None) => Ok(false),
@@ -4310,14 +4320,19 @@ async fn process(
                                     idx.payload.upsert(id, parse_fields(blob));
                                 }
                             }
-                            Err(e) => tracing::error!(
-                                index = %name,
-                                id,
-                                error = e,
-                                "vector committed but its payload fields were not indexed: \
-                                 filtered searches will miss this row until the postings \
-                                 are rebuilt"
-                            ),
+                            Err(e) => {
+                                skeg_telemetry::tick_counter(
+                                    skeg_telemetry::Counter::PayloadPostCommitFailures,
+                                );
+                                tracing::error!(
+                                    index = %name,
+                                    id,
+                                    error = e,
+                                    "vector committed but its payload fields were not indexed: \
+                                     filtered searches will miss this row until the postings \
+                                     are rebuilt"
+                                );
+                            }
                         }
                         Ok(())
                     }
@@ -4358,6 +4373,9 @@ async fn process(
                     }
                 };
                 if let Err(e) = outcome {
+                    skeg_telemetry::tick_counter(
+                        skeg_telemetry::Counter::PayloadPostCommitFailures,
+                    );
                     tracing::error!(
                         index = %name,
                         id,
@@ -4676,6 +4694,9 @@ async fn process(
                                     }
                                 };
                                 if let Err(e) = outcome {
+                                    skeg_telemetry::tick_counter(
+                                        skeg_telemetry::Counter::PayloadPostCommitFailures,
+                                    );
                                     tracing::error!(
                                         index = %name,
                                         id,
