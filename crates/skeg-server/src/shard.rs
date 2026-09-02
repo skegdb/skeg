@@ -853,6 +853,15 @@ enum ShardReq {
     LiveIds {
         name: String,
     },
+    /// Is `id` still the exact row a relocation read - live here, and at
+    /// `version`? The one question the owner map cannot answer: a successful
+    /// delete REMOVES the map entry, and an absent entry is also the normal
+    /// state of a row that has never moved. The tombstone is here.
+    StillCurrent {
+        name: String,
+        id: u64,
+        version: u64,
+    },
     /// Boundary rows for the targeted overlap: live rows whose margin
     /// between the two nearest centroids is below `tau` - returned with
     /// vector, payload and the SECOND-nearest shard they replicate to.
@@ -2839,6 +2848,7 @@ fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
         | ShardReq::SampleVectors { .. }
         | ShardReq::CollectMoves { .. }
         | ShardReq::LiveIds { .. }
+        | ShardReq::StillCurrent { .. }
         | ShardReq::CollectBoundary { .. }
         | ShardReq::GraphSample { .. }
         | ShardReq::VindexCreate { .. }
@@ -3866,6 +3876,23 @@ async fn process(
                             .map(|(id, v)| (id, v.get()))
                             .collect(),
                         idx.backend.max_version().get(),
+                    )
+                }
+            }
+        }
+        ShardReq::StillCurrent { name, id, version } => {
+            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            match entry {
+                None => ShardResp::Err(format!("vindex '{name}' not found")),
+                Some(arc) => {
+                    let idx = arc.read();
+                    // Live AND unchanged. Not "version has not advanced": a
+                    // fold drops a tombstone along with the rows it masked, so
+                    // a deleted row can read back as version 0 - lower than
+                    // what the mover carries, not higher. Liveness is the
+                    // question, and the version answers the other half.
+                    ShardResp::Existed(
+                        idx.backend.contains(id) && idx.backend.version_of(id).get() == version,
                     )
                 }
             }
@@ -5978,6 +6005,30 @@ impl ShardSet {
                         // an acknowledged write used to disappear. Its own
                         // cleanup removes the source copy.
                         continue;
+                    }
+                    // And ask the SOURCE whether the row is still the row that
+                    // was read. The map cannot answer that: a successful
+                    // `vdel` REMOVES the entry, so a deleted row looks exactly
+                    // like a row that has never moved - which is most rows on
+                    // a first reshard - and the guard above does not fire.
+                    // Writing it to its new owner then republishes a delete
+                    // the client was told had happened, and the destination
+                    // has no tombstone to lose against because the tombstone
+                    // is here.
+                    //
+                    // One extra round trip per moved row, under the stripe the
+                    // delete also takes, so the answer cannot go stale between
+                    // the question and the write.
+                    let req = ShardReq::StillCurrent {
+                        name: name.to_owned(),
+                        id,
+                        version,
+                    };
+                    match self.call(source, req).await? {
+                        ShardResp::Existed(true) => {}
+                        ShardResp::Existed(false) => continue,
+                        ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                        _ => return Err(ShardError::Unavailable),
                     }
                     let already_there = current.is_some_and(|(p, _, _)| p == owner);
                     if !already_there {

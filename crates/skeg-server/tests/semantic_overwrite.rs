@@ -748,3 +748,89 @@ async fn a_reinsert_after_a_restart_is_not_dropped_as_stale() {
         "and it must be searchable: {hits:?}"
     );
 }
+
+/// Interleaving B again, on the other relocation. `overlap` skips a row in TWO
+/// cases - the owner map has no entry for it, or its version has advanced -
+/// and `reshard` skipped only the second. A successful `vdel` REMOVES the map
+/// entry, so `current` comes back `None`, the version guard does not fire, and
+/// the row the client was told was deleted is written to its new owner and
+/// published as live.
+///
+/// The missing half cannot be an `else` on "entry absent": for `reshard` that
+/// is also the normal state of a row that has never moved, which is most of
+/// them on a first reshard. The tombstone is on the SOURCE shard, and the
+/// source is the only thing that can tell the two apart.
+///
+/// The fixture is built rather than hoped for. Training the router first makes
+/// the move ORDER computable - source 0's rows in ascending id, then source
+/// 1's - so the deletes can walk exactly that sequence at exactly that rate,
+/// which is what keeps them inside the one-await window instead of crossing it
+/// once. Started on the router epoch changing, so they begin when `reshard`'s
+/// own retrain finishes and its move loop starts.
+#[tokio::test]
+async fn a_reshard_must_not_republish_a_row_a_concurrent_vdel_removed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 1200;
+    let shards = seeded(dir.path(), "rd", N).await;
+    shards.train_router("rd", 0.25, 10).await.expect("train");
+    let router = shards.router("rd").expect("router just trained");
+    let epoch = router.epoch;
+
+    let all: Vec<u64> = (0..N).collect();
+    let placed = shards.owners_of("rd", &all).await.unwrap();
+    let mut victims: Vec<u64> = Vec::new();
+    for source in 0..2u8 {
+        for id in 0..N {
+            if placed[id as usize].0 == source && router.assign(&vec_for(id)) as u8 != source {
+                victims.push(id);
+            }
+        }
+    }
+    assert!(
+        victims.len() > N as usize / 4,
+        "the fixture must give the reshard real work: {}",
+        victims.len()
+    );
+
+    let deleter = {
+        let shards = shards.clone();
+        let victims = victims.clone();
+        async move {
+            // `reshard` retrains before it moves anything; the epoch bump is
+            // the moment its move loop starts.
+            while shards.router("rd").is_none_or(|r| r.epoch == epoch) {
+                tokio::task::yield_now().await;
+            }
+            for id in victims {
+                shards
+                    .vdel("rd", id, 0)
+                    .await
+                    .expect("the delete is acknowledged");
+            }
+        }
+    };
+    let (moved, ()) = tokio::join!(shards.reshard("rd", 0.25, 10, 0), deleter);
+    moved.expect("reshard");
+
+    let mut undone: Vec<u64> = Vec::new();
+    for &id in &victims {
+        if shards.vget("rd", id).await.unwrap().is_some() {
+            undone.push(id);
+            continue;
+        }
+        let hits = shards
+            .vsearch("rd", vec_for(id), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        if hits.iter().any(|h| h.0 == id) {
+            undone.push(id);
+        }
+    }
+    assert!(
+        undone.is_empty(),
+        "{} of {} acknowledged deletes were undone by the reshard: {:?}",
+        undone.len(),
+        victims.len(),
+        &undone[..undone.len().min(8)]
+    );
+}
