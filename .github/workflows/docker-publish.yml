@@ -5,8 +5,10 @@ name: Docker publish
 # - push to `release` → publishes `:release-edge` and `:sha-<short>`
 #   (this is the staging build that follows main into release; users who
 #   want "what is about to ship" pull this tag)
-# - push tag `v*`     → publishes the version tag (e.g. `:0.3.3`) plus
-#   `:latest` (immutable shipped artefact tracking crates.io / brew)
+# - tag `v*`          → publishes the version tag (e.g. `:0.3.3`) plus
+#   `:latest`. Not a trigger of its own: release.yml calls this workflow
+#   (`workflow_call`) once its test gate and the build-binaries matrix are
+#   green, so an image can never ship while a tarball is failing.
 # - manual dispatch   → publishes the user-provided tag (defaults to the
 #   short SHA), useful for back-publishing a stable image for a code state
 #   that has already shipped under crates.io / brew.
@@ -16,9 +18,20 @@ name: Docker publish
 # Docker layer is intentionally gated to the release track to keep
 # ghcr storage tidy and avoid noise on the public image listing.
 on:
+  workflow_call:
+    inputs:
+      gated:
+        description: 'Caller already ran fmt/clippy/test on this commit; skip the local gate.'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Build both architectures but push nothing.'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [release]
-    tags: ['v*']
     paths:
       - 'Dockerfile'
       - '.dockerignore'
@@ -52,13 +65,14 @@ jobs:
   # too. Without it, a tag rejected by release.yml (not reachable from
   # `release`) could still reach this workflow via its own `tags: ['v*']`
   # trigger and publish `:<version>` / `:latest` to ghcr.io.
-  # A manual dispatch with `also_latest` moves `:latest`, so its ref gets
-  # the same check. On `release` pushes and plain dispatches this job is a
-  # no-op that still succeeds, so `needs: guard` resolves to "ok".
+  # Every manual dispatch publishes something (a custom tag and `sha-*` at
+  # least), so its ref gets the same check. On `release` pushes and dry runs
+  # this job is a no-op that still succeeds, so `needs: guard` resolves to
+  # "ok".
   guard:
     runs-on: ubuntu-latest
     env:
-      CHECK: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.also_latest == 'true' }}
+      CHECK: ${{ (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !inputs.dry_run }}
     steps:
       - uses: actions/checkout@v5
         if: env.CHECK == 'true'
@@ -80,8 +94,10 @@ jobs:
   # pushed to ghcr.io - `:<version>`, `:latest`, `:release-edge`, or a manual
   # tag - unless fmt, clippy and the workspace suite are green on this commit.
   # `release` gets no ci.yml run of its own, so this is the only test gate
-  # `release-edge` ever sees.
+  # `release-edge` ever sees. Skipped when release.yml calls in with
+  # `gated: true`: it has just run the identical job on the same commit.
   test:
+    if: ${{ !inputs.gated }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -133,6 +149,9 @@ jobs:
   # few minutes into the better part of an hour.
   build:
     needs: [meta, guard, test]
+    # `test` may be skipped (gated caller); anything else short of success
+    # upstream still blocks the build.
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.guard.result == 'success' && needs.test.result != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
@@ -166,13 +185,14 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           build-args: ${{ matrix.build_args }}
-          outputs: type=image,name=ghcr.io/skegdb/skeg,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/skegdb/skeg,push-by-digest=true,name-canonical=true,push=${{ !inputs.dry_run }}
           labels: |
             org.opencontainers.image.source=https://github.com/skegdb/skeg
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.description=Vector + KV store, SSD-primary, RAM-frugal.
       - name: export digest
+        if: ${{ !inputs.dry_run }}
         run: |
           mkdir -p /tmp/digests
           # Bare hex: upload-artifact rejects a path containing the `:` of
@@ -180,6 +200,7 @@ jobs:
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v5
+        if: ${{ !inputs.dry_run }}
         with:
           name: digest-${{ strategy.job-index }}
           path: /tmp/digests/*
@@ -189,6 +210,7 @@ jobs:
   # skegdb/skeg:0.7.1` resolves to arm64 or amd64 by itself.
   merge:
     needs: [meta, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
