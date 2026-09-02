@@ -1035,6 +1035,34 @@ async fn skeg_vset(
 /// `SKEG.VMSET name (id vector payload)+` - bulk insert. Items fan out
 /// concurrently so the durable payload-blob writes batch in the group committer.
 /// Returns the number of items inserted.
+/// Items one VMSET may carry.
+///
+/// A RESP array may declare `MAX_AGGREGATE_LEN` (1,048,576) elements and VMSET
+/// reads them as triples, so one command could carry ~349,525 items - each
+/// re-parsed into a `Vec<f32>`, which at 1024 dimensions is 1.4 GB materialised
+/// before anything can refuse it. The batch is built first and fanned out
+/// after, so memory admission never sees it: it is upstream of the governor,
+/// not something the governor forgot to check.
+///
+/// 4096 because it is the number this engine already thinks in (`FLUSH_ROWS`)
+/// and because the batches actually in use here are 128 to 200, so the cap
+/// leaves twenty times the room anyone was using. A client with more to send
+/// splits it, which is what it was already doing.
+const MAX_VMSET_ITEMS: usize = 4096;
+
+/// Vector bytes one VMSET may carry, summed across its items.
+///
+/// The item cap alone does not bound the size: 4096 bulks of `MAX_BULK_LEN`
+/// each is 2 TB on paper. The sum of the argument LENGTHS is knowable before a
+/// single f32 is copied, which is the point - it bounds the copy, not the
+/// frame. (The frame itself arriving at all is a parser-level question and is
+/// recorded as one; it is not VMSET's to answer.)
+///
+/// 64 MiB: at 1024 dimensions the item cap already keeps a batch under 16 MiB,
+/// so this only ever fires on dimensions far larger than anything measured -
+/// which is exactly when it should.
+const MAX_VMSET_BYTES: usize = 64 * 1024 * 1024;
+
 async fn skeg_vmset(
     args: &[Bytes],
     shards: &ShardSet,
@@ -1045,6 +1073,24 @@ async fn skeg_vmset(
         return Frame::Error(
             "ERR wrong number of arguments for 'SKEG.VMSET'; want name (id vector payload)+".into(),
         );
+    }
+    // Counted BEFORE the triples are walked. Checking after would mean the
+    // allocation this cap exists to prevent had already happened.
+    let n_items = (args.len() - 1) / 3;
+    if n_items > MAX_VMSET_ITEMS {
+        return Frame::Error(format!(
+            "ERR SKEG.VMSET takes at most {MAX_VMSET_ITEMS} items, got {n_items}; send it in \
+             smaller batches"
+        ));
+    }
+    // Lengths, not contents: no copy has happened yet, and this is what stops
+    // one from happening.
+    let vector_bytes: usize = args[1..].iter().skip(1).step_by(3).map(Bytes::len).sum();
+    if vector_bytes > MAX_VMSET_BYTES {
+        return Frame::Error(format!(
+            "ERR SKEG.VMSET takes at most {MAX_VMSET_BYTES} vector bytes, got {vector_bytes}; \
+             send it in smaller batches"
+        ));
     }
     let raw_name = match parse_utf8_arg(&args[0], "name") {
         Ok(s) => s,
@@ -2013,6 +2059,70 @@ async fn incr_apply(key: &Bytes, delta: i64, shards: &ShardSet, tenant: u128) ->
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_vmset_over_the_cap_is_refused_before_its_vectors_are_parsed() {
+        // A RESP array may declare 1,048,576 elements, and VMSET reads them as
+        // triples, so ONE command can carry ~349,525 items - each re-parsed
+        // into a Vec<f32>. At 1024 dimensions that is 1.4 GB materialised
+        // before admission sees anything, because the batch is built first and
+        // fanned out after. The governor cannot refuse what it is never shown.
+        //
+        // The vectors here are deliberately INVALID. That is the discriminating
+        // part: if the cap were checked after parsing, the answer would be a
+        // parse error, and the test would pass while the batch had already been
+        // walked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
+        let mut args = vec![Bytes::from_static(b"v")];
+        for id in 0..(MAX_VMSET_ITEMS + 1) {
+            args.push(Bytes::from(id.to_string()));
+            // Three bytes: not a multiple of four, so `parse_vector` refuses
+            // it. The first version of this used "not a vector", which is
+            // TWELVE bytes and parses cleanly as three floats - so the batch
+            // was walked without complaint and the test proved nothing.
+            args.push(Bytes::from_static(b"abc"));
+            args.push(Bytes::new());
+        }
+        let Frame::Error(msg) = skeg_vmset(&args, &shards, TenantId::ZERO, None).await else {
+            panic!("an oversized batch must be refused");
+        };
+        assert!(
+            msg.contains(&MAX_VMSET_ITEMS.to_string()),
+            "the refusal must name the cap: {msg}"
+        );
+        assert!(
+            !msg.contains("multiple of 4"),
+            "refused by parsing a vector, which means the batch was walked: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vmset_under_the_item_cap_can_still_be_too_large() {
+        // The item cap does not bound size: 4096 bulks of MAX_BULK_LEN each is
+        // 2 TB on paper. Two items are enough to show the byte cap is a
+        // separate gate, and they are well under the item cap so only the byte
+        // one can refuse them.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
+        let big = Bytes::from(vec![0u8; MAX_VMSET_BYTES / 2 + 8]);
+        let args = vec![
+            Bytes::from_static(b"v"),
+            Bytes::from_static(b"0"),
+            big.clone(),
+            Bytes::new(),
+            Bytes::from_static(b"1"),
+            big,
+            Bytes::new(),
+        ];
+        let Frame::Error(msg) = skeg_vmset(&args, &shards, TenantId::ZERO, None).await else {
+            panic!("an oversized batch must be refused");
+        };
+        assert!(
+            msg.contains("vector bytes"),
+            "refused for some other reason: {msg}"
+        );
+    }
 
     #[tokio::test]
     async fn stats_reports_the_memory_budget() {
