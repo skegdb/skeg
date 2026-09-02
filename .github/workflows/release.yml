@@ -10,8 +10,13 @@ on:
         type: boolean
         default: true
 
-# Three concurrent jobs: publish crates, build & upload binaries, then
-# (final) bump the Homebrew tap formula.
+# Gated pipeline: guard -> test -> {build-binaries, docker} -> publish-crates
+# -> bump-homebrew. Everything downstream of `test` is a build/verification
+# job; `publish-crates` (irreversible: crates.io) only runs once `test`,
+# `build-binaries`, and `docker` have all succeeded, so a broken build or
+# a failing test/lint cannot let a crate escape onto crates.io. Homebrew is
+# bumped last, after publish-crates and build-binaries (the latter is where
+# the GitHub Release tarballs the formula points at get uploaded).
 #
 # `dry_run` (manual trigger only) skips publish-crates and bump-homebrew
 # so you can validate the binary build pipeline without releasing.
@@ -46,9 +51,24 @@ jobs:
           fi
           echo "ok: tag reachable from release"
 
+  test:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo test
+        # Serial: the parallel test suite hits EMFILE on the runner.
+        run: cargo test --workspace --locked -- --test-threads=1
+
   publish-crates:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
-    needs: guard
+    needs: [guard, test, build-binaries, docker]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -134,7 +154,7 @@ jobs:
             runner: ubuntu-latest
             features: avx512
     runs-on: ${{ matrix.runner }}
-    needs: guard
+    needs: [guard, test]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -196,7 +216,7 @@ jobs:
     # Both used to push the same tags on a tag release, so whichever finished
     # last won; now that one of them publishes a multi-architecture manifest,
     # that race would decide whether `:latest` covers amd64 or only arm64.
-    needs: guard
+    needs: [guard, test]
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v5
@@ -240,7 +260,7 @@ jobs:
   # ever need touching here.
   bump-homebrew:
     if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
-    needs: build-binaries
+    needs: [publish-crates, build-binaries]
     runs-on: ubuntu-latest
     env:
       FORMULA: Formula/skeg.rb

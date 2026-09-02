@@ -47,6 +47,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Duplicated from release.yml's `guard` job: workflows cannot depend on
+  # jobs in another workflow, so the ancestry check has to be repeated here
+  # too. Without it, a tag rejected by release.yml (not reachable from
+  # `release`) could still reach this workflow via its own `tags: ['v*']`
+  # trigger and publish `:<version>` / `:latest` to ghcr.io.
+  # On branch pushes and workflow_dispatch this job is a no-op that still
+  # succeeds, so `needs: guard` resolves to "ok" for those triggers.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          fetch-depth: 0
+      - name: tag must be reachable from origin/release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          git fetch origin release:refs/remotes/origin/release
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/release; then
+            echo "::error::tag ${{ github.ref_name }} (commit $GITHUB_SHA) is not reachable from origin/release"
+            exit 1
+          fi
+          echo "ok: tag reachable from release"
+
   # Tags are derived once and shared: the per-architecture builds push by
   # digest and carry no tags of their own, so a half-finished matrix can
   # never leave a tag pointing at one architecture.
@@ -85,7 +110,7 @@ jobs:
   # One native runner per architecture: cross-building Rust under QEMU turns a
   # few minutes into the better part of an hour.
   build:
-    needs: meta
+    needs: [meta, guard]
     strategy:
       fail-fast: false
       matrix:
