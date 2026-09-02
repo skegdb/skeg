@@ -21,9 +21,25 @@
 //!   type annotation, so the write path carries no branch at all - and the
 //!   variant name is still checked by the compiler.
 //!
-//! Points are armed PER THREAD, so a test that arms one cannot fail a test
-//! running beside it. That makes the site's thread part of the contract: every
-//! point below fires on the caller's own thread.
+//! There are two ways to arm a point, and which one a site can use is decided
+//! by the thread it runs on.
+//!
+//! - [`arm`] is PER THREAD, so a test that arms a point cannot fail a test
+//!   running beside it. It only reaches sites that run on the caller's own
+//!   thread: the coordinator half of `ShardSet` does, a shard worker does not
+//!   (`run_shard` spawns the request onto its own runtime thread).
+//! - [`arm_at`] is process-wide but SCOPED TO A KEY - the vindex name - so a
+//!   site inside a shard worker is reachable while two tests naming different
+//!   indexes still cannot see each other. Every test in this repo builds its
+//!   own index under its own name, so that is the whole isolation rule - and
+//!   it is a rule about NAMES, which nothing but convention keeps unique.
+//!   [`arm_at`] therefore refuses to arm a point that is already armed for the
+//!   same key: two tests in one binary sharing a name would otherwise fail
+//!   each other at random, which is the failure mode a per-thread mask exists
+//!   to avoid and this one has to catch instead.
+//!
+//! Both record whether the point actually FIRED, and every test asserts it: an
+//! armed point that never fires makes its test pass for the wrong reason.
 
 /// A point on the server's vector write path that a test can make fail.
 ///
@@ -39,6 +55,21 @@ pub enum WriteFailpoint {
     OverlapReplicaWrite,
     /// The `Vdel` cleaning up the old copy after a routed overwrite committed.
     OverwriteOldCopyDelete,
+    /// Writing a VSET's payload blob to the vLog, BEFORE the commit point.
+    /// Nothing is published yet, so this one is a plain failure.
+    PayloadPrepare,
+    /// The vector write that IS the commit point: the WAL append the engine
+    /// performs under the vindex write lock.
+    VectorCommit,
+    /// Indexing the payload's fields, immediately AFTER the commit point.
+    PayloadApply,
+    /// Reclaiming the blob a committed VSET superseded. Post-commit.
+    PayloadPostCommitCleanup,
+    /// Reclaiming a deleted row's blob, after the tombstone is durable.
+    VdelBlobDelete,
+    /// The blob sweep a `VINDEX.DROP` runs once the catalogue no longer names
+    /// the index.
+    DropBlobSweep,
 }
 
 impl WriteFailpoint {
@@ -51,6 +82,12 @@ impl WriteFailpoint {
             WriteFailpoint::ReshardSourceDelete => 1 << 1,
             WriteFailpoint::OverlapReplicaWrite => 1 << 2,
             WriteFailpoint::OverwriteOldCopyDelete => 1 << 3,
+            WriteFailpoint::PayloadPrepare => 1 << 4,
+            WriteFailpoint::VectorCommit => 1 << 5,
+            WriteFailpoint::PayloadApply => 1 << 6,
+            WriteFailpoint::PayloadPostCommitCleanup => 1 << 7,
+            WriteFailpoint::VdelBlobDelete => 1 << 8,
+            WriteFailpoint::DropBlobSweep => 1 << 9,
         }
     }
 }
@@ -126,6 +163,134 @@ mod armed_state {
 #[cfg(any(test, feature = "failpoints"))]
 pub use armed_state::{arm, armed, disarm, disarm_all, fired};
 
+#[cfg(any(test, feature = "failpoints"))]
+mod armed_at_state {
+    use super::WriteFailpoint;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One armed (point, key) pair.
+    struct Entry {
+        bit: u64,
+        key: String,
+        armed: bool,
+        fired: bool,
+    }
+
+    /// Bits with at least one key armed anywhere in the process.
+    ///
+    /// The guarded sites sit on the vector write path, and under
+    /// `cargo test --workspace` the feature is on for every consumer of this
+    /// crate - so the cost of a DISARMED point has to be nothing worth
+    /// measuring. One relaxed load, and the mutex below is touched only once
+    /// a test has armed that exact point.
+    static ANY: AtomicU64 = AtomicU64::new(0);
+    static STATE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+    fn with<R>(f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
+        // A poisoned lock here means a test panicked mid-assertion; the state
+        // is a few booleans and recovering it is strictly better than turning
+        // every later test in the binary into a panic about the first one.
+        let mut g = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut g)
+    }
+
+    fn refresh_any(entries: &[Entry]) {
+        let mask = entries.iter().filter(|e| e.armed).fold(0, |m, e| m | e.bit);
+        ANY.store(mask, Ordering::Relaxed);
+    }
+
+    /// Make `fp` fail wherever it is reached FOR `key`, until it is disarmed.
+    /// Clears its fired flag, so [`fired_at`] answers about this arming.
+    ///
+    /// # Panics
+    ///
+    /// If `fp` is ALREADY armed for `key`. The mask is process-wide and the
+    /// key is a plain string, so isolation between two tests in one binary
+    /// rests entirely on their choosing different vindex names. Nothing
+    /// enforces that, and when it is broken the symptom is a test failing
+    /// because of what another test armed - the exact kind of failure that
+    /// gets rerun until it passes. A test that arms in a loop disarms each
+    /// time round, so this is never a legitimate state.
+    pub fn arm_at(fp: WriteFailpoint, key: &str) {
+        with(|entries| {
+            match entries
+                .iter_mut()
+                .find(|e| e.bit == fp.bit() && e.key == key)
+            {
+                Some(e) => {
+                    assert!(
+                        !e.armed,
+                        "{fp:?} is already armed for '{key}': two tests in this \
+                         binary are sharing a failpoint key, so each can make \
+                         the other fail. Give them different index names."
+                    );
+                    e.armed = true;
+                    e.fired = false;
+                }
+                None => entries.push(Entry {
+                    bit: fp.bit(),
+                    key: key.to_owned(),
+                    armed: true,
+                    fired: false,
+                }),
+            }
+            refresh_any(entries);
+        });
+    }
+
+    /// Stop `fp` failing for `key`. The fired flag is left alone: a test
+    /// disarms before it asserts.
+    pub fn disarm_at(fp: WriteFailpoint, key: &str) {
+        with(|entries| {
+            if let Some(e) = entries
+                .iter_mut()
+                .find(|e| e.bit == fp.bit() && e.key == key)
+            {
+                e.armed = false;
+            }
+            refresh_any(entries);
+        });
+    }
+
+    /// Is `fp` armed for `key`? Called by [`crate::fp_at`], not usually by
+    /// hand. Records the hit.
+    #[must_use]
+    pub fn armed_at(fp: WriteFailpoint, key: &str) -> bool {
+        if ANY.load(Ordering::Relaxed) & fp.bit() == 0 {
+            return false;
+        }
+        with(|entries| {
+            match entries
+                .iter_mut()
+                .find(|e| e.bit == fp.bit() && e.key == key && e.armed)
+            {
+                Some(e) => {
+                    e.fired = true;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Did `fp` fire for `key` since it was armed? Assert it: an armed point
+    /// that never fired means the test proved nothing.
+    #[must_use]
+    pub fn fired_at(fp: WriteFailpoint, key: &str) -> bool {
+        with(|entries| {
+            entries
+                .iter()
+                .any(|e| e.bit == fp.bit() && e.key == key && e.fired)
+        })
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+pub use armed_at_state::{arm_at, armed_at, disarm_at, fired_at};
+
 /// Fail at `$fp` with `$err` when the point is armed.
 ///
 /// Expands to nothing but a type annotation in a build without the failpoints,
@@ -148,6 +313,55 @@ macro_rules! fp {
     ($fp:expr, $err:expr) => {
         let _: $crate::failpoint::WriteFailpoint = $fp;
     };
+}
+
+/// Fail at `$fp` with `$err` when the point is armed FOR `$key`.
+///
+/// The keyed form, for a site that does not run on the thread that armed it -
+/// anything inside a shard worker. `$key` is the vindex name.
+#[macro_export]
+#[cfg(any(test, feature = "failpoints"))]
+macro_rules! fp_at {
+    ($fp:expr, $key:expr, $err:expr) => {
+        if $crate::failpoint::armed_at($fp, $key) {
+            return $err;
+        }
+    };
+}
+
+/// The disabled expansion: still names the variant and evaluates nothing.
+#[macro_export]
+#[cfg(not(any(test, feature = "failpoints")))]
+macro_rules! fp_at {
+    ($fp:expr, $key:expr, $err:expr) => {{
+        let _: $crate::failpoint::WriteFailpoint = $fp;
+        let _ = &$key;
+    }};
+}
+
+/// [`fp_at!`] as a VALUE rather than a `return`, for a post-commit site that
+/// has to carry on rather than leave.
+#[macro_export]
+#[cfg(any(test, feature = "failpoints"))]
+macro_rules! fp_check_at {
+    ($fp:expr, $key:expr, $err:expr) => {
+        if $crate::failpoint::armed_at($fp, $key) {
+            $err
+        } else {
+            Ok(())
+        }
+    };
+}
+
+/// The disabled expansion: still names the variant.
+#[macro_export]
+#[cfg(not(any(test, feature = "failpoints")))]
+macro_rules! fp_check_at {
+    ($fp:expr, $key:expr, $err:expr) => {{
+        let _: $crate::failpoint::WriteFailpoint = $fp;
+        let _ = &$key;
+        Ok(())
+    }};
 }
 
 /// Like [`fp!`], but yields the failure as a VALUE rather than returning it.
@@ -222,5 +436,52 @@ mod tests {
         disarm_all();
         assert!(!armed(WriteFailpoint::OverlapReplicaWrite));
         assert!(!armed(WriteFailpoint::OverwriteOldCopyDelete));
+    }
+
+    /// The keyed mask is process-wide, so what keeps two tests apart is the
+    /// key. This checks exactly that, plus the fired flag the assertions in
+    /// every failpoint test lean on.
+    #[test]
+    fn a_keyed_point_fires_only_for_the_index_it_was_armed_for() {
+        use super::{arm_at, armed_at, disarm_at, fired_at};
+        let mine = "failpoint-unit-mine";
+        let yours = "failpoint-unit-yours";
+        assert!(!armed_at(WriteFailpoint::PayloadPrepare, mine));
+        arm_at(WriteFailpoint::PayloadPrepare, mine);
+        assert!(!fired_at(WriteFailpoint::PayloadPrepare, mine), "not yet");
+        assert!(armed_at(WriteFailpoint::PayloadPrepare, mine));
+        assert!(
+            fired_at(WriteFailpoint::PayloadPrepare, mine),
+            "and now it has: an armed point that never fires proves nothing"
+        );
+        assert!(
+            !armed_at(WriteFailpoint::PayloadPrepare, yours),
+            "another index must not be caught by this arming"
+        );
+        assert!(
+            !armed_at(WriteFailpoint::VectorCommit, mine),
+            "one bit each"
+        );
+        disarm_at(WriteFailpoint::PayloadPrepare, mine);
+        assert!(!armed_at(WriteFailpoint::PayloadPrepare, mine));
+        assert!(
+            fired_at(WriteFailpoint::PayloadPrepare, mine),
+            "disarming leaves the record of the hit for the assertion that follows"
+        );
+        // And arming it again, after the disarm, is the ordinary loop.
+        arm_at(WriteFailpoint::PayloadPrepare, mine);
+        disarm_at(WriteFailpoint::PayloadPrepare, mine);
+    }
+
+    /// The isolation rule is "two tests, two names", and nothing but
+    /// convention keeps it. This is what makes breaking it loud instead of
+    /// making one of the two tests fail for the other one's reason.
+    #[test]
+    #[should_panic(expected = "sharing a failpoint key")]
+    fn arming_a_key_that_is_already_armed_is_refused() {
+        use super::arm_at;
+        let shared = "failpoint-unit-shared";
+        arm_at(WriteFailpoint::VdelBlobDelete, shared);
+        arm_at(WriteFailpoint::VdelBlobDelete, shared);
     }
 }

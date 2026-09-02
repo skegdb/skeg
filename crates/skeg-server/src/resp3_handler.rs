@@ -1087,6 +1087,16 @@ async fn skeg_vset(
 /// splits it, which is what it was already doing.
 const MAX_VMSET_ITEMS: usize = 4096;
 
+/// The longest one item's error may be in a VMSET reply.
+///
+/// The reply carries one per item, so what used to be a single error is now up
+/// to `MAX_VMSET_ITEMS` of them. 256 bytes is longer than every error this
+/// path produces (the longest names a vindex, two dimensions and a reason) and
+/// the product is checked against `MAX_CONN_BUFFER` in the tests: a reply the
+/// connection buffer cannot hold kills the connection instead of telling the
+/// client which item failed.
+const MAX_VMSET_ERROR_LEN: usize = 256;
+
 /// Vector bytes one VMSET may carry, summed across its items.
 ///
 /// The item cap alone does not bound the size: 4096 bulks of `MAX_BULK_LEN`
@@ -1157,13 +1167,43 @@ async fn skeg_vmset(
         Err(e) => return e,
     };
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
-    match shards
+    let results = shards
         .vmset(&scoped, items, tenant_u128(tenant), limit)
-        .await
-    {
-        Ok(n) => Frame::Integer(n as i64),
-        Err(e) => shard_error(&e),
+        .await;
+    // An array of n, one per item, in request order: `+OK` or that item's
+    // error. The count this used to return could not name the item that
+    // failed, and the single error it returned instead said nothing about the
+    // n-1 items that did not.
+    Frame::Array(
+        results
+            .iter()
+            .map(|r| match r {
+                Ok(()) => Frame::ok(),
+                Err(e) => match shard_error(e) {
+                    Frame::Error(msg) => Frame::Error(cap_item_error(&msg)),
+                    other => other,
+                },
+            })
+            .collect(),
+    )
+}
+
+/// One item's error, capped.
+///
+/// The reply is now n errors rather than one, so its size is the item cap
+/// times this - and a reply the connection buffer cannot hold is a connection
+/// that dies rather than a client that learns which item failed. Cut on a
+/// character boundary: an error message can carry a vindex name, and names are
+/// UTF-8.
+fn cap_item_error(msg: &str) -> String {
+    if msg.len() <= MAX_VMSET_ERROR_LEN {
+        return msg.to_owned();
     }
+    let mut end = MAX_VMSET_ERROR_LEN;
+    while end > 0 && !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &msg[..end])
 }
 
 /// `SKEG.VDEL name id`.
@@ -2119,6 +2159,30 @@ mod tests {
     fn max_conn_buffer_is_bounded_to_one_frame() {
         const { assert!(super::MAX_CONN_BUFFER <= 130 * 1024 * 1024) };
         const { assert!(super::MAX_CONN_BUFFER > super::MAX_VMSET_BYTES + 1024) };
+    }
+
+    /// A VMSET reply is now one line per item, so the worst case is every item
+    /// failing with the longest error each. That has to fit in what a
+    /// connection will hold, or the reply that says which item failed is the
+    /// thing that kills the connection.
+    #[test]
+    fn a_vmset_reply_of_nothing_but_errors_still_fits_a_connection() {
+        // `-` + the message + CRLF per item.
+        const WORST: usize = super::MAX_VMSET_ITEMS * (1 + super::MAX_VMSET_ERROR_LEN + 4 + 2);
+        const { assert!(WORST < super::MAX_CONN_BUFFER) };
+        assert_eq!(
+            super::cap_item_error(&"x".repeat(super::MAX_VMSET_ERROR_LEN + 50)).len(),
+            super::MAX_VMSET_ERROR_LEN + 3,
+            "a long error is cut to the cap plus the ellipsis"
+        );
+        assert_eq!(super::cap_item_error("ERR short"), "ERR short");
+        // A multi-byte character straddling the cut must not be halved.
+        let wide = format!("{}e\u{301}", "x".repeat(super::MAX_VMSET_ERROR_LEN - 1));
+        let cut = super::cap_item_error(&wide);
+        assert!(
+            std::str::from_utf8(cut.as_bytes()).is_ok(),
+            "the cut landed inside a character"
+        );
     }
 
     #[test]

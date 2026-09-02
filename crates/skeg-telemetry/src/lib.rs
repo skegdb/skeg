@@ -355,10 +355,39 @@ pub enum Counter {
     /// is the signal an operator needs BEFORE the alternative, which is the
     /// kernel telling the process to stop.
     MemoryRefused = 43,
+    /// Payload blobs written AHEAD of the commit that publishes their row.
+    ///
+    /// The denominator for the two below, and the only place a staged blob is
+    /// visible at all: until the WAL record lands, nothing can read one.
+    PayloadBlobsStaged = 44,
+    /// Staged blobs that are a COPY of the row's existing payload, made
+    /// because an overwrite carried no payload of its own and the row's new
+    /// version needs its blob under a new key. The cost of keeping a
+    /// payload-less overwrite's payload; a climb here against a flat
+    /// `PayloadBlobsStaged` is a client sending vectors without their
+    /// payloads.
+    PayloadBlobsCarriedForward = 45,
+    /// Steps AFTER a commit point that did not complete: the payload postings
+    /// not indexed, a superseded blob not reclaimed, a deleted row's blob not
+    /// reclaimed.
+    ///
+    /// None of them can be reported to the client - the write is durable and
+    /// saying otherwise invites a retry of something that has happened - so
+    /// without this number they are invisible outside the log. Each one leaves
+    /// either a filter that misses a row until its postings are rebuilt, or a
+    /// blob the next open collects.
+    PayloadPostCommitFailures = 46,
+    /// Payload blobs collected at open because no live row named them.
+    ///
+    /// A steady non-zero value across restarts means writes are dying between
+    /// their staging and their commit, or post-commit reclamation keeps
+    /// failing - both of which have their own counter above. A one-off after a
+    /// crash is the mechanism working.
+    PayloadBlobsReclaimedAtOpen = 47,
 }
 
 impl Counter {
-    pub const COUNT: usize = 44;
+    pub const COUNT: usize = 48;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -404,6 +433,10 @@ impl Counter {
         Counter::MaintenanceCleanupFailures,
         Counter::MemoryRefused,
         Counter::VacuumSkipped,
+        Counter::PayloadBlobsStaged,
+        Counter::PayloadBlobsCarriedForward,
+        Counter::PayloadPostCommitFailures,
+        Counter::PayloadBlobsReclaimedAtOpen,
     ];
 
     #[inline]
@@ -452,6 +485,10 @@ impl Counter {
             Counter::MaintenanceFailures => "skeg_maintenance_failures_total",
             Counter::MaintenanceCleanupFailures => "skeg_maintenance_cleanup_failures_total",
             Counter::MemoryRefused => "skeg_memory_refused_total",
+            Counter::PayloadBlobsStaged => "skeg_payload_blobs_staged_total",
+            Counter::PayloadBlobsCarriedForward => "skeg_payload_blobs_carried_forward_total",
+            Counter::PayloadPostCommitFailures => "skeg_payload_post_commit_failures_total",
+            Counter::PayloadBlobsReclaimedAtOpen => "skeg_payload_blobs_reclaimed_at_open_total",
             Counter::VacuumSkipped => "skeg_vacuum_skipped_total",
         }
     }

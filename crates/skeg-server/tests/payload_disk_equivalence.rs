@@ -9,6 +9,10 @@
 use skeg_server::payload::{PayloadIndex, parse_fields, parse_filter};
 use skeg_server::payload_disk::DiskPostings;
 
+/// The incarnation these fixtures pretend to be. Any non-zero value: what the
+/// file has to do is refuse another one.
+const GEN: u128 = 0x0bad_c0de_0bad_c0de_0bad_c0de_0bad_c0de;
+
 /// Deterministic pseudo-random: reproducible failures beat lucky passes.
 struct Rng(u64);
 impl Rng {
@@ -106,9 +110,9 @@ fn compare(mem: &PayloadIndex, disk: &PayloadIndex, label: &str) {
 fn a_disk_backed_index_answers_exactly_like_one_in_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mem, _) = build(3000, 0x5EED);
-    mem.persist(tmp.path(), (7, 4096)).unwrap();
+    mem.persist(tmp.path(), (7, 4096), GEN).unwrap();
     let disk = PayloadIndex::from_disk(
-        DiskPostings::open(tmp.path(), (7, 4096)).expect("il file deve aprirsi"),
+        DiskPostings::open(tmp.path(), (7, 4096), GEN).expect("il file deve aprirsi"),
     );
     assert_eq!(disk.len(), mem.len(), "the two must cover the same ids");
     compare(&mem, &disk, "fresh");
@@ -118,9 +122,9 @@ fn a_disk_backed_index_answers_exactly_like_one_in_memory() {
 fn writes_after_the_file_was_built_are_visible_and_shadow_it() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut mem, _) = build(2000, 0xC0FFEE);
-    mem.persist(tmp.path(), (1, 1)).unwrap();
+    mem.persist(tmp.path(), (1, 1), GEN).unwrap();
     let mut disk = PayloadIndex::from_disk(
-        DiskPostings::open(tmp.path(), (1, 1)).expect("il file deve aprirsi"),
+        DiskPostings::open(tmp.path(), (1, 1), GEN).expect("il file deve aprirsi"),
     );
 
     // The same churn applied to both: overwrites, deletes, and new ids.
@@ -153,9 +157,9 @@ fn writes_after_the_file_was_built_are_visible_and_shadow_it() {
 fn persisting_again_folds_the_previous_file_in_rather_than_chaining() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut mem, _) = build(1500, 0x1234);
-    mem.persist(tmp.path(), (1, 1)).unwrap();
+    mem.persist(tmp.path(), (1, 1), GEN).unwrap();
     let mut disk = PayloadIndex::from_disk(
-        DiskPostings::open(tmp.path(), (1, 1)).expect("il file deve aprirsi"),
+        DiskPostings::open(tmp.path(), (1, 1), GEN).expect("il file deve aprirsi"),
     );
 
     let mut rng = Rng(0x9999);
@@ -166,9 +170,9 @@ fn persisting_again_folds_the_previous_file_in_rather_than_chaining() {
         disk.upsert(id, parse_fields(p.as_bytes()));
     }
     // Second generation, written from an index that already had a disk part.
-    disk.persist(tmp.path(), (2, 2)).unwrap();
+    disk.persist(tmp.path(), (2, 2), GEN).unwrap();
     let reloaded = PayloadIndex::from_disk(
-        DiskPostings::open(tmp.path(), (2, 2)).expect("il file deve aprirsi"),
+        DiskPostings::open(tmp.path(), (2, 2), GEN).expect("il file deve aprirsi"),
     );
     assert_eq!(reloaded.len(), mem.len());
     compare(&mem, &reloaded, "second generation");
@@ -178,23 +182,38 @@ fn persisting_again_folds_the_previous_file_in_rather_than_chaining() {
 fn a_file_written_for_another_log_position_is_refused() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mem, _) = build(50, 1);
-    mem.persist(tmp.path(), (5, 100)).unwrap();
-    assert!(DiskPostings::open(tmp.path(), (5, 200)).is_none());
-    assert!(DiskPostings::open(tmp.path(), (6, 100)).is_none());
-    assert!(DiskPostings::open(tmp.path(), (5, 100)).is_some());
+    mem.persist(tmp.path(), (5, 100), GEN).unwrap();
+    assert!(DiskPostings::open(tmp.path(), (5, 200), GEN).is_none());
+    assert!(DiskPostings::open(tmp.path(), (6, 100), GEN).is_none());
+    assert!(DiskPostings::open(tmp.path(), (5, 100), GEN).is_some());
+}
+
+/// The log position says which LOG the file describes. It does not say which
+/// index, and a `vindex-<name>/` directory outlives a drop that failed partway
+/// - so the next index of that name would read the dead one's postings.
+#[test]
+fn a_file_written_by_another_incarnation_of_the_name_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (mem, _) = build(50, 1);
+    mem.persist(tmp.path(), (5, 100), GEN).unwrap();
+    assert!(
+        DiskPostings::open(tmp.path(), (5, 100), GEN + 1).is_none(),
+        "a payload index must not be served to a different incarnation of the name"
+    );
+    assert!(DiskPostings::open(tmp.path(), (5, 100), GEN).is_some());
 }
 
 #[test]
 fn truncation_at_every_length_is_refused_and_never_panics() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mem, _) = build(60, 2);
-    mem.persist(tmp.path(), (3, 3)).unwrap();
+    mem.persist(tmp.path(), (3, 3), GEN).unwrap();
     let path = tmp.path().join(skeg_server::payload_disk::FILE);
     let full = std::fs::read(&path).unwrap();
     for cut in 0..full.len() {
         std::fs::write(&path, &full[..cut]).unwrap();
         assert!(
-            DiskPostings::open(tmp.path(), (3, 3)).is_none(),
+            DiskPostings::open(tmp.path(), (3, 3), GEN).is_none(),
             "a file cut at {cut} of {} was accepted",
             full.len()
         );
@@ -205,7 +224,7 @@ fn truncation_at_every_length_is_refused_and_never_panics() {
 fn a_flipped_bit_anywhere_is_refused() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mem, _) = build(40, 4);
-    mem.persist(tmp.path(), (2, 2)).unwrap();
+    mem.persist(tmp.path(), (2, 2), GEN).unwrap();
     let path = tmp.path().join(skeg_server::payload_disk::FILE);
     let full = std::fs::read(&path).unwrap();
     for byte in (0..full.len()).step_by(7) {
@@ -213,7 +232,7 @@ fn a_flipped_bit_anywhere_is_refused() {
         buf[byte] ^= 0x40;
         std::fs::write(&path, &buf).unwrap();
         assert!(
-            DiskPostings::open(tmp.path(), (2, 2)).is_none(),
+            DiskPostings::open(tmp.path(), (2, 2), GEN).is_none(),
             "a bit flipped at byte {byte} was accepted"
         );
     }

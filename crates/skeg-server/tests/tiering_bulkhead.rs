@@ -61,7 +61,7 @@ async fn load(shards: &ShardSet, name: &str, n: u64) {
     while id < n {
         let end = (id + 4096).min(n);
         // `None` infers to `Option<Bytes>` from vmset's signature.
-        shards
+        for r in shards
             .vmset(
                 name,
                 (id..end).map(|i| (i, vec_for(i), None)).collect(),
@@ -69,7 +69,9 @@ async fn load(shards: &ShardSet, name: &str, n: u64) {
                 None,
             )
             .await
-            .unwrap();
+        {
+            r.unwrap();
+        }
         id = end;
     }
     // Fold the delta into the on-disk graph so a reopen reads a real index.

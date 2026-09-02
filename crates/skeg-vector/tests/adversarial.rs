@@ -843,3 +843,111 @@ fn live_ids_with_versions_agrees_across_the_layer_shapes() {
     assert_eq!(taken(&i), general(&i));
     assert_eq!(taken(&i).len(), 59);
 }
+
+/// The insert record says what the write did to the row's payload blob, and
+/// the replay reads it back from the RECORD - not from the shape of a key, and
+/// not by guessing from the row's version. A reference the reopen cannot see
+/// is a reference the recovery cannot act on.
+#[test]
+fn wal_v3_round_trips_a_payload_ref() {
+    use skeg_vector::PayloadRef;
+    let d = tempfile::TempDir::new().unwrap();
+    let refs = [
+        (1u64, PayloadRef::Blob(7)),
+        (2, PayloadRef::Cleared),
+        (3, PayloadRef::Unchanged),
+        // A sequence that needs all eight bytes, so a truncated field shows.
+        (4, PayloadRef::Blob(0xfedc_ba98_7654_3210)),
+    ];
+    {
+        let mut i = idx(d.path());
+        for (id, r) in refs {
+            i.insert_with_payload(id, &v(id), VectorVersion::new(id + 10), r)
+                .unwrap();
+            assert_eq!(i.payload_ref_of(id), r, "id {id}: before the reopen");
+        }
+    }
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    for (id, r) in refs {
+        assert_eq!(i.get(id).unwrap().unwrap(), v(id), "id {id}");
+        assert_eq!(i.payload_ref_of(id), r, "id {id}: after the reopen");
+    }
+    assert_eq!(
+        i.payload_ref_of(99),
+        PayloadRef::Unchanged,
+        "a row this index has never seen says nothing about a payload"
+    );
+}
+
+/// A record written before the field existed says nothing about the payload -
+/// which is not the same as saying the row has none. `Unchanged` is the only
+/// honest answer, and inventing `Cleared` there would delete a blob a legacy
+/// store still serves.
+#[test]
+fn wal_v2_reads_as_payload_ref_unchanged() {
+    use skeg_vector::PayloadRef;
+    for (name, magic, framed) in [("v1", &b""[..], false), ("v2", &b"SKWL\x02"[..], true)] {
+        let d = tempfile::TempDir::new().unwrap();
+        {
+            let _ = idx(d.path());
+        }
+        let mut wal = magic.to_vec();
+        for id in 0..4u64 {
+            let mut body = vec![0u8];
+            body.extend_from_slice(&id.to_le_bytes());
+            for x in v(id) {
+                body.extend_from_slice(&x.to_le_bytes());
+            }
+            if framed {
+                let c = crc32c::crc32c(&body);
+                body.extend_from_slice(&c.to_le_bytes());
+            }
+            wal.extend_from_slice(&body);
+        }
+        std::fs::write(d.path().join("delta.log"), &wal).unwrap();
+
+        let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+        for id in 0..4u64 {
+            assert_eq!(i.get(id).unwrap().unwrap(), v(id), "{name}: id {id}");
+            assert_eq!(
+                i.payload_ref_of(id),
+                PayloadRef::Unchanged,
+                "{name}: id {id} - a legacy record makes no claim about a payload"
+            );
+        }
+    }
+}
+
+/// The WAL append is the commit point of a vector and the blob staged for it.
+/// A failure there must leave the row absent - not present in RAM and missing
+/// from the file it will be recovered from.
+#[test]
+fn a_wal_append_that_fails_leaves_the_row_absent() {
+    use skeg_vector::failpoint::{WriteFailpoint, arm, disarm_all, fired};
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    i.insert_versioned(1, &v(1), VectorVersion::new(1)).unwrap();
+
+    arm(WriteFailpoint::DeltaWalAppend);
+    let outcome = i.insert_versioned(2, &v(2), VectorVersion::new(1));
+    disarm_all();
+    assert!(
+        fired(WriteFailpoint::DeltaWalAppend),
+        "the failpoint never fired, so this test proved nothing"
+    );
+    assert!(outcome.is_err(), "an unappended write must be reported");
+    assert!(i.get(2).unwrap().is_none(), "and must not be in RAM");
+    assert_eq!(i.len(), 1);
+    drop(i);
+
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    assert_eq!(
+        i.get(1).unwrap().unwrap(),
+        v(1),
+        "the committed row survives"
+    );
+    assert!(
+        i.get(2).unwrap().is_none(),
+        "a row whose append failed came back from the WAL"
+    );
+}

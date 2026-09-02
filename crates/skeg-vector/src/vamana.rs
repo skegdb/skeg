@@ -3538,6 +3538,20 @@ pub struct DiskVamanaIndex {
     /// INVARIANT: the same key set as `delta`. Every mutation of either goes
     /// through `apply_insert` / `apply_delete`, which touch both.
     delta_ver: AHashMap<u64, u64>,
+    /// What the newest WAL record for a row said about its payload blob.
+    ///
+    /// Only rows the WAL still covers are in here - the delta and, during an
+    /// off-thread flush, its staging buffer. A row folded into a segment loses
+    /// its reference, because the record that carried it is gone and no
+    /// segment column holds one. That is the honest reach of
+    /// [`payload_ref_of`](DiskVamanaIndex::payload_ref_of): it answers about
+    /// the recent past, which is exactly the window a recovery has to
+    /// reconcile.
+    ///
+    /// Entries only exist for a record that said something. `Unchanged` -
+    /// every record written before the field meant anything, and every write
+    /// that makes no claim about the payload - is the ABSENCE of an entry.
+    payload_refs: AHashMap<u64, PayloadRef>,
     /// Staging buffer for an in-flight OFF-THREAD flush: the delta entries moved
     /// aside by `flush_begin` while their run is built off-thread. Searched with
     /// precedence `delta > flushing > runs > base`, so the batch stays visible
@@ -3760,6 +3774,7 @@ impl DiskVamanaIndex {
             dir: dir.to_path_buf(),
             delta: AHashMap::new(),
             delta_ver: AHashMap::new(),
+            payload_refs: AHashMap::new(),
             flushing: AHashMap::new(),
             flushing_ver: AHashMap::new(),
             wal_epoch: 0,
@@ -3788,11 +3803,7 @@ impl DiskVamanaIndex {
                     payload_ref,
                     vector,
                 } => {
-                    // Reserved by the format, unused until the payload commit
-                    // point lands. Named rather than swallowed by `..` so the
-                    // day it means something the compiler points here.
-                    let _ = payload_ref;
-                    self.apply_insert(id, version, vector);
+                    self.apply_insert(id, version, payload_ref, vector);
                 }
                 DeltaWalOp::Delete { id, version } => {
                     self.apply_delete(id, version);
@@ -3835,7 +3846,13 @@ impl DiskVamanaIndex {
     /// carries the version it read, so it cannot land on top of a user write
     /// that replaced the row while it was in flight. Equal versions apply,
     /// which is what keeps legacy (version 0) stores on last-write-wins.
-    fn apply_insert(&mut self, id: u64, version: VectorVersion, vector: Vec<f32>) {
+    fn apply_insert(
+        &mut self,
+        id: u64,
+        version: VectorVersion,
+        payload_ref: PayloadRef,
+        vector: Vec<f32>,
+    ) {
         if version.get() < self.known_version(id) {
             return;
         }
@@ -3843,6 +3860,12 @@ impl DiskVamanaIndex {
         self.tombstones.remove(&id);
         self.delta.insert(id, vector);
         self.delta_ver.insert(id, version.get());
+        // A DROPPED write must not leave its claim behind, which is why this
+        // sits after the staleness guard and not beside the append.
+        match payload_ref {
+            PayloadRef::Unchanged => self.payload_refs.remove(&id),
+            other => self.payload_refs.insert(id, other),
+        };
         if !was_live {
             self.live_count += 1;
         }
@@ -3860,6 +3883,7 @@ impl DiskVamanaIndex {
         let was_live = self.is_live(id);
         self.delta.remove(&id);
         self.delta_ver.remove(&id);
+        self.payload_refs.remove(&id);
         // Drop from the flush staging too, so a deleted id in an in-flight flush
         // is not flat-scanned as live (the run copy is tombstone-masked).
         self.flushing.remove(&id);
@@ -4342,6 +4366,15 @@ impl DiskVamanaIndex {
             vector: vector.to_vec(),
         };
         let rec = encode_wal_record(self.wal_format, &op);
+        // THE COMMIT POINT of a vector and the payload blob staged for it.
+        // Before this append neither is reachable - a search walks live ids,
+        // and the blob is filed under a version no live row carries; after it
+        // both are. So this is the one step of the pair that is allowed to
+        // fail the call.
+        crate::fp!(
+            crate::failpoint::WriteFailpoint::DeltaWalAppend,
+            Err(io::Error::other("failpoint: delta WAL append refused"))
+        );
         self.delta_log.write_all(&rec)?;
         self.replay_wal_ops(vec![op]);
         // Keep the brute-forced L0 small: once it fills, fold it into a navigable
@@ -4374,6 +4407,51 @@ impl DiskVamanaIndex {
         version: VectorVersion,
     ) -> io::Result<()> {
         self.insert_at(id, vector, version, PayloadRef::Unchanged)
+    }
+
+    /// [`insert_versioned`](Self::insert_versioned), naming what this write
+    /// does to the row's payload blob.
+    ///
+    /// The record IS the commit point of the pair: the caller stages the blob
+    /// first, then appends this, and after it the row and its payload are
+    /// either both there or neither is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the WAL append fails, or `InvalidInput` if
+    /// `vector.len()` does not equal the index dimension.
+    pub fn insert_with_payload(
+        &mut self,
+        id: u64,
+        vector: &[f32],
+        version: VectorVersion,
+        payload_ref: PayloadRef,
+    ) -> io::Result<()> {
+        self.insert_at(id, vector, version, payload_ref)
+    }
+
+    /// What the newest WAL record for `id` said about its payload blob.
+    ///
+    /// Read from the RECORD, not inferred from a key or from the row's
+    /// version: a recovery that guessed would be guessing about the one thing
+    /// the record exists to state.
+    ///
+    /// [`PayloadRef::Unchanged`] for a row this index has never seen, for a
+    /// row whose record predates the field, and for a row the WAL no longer
+    /// covers because a fold has taken it into a segment. The reach is the
+    /// delta and its flush staging - the window a crash leaves behind, which
+    /// is the window a recovery has to reconcile.
+    ///
+    /// # No production reader yet
+    ///
+    /// The server derives a blob's key from the row's live version, not from
+    /// this, so today the only callers are the tests that pin the round trip.
+    /// Nothing has ever depended on a stored `Cleared` being true - it has
+    /// only had to be written - so the first real reader must treat the
+    /// records already on disk as unverified rather than as evidence.
+    #[must_use]
+    pub fn payload_ref_of(&self, id: u64) -> PayloadRef {
+        self.payload_refs.get(&id).copied().unwrap_or_default()
     }
 
     /// Tombstone `id` at `version`, dropping the delete when a newer copy of
@@ -5359,6 +5437,7 @@ impl DiskVamanaIndex {
         self.run_dirs.push(seq);
         self.delta.clear();
         self.delta_ver.clear();
+        self.payload_refs.clear();
         Ok(())
     }
 
@@ -5911,6 +5990,7 @@ impl DiskVamanaIndex {
         self.base = built.base;
         self.delta.clear();
         self.delta_ver.clear();
+        self.payload_refs.clear();
         self.tombstones.clear();
         // Base PLUS whatever runs survived the bounded discard. It used to be
         // the base alone, which was right only while every run was thrown
@@ -6481,7 +6561,7 @@ impl DiskVamanaIndex {
             ops.push(DeltaWalOp::Insert {
                 id,
                 version: VectorVersion::new(self.delta_ver.get(&id).copied().unwrap_or(0)),
-                payload_ref: PayloadRef::Unchanged,
+                payload_ref: self.payload_refs.get(&id).copied().unwrap_or_default(),
                 vector: v.clone(),
             });
         }
