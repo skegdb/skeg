@@ -192,7 +192,12 @@ impl PayloadIndex {
     /// # Errors
     ///
     /// Returns an error if the file cannot be written, synced or renamed.
-    pub fn persist(&self, dir: &std::path::Path, stamp: (u64, u64)) -> std::io::Result<()> {
+    pub fn persist(
+        &self,
+        dir: &std::path::Path,
+        stamp: (u64, u64),
+        generation: u128,
+    ) -> std::io::Result<()> {
         let mut keys: BTreeMap<&str, BTreeMap<Value, ()>> = BTreeMap::new();
         if let Some(d) = &self.disk {
             for (f, vs) in d.directory() {
@@ -221,6 +226,7 @@ impl PayloadIndex {
         crate::payload_disk::write(
             dir,
             stamp,
+            generation,
             &all,
             lists.iter().map(|(f, v, ids)| (*f, v, ids.as_slice())),
         )

@@ -26,9 +26,22 @@ use crate::payload::Value;
 
 /// `"SPIX"`, payload index.
 const MAGIC: u32 = 0x5350_4958;
-const VERSION: u32 = 1;
-/// magic + version + hwm + hwm_offset + n_ids + body_len + crc32c(body).
-const HEADER: usize = 4 + 4 + 8 + 8 + 8 + 8 + 4;
+/// V2 stamps the vindex GENERATION beside the log position.
+///
+/// The stamp says which log this file describes; it does not say which INDEX.
+/// A `vindex-<name>/` directory is removed with its index, so a stale file
+/// normally cannot outlive its incarnation - but a drop that fails partway
+/// leaves the directory, and the next index of the same name would then find a
+/// file whose ids belong to the dead one. The generation is the thing the two
+/// do not share.
+///
+/// A V1 file is REFUSED, not upgraded: it names no generation, so there is no
+/// answer to the question it is being asked. The caller rebuilds from the log,
+/// which is always correct.
+const VERSION: u32 = 2;
+/// magic + version + hwm + hwm_offset + n_ids + body_len + crc32c(body)
+/// + generation.
+const HEADER: usize = 4 + 4 + 8 + 8 + 8 + 8 + 4 + 16;
 
 /// File name inside a `vindex-<name>/` directory.
 pub const FILE: &str = "payload.idx";
@@ -78,7 +91,13 @@ pub type Directory = BTreeMap<String, BTreeMap<Value, Span>>;
 /// # Errors
 ///
 /// Returns an error if the file cannot be written, synced or renamed.
-pub fn write<'a, I>(dir: &Path, stamp: (u64, u64), all_ids: &[u64], lists: I) -> std::io::Result<()>
+pub fn write<'a, I>(
+    dir: &Path,
+    stamp: (u64, u64),
+    generation: u128,
+    all_ids: &[u64],
+    lists: I,
+) -> std::io::Result<()>
 where
     I: Iterator<Item = (&'a str, &'a Value, &'a [u64])>,
 {
@@ -141,6 +160,7 @@ where
     out.extend_from_slice(&(all_ids.len() as u64).to_le_bytes());
     out.extend_from_slice(&(dir_len as u64).to_le_bytes());
     out.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
+    out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&body);
 
     let path = dir.join(FILE);
@@ -172,13 +192,15 @@ pub struct DiskPostings {
 }
 
 impl DiskPostings {
-    /// Open the file if it exists, is intact, and carries `stamp`.
+    /// Open the file if it exists, is intact, and carries `stamp` AND
+    /// `generation`.
     ///
     /// Returns `None` for anything else: absent, wrong magic or version, a
-    /// different stamp, a failed checksum, or a directory that does not parse.
-    /// The caller then builds the index from the log, which is always correct.
+    /// different stamp, a file written by another incarnation of the name, a
+    /// failed checksum, or a directory that does not parse. The caller then
+    /// builds the index from the log, which is always correct.
     #[must_use]
-    pub fn open(dir: &Path, stamp: (u64, u64)) -> Option<Self> {
+    pub fn open(dir: &Path, stamp: (u64, u64), generation: u128) -> Option<Self> {
         let mut f = std::fs::File::open(dir.join(FILE)).ok()?;
         let mut head = [0u8; HEADER];
         f.read_exact(&mut head).ok()?;
@@ -193,6 +215,14 @@ impl DiskPostings {
             return None;
         }
         if (u64_at(8), u64_at(16)) != stamp {
+            return None;
+        }
+        let stamped_generation = {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&head[44..60]);
+            u128::from_le_bytes(b)
+        };
+        if stamped_generation != generation {
             return None;
         }
         let n_ids = usize::try_from(u64_at(24)).ok()?;

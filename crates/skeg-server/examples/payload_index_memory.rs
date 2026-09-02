@@ -21,6 +21,10 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
+/// The incarnation this scratch index pretends to be; the file records it and
+/// the open checks it.
+const GEN: u128 = 1;
+
 fn main() {
     let dir = std::env::args()
         .nth(1)
@@ -61,7 +65,7 @@ fn main() {
             .len();
         let base = rss_kb();
         let disk = PayloadIndex::from_disk(
-            skeg_server::payload_disk::DiskPostings::open(&tmp, (1, 1)).expect("open"),
+            skeg_server::payload_disk::DiskPostings::open(&tmp, (1, 1), GEN).expect("open"),
         );
         let after = rss_kb();
         let dm = (after - base) as f64;
@@ -93,7 +97,7 @@ fn main() {
     // write the file the second mode reads
     let tmp = std::env::temp_dir().join("pidx_probe");
     let _ = std::fs::create_dir_all(&tmp);
-    idx.persist(&tmp, (1, 1)).unwrap();
+    idx.persist(&tmp, (1, 1), GEN).unwrap();
     println!(
         "  file written: {:.1} MB   (rerun with DISK_ONLY=1)",
         std::fs::metadata(tmp.join(skeg_server::payload_disk::FILE))

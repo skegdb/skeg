@@ -389,7 +389,6 @@ async fn replay_is_idempotent() {
 /// with nothing to remove them. If the next index of the same name keys its
 /// blobs the same way, it serves the dead one's payloads as its own.
 #[tokio::test]
-#[ignore = "opens in vindex: a persistent generation per incarnation"]
 async fn a_recreated_index_does_not_inherit_the_old_generations_blobs() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
