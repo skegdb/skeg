@@ -35,29 +35,43 @@ impl WriteFailpoint {
 #[cfg(any(test, feature = "failpoints"))]
 mod armed_state {
     use super::WriteFailpoint;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::Cell;
 
-    static ARMED: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        /// PER THREAD, not process-wide.
+        ///
+        /// The harness runs a crate's tests in parallel threads, so a global
+        /// mask means a test that arms a point fails whichever unrelated test
+        /// happens to be running beside it. That is how this was first
+        /// written, and it took exactly one run to show: a fold in another
+        /// test came back "failpoint: versions.bin write refused".
+        ///
+        /// The cost is a real constraint rather than a free win - the site has
+        /// to fire on the thread that armed it. Every point here does: they
+        /// all sit on the caller's own thread, not on a shard worker and not
+        /// inside a rayon pool.
+        static ARMED: Cell<u64> = const { Cell::new(0) };
+    }
 
-    /// Make `fp` fail until it is disarmed.
+    /// Make `fp` fail on THIS THREAD until it is disarmed.
     pub fn arm(fp: WriteFailpoint) {
-        ARMED.fetch_or(fp.bit(), Ordering::SeqCst);
+        ARMED.with(|a| a.set(a.get() | fp.bit()));
     }
 
     /// Stop `fp` failing.
     pub fn disarm(fp: WriteFailpoint) {
-        ARMED.fetch_and(!fp.bit(), Ordering::SeqCst);
+        ARMED.with(|a| a.set(a.get() & !fp.bit()));
     }
 
-    /// Disarm every point.
+    /// Disarm every point. Cheap insurance at the end of a test.
     pub fn disarm_all() {
-        ARMED.store(0, Ordering::SeqCst);
+        ARMED.with(|a| a.set(0));
     }
 
     /// Is `fp` armed? Called by [`crate::fp`], not usually by hand.
     #[must_use]
     pub fn armed(fp: WriteFailpoint) -> bool {
-        ARMED.load(Ordering::SeqCst) & fp.bit() != 0
+        ARMED.with(Cell::get) & fp.bit() != 0
     }
 }
 
@@ -97,8 +111,8 @@ mod tests {
         Ok(())
     }
 
-    /// One test, not two: the armed mask is process-wide and the harness runs
-    /// a crate's tests in parallel threads.
+    /// One test, not two: the mask is per thread, so splitting this would
+    /// only produce two tests that cannot see each other.
     #[test]
     fn points_fire_only_while_armed_and_only_the_one_armed() {
         disarm_all();

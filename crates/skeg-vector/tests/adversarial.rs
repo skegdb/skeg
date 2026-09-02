@@ -609,7 +609,6 @@ fn a_delete_at_version_n_is_not_undone_by_an_insert_at_version_n_minus_one() {
 /// that chain silently reverts the row to legacy and hands the tie-break back
 /// to position.
 #[test]
-#[ignore = "opens in \"vector: persist per-row versions in every segment\""]
 fn versions_survive_a_flush_a_run_merge_and_a_fold() {
     let d = tempfile::TempDir::new().unwrap();
     let mut i = idx(d.path());
@@ -757,7 +756,6 @@ fn a_truncated_v3_record_is_ignored_not_half_applied() {
 /// silently dropped when it does not fit, so the index comes back serving
 /// zeros with a clean bill of health.
 #[test]
-#[ignore = "opens in \"vector: persist per-row versions in every segment\""]
 fn a_fold_that_cannot_write_versions_bin_does_not_commit_a_new_generation() {
     use skeg_vector::failpoint::{WriteFailpoint, arm, disarm_all};
 

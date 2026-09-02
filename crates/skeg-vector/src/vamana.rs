@@ -1777,6 +1777,77 @@ fn write_framed_wal(path: &Path, ops: &[DeltaWalOp]) -> io::Result<()> {
 }
 /// Persisted IVF router sidecar (centroids + cell assignment).
 const IVF_FILE: &str = "ivf.bin";
+/// Per-row [`VectorVersion`] column of a segment: `n` u64s, little-endian, in
+/// graph row order. Written by whatever BUILT the segment and published by the
+/// same rename that publishes the graph, so a generation can never be live
+/// without the column that says which of its rows are the newest copies.
+///
+/// ABSENT means every row is [`VectorVersion::LEGACY`]: that is what a store
+/// written before this file existed holds, and reading it as legacy is what
+/// makes the upgrade a no-op on data at rest.
+///
+/// A file of the WRONG LENGTH is an ERROR, not a fallback. `load_attr` next
+/// door does fall back - a stale `attr.bin` is silently ignored - and that is
+/// exactly the trap being avoided here: a version column dropped because it
+/// did not fit would bring the index back serving zeros, tie-breaking by shard
+/// number again, with nothing anywhere saying so.
+const VERSIONS_FILE: &str = "versions.bin";
+
+/// Read a segment's version column. See [`VERSIONS_FILE`] for the rules.
+fn read_versions(bdir: &Path, n: usize) -> io::Result<Vec<u64>> {
+    let raw = match std::fs::read(bdir.join(VERSIONS_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![0; n]),
+        Err(e) => return Err(e),
+    };
+    if raw.len() != n * 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: {} bytes for {n} rows (want {})",
+                bdir.join(VERSIONS_FILE).display(),
+                raw.len(),
+                n * 8
+            ),
+        ));
+    }
+    Ok(raw
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("8-byte window by construction")))
+        .collect())
+}
+
+/// Write a segment's version column beside the graph it belongs to.
+///
+/// Call it between `save` and the open/install: the column has to be in the
+/// directory before anything renames it into place, or a crash publishes a
+/// generation whose rows have no versions.
+fn write_versions(dir: &Path, versions: &[u64]) -> io::Result<()> {
+    crate::fp!(
+        crate::failpoint::WriteFailpoint::VersionsSidecarWrite,
+        Err(io::Error::other("failpoint: versions.bin write refused"))
+    );
+    let dir = base_dir(dir)?;
+    let mut bytes = Vec::with_capacity(versions.len() * 8);
+    for &v in versions {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join(VERSIONS_FILE), &bytes)
+}
+
+/// Save a freshly built segment AND its version column, which is the only way
+/// a segment should ever reach disk: `save` alone leaves the column absent,
+/// and absent reads back as legacy - a silent downgrade of every row.
+fn save_segment(index: &VamanaIndex, dir: &Path, versions: &[u64]) -> io::Result<()> {
+    assert_eq!(
+        versions.len(),
+        index.ids.len(),
+        "version column and row count disagree"
+    );
+    index.save(dir)?;
+    write_versions(dir, versions)
+}
+
 /// Optional per-base-row u64 attribute column (little-endian), for range-filtered
 /// search. Absent unless [`DiskVamanaIndex::set_attr`] was called.
 const ATTR_FILE: &str = "attr.bin";
@@ -2041,6 +2112,9 @@ struct Segment {
     main_n: u32,
     nodes: NodeBacking,
     ids: Vec<u64>,
+    /// [`VectorVersion`] per row, parallel to `ids`. All zeros for a segment
+    /// written before the column existed.
+    versions: Vec<u64>,
     id_to_main_row: AHashMap<u64, VecId>,
     medoid: VecId,
     quant: QuantizedVectors,
@@ -2602,6 +2676,7 @@ fn open_segment(
         Segment {
             main_n: n,
             nodes,
+            versions: read_versions(&bdir, n as usize)?,
             ids,
             id_to_main_row,
             medoid,
@@ -2762,9 +2837,11 @@ pub struct ConsolidateJob {
     /// build on the caller). Row-major, paired with `delta_ids`.
     delta_vectors: Vec<f32>,
     delta_ids: Vec<u64>,
+    /// The version of each `delta_ids` row, in the same order.
+    delta_versions: Vec<u64>,
     /// Base/run survivors, read OFF-THREAD in `build` from `seg_files`.
-    /// `(id, seg_index, row)`; seg_index 0 = base, 1.. = runs.
-    survivors: Vec<(u64, usize, u32)>,
+    /// `(id, seg_index, row, version)`; seg_index 0 = base, 1.. = runs.
+    survivors: Vec<(u64, usize, u32, u64)>,
     /// Duplicated `vectors.bin` handles [base, run0, run1, ...]. `try_clone`
     /// dups the fd (O(1)); the reads happen off the caller in `build`. A
     /// concurrent consolidate/flush may rename these files, but an open fd keeps
@@ -2845,6 +2922,7 @@ impl ConsolidateJob {
         let ConsolidateJob {
             delta_vectors,
             delta_ids,
+            delta_versions,
             survivors,
             seg_files,
             dim,
@@ -2862,22 +2940,23 @@ impl ConsolidateJob {
             Seg(usize, u32),
         }
         let total = delta_ids.len() + survivors.len();
-        let mut items: Vec<(u64, Src)> = Vec::with_capacity(total);
+        let mut items: Vec<(u64, Src, u64)> = Vec::with_capacity(total);
         for (i, &id) in delta_ids.iter().enumerate() {
-            items.push((id, Src::Delta(i)));
+            items.push((id, Src::Delta(i), delta_versions[i]));
         }
-        for (id, seg, row) in survivors {
-            items.push((id, Src::Seg(seg, row)));
+        for (id, seg, row, version) in survivors {
+            items.push((id, Src::Seg(seg, row), version));
         }
-        items.sort_unstable_by_key(|&(id, _)| id);
+        items.sort_unstable_by_key(|&(id, _, _)| id);
         let mut vectors: Vec<f32> = Vec::with_capacity(total * dim);
         let mut ids: Vec<u64> = Vec::with_capacity(total);
+        let mut versions: Vec<u64> = Vec::with_capacity(total);
         // Per new row: the OLD base row it came from, or `u32::MAX` for a row
         // that is new to the base (delta or run). This is what lets the patched
         // route tell "keep your edges" from "insert yourself".
         let mut base_origin: Vec<u32> = Vec::with_capacity(total);
         let mut buf = vec![0u8; dim * 4];
-        for (id, src) in items {
+        for (id, src, version) in items {
             match src {
                 Src::Delta(i) => {
                     vectors.extend_from_slice(&delta_vectors[i * dim..(i + 1) * dim]);
@@ -2894,6 +2973,7 @@ impl ConsolidateJob {
                 }
             }
             ids.push(id);
+            versions.push(version);
         }
         let t_read = phase_start.elapsed();
         let cfg = disk_build_config();
@@ -2919,7 +2999,7 @@ impl ConsolidateJob {
             None => build(),
         };
         let t_graph = phase_start.elapsed();
-        rebuilt.save(&tmp)?;
+        save_segment(&rebuilt, &tmp, &versions)?;
         // Open the freshly-saved base HERE (still off-thread): this is where the
         // O(live) quant-tier build happens now - not on the shard thread in
         // finish. The vectors.bin fd survives the finish rename (inode), so the
@@ -3001,6 +3081,8 @@ pub struct RunMergeJob {
     /// from the duped fds. seg_index parallels `seg_files`.
     survivors: Vec<(usize, u32)>,
     ids: Vec<u64>,
+    /// Version per row of `ids`, carried into the merged run's column.
+    versions: Vec<u64>,
     /// Duped vectors.bin fds for the folded runs (O(1) each at begin).
     seg_files: Vec<File>,
     dim: usize,
@@ -3038,6 +3120,7 @@ impl RunMergeJob {
         let RunMergeJob {
             survivors,
             ids,
+            versions,
             seg_files,
             dim,
             tier,
@@ -3079,7 +3162,7 @@ impl RunMergeJob {
             Some(pool) => pool.install(build),
             None => build(),
         };
-        rebuilt.save(&dir)?;
+        save_segment(&rebuilt, &dir, &versions)?;
         // Open the merged run HERE (off-thread): the quant-tier build for the
         // merged run happens now, not on the shard thread in finish.
         let merged = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
@@ -3153,6 +3236,8 @@ pub type FinishResult = io::Result<FinishOutcome>;
 pub struct FlushJob {
     vectors: Vec<f32>,
     ids: Vec<u64>,
+    /// Version per row of `ids`, carried into the run's version column.
+    versions: Vec<u64>,
     dim: usize,
     tier: QuantKind,
     seq: u64,
@@ -3218,6 +3303,7 @@ impl FlushJob {
         let FlushJob {
             vectors,
             ids,
+            versions,
             dim,
             tier,
             seq,
@@ -3233,7 +3319,7 @@ impl FlushJob {
             Some(pool) => pool.install(move || build_disk_graph(tier, vectors, ids, dim, &cfg)),
             None => build_disk_graph(tier, vectors, ids, dim, &cfg),
         };
-        rebuilt.save(&dir)?;
+        save_segment(&rebuilt, &dir, &versions)?;
         let run = DiskVamanaIndex::open_with_tier(&dir, tier)?.base;
         let built = FlushBuilt { run, seq };
         build_dir.preserve();
@@ -3255,6 +3341,8 @@ pub struct DeletePatchJob {
     n_rows: usize,
     /// Base id by old row.
     ids: Vec<u64>,
+    /// Base version by old row; the survivors keep theirs through the patch.
+    versions: Vec<u64>,
     /// Base adjacency by old row (owned copy of the served graph).
     adj: Vec<Node>,
     /// old row -> removed at this patch.
@@ -3288,6 +3376,7 @@ impl DeletePatchJob {
             seg_file,
             n_rows,
             ids,
+            versions,
             adj,
             dead,
             medoid,
@@ -3308,7 +3397,15 @@ impl DeletePatchJob {
             }
             None => patch_graph(vectors, ids, adj, &dead, medoid, dim, l_search, &cfg),
         };
-        patched.save(&tmp)?;
+        // `patch_graph` keeps the survivors in old-row order, so filtering the
+        // column the same way is what keeps the two aligned.
+        let kept: Vec<u64> = versions
+            .iter()
+            .zip(&dead)
+            .filter(|&(_, &d)| !d)
+            .map(|(&v, _)| v)
+            .collect();
+        save_segment(&patched, &tmp, &kept)?;
         // Open the patched base HERE (off-thread): the O(live) tier rebuild
         // happens off the shard thread, not in finish.
         let base = DiskVamanaIndex::open_with_tier(&tmp, tier)?.base;
@@ -3717,6 +3814,16 @@ impl DiskVamanaIndex {
         }
         if let Some(&d) = self.tombstones.get(&id) {
             v = v.max(d);
+        }
+        // And the persisted layers. Same lookups `is_live` already does on
+        // this path, so this costs one array index more, not another probe.
+        for run in &self.runs {
+            if let Some(&row) = run.id_to_main_row.get(&id) {
+                v = v.max(run.versions[row as usize]);
+            }
+        }
+        if let Some(&row) = self.base.id_to_main_row.get(&id) {
+            v = v.max(self.base.versions[row as usize]);
         }
         v
     }
@@ -5151,15 +5258,17 @@ impl DiskVamanaIndex {
         }
         let mut vectors: Vec<f32> = Vec::with_capacity(self.delta.len() * self.dim);
         let mut ids: Vec<u64> = Vec::with_capacity(self.delta.len());
+        let mut versions: Vec<u64> = Vec::with_capacity(self.delta.len());
         for (&id, v) in &self.delta {
             vectors.extend_from_slice(v);
             ids.push(id);
+            versions.push(self.delta_ver.get(&id).copied().unwrap_or(0));
         }
         let seq = self.run_seq;
         let run_dir = self.dir.join(format!("run-{seq}"));
         self.run_seq += 1;
         let rebuilt = build_disk_graph(self.tier, vectors, ids, self.dim, &disk_build_config());
-        rebuilt.save(&run_dir)?;
+        save_segment(&rebuilt, &run_dir, &versions)?;
         // Open the run with this index's tier and keep only its base segment; the
         // rest of the opened index (an empty delta/WAL over the run dir) is dropped.
         let run = DiskVamanaIndex::open_with_tier(&run_dir, self.tier)?;
@@ -5276,28 +5385,66 @@ impl DiskVamanaIndex {
     /// `seen` is threaded in rather than created here because the caller has
     /// already claimed the newer layers (delta, and any in-flight flush
     /// staging) into it. That ordering IS the precedence.
+    /// Now by MAX VERSION, with the layer order as the tie-break rather than
+    /// the rule. Layer order is a proxy for age and it is the one that fails:
+    /// a row can reach a newer layer carrying an older version - that is what
+    /// a relocation is - and picking by position then folds the copy a write
+    /// had already replaced into the new base, permanently.
+    ///
+    /// Equal versions keep the old behaviour exactly: the strict `>` leaves
+    /// the first sighting in place, and the loops still run newest run first,
+    /// then the base. A store where nothing is versioned folds identically.
     fn append_persisted_survivors(
         &self,
         seen: &mut AHashSet<u64>,
-        out: &mut Vec<(u64, usize, u32)>,
+        out: &mut Vec<(u64, usize, u32, u64)>,
     ) {
-        // Runs are appended, so the last is the newest: iterate in reverse.
+        use std::collections::hash_map::Entry;
         // Segment numbering matches `segs`: 0 is the base, 1.. are the runs.
+        let mut best: AHashMap<u64, (usize, u32, u64)> = AHashMap::new();
+        // Runs are appended, so the last is the newest: iterate in reverse.
         for (ri, run) in self.runs.iter().enumerate().rev() {
             for row in 0..run.main_n {
                 let id = run.ids[row as usize];
-                if self.tombstones.contains_key(&id) || !seen.insert(id) {
+                if self.tombstones.contains_key(&id) || seen.contains(&id) {
                     continue;
                 }
-                out.push((id, ri + 1, row));
+                let candidate = (ri + 1, row, run.versions[row as usize]);
+                match best.entry(id) {
+                    Entry::Occupied(mut e) => {
+                        if candidate.2 > e.get().2 {
+                            e.insert(candidate);
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(candidate);
+                    }
+                }
             }
         }
         for row in 0..self.base.main_n {
             let id = self.base.ids[row as usize];
-            if self.tombstones.contains_key(&id) || !seen.insert(id) {
+            if self.tombstones.contains_key(&id) || seen.contains(&id) {
                 continue;
             }
-            out.push((id, 0, row));
+            let candidate = (0usize, row, self.base.versions[row as usize]);
+            match best.entry(id) {
+                Entry::Occupied(mut e) => {
+                    if candidate.2 > e.get().2 {
+                        e.insert(candidate);
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(candidate);
+                }
+            }
+        }
+        // Hash order here, but both callers sort the survivor list by id
+        // before they build (re-rank cache locality), so the fold is still
+        // deterministic.
+        for (id, (seg, row, version)) in best {
+            seen.insert(id);
+            out.push((id, seg, row, version));
         }
     }
 
@@ -5311,7 +5458,7 @@ impl DiskVamanaIndex {
             .chain(self.runs.iter())
             .collect();
         let mut seen: AHashSet<u64> = AHashSet::new();
-        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        let mut survivors: Vec<(u64, usize, u32, u64)> = Vec::new();
         // `delta`, then `flushing`: the documented precedence is
         // `delta > flushing > runs > base`. Skipping the staging map here loses
         // every vector an in-flight `flush_begin` moved out of the delta, since
@@ -5321,12 +5468,14 @@ impl DiskVamanaIndex {
         // command `SKEG.VINDEX.CONSOLIDATE` takes that lock and lands here.
         for &id in self.delta.keys() {
             if seen.insert(id) {
-                survivors.push((id, Self::LOC_DELTA, 0));
+                let v = self.delta_ver.get(&id).copied().unwrap_or(0);
+                survivors.push((id, Self::LOC_DELTA, 0, v));
             }
         }
         for &id in self.flushing.keys() {
             if seen.insert(id) {
-                survivors.push((id, Self::LOC_FLUSHING, 0));
+                let v = self.flushing_ver.get(&id).copied().unwrap_or(0);
+                survivors.push((id, Self::LOC_FLUSHING, 0, v));
             }
         }
         self.append_persisted_survivors(&mut seen, &mut survivors);
@@ -5338,16 +5487,18 @@ impl DiskVamanaIndex {
         // vectors.bin rows and the re-rank's f32 reads stay cache-local. Without
         // it the fold order scatters them and 500k+ search latency regresses ~1.5x
         // (root-caused: the re-rank is disk-read bound at scale).
-        survivors.sort_unstable_by_key(|&(id, _, _)| id);
+        survivors.sort_unstable_by_key(|&(id, _, _, _)| id);
         let mut vectors: Vec<f32> = Vec::with_capacity(survivors.len() * dim);
         let mut ids: Vec<u64> = Vec::with_capacity(survivors.len());
-        for (id, loc, row) in survivors {
+        let mut versions: Vec<u64> = Vec::with_capacity(survivors.len());
+        for (id, loc, row, version) in survivors {
             match loc {
                 Self::LOC_DELTA => vectors.extend_from_slice(&self.delta[&id]),
                 Self::LOC_FLUSHING => vectors.extend_from_slice(&self.flushing[&id]),
                 seg => vectors.extend(self.read_vector(segs[seg], row)?),
             }
             ids.push(id);
+            versions.push(version);
         }
         let dir = self.dir.clone();
         let tier = self.tier;
@@ -5391,7 +5542,7 @@ impl DiskVamanaIndex {
         let staging_path = dir.join("consolidating");
         // `save` resolves through `base_dir`, and a staging directory has no
         // CURRENT of its own, so this writes straight into it.
-        rebuilt.save(&staging_path)?;
+        save_segment(&rebuilt, &staging_path, &versions)?;
         // THE COMMIT: one atomic rename publishes the whole generation.
         //
         // The guard is deliberately NOT preserved. A successful install has
@@ -5490,17 +5641,19 @@ impl DiskVamanaIndex {
         let mut seen: AHashSet<u64> = AHashSet::new();
         let cap = self.delta.len() + self.flushing.len();
         let mut delta_ids: Vec<u64> = Vec::with_capacity(cap);
+        let mut delta_versions: Vec<u64> = Vec::with_capacity(cap);
         let mut delta_vectors: Vec<f32> = Vec::with_capacity(cap * self.dim);
         // delta first (newest), then any in-flight flush staging (delta shadows
         // it via `seen`). Tombstoned ids are already removed from both.
         for (&id, v) in self.delta.iter().chain(self.flushing.iter()) {
             if seen.insert(id) {
                 delta_ids.push(id);
+                delta_versions.push(self.known_version(id));
                 delta_vectors.extend_from_slice(v);
             }
         }
-        // Base/runs, newest run first; delta already shadows via `seen`.
-        let mut survivors: Vec<(u64, usize, u32)> = Vec::new();
+        // Base/runs, newest version first; delta already shadows via `seen`.
+        let mut survivors: Vec<(u64, usize, u32, u64)> = Vec::new();
         self.append_persisted_survivors(&mut seen, &mut survivors);
         if survivors.is_empty() && delta_ids.is_empty() {
             return Ok(None);
@@ -5532,6 +5685,7 @@ impl DiskVamanaIndex {
         Ok(Some(ConsolidateJob {
             delta_vectors,
             delta_ids,
+            delta_versions,
             survivors,
             seg_files,
             dim: self.dim,
@@ -5886,19 +6040,35 @@ impl DiskVamanaIndex {
         // decided below, from the survivor set, where the answer is exact:
         // deciding it up here from `run_rows / live_rows` is what produced an
         // infinite rewrite loop, because that ratio is 1.0 for a spotless run.
-        // Newer runs win on a re-inserted id: fold the front runs newest-first.
-        let mut seen: AHashSet<u64> = AHashSet::new();
-        let mut survivors: Vec<(usize, u32)> = Vec::new();
+        // The NEWEST VERSION of a re-inserted id wins, with "newer run" as the
+        // tie-break rather than the rule - the same correction the fold takes,
+        // and for the same reason: a row reaches a newer run by being
+        // relocated, which does not make its contents newer. Strict `>` leaves
+        // equal versions on the first sighting, so a run set where nothing is
+        // versioned merges exactly as it did.
+        let mut best: AHashMap<u64, (usize, u32, u64)> = AHashMap::new();
         for ri in (0..n_merged).rev() {
             let run = &self.runs[ri];
             for row in 0..run.main_n {
                 let id = run.ids[row as usize];
-                if self.tombstones.contains_key(&id) || !seen.insert(id) {
+                if self.tombstones.contains_key(&id) {
                     continue;
                 }
-                survivors.push((ri, row));
+                let candidate = (ri, row, run.versions[row as usize]);
+                match best.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if candidate.2 > e.get().2 {
+                            e.insert(candidate);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(candidate);
+                    }
+                }
             }
         }
+        let mut survivors: Vec<(usize, u32)> =
+            best.values().map(|&(ri, row, _)| (ri, row)).collect();
         // Garbage, measured rather than inferred: physical rows in the folded
         // runs minus the ones that survive. The loop above already computed
         // the survivors, so this costs nothing extra - and it is the only
@@ -5944,11 +6114,16 @@ impl DiskVamanaIndex {
             }
             return Ok(None);
         }
-        // id order for re-rank cache locality, same rule as consolidate.
+        // id order for re-rank cache locality, same rule as consolidate. It is
+        // also what makes the hash-ordered `best` above deterministic again.
         survivors.sort_unstable_by_key(|&(ri, row)| self.runs[ri].ids[row as usize]);
         let ids: Vec<u64> = survivors
             .iter()
             .map(|&(ri, row)| self.runs[ri].ids[row as usize])
+            .collect();
+        let versions: Vec<u64> = survivors
+            .iter()
+            .map(|&(ri, row)| self.runs[ri].versions[row as usize])
             .collect();
         // Dup the folded runs' vectors.bin fds (O(1)); the reads happen off-thread
         // in build. seg_index in `survivors` is the run index 0..n_merged.
@@ -5988,6 +6163,7 @@ impl DiskVamanaIndex {
         Ok(Some(RunMergeJob {
             survivors,
             ids,
+            versions,
             seg_files,
             dim: self.dim,
             tier: self.tier,
@@ -6082,15 +6258,18 @@ impl DiskVamanaIndex {
         self.flushing_ver = std::mem::take(&mut self.delta_ver);
         let mut vectors: Vec<f32> = Vec::with_capacity(self.flushing.len() * self.dim);
         let mut ids: Vec<u64> = Vec::with_capacity(self.flushing.len());
+        let mut versions: Vec<u64> = Vec::with_capacity(self.flushing.len());
         for (&id, v) in &self.flushing {
             vectors.extend_from_slice(v);
             ids.push(id);
+            versions.push(self.flushing_ver.get(&id).copied().unwrap_or(0));
         }
         let seq = self.run_seq;
         self.run_seq += 1;
         Ok(Some(FlushJob {
             vectors,
             ids,
+            versions,
             dim: self.dim,
             tier: self.tier,
             seq,
@@ -6324,6 +6503,7 @@ impl DiskVamanaIndex {
             seg_file,
             n_rows: n,
             ids: self.base.ids.clone(),
+            versions: self.base.versions.clone(),
             adj,
             dead,
             medoid: self.base.medoid,

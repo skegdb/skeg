@@ -21,9 +21,9 @@
 //!   type annotation, so the write path carries no branch at all - and the
 //!   variant name is still checked by the compiler.
 //!
-//! Points are armed process-wide, so a test that arms one must not run
-//! concurrently with another that cares. Tests here are `#[tokio::test]` on
-//! their own runtime but share the process: arm, exercise, disarm.
+//! Points are armed PER THREAD, so a test that arms one cannot fail a test
+//! running beside it. That makes the site's thread part of the contract: every
+//! point below fires on the caller's own thread.
 
 /// A point on the server's vector write path that a test can make fail.
 ///
@@ -58,29 +58,43 @@ impl WriteFailpoint {
 #[cfg(any(test, feature = "failpoints"))]
 mod armed_state {
     use super::WriteFailpoint;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::Cell;
 
-    static ARMED: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        /// PER THREAD, not process-wide.
+        ///
+        /// The harness runs a crate's tests in parallel threads, so a global
+        /// mask means a test that arms a point fails whichever unrelated test
+        /// happens to be running beside it. That is how this was first
+        /// written, and it took exactly one run to show: a fold in another
+        /// test came back "failpoint: versions.bin write refused".
+        ///
+        /// The cost is a real constraint rather than a free win - the site has
+        /// to fire on the thread that armed it. Every point here does: they
+        /// all sit on the caller's own thread, not on a shard worker and not
+        /// inside a rayon pool.
+        static ARMED: Cell<u64> = const { Cell::new(0) };
+    }
 
-    /// Make `fp` fail until it is disarmed.
+    /// Make `fp` fail on THIS THREAD until it is disarmed.
     pub fn arm(fp: WriteFailpoint) {
-        ARMED.fetch_or(fp.bit(), Ordering::SeqCst);
+        ARMED.with(|a| a.set(a.get() | fp.bit()));
     }
 
     /// Stop `fp` failing.
     pub fn disarm(fp: WriteFailpoint) {
-        ARMED.fetch_and(!fp.bit(), Ordering::SeqCst);
+        ARMED.with(|a| a.set(a.get() & !fp.bit()));
     }
 
     /// Disarm every point. Cheap insurance at the end of a test.
     pub fn disarm_all() {
-        ARMED.store(0, Ordering::SeqCst);
+        ARMED.with(|a| a.set(0));
     }
 
     /// Is `fp` armed? Called by [`crate::fp`], not usually by hand.
     #[must_use]
     pub fn armed(fp: WriteFailpoint) -> bool {
-        ARMED.load(Ordering::SeqCst) & fp.bit() != 0
+        ARMED.with(Cell::get) & fp.bit() != 0
     }
 }
 
@@ -120,9 +134,9 @@ mod tests {
         Ok("wrote")
     }
 
-    /// One test, not two: the armed mask is process-wide and the test harness
-    /// runs a crate's tests in parallel threads, so two tests arming points
-    /// would race each other rather than test anything.
+    /// One test, not two: the mask is per thread, so two tests that arm
+    /// points would be checking different masks and neither would say
+    /// anything about the other.
     #[test]
     fn points_fire_only_while_armed_and_only_the_one_armed() {
         disarm_all();
