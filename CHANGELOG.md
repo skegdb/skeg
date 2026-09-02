@@ -21,8 +21,14 @@ a tag the release workflow rejected still produced `:<version>` and
 Now: guard -> test (fmt, clippy, serial workspace suite) -> build-binaries
 and the Dockerfile check -> publish-crates -> homebrew. Nothing irreversible
 runs before every build is green. The Docker workflow carries its own copy
-of the ancestry guard, because workflows cannot depend on each other's
-jobs. Not in this change: SHA-pinned actions, SBOM, provenance, cargo-deny.
+of the ancestry guard *and* of the test job, because workflows cannot
+depend on each other's jobs: `:<version>`, `:latest` and `:release-edge`
+are pushed only once the same gate is green on that commit (`release` has
+no CI run of its own, so this is the only test `release-edge` ever sees).
+The ancestry guard also covers manual dispatches that publish - `dry_run:
+false` in the release workflow, `also_latest` in the Docker one - so a
+dispatch from a feature branch cannot push a crate or move `:latest`. Not
+in this change: SHA-pinned actions, SBOM, provenance, cargo-deny.
 
 ### The single-tenant servers refuse a network bind without an opt-in
 
@@ -34,7 +40,12 @@ the container port on the host loopback only (`-p 127.0.0.1:6379:6379`);
 the image itself keeps `0.0.0.0` inside the container and sets the opt-in,
 because a container needs to bind all interfaces to be reachable through
 `-p` at all. For network exposure use `skeg-server-tenant` with
-`--tenant-auth`/`--tenant-strict`, or an authenticating proxy.
+`--tenant-auth --tenant-strict`, or an authenticating proxy.
+
+`skeg-server-tenant` applies the same guard unless auth is actually
+enforced: `--tenant-auth` alone (lenient mode) still maps an anonymous
+`HELLO 3` to tenant ZERO, so only `--tenant-auth --tenant-strict` lifts the
+check. The review version lifted it on `--tenant-auth` alone.
 
 ### One RESP3 connection is bounded to one legitimate frame
 
