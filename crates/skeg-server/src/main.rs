@@ -65,6 +65,12 @@ OPTIONS:
                             Requires the binary to be built with the
                             `metrics-http` cargo feature. Default: off.
                             Env: SKEG_METRICS_PORT.
+    --allow-unauthenticated-network
+                            This server has no authentication. By default a
+                            non-loopback --addr is refused. Pass this flag (or
+                            set SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1) to accept
+                            the risk and bind it anyway. Loopback addresses
+                            (127.0.0.1, ::1) never need this flag.
     -h, --help             Print this help.
     -V, --version          Print the version.
 
@@ -176,6 +182,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(port) = cfg.metrics_port {
         spawn_metrics_exporter(port);
     }
+    match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network) {
+        Ok(true) => {
+            tracing::warn!(
+                "--allow-unauthenticated-network: {} is reachable over the network with no \
+                 authentication",
+                cfg.addr
+            );
+        }
+        Ok(false) => {}
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
     let data_dir = std::path::Path::new(&cfg.data_dir);
     let server = if cfg.serve {
         tracing::info!(
@@ -277,6 +297,10 @@ struct Config {
     /// RESP3 `STATS` command reads. Only available when the binary is
     /// built with `--features metrics-http`. Env var `SKEG_METRICS_PORT`.
     metrics_port: Option<u16>,
+    /// Opt-in to binding a non-loopback `--addr` on a server with no
+    /// authentication. See `skeg_server::check_unauthenticated_bind`.
+    /// Env var `SKEG_ALLOW_UNAUTHENTICATED_NETWORK`.
+    allow_unauthenticated_network: bool,
 }
 
 impl Config {
@@ -305,6 +329,10 @@ impl Config {
             metrics_port: std::env::var("SKEG_METRICS_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            allow_unauthenticated_network: matches!(
+                std::env::var("SKEG_ALLOW_UNAUTHENTICATED_NETWORK").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            ),
         };
         let args: Vec<String> = args.collect();
         let mut i = 0;
@@ -353,6 +381,10 @@ impl Config {
                         cfg.metrics_port = Some(v);
                     }
                     i += 2;
+                }
+                "--allow-unauthenticated-network" => {
+                    cfg.allow_unauthenticated_network = true;
+                    i += 1;
                 }
                 _ => i += 1,
             }

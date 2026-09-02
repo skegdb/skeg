@@ -54,6 +54,12 @@ OPTIONS:
                              0 (default) = inline; overload is rejected. Also: SKEG_WORKERS.
     --tier-mmap            mmap the TurboQuant tier. Also: SKEG_TIER_MMAP=1.
     --graph-mmap           mmap the Vamana graph Node array. Also: SKEG_GRAPH_MMAP=1.
+    --allow-unauthenticated-network
+                            This server has no authentication. By default a
+                            non-loopback --addr is refused. Pass this flag (or
+                            set SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1) to accept
+                            the risk and bind it anyway. Loopback addresses
+                            (127.0.0.1, ::1) never need this flag.
     -h, --help             Print this help.
     -V, --version          Print the version.
 
@@ -122,6 +128,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cfg.graph_mmap {
         tracing::info!("--graph-mmap: graph.vmn Node array memory-mapped");
+    }
+    match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network) {
+        Ok(true) => {
+            tracing::warn!(
+                "--allow-unauthenticated-network: {} is reachable over the network with no \
+                 authentication",
+                cfg.addr
+            );
+        }
+        Ok(false) => {}
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
     }
     let data_dir = std::path::Path::new(&cfg.data_dir);
     let server = if cfg.serve {
@@ -200,6 +220,7 @@ struct Config {
     workers: usize,
     tier_mmap: bool,
     graph_mmap: bool,
+    allow_unauthenticated_network: bool,
 }
 
 impl Config {
@@ -223,6 +244,10 @@ impl Config {
             ),
             graph_mmap: matches!(
                 std::env::var("SKEG_GRAPH_MMAP").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            ),
+            allow_unauthenticated_network: matches!(
+                std::env::var("SKEG_ALLOW_UNAUTHENTICATED_NETWORK").as_deref(),
                 Ok("1") | Ok("true") | Ok("on")
             ),
         };
@@ -266,6 +291,10 @@ impl Config {
                 }
                 "--graph-mmap" => {
                     cfg.graph_mmap = true;
+                    i += 1;
+                }
+                "--allow-unauthenticated-network" => {
+                    cfg.allow_unauthenticated_network = true;
                     i += 1;
                 }
                 _ => i += 1,

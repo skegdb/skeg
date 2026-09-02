@@ -37,13 +37,17 @@ sits in RAM, so memory grows far more slowly than the corpus it serves.
 ## Quickstart
 
 ```sh
-docker run -d --name skeg -p 6379:6379 -v skeg-data:/var/lib/skeg \
+docker run -d --name skeg -p 127.0.0.1:6379:6379 -v skeg-data:/var/lib/skeg \
   --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest \
   --addr 0.0.0.0:6379
 ```
 
 `--addr` is not optional here: that binary defaults to `127.0.0.1:6379`, which
-inside a container only the container can reach.
+inside a container only the container can reach. The port is published on the
+host's loopback interface only because this server has no authentication -
+anyone who can reach it can read, write and drop indices. For network
+exposure, put `skeg-server-tenant` (with `--tenant-auth`/`--tenant-strict`) or
+an authenticating proxy in front instead of publishing the port directly.
 
 It is a Redis server, so any Redis client works:
 
