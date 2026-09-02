@@ -3557,6 +3557,23 @@ impl DiskVamanaIndex {
         // the library are, and an assertion is not an answer for them either.
         tier.validate_dim(dim)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // A directory that already holds an index is not free space. Creating
+        // over it used to succeed and write an empty graph, vectors, CURRENT
+        // and WAL on top of whatever was there, so any caller that "creates"
+        // when it cannot tell whether the index exists (an embedder keyed on
+        // its own sidecar, a retry after a partial open) wiped live data.
+        // The tier file and the CURRENT pointer are the first and last things
+        // a create writes; either one present means an index, or the remains
+        // of one, and only the caller can decide what to do with that.
+        if dir.join(TIER_FILE).exists() || dir.join(CURRENT_FILE).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already holds an index: open it, or remove the directory to recreate",
+                    dir.display()
+                ),
+            ));
+        }
         std::fs::create_dir_all(dir)?;
         write_tier(dir, tier)?;
         // The base starts in the first generation slot; CURRENT points at it. A
