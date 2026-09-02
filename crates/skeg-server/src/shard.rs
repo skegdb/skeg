@@ -4207,7 +4207,13 @@ async fn process(
                     // order.
                     let previous = idx.backend.version_of(id).get();
                     let existed_before = idx.backend.contains(id);
-                    let version = version.unwrap_or(previous + 1);
+                    // `next()`, not `previous + 1`: it saturates. An index
+                    // that has issued 2^64 versions for one id has other
+                    // problems, but wrapping to zero would turn every later
+                    // row into a legacy one, and legacy loses to nothing -
+                    // so the write after the wrap would be silently dropped.
+                    let version =
+                        version.unwrap_or_else(|| VectorVersion::new(previous).next().get());
                     let was_new = !internal && !existed_before;
                     if was_new
                         && let Some(max) = limit
@@ -4663,7 +4669,9 @@ async fn process(
                         // blob is filed under the row.
                         let held = g.backend.version_of(id).get();
                         let generation = g.generation;
-                        let version = VectorVersion::new(version.unwrap_or(held + 1));
+                        // Saturating, same reason as the write path.
+                        let version = version
+                            .map_or_else(|| VectorVersion::new(held).next(), VectorVersion::new);
                         let r = g.backend.delete(id, version);
                         if matches!(r, Ok(true)) {
                             g.payload.remove(id);
