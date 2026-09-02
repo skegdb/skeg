@@ -78,7 +78,8 @@ use skeg_core::{Durability, VLog};
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{
     ConsolidateBuilt, ConsolidateJob, DeletePatchBuilt, DeletePatchJob, DiskVamanaIndex, FlatIndex,
-    FlushBuilt, FlushJob, IvfBuilt, IvfJob, QuantKind, RunMergeBuilt, RunMergeJob, VectorVersion,
+    FlushBuilt, FlushJob, IvfBuilt, IvfJob, PayloadRef, QuantKind, RunMergeBuilt, RunMergeJob,
+    VectorVersion,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Semaphore, oneshot};
@@ -249,23 +250,50 @@ const VAMANA_L_SEARCH: usize = 100;
 // Both variants boxed: DiskVamanaIndex and FlatIndex are each hundreds of bytes,
 // so an unboxed variant would size every VectorBackend to the larger one (clippy
 // large_enum_variant). One heap indirection per vindex, off the hot path.
-/// What a `Vset` did on the answering shard.
-enum VsetOutcome {
-    /// The row was written, so everything hanging off it - its payload
-    /// postings, its blob in the vLog - has to follow.
-    Stored {
-        /// The version the row now stands at. Its blob key is built from
-        /// this, so a copy of the row at any other version has its own.
-        version: u64,
-        /// The version this shard held for the row before, when it held one
-        /// at all. `None` for a row arriving here for the first time, which
-        /// is also the answer to "is there a previous blob to carry forward
-        /// or to reclaim".
-        previous: Option<u64>,
-    },
-    /// The shard already holds a NEWER copy of this row, so nothing was
-    /// written and nothing must follow.
-    Superseded,
+/// What a `Vset` decided under the write lock, before anything was staged.
+///
+/// Carried out of the lock rather than re-read afterwards: the values below
+/// describe the write's own decisions, and re-reading them would be reading a
+/// state a concurrent write could have moved - which is exactly the class of
+/// bug the row stripe and the version exist to close.
+struct Admitted {
+    /// The version this write publishes the row at. Its blob key is built
+    /// from it, so a copy at any other version has its own.
+    version: u64,
+    /// The version this shard held for the row before, when it held one at
+    /// all. `None` for a row arriving here for the first time, which is also
+    /// the answer to "is there a previous blob to carry forward or reclaim".
+    previous: Option<u64>,
+    /// Whether a quota slot was actually reserved, so a later failure gives
+    /// back exactly what was taken and nothing else.
+    charged: bool,
+    /// The incarnation of the index, for the blob key.
+    generation: IndexGeneration,
+}
+
+/// Write a payload blob to the key of the version it belongs to. `Ok(true)`
+/// once the blob is there.
+///
+/// Split out because both the supplied-payload and the carry-forward paths
+/// write to the same place under the same failpoint, and a second copy of that
+/// is a second place for the key to be built differently.
+async fn stage_payload_blob(
+    vlog: &VLog,
+    scope: BlobScope<'_>,
+    id: u64,
+    version: u64,
+    blob: &[u8],
+) -> Result<bool, String> {
+    crate::fp_at!(
+        crate::failpoint::WriteFailpoint::PayloadPrepare,
+        scope.name,
+        Err("vset payload failed: failpoint: payload staging refused".to_owned())
+    );
+    vlog.tenant(scope.tenant)
+        .set(&scope.key(id, version), blob, PAYLOAD_DURABILITY)
+        .await
+        .map(|()| true)
+        .map_err(|e| format!("vset payload failed: {e}"))
 }
 
 enum VectorBackend {
@@ -336,7 +364,19 @@ impl VectorBackend {
     /// `version` says WHICH copy of the row this is. A write older than the
     /// copy the backend already holds is dropped by the backend itself, which
     /// is what stops a relocation republishing a value a user write replaced.
-    fn insert(&mut self, id: u64, vector: &[f32], version: VectorVersion) -> std::io::Result<()> {
+    ///
+    /// `payload_ref` says what this copy's payload blob is, and the record
+    /// that carries it is the commit point of the pair. A FLAT index has no
+    /// WAL and therefore nothing to record it in, which is the whole of what
+    /// "flat is ephemeral by design" costs here: an in-RAM index recovers
+    /// nothing, so there is no recovery to describe.
+    fn insert(
+        &mut self,
+        id: u64,
+        vector: &[f32],
+        version: VectorVersion,
+        payload_ref: PayloadRef,
+    ) -> std::io::Result<()> {
         match self {
             VectorBackend::Flat(i) => {
                 // `FlatIndex::insert` panics on a dim mismatch and its
@@ -349,6 +389,7 @@ impl VectorBackend {
                         format!("vector has {} dims, index has {}", vector.len(), i.dim()),
                     ));
                 }
+                let _ = payload_ref;
                 i.insert_versioned(id, vector, version);
                 Ok(())
             }
@@ -356,7 +397,7 @@ impl VectorBackend {
                 // Append only. The geometric fold (delta >= built size) runs
                 // OFF-THREAD in the background maintenance loop (with the cheap
                 // consolidate_begin), so ingest never blocks the shard on a fold.
-                i.insert_versioned(id, vector, version)
+                i.insert_with_payload(id, vector, version, payload_ref)
             }
         }
     }
@@ -3922,173 +3963,237 @@ async fn process(
             // outer lock before taking the per-vindex write. This lets
             // another vindex's ops run in parallel with this one.
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
-            match entry {
-                None => ShardResp::Err(format!("vindex '{name}' not found")),
-                Some(arc) => {
-                    // Insert under the per-vindex write lock, then drop the
-                    // guard before any `await` (the payload write below): a
-                    // parking_lot guard must not be held across a suspension.
-                    let insert_result = {
-                        let mut idx = arc.write();
-                        if idx.backend.dim() != vector.len() {
-                            Err(format!(
-                                "vindex '{name}' dim {} but vector has {}",
-                                idx.backend.dim(),
-                                vector.len()
-                            ))
-                        } else if version.is_some_and(|v| v < idx.backend.version_of(id).get()) {
-                            // A relocation carrying a copy this shard has
-                            // already moved past. The engine would refuse the
-                            // vector by itself; what it cannot refuse is the
-                            // rest of the write. Refusing it HERE is what
-                            // keeps the quota unspent, the payload postings
-                            // untouched and the blob unwritten - the row that
-                            // stands must not end up described by the payload
-                            // of the value it replaced.
-                            Ok(VsetOutcome::Superseded)
-                        } else {
-                            // Quota: only a NEW id consumes a slot. Reserve
-                            // before the insert (race-free under this write
-                            // lock) so an over-limit insert is rejected without
-                            // storing; an overwrite never touches the quota.
-                            // `internal` first: a moved or replicated row is
-                            // new to THIS shard and not to the tenant.
-                            // `None` means nobody upstream is tracking this
-                            // row's versions - the hash-placed path, where the
-                            // row never moves - so this shard allocates one
-                            // past whatever it holds. Never zero: a legacy
-                            // version would tie with the copy already here and
-                            // hand the decision back to write order.
-                            let previous = idx.backend.version_of(id).get();
-                            let existed_before = idx.backend.contains(id);
-                            let version =
-                                VectorVersion::new(version.unwrap_or_else(|| previous + 1));
-                            let was_new = !internal && !existed_before;
-                            if was_new
-                                && let Some(max) = limit
-                                && quota.try_add(tenant, 1, max).is_err()
-                            {
-                                return ShardResp::Err("tenant vector quota exceeded".to_owned());
-                            }
-                            // Memory admission, same shape as the quota above
-                            // and for the same reason: refuse BEFORE storing,
-                            // under this write lock, so a refusal leaves
-                            // nothing behind. The cost is what the delta will
-                            // hold - f32 per dimension - and it is charged
-                            // against a promise covering the whole delta, not
-                            // this row, so the bound is on the buffer rather
-                            // than on the request.
-                            let want = idx.backend.resident_bytes()
-                                + (vector.len() * std::mem::size_of::<f32>()) as u64;
-                            if let Err(rejected) = idx.reserve_memory(memory, want) {
-                                if was_new && limit.is_some() {
-                                    quota.sub(tenant, 1);
-                                }
-                                skeg_telemetry::tick_counter(
-                                    skeg_telemetry::Counter::MemoryRefused,
-                                );
-                                return ShardResp::Err(format!(
-                                    "BACKPRESSURE out of memory budget: {rejected}"
-                                ));
-                            }
-                            match idx.backend.insert(id, &vector, version) {
-                                Ok(()) => {
-                                    // Index the payload's fields when one is
-                                    // supplied; an overwrite with a fresh payload
-                                    // replaces the id's old fields. A payload-less
-                                    // overwrite leaves the index (and blob) as is.
-                                    if let Some(blob) = &payload {
-                                        idx.payload.upsert(id, parse_fields(blob));
-                                    }
-                                    Ok(VsetOutcome::Stored {
-                                        version: version.get(),
-                                        previous: existed_before.then_some(previous),
-                                    })
-                                }
-                                Err(e) => {
-                                    if was_new && limit.is_some() {
-                                        quota.sub(tenant, 1); // roll back reservation
-                                    }
-                                    Err(format!("vset failed: {e}"))
-                                }
-                            }
+            let Some(arc) = entry else {
+                return ShardResp::Err(format!("vindex '{name}' not found"));
+            };
+
+            // ── Admission, under the write lock ──────────────────────────
+            //
+            // Everything that can REFUSE the write happens here, before a
+            // single byte is staged: a refusal has to leave nothing behind,
+            // and the cheapest way to guarantee that is to have written
+            // nothing yet. The lock is dropped before the staging below, as
+            // it must be - a parking_lot guard cannot be held across an
+            // await - and the coordinator holds this row's stripe for the
+            // whole span, so nothing else can write this id in between.
+            let admitted = {
+                let mut idx = arc.write();
+                if idx.backend.dim() != vector.len() {
+                    Err(format!(
+                        "vindex '{name}' dim {} but vector has {}",
+                        idx.backend.dim(),
+                        vector.len()
+                    ))
+                } else if version.is_some_and(|v| v < idx.backend.version_of(id).get()) {
+                    // A relocation carrying a copy this shard has already
+                    // moved past. The engine would refuse the vector by
+                    // itself; what it cannot refuse is the rest of the write.
+                    // Refusing it HERE is what keeps the quota unspent, the
+                    // payload postings untouched and the blob unwritten - the
+                    // row that stands must not end up described by the
+                    // payload of the value it replaced.
+                    Ok(None)
+                } else {
+                    // Quota: only a NEW id consumes a slot. Reserve before the
+                    // insert (race-free under this write lock) so an
+                    // over-limit insert is rejected without storing; an
+                    // overwrite never touches the quota. `internal` first: a
+                    // moved or replicated row is new to THIS shard and not to
+                    // the tenant.
+                    //
+                    // `None` means nobody upstream is tracking this row's
+                    // versions - the hash-placed path, where the row never
+                    // moves - so this shard allocates one past whatever it
+                    // holds. Never zero: a legacy version would tie with the
+                    // copy already here and hand the decision back to write
+                    // order.
+                    let previous = idx.backend.version_of(id).get();
+                    let existed_before = idx.backend.contains(id);
+                    let version = version.unwrap_or(previous + 1);
+                    let was_new = !internal && !existed_before;
+                    if was_new
+                        && let Some(max) = limit
+                        && quota.try_add(tenant, 1, max).is_err()
+                    {
+                        return ShardResp::Err("tenant vector quota exceeded".to_owned());
+                    }
+                    // Memory admission, same shape as the quota above and for
+                    // the same reason: refuse BEFORE storing. The cost is what
+                    // the delta will hold - f32 per dimension - and it is
+                    // charged against a promise covering the whole delta, not
+                    // this row, so the bound is on the buffer rather than on
+                    // the request.
+                    let want = idx.backend.resident_bytes()
+                        + (vector.len() * std::mem::size_of::<f32>()) as u64;
+                    if let Err(rejected) = idx.reserve_memory(memory, want) {
+                        if was_new && limit.is_some() {
+                            quota.sub(tenant, 1);
                         }
-                    };
-                    match insert_result {
-                        Err(e) => ShardResp::Err(e),
-                        // Not an error. The caller is a relocation and what it
-                        // wants is for the newest copy of the row to be the
-                        // one that stands, which it is.
-                        Ok(VsetOutcome::Superseded) => ShardResp::Done,
-                        Ok(VsetOutcome::Stored { version, previous }) => {
-                            let scope = BlobScope {
-                                tenant,
-                                generation: arc.read().generation,
-                                name: &name,
-                            };
-                            let store = vlog.tenant(tenant);
-                            match payload {
-                                // The blob belongs to THIS copy of the row, so
-                                // it is written under this version's key.
-                                Some(blob) => {
-                                    if let Err(e) = store
-                                        .set(&scope.key(id, version), &blob[..], PAYLOAD_DURABILITY)
-                                        .await
-                                    {
-                                        return ShardResp::Err(format!("vset payload failed: {e}"));
-                                    }
-                                }
-                                // A payload-less overwrite keeps the payload
-                                // the row already had - which now means
-                                // CARRYING it to the new version's key.
-                                // Skipped entirely for a row this shard did
-                                // not already hold, which is every insert and
-                                // every arriving relocation: those have no
-                                // previous blob and must not pay a lookup for
-                                // one.
-                                None => {
-                                    if let Some(old) = previous.filter(|&v| v != version) {
-                                        match read_payload_blob(vlog, scope, id, old).await {
-                                            Ok(Some(blob)) => {
-                                                if let Err(e) = store
-                                                    .set(
-                                                        &scope.key(id, version),
-                                                        &blob[..],
-                                                        PAYLOAD_DURABILITY,
-                                                    )
-                                                    .await
-                                                {
-                                                    return ShardResp::Err(format!(
-                                                        "vset payload failed: {e}"
-                                                    ));
-                                                }
-                                            }
-                                            Ok(None) => {}
-                                            Err(e) => {
-                                                return ShardResp::Err(format!(
-                                                    "vset payload failed: {e}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // The copy this write replaced keeps nothing: its
-                            // blob is named by no live row.
-                            if let Some(old) = previous.filter(|&v| v != version) {
-                                for key in
-                                    std::iter::once(scope.key(id, old)).chain(scope.legacy_key(id))
-                                {
-                                    if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
-                                        return ShardResp::Err(format!("vset payload failed: {e}"));
-                                    }
-                                }
-                            }
-                            ShardResp::Done
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::MemoryRefused);
+                        return ShardResp::Err(format!(
+                            "BACKPRESSURE out of memory budget: {rejected}"
+                        ));
+                    }
+                    Ok(Some(Admitted {
+                        version,
+                        previous: existed_before.then_some(previous),
+                        charged: was_new && limit.is_some(),
+                        generation: idx.generation,
+                    }))
+                }
+            };
+            let admitted = match admitted {
+                Err(e) => return ShardResp::Err(e),
+                // Not an error. The caller is a relocation and what it wants
+                // is for the newest copy of the row to be the one that
+                // stands, which it is.
+                Ok(None) => return ShardResp::Done,
+                Ok(Some(a)) => a,
+            };
+            let scope = BlobScope {
+                tenant,
+                generation: admitted.generation,
+                name: &name,
+            };
+            let refund = |a: &Admitted| {
+                if a.charged {
+                    quota.sub(tenant, 1);
+                }
+            };
+
+            // ── W1: stage the blob, before anything is published ─────────
+            //
+            // The blob goes to the key of the version this write is ABOUT to
+            // take, which no live row carries yet: a search walks live ids and
+            // a payload read is keyed by the row's version, so nothing can
+            // reach it. That is what makes it safe to write first - and
+            // writing first is what makes the pair atomic without an fsync,
+            // because the record that publishes the row is then the only step
+            // that has to survive.
+            let staged = match &payload {
+                Some(blob) => stage_payload_blob(vlog, scope, id, admitted.version, blob).await,
+                // A payload-less overwrite keeps the payload the row already
+                // had, which means CARRYING it to the new version's key.
+                // Skipped for a row this shard did not already hold - every
+                // insert, and every arriving relocation - so those pay no
+                // lookup for a blob that cannot exist.
+                None => match admitted.previous.filter(|&v| v != admitted.version) {
+                    Some(old) => match read_payload_blob(vlog, scope, id, old).await {
+                        Ok(Some(blob)) => {
+                            stage_payload_blob(vlog, scope, id, admitted.version, &blob).await
                         }
+                        Ok(None) => Ok(false),
+                        Err(e) => Err(format!("vset payload failed: {e}")),
+                    },
+                    None => Ok(false),
+                },
+            };
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(e) => {
+                    refund(&admitted);
+                    return ShardResp::Err(e);
+                }
+            };
+            let payload_ref = if staged {
+                PayloadRef::Blob(admitted.version)
+            } else {
+                PayloadRef::Cleared
+            };
+
+            // ── W2: the commit point ─────────────────────────────────────
+            let committed = {
+                let mut idx = arc.write();
+                crate::fp_at!(crate::failpoint::WriteFailpoint::VectorCommit, &name, {
+                    refund(&admitted);
+                    ShardResp::Err("failpoint: vector commit refused".to_owned())
+                });
+                let result = idx.backend.insert(
+                    id,
+                    &vector,
+                    VectorVersion::new(admitted.version),
+                    payload_ref,
+                );
+                match result {
+                    Ok(()) => {
+                        // ── W3: post-commit ──────────────────────────────
+                        //
+                        // The record is durable. Indexing the payload's fields
+                        // is what makes it FILTERABLE, and a filter that
+                        // cannot see a row is a wrong answer - but it is a
+                        // recoverable one: the postings rebuild from the blobs
+                        // at the next open. Reporting the write as failed
+                        // would not be recoverable, because the client would
+                        // believe a durable row is not there.
+                        let applied: Result<(), &'static str> = crate::fp_check_at!(
+                            crate::failpoint::WriteFailpoint::PayloadApply,
+                            &name,
+                            Err("failpoint: payload apply refused")
+                        );
+                        match applied {
+                            Ok(()) => {
+                                if let Some(blob) = &payload {
+                                    idx.payload.upsert(id, parse_fields(blob));
+                                }
+                            }
+                            Err(e) => tracing::error!(
+                                index = %name,
+                                id,
+                                error = e,
+                                "vector committed but its payload fields were not indexed: \
+                                 filtered searches will miss this row until the postings \
+                                 are rebuilt"
+                            ),
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        refund(&admitted);
+                        Err(format!("vset failed: {e}"))
                     }
                 }
+            };
+            if let Err(e) = committed {
+                return ShardResp::Err(e);
             }
+
+            // ── W4: reclaim what the commit superseded ───────────────────
+            //
+            // Past the commit point. Nothing here may fail the call: the row
+            // is durable and readable, and telling the client otherwise
+            // invites a retry of a write that has already happened. What is
+            // left behind is a blob no live row names - reclaimable garbage,
+            // collected at the next open.
+            if let Some(old) = admitted.previous.filter(|&v| v != admitted.version) {
+                let refused = crate::fp_check_at!(
+                    crate::failpoint::WriteFailpoint::PayloadPostCommitCleanup,
+                    &name,
+                    Err("failpoint: post-commit blob cleanup refused".to_owned())
+                );
+                let outcome = match refused {
+                    Err(e) => Err(e),
+                    Ok(()) => {
+                        let mut out = Ok(());
+                        for key in std::iter::once(scope.key(id, old)).chain(scope.legacy_key(id)) {
+                            if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
+                                out = Err(format!("{e}"));
+                                break;
+                            }
+                        }
+                        out
+                    }
+                };
+                if let Err(e) = outcome {
+                    tracing::error!(
+                        index = %name,
+                        id,
+                        error = %e,
+                        "vector committed but the payload blob it superseded was not \
+                         reclaimed; it will be collected at the next open"
+                    );
+                }
+            }
+            ShardResp::Done
         }
         ShardReq::Vget { name, id } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
@@ -4367,14 +4472,43 @@ async fn process(
                                     generation,
                                     name: &name,
                                 };
-                                // Reclaim the payload blob, if any. Harmless when
-                                // the id never had one (del returns false).
-                                for key in
-                                    std::iter::once(scope.key(id, held)).chain(scope.legacy_key(id))
-                                {
-                                    if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await {
-                                        return ShardResp::Err(format!("vdel payload failed: {e}"));
+                                // Past the commit point. The tombstone is
+                                // durable and the row is gone from every
+                                // reader; reclaiming its blob is cleanup, and
+                                // reporting a failure here told the client a
+                                // delete had not happened when it had. What is
+                                // left is a blob no live row names -
+                                // reclaimable garbage, collected at the next
+                                // open. Harmless when the id never had one
+                                // (del returns false).
+                                let outcome: Result<(), String> = match crate::fp_check_at!(
+                                    crate::failpoint::WriteFailpoint::VdelBlobDelete,
+                                    &name,
+                                    Err("failpoint: blob reclamation refused".to_owned())
+                                ) {
+                                    Err(e) => Err(e),
+                                    Ok(()) => {
+                                        let mut out = Ok(());
+                                        for key in std::iter::once(scope.key(id, held))
+                                            .chain(scope.legacy_key(id))
+                                        {
+                                            if let Err(e) = vlog.del(&key, PAYLOAD_DURABILITY).await
+                                            {
+                                                out = Err(format!("{e}"));
+                                                break;
+                                            }
+                                        }
+                                        out
                                     }
+                                };
+                                if let Err(e) = outcome {
+                                    tracing::error!(
+                                        index = %name,
+                                        id,
+                                        error = %e,
+                                        "row deleted but its payload blob was not reclaimed; \
+                                         it will be collected at the next open"
+                                    );
                                 }
                             }
                             ShardResp::Existed(existed)
@@ -6247,6 +6381,14 @@ impl ShardSet {
             }
             return Ok(());
         }
+        // The same row stripe the routed path takes, for a different reason.
+        // Placement never moves here, so there is nothing to serialise about
+        // WHERE the row lives - but a VSET is no longer one shard message: it
+        // stages a blob, commits, then reclaims. The worker awaits between
+        // those, and the shard runs its requests concurrently, so two writes
+        // to one id would interleave their halves and leave the row described
+        // by the other one's payload.
+        let _stripe = self.owner_stripe(name, id).lock().await;
         let shard = shard_for(&id.to_le_bytes(), self.inner.n);
         let req = ShardReq::Vset {
             name: name.to_owned(),
@@ -6962,13 +7104,11 @@ impl ShardSet {
 
     pub async fn vdel(&self, name: &str, id: u64, tenant: u128) -> Result<bool, ShardError> {
         self.ensure_owner_map(name).await?;
-        // Serialise against a concurrent routed vset on the same id (review
-        // finding); a hash-routed vindex has no router so the guard is skipped.
-        let _guard = if self.router(name).is_some() {
-            Some(self.owner_stripe(name, id).lock().await)
-        } else {
-            None
-        };
+        // Serialise against a concurrent vset on the same id. Taken whether or
+        // not the index is routed: the delete is now a commit followed by a
+        // blob reclamation with an await between them, so it has the same
+        // interleaving to lose as the write does.
+        let _guard = self.owner_stripe(name, id).lock().await;
         let shard = self.point_shard(name, id);
         // A user delete allocates, exactly like a user write: the tombstone
         // has to beat every copy of the row that exists, including one a
@@ -10984,7 +11124,9 @@ mod tests {
             let mut g = arc.write();
             for id in 100_000u64..(100_000 + FLUSH_ROWS as u64 + 50) {
                 let v = tvec(id);
-                g.backend.insert(id, &v, VectorVersion::LEGACY).unwrap();
+                g.backend
+                    .insert(id, &v, VectorVersion::LEGACY, PayloadRef::Unchanged)
+                    .unwrap();
             }
         }
         let d = vdir.clone();
@@ -11208,7 +11350,7 @@ mod tests {
                 for _ in 0..(SMALL_FLUSH + 20) {
                     let v = small(next_id + 1);
                     g.backend
-                        .insert(next_id, &v, VectorVersion::LEGACY)
+                        .insert(next_id, &v, VectorVersion::LEGACY, PayloadRef::Unchanged)
                         .unwrap();
                     next_id += 1;
                 }

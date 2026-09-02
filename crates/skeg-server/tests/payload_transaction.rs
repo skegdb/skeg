@@ -97,7 +97,6 @@ fn blob(text: &str) -> Bytes {
 /// write failed - and there must be no vector, no payload and no posting to
 /// contradict that.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn vset_error_at_payload_prepare_leaves_nothing_visible() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
@@ -135,7 +134,6 @@ async fn vset_error_at_payload_prepare_leaves_nothing_visible() {
 /// nothing is committed - the staged blob is unreachable because no row names
 /// it, and the client is told the truth.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn vset_error_at_wal_commit_leaves_nothing_visible() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
@@ -166,7 +164,6 @@ async fn vset_error_at_wal_commit_leaves_nothing_visible() {
 /// that succeeded as failed, which is the same lie as the opposite one: the
 /// client retries, or gives up, on a row that is already durable.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn vset_error_after_commit_is_not_reported_as_failure() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
@@ -202,7 +199,6 @@ async fn vset_error_after_commit_is_not_reported_as_failure() {
 
 /// The same rule at the other post-commit site: the payload postings.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn vset_error_at_payload_apply_is_not_reported_as_failure() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
@@ -233,7 +229,6 @@ async fn vset_error_at_payload_apply_is_not_reported_as_failure() {
 /// destroyed the payload it was overwriting, and the client is told nothing
 /// happened.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn vset_overwrite_that_fails_keeps_the_previous_payload() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());
@@ -275,7 +270,6 @@ async fn vset_overwrite_that_fails_keeps_the_previous_payload() {
 /// Table-driven over W1..W4 because the windows are the point: a fix that
 /// closes one of them and opens another passes any single-window test.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn reopen_after_kill_in_every_window_has_one_logical_state() {
     for (label, fp) in [
         ("W1 prepare", WriteFailpoint::PayloadPrepare),
@@ -439,7 +433,6 @@ async fn a_recreated_index_does_not_inherit_the_old_generations_blobs() {
 /// after it, so a failure there is cleanup that did not happen - not a delete
 /// that did not happen.
 #[tokio::test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 async fn vdel_error_at_blob_delete_still_reports_the_delete() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = open(dir.path());

@@ -849,7 +849,6 @@ fn live_ids_with_versions_agrees_across_the_layer_shapes() {
 /// not by guessing from the row's version. A reference the reopen cannot see
 /// is a reference the recovery cannot act on.
 #[test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 fn wal_v3_round_trips_a_payload_ref() {
     use skeg_vector::PayloadRef;
     let d = tempfile::TempDir::new().unwrap();
@@ -885,7 +884,6 @@ fn wal_v3_round_trips_a_payload_ref() {
 /// honest answer, and inventing `Cleared` there would delete a blob a legacy
 /// store still serves.
 #[test]
-#[ignore = "opens in payload: one commit point for vector and blob"]
 fn wal_v2_reads_as_payload_ref_unchanged() {
     use skeg_vector::PayloadRef;
     for (name, magic, framed) in [("v1", &b""[..], false), ("v2", &b"SKWL\x02"[..], true)] {
@@ -918,4 +916,38 @@ fn wal_v2_reads_as_payload_ref_unchanged() {
             );
         }
     }
+}
+
+/// The WAL append is the commit point of a vector and the blob staged for it.
+/// A failure there must leave the row absent - not present in RAM and missing
+/// from the file it will be recovered from.
+#[test]
+fn a_wal_append_that_fails_leaves_the_row_absent() {
+    use skeg_vector::failpoint::{WriteFailpoint, arm, disarm_all, fired};
+    let d = tempfile::TempDir::new().unwrap();
+    let mut i = idx(d.path());
+    i.insert_versioned(1, &v(1), VectorVersion::new(1)).unwrap();
+
+    arm(WriteFailpoint::DeltaWalAppend);
+    let outcome = i.insert_versioned(2, &v(2), VectorVersion::new(1));
+    disarm_all();
+    assert!(
+        fired(WriteFailpoint::DeltaWalAppend),
+        "the failpoint never fired, so this test proved nothing"
+    );
+    assert!(outcome.is_err(), "an unappended write must be reported");
+    assert!(i.get(2).unwrap().is_none(), "and must not be in RAM");
+    assert_eq!(i.len(), 1);
+    drop(i);
+
+    let i = DiskVamanaIndex::open_with_tier(d.path(), TIER).unwrap();
+    assert_eq!(
+        i.get(1).unwrap().unwrap(),
+        v(1),
+        "the committed row survives"
+    );
+    assert!(
+        i.get(2).unwrap().is_none(),
+        "a row whose append failed came back from the WAL"
+    );
 }
