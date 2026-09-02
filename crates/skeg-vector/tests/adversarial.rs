@@ -757,7 +757,7 @@ fn a_truncated_v3_record_is_ignored_not_half_applied() {
 /// zeros with a clean bill of health.
 #[test]
 fn a_fold_that_cannot_write_versions_bin_does_not_commit_a_new_generation() {
-    use skeg_vector::failpoint::{WriteFailpoint, arm, disarm_all};
+    use skeg_vector::failpoint::{WriteFailpoint, arm, disarm_all, fired};
 
     let d = tempfile::TempDir::new().unwrap();
     let mut i = idx(d.path());
@@ -772,6 +772,10 @@ fn a_fold_that_cannot_write_versions_bin_does_not_commit_a_new_generation() {
     arm(WriteFailpoint::VersionsSidecarWrite);
     let built = job.build(d.path());
     disarm_all();
+    assert!(
+        fired(WriteFailpoint::VersionsSidecarWrite),
+        "the failpoint never fired, so this test proved nothing"
+    );
     assert!(
         built.is_err(),
         "a fold that cannot write the version column must fail, not publish"

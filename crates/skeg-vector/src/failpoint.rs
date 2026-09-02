@@ -49,34 +49,59 @@ mod armed_state {
         /// The cost is a real constraint rather than a free win - the site has
         /// to fire on the thread that armed it. Every point here does: they
         /// all sit on the caller's own thread, not on a shard worker and not
-        /// inside a rayon pool.
+        /// inside a rayon pool. `fired` is what turns that from a note into
+        /// something a test can check.
         static ARMED: Cell<u64> = const { Cell::new(0) };
+        /// Points that have actually FIRED since they were armed.
+        ///
+        /// An armed point that never fires makes its test pass for the wrong
+        /// reason: the operation succeeds, the assertion about the aftermath
+        /// holds trivially, and nothing says the window was never entered. A
+        /// site moved onto another thread, or behind a branch that no longer
+        /// runs, fails silently that way.
+        static FIRED: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Make `fp` fail on THIS THREAD until it is disarmed.
+    /// Make `fp` fail on THIS THREAD until it is disarmed. Clears its fired
+    /// flag, so [`fired`] answers about this arming and not an earlier one.
     pub fn arm(fp: WriteFailpoint) {
         ARMED.with(|a| a.set(a.get() | fp.bit()));
+        FIRED.with(|f| f.set(f.get() & !fp.bit()));
     }
 
-    /// Stop `fp` failing.
+    /// Stop `fp` failing. The fired flag is left alone: a test disarms before
+    /// it asserts.
     pub fn disarm(fp: WriteFailpoint) {
         ARMED.with(|a| a.set(a.get() & !fp.bit()));
     }
 
-    /// Disarm every point. Cheap insurance at the end of a test.
+    /// Disarm every point. Cheap insurance at the end of a test, and it too
+    /// leaves the fired flags for the assertions that follow.
     pub fn disarm_all() {
         ARMED.with(|a| a.set(0));
     }
 
-    /// Is `fp` armed? Called by [`crate::fp`], not usually by hand.
+    /// Is `fp` armed? Called by [`crate::fp`], not usually by hand. Records
+    /// the hit.
     #[must_use]
     pub fn armed(fp: WriteFailpoint) -> bool {
-        ARMED.with(Cell::get) & fp.bit() != 0
+        let hit = ARMED.with(Cell::get) & fp.bit() != 0;
+        if hit {
+            FIRED.with(|f| f.set(f.get() | fp.bit()));
+        }
+        hit
+    }
+
+    /// Did `fp` fire since it was armed? Assert it: an armed point that never
+    /// fired means the test proved nothing.
+    #[must_use]
+    pub fn fired(fp: WriteFailpoint) -> bool {
+        FIRED.with(Cell::get) & fp.bit() != 0
     }
 }
 
 #[cfg(any(test, feature = "failpoints"))]
-pub use armed_state::{arm, armed, disarm, disarm_all};
+pub use armed_state::{arm, armed, disarm, disarm_all, fired};
 
 /// Fail at `$fp` with `$err` when the point is armed.
 #[macro_export]
@@ -101,7 +126,7 @@ macro_rules! fp {
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteFailpoint, arm, armed, disarm_all};
+    use super::{WriteFailpoint, arm, armed, disarm_all, fired};
 
     fn guarded(fp: WriteFailpoint) -> std::io::Result<()> {
         crate::fp!(
@@ -118,8 +143,15 @@ mod tests {
         disarm_all();
         assert!(guarded(WriteFailpoint::VersionsSidecarWrite).is_ok());
         arm(WriteFailpoint::VersionsSidecarWrite);
+        assert!(!fired(WriteFailpoint::VersionsSidecarWrite), "not yet");
         assert!(guarded(WriteFailpoint::VersionsSidecarWrite).is_err());
+        assert!(
+            fired(WriteFailpoint::VersionsSidecarWrite),
+            "and now it has: an armed point that never fires makes its test \
+             pass for the wrong reason"
+        );
         assert!(!armed(WriteFailpoint::DeltaWalAppend));
+        assert!(!fired(WriteFailpoint::DeltaWalAppend));
         disarm_all();
         assert!(guarded(WriteFailpoint::VersionsSidecarWrite).is_ok());
     }

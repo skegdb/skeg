@@ -527,7 +527,7 @@ async fn vget_and_vsearch_agree_on_which_copy_is_live_after_a_reopen() {
 /// both are needed.
 #[tokio::test]
 async fn a_reshard_that_cannot_write_the_destination_leaves_the_source_authoritative() {
-    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all, fired};
     let dir = tempfile::TempDir::new().unwrap();
     const N: u64 = 200;
     let shards = seeded(dir.path(), "fd", N).await;
@@ -535,6 +535,10 @@ async fn a_reshard_that_cannot_write_the_destination_leaves_the_source_authorita
     arm(WriteFailpoint::ReshardDestinationWrite);
     let outcome = shards.reshard("fd", 0.25, 10, 0).await;
     disarm_all();
+    assert!(
+        fired(WriteFailpoint::ReshardDestinationWrite),
+        "the failpoint never fired, so this test proved nothing"
+    );
     assert!(
         outcome.is_err(),
         "a move whose destination write failed must be reported, not counted"
@@ -554,7 +558,7 @@ async fn a_reshard_that_cannot_write_the_destination_leaves_the_source_authorita
 /// copy after a restart, and it must be found the same way by every reader.
 #[tokio::test]
 async fn a_reshard_that_crashes_after_copy_before_delete_reopens_with_one_winner() {
-    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all, fired};
     let dir = tempfile::TempDir::new().unwrap();
     const N: u64 = 200;
     let shards = seeded(dir.path(), "fs", N).await;
@@ -562,6 +566,10 @@ async fn a_reshard_that_crashes_after_copy_before_delete_reopens_with_one_winner
     arm(WriteFailpoint::ReshardSourceDelete);
     let outcome = shards.reshard("fs", 0.25, 10, 0).await;
     disarm_all();
+    assert!(
+        fired(WriteFailpoint::ReshardSourceDelete),
+        "the failpoint never fired, so this test proved nothing"
+    );
     assert!(
         outcome.is_err(),
         "a move whose source delete failed must be reported"
@@ -609,7 +617,7 @@ async fn a_reshard_that_crashes_after_copy_before_delete_reopens_with_one_winner
 /// happen is a restart promoting it.
 #[tokio::test]
 async fn a_reopen_after_a_failed_old_copy_cleanup_still_names_the_new_copy_primary() {
-    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all, fired};
     let dir = tempfile::TempDir::new().unwrap();
     const N: u64 = 200;
     let shards = seeded(dir.path(), "cl", N).await;
@@ -623,6 +631,10 @@ async fn a_reopen_after_a_failed_old_copy_cleanup_still_names_the_new_copy_prima
         .await
         .expect("the overwrite commits: the cleanup is post-commit");
     disarm_all();
+    assert!(
+        fired(WriteFailpoint::OverwriteOldCopyDelete),
+        "the failpoint never fired, so this test proved nothing"
+    );
 
     // The failpoint must actually have left the duplicate behind, or the rest
     // of this test proves nothing.
@@ -907,7 +919,7 @@ async fn a_shard_that_cannot_open_its_index_fails_the_owner_map_rebuild() {
 /// as an error after the row is already in; a lost reply does the same.
 #[tokio::test]
 async fn an_overlap_that_fails_after_writing_a_replica_does_not_leave_a_ghost() {
-    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all, fired};
     let dir = tempfile::TempDir::new().unwrap();
     const N: u64 = 200;
     let shards = seeded(dir.path(), "gh", N).await;
@@ -916,6 +928,10 @@ async fn an_overlap_that_fails_after_writing_a_replica_does_not_leave_a_ghost() 
     arm(WriteFailpoint::OverlapReplicaWrite);
     let err = shards.overlap("gh", 4.0, 0).await;
     disarm_all();
+    assert!(
+        fired(WriteFailpoint::OverlapReplicaWrite),
+        "the failpoint never fired, so this test proved nothing"
+    );
     err.expect_err("the replica write failed, so the overlap must report it");
 
     // Every row deleted; nothing may survive. A copy the map does not name is
