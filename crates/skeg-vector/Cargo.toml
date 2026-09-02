@@ -39,6 +39,7 @@ crc32c = { workspace = true }
 # The crate itself, with failpoints on: `tests/*.rs` are separate crates, so
 # `cfg(test)` never reaches the library and a feature is the only way in.
 skeg-vector = { path = ".", features = ["failpoints"] }
+crc32c = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }

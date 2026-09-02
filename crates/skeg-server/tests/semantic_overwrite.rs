@@ -269,3 +269,384 @@ async fn search_returns_the_committed_copy_not_the_best_scoring_stale_one() {
          committed copy holds a different vector and cannot score that high"
     );
 }
+
+// ── the stale-copy interleavings ─────────────────────────────────────────────
+//
+// A row can exist in more than one place at once, and which copy is LIVE was
+// decided by position: the shard the owner map happened to name, and on a
+// reopen the lowest shard number that answered. Position is not identity.
+// `reshard` and `overlap` relocate rows without taking the stripe lock that
+// serialises point ops on an id, so both can publish a copy they read before a
+// concurrent write replaced it - and an acknowledged write then disappears.
+//
+// Each test here reproduces one interleaving through the public API only.
+
+/// The bigger fixture the concurrency tests need: enough rows that a reshard
+/// takes many batches, so a concurrent overwrite lands inside one.
+async fn seeded(dir: &std::path::Path, name: &str, n: u64) -> ShardSet {
+    let shards = ShardSet::open_mode_with_workers(dir, 2, false, TIER, 1).unwrap();
+    shards.vindex_create(name, DIM as u32, 4, 1).await.unwrap();
+    for id in 0..n {
+        shards
+            .vset(name, id, vec_for(id), 0, None, None)
+            .await
+            .unwrap();
+    }
+    shards
+}
+
+/// The vindex directory of one shard, used as a failure injector.
+fn vindex_dir(dir: &std::path::Path, shard: usize, name: &str) -> std::path::PathBuf {
+    dir.join(format!("shard-{shard}"))
+        .join(format!("vindex-{name}"))
+}
+
+fn block(path: &std::path::Path) -> std::fs::Permissions {
+    let saved = std::fs::metadata(path).unwrap().permissions();
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    saved
+}
+
+/// Interleaving A. `reshard` collects a batch of rows, then moves them one at
+/// a time with an await between each. A `vset` that commits inside that window
+/// replaces the row - the client is told so - and the reshard then writes the
+/// copy IT read over the top and points the owner map at it. The acknowledged
+/// version is gone, and nothing reports a failure.
+#[tokio::test]
+#[ignore = "opens in \"shard: serialise reshard and overlap on the owner stripe\""]
+async fn a_reshard_must_not_republish_a_vector_a_concurrent_vset_replaced() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 1200;
+    let shards = seeded(dir.path(), "ow", N).await;
+
+    // Spread the victims across the id space so they land in different
+    // batches, and across BOTH clusters: a reshard batch from one shard holds
+    // only the rows that shard has to give away, and a victim set drawn from
+    // the other half is never in the batch that is in flight.
+    let victims: Vec<u64> = (0..N).step_by(5).collect();
+    let writer = {
+        let shards = shards.clone();
+        let victims = victims.clone();
+        async move {
+            // The routed path only exists once the router does; before that a
+            // vset is hash-placed and never enters the owner map.
+            while shards.router("ow").is_none() {
+                tokio::task::yield_now().await;
+            }
+            for id in victims {
+                shards
+                    .vset("ow", id, other_cluster(id), 0, None, None)
+                    .await
+                    .expect("the overwrite is acknowledged");
+            }
+        }
+    };
+    let (resharded, ()) = tokio::join!(shards.reshard("ow", 0.25, 10, 0), writer);
+    resharded.expect("reshard");
+
+    // THE ASSERTION. Every acknowledged overwrite must still be the value the
+    // store holds, and the owner map must name the shard that holds it.
+    for id in victims {
+        let want = other_cluster(id);
+        assert_eq!(
+            shards.vget("ow", id).await.unwrap().as_deref(),
+            Some(&want[..]),
+            "id {id}: the reshard republished the copy the overwrite replaced"
+        );
+    }
+}
+
+/// Interleaving B. `overlap` reads a batch of boundary rows, checks the owner
+/// map, then writes a replica - with awaits in between. A `vdel` that commits
+/// inside that window removes both copies and the map entry; the replica then
+/// lands afterwards on a shard nobody will clean up, and the deleted row is
+/// searchable again.
+#[tokio::test]
+#[ignore = "opens in \"shard: serialise reshard and overlap on the owner stripe\""]
+async fn an_overlap_must_not_replicate_a_row_a_concurrent_vdel_removed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 800;
+    let shards = seeded(dir.path(), "ov", N).await;
+    shards.reshard("ov", 0.25, 10, 0).await.expect("reshard");
+
+    // The deletes have to WALK WITH the replication, not race past it: the
+    // window is one await wide, so a deleter that sweeps the id space at a
+    // different rate crosses it once and mostly misses. `overlap` replicates
+    // the rows of shard 0 in ascending id, one await each; deleting exactly
+    // those ids in the same order keeps the two in step.
+    let all: Vec<u64> = (0..N).collect();
+    let placement = shards.owners_of("ov", &all).await.unwrap();
+    let victims: Vec<u64> = all
+        .iter()
+        .copied()
+        .filter(|&id| placement[id as usize].0 == 0)
+        .collect();
+    assert!(
+        victims.len() > N as usize / 4,
+        "the fixture must split the set"
+    );
+    let deleter = {
+        let shards = shards.clone();
+        let victims = victims.clone();
+        async move {
+            for id in victims {
+                shards
+                    .vdel("ov", id, 0)
+                    .await
+                    .expect("the delete is acknowledged");
+            }
+        }
+    };
+    // tau above any achievable margin: every row is a boundary row, so the
+    // replication loop is long enough to interleave with the deletes.
+    let (replicated, ()) = tokio::join!(shards.overlap("ov", 4.0, 0), deleter);
+    replicated.expect("overlap");
+
+    for id in victims {
+        assert!(
+            shards.vget("ov", id).await.unwrap().is_none(),
+            "id {id}: the overlap replicated a row a concurrent delete removed"
+        );
+        let hits = shards
+            .vsearch("ov", vec_for(id), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert!(
+            !hits.iter().any(|h| h.0 == id),
+            "id {id}: a deleted row came back through its replica: {hits:?}"
+        );
+    }
+}
+
+/// Pick a live id whose primary is `from`, and whose overwritten form the
+/// router would place elsewhere.
+async fn victim_on(shards: &ShardSet, name: &str, n: u64, from: u8) -> u64 {
+    for id in 0..n {
+        if shards.owners_of(name, &[id]).await.unwrap()[0].0 == from {
+            return id;
+        }
+    }
+    panic!("no row is placed on shard {from}");
+}
+
+/// The fixture the reopen tests share: an overwrite that moves a row UP a
+/// shard number, with the old copy left behind because the cleanup could not
+/// run. Returns `(victim, new owner, the vector now committed)`.
+async fn a_committed_move_with_a_surviving_old_copy(
+    dir: &std::path::Path,
+    shards: &ShardSet,
+    name: &str,
+    n: u64,
+) -> (u64, u8, Vec<f32>) {
+    // The old copy has to sit on the LOWER shard, or the positional rule and
+    // the correct answer coincide and the test cannot fail.
+    let victim = victim_on(shards, name, n, 0).await;
+    shards.control_handle().evict(0, name).await.unwrap();
+    let blocked = vindex_dir(dir, 0, name);
+    let saved = block(&blocked);
+    let committed = other_cluster(victim);
+    shards
+        .vset(name, victim, committed.clone(), 0, None, None)
+        .await
+        .expect("the write to the new owner must succeed");
+    std::fs::set_permissions(&blocked, saved).unwrap();
+    let owner = shards.owners_of(name, &[victim]).await.unwrap()[0].0;
+    assert_eq!(owner, 1, "the overwrite must have moved the row up a shard");
+    (victim, owner, committed)
+}
+
+/// Interleaving C, without any concurrency at all. Two copies of a row, the
+/// stale one on the lower shard. `rebuild_owner_maps` picks a primary by
+/// iteration order - lowest shard first - so a restart promotes the copy the
+/// overwrite replaced, and every read after it returns the old value with a
+/// confident face.
+#[tokio::test]
+#[ignore = "opens in \"shard: rebuild the owner map by max(version)\""]
+async fn a_reopened_set_names_the_newest_copy_primary_not_the_lowest_shard() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "rp", N).await;
+    shards.reshard("rp", 0.25, 10, 0).await.expect("reshard");
+    let (victim, owner, committed) =
+        a_committed_move_with_a_surviving_old_copy(dir.path(), &shards, "rp", N).await;
+    drop(shards);
+
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    assert_eq!(
+        shards.owners_of("rp", &[victim]).await.unwrap()[0].0,
+        owner,
+        "the reopened set named the stale copy primary"
+    );
+    assert_eq!(
+        shards.vget("rp", victim).await.unwrap().unwrap(),
+        committed,
+        "a restart handed back the value the overwrite replaced"
+    );
+}
+
+/// The same state, asked the two ways a client can ask. A point read and a
+/// search that disagree about which copy of a row is live is a wrong answer
+/// that cannot be recognised as one from either side.
+#[tokio::test]
+#[ignore = "opens in \"shard: rebuild the owner map by max(version)\""]
+async fn vget_and_vsearch_agree_on_which_copy_is_live_after_a_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "ag", N).await;
+    shards.reshard("ag", 0.25, 10, 0).await.expect("reshard");
+    let stale = shards.vget("ag", 0).await.unwrap(); // touch, keeps the map warm
+    let _ = stale;
+    let (victim, _, committed) =
+        a_committed_move_with_a_surviving_old_copy(dir.path(), &shards, "ag", N).await;
+    let replaced = vec_for(victim);
+    drop(shards);
+
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    assert_eq!(
+        shards.vget("ag", victim).await.unwrap().unwrap(),
+        committed,
+        "the point read must see the committed copy"
+    );
+    // The query the stale copy is an EXACT match for: the case where scoring
+    // alone hands back the replaced value.
+    let hits = shards
+        .vsearch("ag", replaced, 10, 0, 0, false, None)
+        .await
+        .unwrap();
+    let &(_, score, _) = hits
+        .iter()
+        .find(|h| h.0 == victim)
+        .unwrap_or_else(|| panic!("id {victim} must be in the results at all: {hits:?}"));
+    assert!(
+        score < 0.9,
+        "search returned the STALE copy for id {victim} (score {score}) while \
+         vget returned the committed one"
+    );
+}
+
+/// A move whose destination write fails must leave the source authoritative:
+/// nothing removed, nothing renamed, and the failure reported. The failpoint
+/// makes exactly that one step fail - which permissions cannot, since the
+/// source and the destination of a reshard are the same kind of directory and
+/// both are needed.
+#[tokio::test]
+#[ignore = "opens in \"shard: serialise reshard and overlap on the owner stripe\""]
+async fn a_reshard_that_cannot_write_the_destination_leaves_the_source_authoritative() {
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "fd", N).await;
+
+    arm(WriteFailpoint::ReshardDestinationWrite);
+    let outcome = shards.reshard("fd", 0.25, 10, 0).await;
+    disarm_all();
+    assert!(
+        outcome.is_err(),
+        "a move whose destination write failed must be reported, not counted"
+    );
+    for id in 0..N {
+        assert_eq!(
+            shards.vget("fd", id).await.unwrap().as_deref(),
+            Some(&vec_for(id)[..]),
+            "id {id}: a failed move must leave the source copy readable"
+        );
+    }
+}
+
+/// The crash window a move exists to survive: the destination copy is written
+/// and the source delete never happens. Both copies hold the same vector, so
+/// there is no wrong value to return - but there must be exactly ONE live
+/// copy after a restart, and it must be found the same way by every reader.
+#[tokio::test]
+#[ignore = "opens in \"shard: serialise reshard and overlap on the owner stripe\""]
+async fn a_reshard_that_crashes_after_copy_before_delete_reopens_with_one_winner() {
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "fs", N).await;
+
+    arm(WriteFailpoint::ReshardSourceDelete);
+    let outcome = shards.reshard("fs", 0.25, 10, 0).await;
+    disarm_all();
+    assert!(
+        outcome.is_err(),
+        "a move whose source delete failed must be reported"
+    );
+    drop(shards);
+
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    for id in 0..N {
+        let placement = shards.owners_of("fs", &[id]).await.unwrap()[0];
+        assert_eq!(
+            placement.1, None,
+            "id {id}: a duplicate left by the crash must not read as a replica"
+        );
+        assert_eq!(
+            shards.vget("fs", id).await.unwrap().as_deref(),
+            Some(&vec_for(id)[..]),
+            "id {id}: the surviving copy must hold the right vector"
+        );
+        let hits = shards
+            .vsearch("fs", vec_for(id), 5, 0, 0, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().filter(|h| h.0 == id).count(),
+            1,
+            "id {id}: exactly one winner, {hits:?}"
+        );
+    }
+}
+
+/// The cleanup after a committed overwrite is best-effort by design, so a
+/// surviving old copy is an expected state, not a corrupt one. What must not
+/// happen is a restart promoting it.
+#[tokio::test]
+#[ignore = "opens in \"shard: rebuild the owner map by max(version)\""]
+async fn a_reopen_after_a_failed_old_copy_cleanup_still_names_the_new_copy_primary() {
+    use skeg_server::failpoint::{WriteFailpoint, arm, disarm_all};
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "cl", N).await;
+    shards.reshard("cl", 0.25, 10, 0).await.expect("reshard");
+    let victim = victim_on(&shards, "cl", N, 0).await;
+    let committed = other_cluster(victim);
+
+    arm(WriteFailpoint::OverwriteOldCopyDelete);
+    shards
+        .vset("cl", victim, committed.clone(), 0, None, None)
+        .await
+        .expect("the overwrite commits: the cleanup is post-commit");
+    disarm_all();
+
+    // The failpoint must actually have left the duplicate behind, or the rest
+    // of this test proves nothing.
+    let held: usize = shards
+        .control_handle()
+        .open_indices()
+        .await
+        .iter()
+        .filter(|s| s.index == "cl")
+        .map(|s| s.vectors)
+        .sum();
+    assert_eq!(
+        held,
+        N as usize + 1,
+        "the old copy must have survived the failed cleanup"
+    );
+    let owner = shards.owners_of("cl", &[victim]).await.unwrap()[0].0;
+    assert_eq!(owner, 1, "the overwrite must have moved the row up a shard");
+    drop(shards);
+
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    assert_eq!(
+        shards.owners_of("cl", &[victim]).await.unwrap()[0].0,
+        owner,
+        "the reopened set named the stale copy primary"
+    );
+    assert_eq!(
+        shards.vget("cl", victim).await.unwrap().unwrap(),
+        committed,
+        "a restart handed back the value the overwrite replaced"
+    );
+}

@@ -27,6 +27,7 @@ use skeg_platform::advise_sequential_file;
 use skeg_simd::{cosine_f32, dot_int8};
 use smallvec::SmallVec;
 
+use crate::VectorVersion;
 use crate::ivf_router::IvfRouter;
 use crate::quant::{QuantKind, QuantizedVectors, Tq1ProxyMode};
 use crate::source::{InMemoryVectorSource, VectorSource};
@@ -3956,6 +3957,52 @@ impl DiskVamanaIndex {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// Insert or overwrite the vector for `id` at `version`, dropping the write
+    /// when a NEWER copy of the row is already known.
+    ///
+    /// This is the versioned form of [`insert`](Self::insert), and the one the
+    /// server calls: it is what makes an internal write that only relocates a
+    /// row - a reshard move, a boundary replica - unable to republish a value
+    /// a concurrent user write has already replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the WAL append fails, or `InvalidInput` if
+    /// `vector.len()` does not equal the index dimension.
+    pub fn insert_versioned(
+        &mut self,
+        id: u64,
+        vector: &[f32],
+        version: VectorVersion,
+    ) -> io::Result<()> {
+        // Not yet: the version is accepted and ignored until
+        // "vector: version the delta WAL (V3, payload_ref reserved)".
+        let _ = version;
+        self.insert(id, vector)
+    }
+
+    /// Tombstone `id` at `version`, dropping the delete when a newer copy of
+    /// the row is already known. Returns `true` if the row was live.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the WAL append fails.
+    pub fn delete_versioned(&mut self, id: u64, version: VectorVersion) -> io::Result<bool> {
+        // Not yet: see `insert_versioned`.
+        let _ = version;
+        self.delete(id)
+    }
+
+    /// The newest version this index knows for `id`, across every layer:
+    /// [`LEGACY`](VectorVersion::LEGACY) when the row is unknown or predates
+    /// versioning.
+    #[must_use]
+    pub fn version_of(&self, id: u64) -> VectorVersion {
+        // Not yet: see `insert_versioned`.
+        let _ = id;
+        VectorVersion::LEGACY
     }
 
     /// Turn the inline auto-flush on (default) or off. With it off, the delta
