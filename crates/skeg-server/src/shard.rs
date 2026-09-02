@@ -6748,8 +6748,16 @@ impl ShardSet {
             // and it is derived state: when it is the thing that is stale -
             // a restart mid-reshard, a rebuild that has not run yet - it
             // points at the copy an overwrite replaced, and search then agrees
-            // with the point read on the wrong value. The version comes from
-            // the shard that holds the row and cannot be behind it.
+            // with the point read on the wrong value.
+            //
+            // The version is read on the shard that holds the row, but AFTER
+            // the walk and under a separate lock, so it is the shard's current
+            // version and not necessarily the version of the copy that
+            // produced the hit: a write landing in between reports the newer
+            // one. That decides which SHARD wins the merge for an id, never
+            // which id is returned, and it errs towards the shard that has
+            // just been written - which is the one a point read would pick.
+            // What it is not is a snapshot.
             //
             // The map still decides what the version cannot: a boundary
             // replica is the SAME copy in a second place, same version, and
