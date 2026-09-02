@@ -3559,9 +3559,15 @@ impl DiskVamanaIndex {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         std::fs::create_dir_all(dir)?;
         write_tier(dir, tier)?;
-        // The base starts in generation slot g0; CURRENT points at it. A
-        // consolidate later builds g1 and flips the pointer atomically.
-        let g0 = dir.join("g0");
+        // The base starts in the first generation slot; CURRENT points at it. A
+        // consolidate later builds the other and flips the pointer atomically.
+        //
+        // Named through the type, not spelled out: the slot's directory name is
+        // `Slot`'s to own, and a second copy of it here would be a fact stated
+        // twice with nothing tying the two together. That is exactly how the
+        // cleanup below came to look for `gg0` - it rebuilt the name by hand
+        // from a `Display` that already carried the `g`.
+        let g0 = dir.join(Slot::G0.dir_name());
         std::fs::create_dir_all(&g0)?;
         write_graph_vmn(&g0.join(GRAPH_FILE), 0, dim, 0, MAX_R, l_search, &[], &[])?;
         write_vectors_bin(
@@ -8535,6 +8541,26 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join(CURRENT_FILE), "1\n").unwrap();
         assert_eq!(current_slot(tmp.path()).unwrap(), Some(Slot::G1));
+    }
+
+    #[test]
+    fn a_new_index_lives_in_the_slot_its_pointer_names() {
+        // The create writes a directory and separately writes CURRENT. Two
+        // statements of one fact: if they ever disagree every new index is born
+        // unopenable. This ties them, so a hand-written name cannot drift from
+        // the one `Slot` owns.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = DiskVamanaIndex::create_empty_with_tier(tmp.path(), 8, 32, QuantKind::Int8)
+            .expect("a fresh index");
+        drop(idx);
+        let slot = current_slot(tmp.path())
+            .expect("CURRENT parses")
+            .expect("CURRENT names a slot");
+        assert!(
+            tmp.path().join(slot.dir_name()).join(GRAPH_FILE).exists(),
+            "CURRENT names {} but the graph is not there",
+            slot.dir_name()
+        );
     }
 
     #[test]
