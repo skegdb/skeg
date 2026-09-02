@@ -37,7 +37,7 @@ skeg-tenant = { path = "../skeg-tenant", version = "0.1.3" }
 # the patch does not apply: release.yml publishes skeg-vector before
 # this crate, and `^0.1` then resolves to the freshly published one.
 skeg-rigging = "0.1.3"
-skeg-rigging-skeg = "0.1.3"
+skeg-rigging-skeg = "=0.1.4"
 skeg-rigging-net = { version = "0.1.1", optional = true }
 skeg-rigging-net-resp3 = { version = "0.1.1", optional = true }
 

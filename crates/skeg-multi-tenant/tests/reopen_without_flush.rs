@@ -10,7 +10,6 @@ use skeg_rigging::prelude::*;
 const DIM: u32 = 4;
 
 #[test]
-#[ignore = "needs skeg-rigging-skeg >= 0.1.4 (Tenant::open reopens an index without a sidecar); passes with the fix path-patched"]
 fn reopen_without_flush_keeps_inserted_vectors() {
     let dir = tempfile::tempdir().unwrap();
     let root = MultiTenantRoot::new(dir.path());

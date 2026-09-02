@@ -1675,9 +1675,9 @@ dependencies = [
 
 [[package]]
 name = "skeg-rigging"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28b8390fd8072e39592599d478cfe3f4c6a7a1eab9090ebd7be66caba854c835"
+checksum = "f73c6a43b01b5af588e59f70a39d82479792f11879eeb6074b06c65dd1f8cf1b"
 dependencies = [
  "bytes",
  "thiserror",
@@ -1716,9 +1716,9 @@ dependencies = [
 
 [[package]]
 name = "skeg-rigging-skeg"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8974fc5e9747b9f1f116b5f987712c6577256fb069270548f3e3449d3c18d2b6"
+checksum = "fe31b41e35e8625ae771461fdf913751ed987cef215ffc47e8f611b486bd1b39"
 dependencies = [
  "bytes",
  "parking_lot",
