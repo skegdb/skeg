@@ -694,3 +694,57 @@ async fn a_search_before_the_owner_map_is_rebuilt_still_returns_the_newest_copy(
     // And the point read, which does rebuild the map, agrees.
     assert_eq!(shards.vget("nm", victim).await.unwrap().unwrap(), committed);
 }
+
+/// The version allocator is derived state, seeded at every owner-map rebuild
+/// from what the shards report. A DELETED row is not in that report, and its
+/// tombstone carries the highest version in the index whenever the last thing
+/// anyone did was delete the row they had just written.
+///
+/// The allocator then restarts below that tombstone, the next write to that id
+/// is handed a version the tombstone beats, and the engine drops it - correctly
+/// by its own rule, and catastrophically from outside: `vset` returns success
+/// and the row is not there.
+#[tokio::test]
+async fn a_reinsert_after_a_restart_is_not_dropped_as_stale() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let shards = seeded(dir.path(), "rs", N).await;
+    shards.reshard("rs", 0.25, 10, 0).await.expect("reshard");
+
+    // Give one row the highest version in the index, then delete it: the
+    // delete allocates a version above that again, and it now lives only in a
+    // tombstone.
+    let victim = 7u64;
+    for _ in 0..3 {
+        shards
+            .vset("rs", victim, other_cluster(victim), 0, None, None)
+            .await
+            .unwrap();
+        shards
+            .vset("rs", victim, vec_for(victim), 0, None, None)
+            .await
+            .unwrap();
+    }
+    assert!(shards.vdel("rs", victim, 0).await.unwrap());
+    drop(shards);
+
+    let shards = ShardSet::open_mode_with_workers(dir.path(), 2, false, TIER, 1).unwrap();
+    let back = other_cluster(victim);
+    shards
+        .vset("rs", victim, back.clone(), 0, None, None)
+        .await
+        .expect("the re-insert is acknowledged");
+    assert_eq!(
+        shards.vget("rs", victim).await.unwrap().as_deref(),
+        Some(&back[..]),
+        "an acknowledged re-insert after a restart was dropped as stale"
+    );
+    let hits = shards
+        .vsearch("rs", back.clone(), 3, 0, 0, false, None)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.0 == victim),
+        "and it must be searchable: {hits:?}"
+    );
+}

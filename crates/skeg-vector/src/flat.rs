@@ -273,6 +273,15 @@ impl FlatIndex {
             .collect()
     }
 
+    /// The highest version this index has ever recorded, TOMBSTONES INCLUDED.
+    /// A tombstoned row keeps its version, so a dead row can still be the
+    /// high-water mark - and an allocator seeded below it would hand the next
+    /// write to that id a version the tombstone beats.
+    #[must_use]
+    pub fn max_version(&self) -> VectorVersion {
+        VectorVersion::new(self.versions.iter().copied().max().unwrap_or(0))
+    }
+
     /// Every live id with its version. What an owner-map rebuild needs: the id
     /// says which rows exist, the version says which copy of a row is the one
     /// to serve.

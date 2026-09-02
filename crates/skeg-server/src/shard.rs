@@ -357,6 +357,16 @@ impl VectorBackend {
         }
     }
 
+    /// The highest version this shard has recorded for the index, tombstones
+    /// included. Separate from the live ids because a DELETED row can be the
+    /// high-water mark and is in no list of live ones.
+    fn max_version(&self) -> VectorVersion {
+        match self {
+            VectorBackend::Flat(i) => i.max_version(),
+            VectorBackend::Disk(i) => i.max_version(),
+        }
+    }
+
     /// True if `id` is currently stored (live). Cheap, in-memory; lets the
     /// quota tell a new insert from an overwrite.
     fn contains(&self, id: u64) -> bool {
@@ -1003,8 +1013,10 @@ enum ShardResp {
     /// the row: it is what the mover writes at the destination, and what tells
     /// it the row has moved on since the batch was collected.
     Moves(Vec<MoveRow>, Option<u64>),
-    /// Live ids on this shard, each with the version of the copy held here.
-    Ids(Vec<(u64, u64)>),
+    /// Live ids on this shard, each with the version of the copy held here,
+    /// plus this shard's HIGH-WATER version for the index - which the live
+    /// rows do not give, since a tombstone can hold it.
+    Ids(Vec<(u64, u64)>, u64),
     /// Graph sample: (id, degree) nodes and (from, to) edges.
     Graph(Vec<(u64, u32)>, Vec<(u64, u64)>),
     /// VGET result: the stored f32 vector, or `None` if absent.
@@ -3845,14 +3857,17 @@ async fn process(
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
-                Some(arc) => ShardResp::Ids(
-                    arc.read()
-                        .backend
-                        .live_ids_with_versions()
-                        .into_iter()
-                        .map(|(id, v)| (id, v.get()))
-                        .collect(),
-                ),
+                Some(arc) => {
+                    let idx = arc.read();
+                    ShardResp::Ids(
+                        idx.backend
+                            .live_ids_with_versions()
+                            .into_iter()
+                            .map(|(id, v)| (id, v.get()))
+                            .collect(),
+                        idx.backend.max_version().get(),
+                    )
+                }
             }
         }
         ShardReq::GraphSample { name, count } => {
@@ -6183,9 +6198,15 @@ impl ShardSet {
                     .call(shard, ShardReq::LiveIds { name: name.clone() })
                     .await?
                 {
-                    ShardResp::Ids(ids) => {
+                    ShardResp::Ids(ids, high_water) => {
+                        // The shard's own high-water, not the maximum over the
+                        // live ids: a row deleted right after it was written
+                        // leaves its version only in a tombstone, and seeding
+                        // the allocator below that hands the next write to
+                        // that id a version the tombstone beats - a write
+                        // acknowledged and dropped.
+                        highest = highest.max(high_water);
                         for (id, version) in ids {
-                            highest = highest.max(version);
                             match map.entry(id) {
                                 std::collections::hash_map::Entry::Occupied(mut e) => {
                                     let (primary, _, live) = *e.get();

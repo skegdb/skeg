@@ -4390,6 +4390,29 @@ impl DiskVamanaIndex {
         VectorVersion::new(self.known_version(id))
     }
 
+    /// The highest version this index has ever recorded, TOMBSTONES INCLUDED.
+    ///
+    /// The live rows are not the high-water mark. A row deleted right after it
+    /// was written leaves its version only in a tombstone, and an allocator
+    /// seeded from the live set alone restarts below it - so the next write to
+    /// that id is handed a version the tombstone beats, and the engine drops
+    /// it. Correct by its own rule, and from outside indistinguishable from a
+    /// write that was acknowledged and lost.
+    ///
+    /// O(rows) over already-resident columns and maps; called once per index
+    /// at cold start, not on any request path.
+    #[must_use]
+    pub fn max_version(&self) -> VectorVersion {
+        let mut v = self.base.versions.iter().copied().max().unwrap_or(0);
+        for run in &self.runs {
+            v = v.max(run.versions.iter().copied().max().unwrap_or(0));
+        }
+        for m in [&self.delta_ver, &self.flushing_ver, &self.tombstones] {
+            v = v.max(m.values().copied().max().unwrap_or(0));
+        }
+        VectorVersion::new(v)
+    }
+
     /// Every live id with its version. What an owner-map rebuild needs: the id
     /// says which shards hold a row, the version says which of them holds the
     /// copy to serve.
