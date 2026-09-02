@@ -2,13 +2,13 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual runs are dry runs, always: they exercise guard, test, both
+  # binary and image builds, and stop there. Publishing only happens from a
+  # `v*` tag, because every promotion step (GitHub Release, image tags,
+  # crates.io, Homebrew) is keyed on that tag name; a publishing dispatch
+  # had no tag and would have shipped crates and images, then failed the
+  # Homebrew bump looking for a Release that was never created.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Skip the publish steps (crates.io + brew bump). Build binaries only."
-        required: false
-        type: boolean
-        default: true
 
 # Build, then promote. guard -> test -> {build-binaries, docker-build}
 # produce nothing public: tarballs are run artifacts, images are pushed by
@@ -21,8 +21,13 @@ on:
 # failure among them does leave the earlier ones visible.
 # `scripts/check-release-graph.rb` asserts this shape.
 #
-# `dry_run` (manual trigger only) skips publish-crates and bump-homebrew
-# so you can validate the binary build pipeline without releasing.
+# A manual run (workflow_dispatch) stops after the build jobs: nothing is
+# promoted, so the pipeline can be validated on any branch without
+# releasing. Candidate image digests are never pushed on a manual run; a
+# tag run that fails before `docker-promote` does leave its untagged
+# digests on ghcr.io (not reachable by tag; no automatic cleanup - the
+# per-architecture digests under a promoted manifest look identical to
+# GHCR, so a blind "delete untagged" would break shipped images).
 
 # `contents: write` for GitHub Release artifact uploads.
 # `packages: write` for pushing the container image to ghcr.io.
@@ -35,19 +40,16 @@ jobs:
     # Reject tags that do not point at a commit reachable from `release`.
     # Convention: only the `release` branch is rolled forward to a
     # publishable state; tags created elsewhere are mistakes.
-    # A `workflow_dispatch` with `dry_run: false` publishes too, so it gets
-    # the same check on its ref; a dry run is a no-op here so the downstream
-    # `needs: guard` still resolves to "ok".
+    # A manual run publishes nothing, so this is a no-op there and the
+    # downstream `needs: guard` still resolves to "ok".
     runs-on: ubuntu-latest
-    env:
-      PUBLISHES: ${{ github.event_name == 'push' || github.event.inputs.dry_run == 'false' }}
     steps:
       - uses: actions/checkout@v5
-        if: env.PUBLISHES == 'true'
+        if: github.event_name == 'push'
         with:
           fetch-depth: 0
-      - name: ref must be reachable from origin/release
-        if: env.PUBLISHES == 'true'
+      - name: tag must be reachable from origin/release
+        if: github.event_name == 'push'
         run: |
           set -e
           git fetch origin release:refs/remotes/origin/release
@@ -78,7 +80,7 @@ jobs:
         run: cargo test --workspace --release --locked -- --test-threads=1
 
   publish-crates:
-    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    if: github.event_name == 'push'
     needs: [promote-release, docker-promote]
     runs-on: ubuntu-latest
     steps:
@@ -100,9 +102,6 @@ jobs:
         # - First tag (no previous): every crate is published.
         # - Re-run of a partially-failed publish: the "already exists on
         #   crates.io index" branch still skips already-shipped crates.
-        # - Manual workflow_dispatch with dry_run=false: also publishes
-        #   only changed crates.
-        #
         # NOT `--locked`: the committed Cargo.lock pins sibling crates to
         # their previous registry versions (pulled in transitively by
         # already-published deps), so a crate using a just-bumped sibling's
@@ -220,34 +219,30 @@ jobs:
     # candidates, invisible to `docker pull ghcr.io/skegdb/skeg:<anything>`.
     # docker-publish.yml no longer fires on `v*` by itself; `gated: true`
     # skips its test job (the identical one ran above on this commit) and a
-    # manual dry run builds without pushing so a broken Dockerfile still
+    # manual run builds without pushing so a broken Dockerfile still
     # fails here.
     needs: [guard, test]
     uses: ./.github/workflows/docker-publish.yml
     with:
       stage: build
       gated: true
-      dry_run: ${{ github.event_name != 'push' && github.event.inputs.dry_run != 'false' }}
+      dry_run: ${{ github.event_name != 'push' }}
 
   # ---- promotion: nothing above this line is public ----
 
   promote-release:
     # First public step. Runs only once every build succeeded; on a tag push
-    # it creates the GitHub Release with every tarball at once. On a
-    # publishing dispatch (no tag to release) it is a no-op that still
-    # succeeds, so the chain below keeps a single `needs` shape.
-    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    # it creates the GitHub Release with every tarball at once.
+    if: github.event_name == 'push'
     needs: [guard, test, build-binaries, docker-build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
-        if: github.event_name == 'push'
         with:
           pattern: skeg-${{ github.sha }}-*
           merge-multiple: true
           path: dist
       - uses: softprops/action-gh-release@v3
-        if: github.event_name == 'push'
         with:
           files: |
             dist/skeg-*.tar.gz
@@ -256,7 +251,7 @@ jobs:
   docker-promote:
     # Binds the digests `docker-build` pushed under `:<version>` / `:latest`
     # (or the dispatch tag). Same call, `stage: promote`: no rebuild.
-    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    if: github.event_name == 'push'
     needs: [promote-release]
     uses: ./.github/workflows/docker-publish.yml
     with:
@@ -272,7 +267,7 @@ jobs:
   # `v#{version}` template, so only the version + the two checksums
   # ever need touching here.
   bump-homebrew:
-    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    if: github.event_name == 'push'
     needs: [publish-crates]
     runs-on: ubuntu-latest
     env:

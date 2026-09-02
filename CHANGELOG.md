@@ -40,11 +40,16 @@ guard and of the test job (workflows cannot share jobs): `:release-edge`
 and any manual image dispatch are pushed only once fmt, clippy and the
 suite are green on that commit (`release` has no CI run of its own, so
 this is the only test `release-edge` ever sees). The ancestry guard runs on
-every manual dispatch that publishes - `dry_run: false` in the release
-workflow, any Docker dispatch (each one pushes at least its custom tag and
-`sha-*`) - so a dispatch from a feature branch cannot push a crate or an
-image. Not in this change: SHA-pinned actions, SBOM, provenance,
-cargo-deny.
+every Docker dispatch (each one pushes at least its custom tag and
+`sha-*`), so a dispatch from a feature branch cannot push an image.
+
+A manual run of the release workflow is now always a dry run: guard, test,
+binary and image builds, nothing promoted. The former `dry_run: false`
+dispatch had no tag, so it would have shipped crates and tagged the image,
+then failed the Homebrew bump looking for a GitHub Release that was never
+created. Not in this change: SHA-pinned actions, SBOM, provenance,
+cargo-deny, cleanup of untagged candidate digests left on ghcr.io by a tag
+run that failed before promotion.
 
 ### The single-tenant servers refuse a network bind without an opt-in
 

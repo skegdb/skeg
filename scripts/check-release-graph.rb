@@ -36,6 +36,10 @@ publishers.each do |p|
   fails << "#{p} publishes but does not (transitively) need #{missing.join(', ')}" unless missing.empty?
 end
 (BUILDS & publishers).each { |b| fails << "build job #{b} publishes" }
+# Manual runs are dry runs: every publisher must be keyed on the tag push.
+publishers.each do |p|
+  fails << "#{p} may publish on a manual run (if: #{jobs[p]['if'].inspect})" unless jobs[p]['if'].to_s.strip == "github.event_name == 'push'"
+end
 fails << 'build-binaries is not a matrix build' unless jobs['build-binaries'].dig('strategy', 'matrix')
 
 # docker-publish.yml: `stage: build` must not tag, `stage: promote` must not rebuild.
