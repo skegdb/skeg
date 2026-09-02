@@ -35,6 +35,15 @@ The owner-map rebuild reads the base's version column directly, so a cold start
 is now cheaper WITH versions than it was without them: 73 µs against 0,6 ms over
 200k rows.
 
+**Breaking on disk, no downgrade path.** A store created or folded by this
+version does not open on `skeg-vector` 0.1.9 or earlier. It is not limited to
+stores that have been folded: the WAL header is written at CREATION, so every
+disk vindex created by this version is already `SKWL\x03`, and the published
+engine's header check REFUSES an unknown `SKWL` version rather than ignoring
+the file - the open fails. `versions.bin` is harmless by comparison; an older
+engine never looks for it. Rolling back means restoring a copy taken before the
+upgrade.
+
 ### `create_empty` refuses a directory that already holds an index
 
 `DiskVamanaIndex::create_empty_with_tier` called `create_dir_all` and then

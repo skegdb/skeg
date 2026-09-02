@@ -99,13 +99,31 @@ bump the format again.
 
 ## Migration
 
-V1 and V2 WALs still open and decode as legacy. Promotion to V3 happens only
-where the whole file is rewritten anyway - a flush's WAL compaction, or a fold -
-and never at an open, which is only asked to read. Until then, a version written
-into a V1 or V2 store is dropped by the encoding.
+Forward, this is a no-op. V1 and V2 WALs still open and decode as legacy.
+Promotion of an EXISTING file to V3 happens only where the whole file is
+rewritten anyway - a flush's WAL compaction, or a fold - and never at an open,
+which is only asked to read. Until then, a version written into a V1 or V2 store
+is dropped by the encoding. An index whose segments have no `versions.bin` reads
+back as all-legacy and behaves exactly as it did; the first fold writes the
+column.
 
-An index whose segments have no `versions.bin` reads back as all-legacy and
-behaves exactly as it did; the first fold writes the column.
+### Backward: there is no downgrade path
+
+**A store created or folded by this version does not open on `skeg-vector`
+0.1.9 or earlier.** This is a breaking on-disk change and it is not confined to
+folded stores: `create_empty` writes the WAL header at CREATION, and
+`write_framed_wal` is pinned to V3, so **every disk vindex created by this
+version is already V3**. The published engine's `detect` refuses any `SKWL`
+header that is not `\x02` - it does not skip the file, it fails the open - so
+a store written here and then read by 0.1.9 (the crate `skeg-rigging-skeg`
+0.1.4 resolves) is refused, not silently degraded.
+
+`versions.bin` is the harmless half: an older engine never looks for it and the
+column is simply ignored.
+
+Nothing here decides the version bump; it records that one is owed, and that
+the decision has to be made before this engine is republished. Rolling a store
+back means restoring it from before the upgrade.
 
 ## What this does not cover
 
