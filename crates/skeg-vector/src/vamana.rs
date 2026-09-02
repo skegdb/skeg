@@ -2142,7 +2142,7 @@ fn install_base_generation(dir: &Path, built_tmp: &Path) -> io::Result<()> {
     // slot the next install overwrites; never the live one.
     match old {
         Some(s) => {
-            let _ = std::fs::remove_dir_all(dir.join(format!("g{s}")));
+            let _ = std::fs::remove_dir_all(dir.join(s.dir_name()));
         }
         None => {
             // Legacy flat files are now dead - the pointer names g{next}.
@@ -8546,6 +8546,28 @@ mod tests {
         assert_eq!(Slot::G1.other(), Slot::G0);
         assert_ne!(Slot::G0.other(), Slot::G0);
         assert_ne!(Slot::G1.other(), Slot::G1);
+    }
+
+    #[test]
+    fn a_successful_install_removes_the_superseded_slot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = tmp.path().join(Slot::G0.dir_name());
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("old.marker"), b"old").unwrap();
+        set_current_slot(tmp.path(), Slot::G0).unwrap();
+
+        let built = tmp.path().join("built.tmp");
+        std::fs::create_dir_all(&built).unwrap();
+        std::fs::write(built.join("new.marker"), b"new").unwrap();
+
+        install_base_generation(tmp.path(), &built).unwrap();
+
+        assert_eq!(current_slot(tmp.path()).unwrap(), Some(Slot::G1));
+        assert!(tmp.path().join(Slot::G1.dir_name()).exists());
+        assert!(
+            !old.exists(),
+            "the superseded generation must be reclaimed after CURRENT flips"
+        );
     }
 
     /// Write a graph file with a deliberately corrupt node region and try to
