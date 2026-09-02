@@ -32,24 +32,27 @@ jobs:
     # Reject tags that do not point at a commit reachable from `release`.
     # Convention: only the `release` branch is rolled forward to a
     # publishable state; tags created elsewhere are mistakes.
-    # On `workflow_dispatch` this job is a no-op so the downstream
+    # A `workflow_dispatch` with `dry_run: false` publishes too, so it gets
+    # the same check on its ref; a dry run is a no-op here so the downstream
     # `needs: guard` still resolves to "ok".
     runs-on: ubuntu-latest
+    env:
+      PUBLISHES: ${{ github.event_name == 'push' || github.event.inputs.dry_run == 'false' }}
     steps:
       - uses: actions/checkout@v5
-        if: github.event_name == 'push'
+        if: env.PUBLISHES == 'true'
         with:
           fetch-depth: 0
-      - name: tag must be reachable from origin/release
-        if: github.event_name == 'push'
+      - name: ref must be reachable from origin/release
+        if: env.PUBLISHES == 'true'
         run: |
           set -e
           git fetch origin release:refs/remotes/origin/release
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/release; then
-            echo "::error::tag ${{ github.ref_name }} (commit $GITHUB_SHA) is not reachable from origin/release"
+            echo "::error::${{ github.ref_name }} (commit $GITHUB_SHA) is not reachable from origin/release"
             exit 1
           fi
-          echo "ok: tag reachable from release"
+          echo "ok: ref reachable from release"
 
   test:
     needs: guard
