@@ -166,7 +166,11 @@ jobs:
           else
             echo "no previous tag found; will publish every crate"
           fi
-          for crate in skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core skeg-vector skeg-tenant skeg-server skeg-server-tenant skeg-multi-tenant; do
+          # skeg-multi-tenant is NOT published by this release: its registry
+          # dependency skeg-rigging-skeg 0.1.4 requires skeg-vector ^0.1, so a
+          # published copy would embed the previous engine (the P0.7 defect
+          # again). It ships once skeg-rigging-skeg depends on skeg-vector 0.2.
+          for crate in skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core skeg-vector skeg-tenant skeg-server skeg-server-tenant; do
             echo "::group::publish $crate"
             if [ -n "$prev_tag" ] && git diff --quiet "$prev_tag" HEAD -- "crates/$crate"; then
               echo "$crate: no changes since $prev_tag, skipping cargo publish"

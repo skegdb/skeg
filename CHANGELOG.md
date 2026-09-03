@@ -9,6 +9,55 @@ repository.
 
 ## [Unreleased]
 
+### Upgrading to 0.8.0 - read this first
+
+This release changes the on-disk formats, the wire, and the crate versions
+together. The sections below give the reasons; this one is the checklist.
+
+**Versions shipped by the `v0.8.0` tag** (one workflow, one crates.io token,
+dependency order):
+
+| crate | from | to | why |
+|---|---|---|---|
+| skeg-proto | 0.2.0 | **0.3.0** | `ErrCode::Backpressure` (0x04) and its decoder helpers |
+| skeg-simd | 0.1.6 | 0.1.7 | additive kernels |
+| skeg-platform | 0.1.5 | 0.1.6 | additive |
+| skeg-telemetry | 0.2.2 | **0.3.0** | `Counter`/`Gauge` enums grew variants and are not `non_exhaustive`; gauge source registry |
+| skeg-resp3 | 0.2.4 | **0.3.0** | `MAX_BULK_LEN` 512 MiB -> 64 MiB changes what is accepted |
+| skeg-core | 0.3.4 | 0.3.5 | additive; disk-quota reservation is atomic |
+| skeg-vector | 0.1.8 | **0.2.0** | WAL `SKWL\x03` + `versions.bin`: no downgrade |
+| skeg-tenant | 0.1.3 | 0.1.3 | unchanged |
+| skeg-server | 0.7.2 | **0.8.0** | registry `SVI3`, `payload.idx` v2, `SKEG.VMSET` array reply, `::` refused in names, ingress budget, admission classification |
+| skeg-server-tenant | 0.2.4 | 0.2.5 | `--allow-unauthenticated-network`, lenient-mode guard |
+| skeg-multi-tenant | 0.1.0 | **not published** | `skeg-rigging-skeg` 0.1.4 requires `skeg-vector ^0.1`; a published copy would embed the previous engine. Ships after a rigging release that depends on 0.2. |
+
+**Operators.** Stop the server. Take a copy of the store root: this is the
+only way back. Start 0.8.0 once: it opens every store written by 0.7.x (the
+registry, `payload.idx` and the WAL all read the previous formats) and from
+the first write the store is 0.8-only - 0.7.x refuses to open it (`SKWL`
+version check fails the open; there is no repair). Vindex names containing
+`::` created by an earlier build on tenant 0: grep each shard's
+`vindexes.registry` for `::` and confirm every scoped key belongs to the
+tenant it spells (see "A tenant is not something a client can spell").
+Resharded indexes must still have their `router-<name>.bin` after any
+restore. New ceilings you may hit by name instead of by OOM: a payload blob
+is at most 1 MiB (`MAX_PAYLOAD_BYTES`); one RESP3 frame at most ~129 MiB; a
+VMSET at most 4096 items / 64 MiB; `max_disk_bytes` now counts payload blobs
+and MSET; in a 256 MiB container the ingress class is ~21 MiB and a maximum
+VMSET is refused rather than OOM-killing the process.
+
+**Clients and SDKs.** `SKEG.VMSET` replies with an array of one result per
+item, in request order, instead of an integer. The native wire has a new
+error code `0x04 Backpressure` (retry); old decoders that map unknown codes
+to `Internal` keep working but lose the retry hint. On RESP3, retryable
+refusals begin with `BACKPRESSURE` or, from a tenant backend, `RATELIMITED`:
+`is_retryable` must be a table, not a prefix check. A vindex name containing
+`::` is refused at create. Conformance cases carry `want.retryable`. The
+SDK changes are listed per repository in the skeg-internal handoff and land
+after the tag (skeg-py and skeg-client-rs depend on the published crates;
+skeg-gleam implements the wire directly and can be updated before).
+
+
 ### A refusal now says whether retrying is worth it, on both wires
 
 A request can be refused before it runs for half a dozen reasons, and the

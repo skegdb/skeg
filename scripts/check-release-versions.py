@@ -13,8 +13,9 @@ index.crates.io (no auth); a crate that is not on the index at all is fine.
 import json, os, subprocess, sys, urllib.request
 
 CRATES = ["skeg-proto", "skeg-simd", "skeg-platform", "skeg-telemetry", "skeg-resp3",
-          "skeg-core", "skeg-vector", "skeg-tenant", "skeg-server", "skeg-server-tenant",
-          "skeg-multi-tenant"]
+          "skeg-core", "skeg-vector", "skeg-tenant", "skeg-server", "skeg-server-tenant"]
+# skeg-multi-tenant is not published by this release (skeg-rigging-skeg 0.1.4 pins the
+# engine to ^0.1); it rejoins the list when the workflow's publish loop does.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def sh(*a):
