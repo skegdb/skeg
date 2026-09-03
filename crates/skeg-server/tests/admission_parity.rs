@@ -529,7 +529,7 @@ fn oversized_header(payload_len: u32) -> Vec<u8> {
 // ----------------------------------------------------------------- the test
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in `server: both handlers map an admission refusal through one helper`"]
+#[ignore = "opens in `native: refuse an oversized frame by name, not by silence`"]
 async fn every_admission_refusal_says_the_same_thing_on_both_wires() {
     for cond in Condition::ALL {
         let (want_retryability, want_code) = cond.expected();

@@ -469,18 +469,19 @@ async fn admit_or_refuse(
         Err(e) => {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedAccept);
             warn!("ingress refused a connection: {e}");
-            let message = e.wire_message();
+            let admission = crate::admission::AdmissionError::from(e);
             tokio::spawn(async move {
                 let mut stream = stream;
                 let bytes = match wire {
-                    RefusalWire::Resp3 => format!("-{message}\r\n").into_bytes(),
+                    RefusalWire::Resp3 => format!("-{}\r\n", admission.wire_message()).into_bytes(),
                     // req_id 0: there is no request yet, and inventing one
                     // would make a client match this to something it sent.
-                    // The message carries the BACKPRESSURE code as text; the
-                    // native error enum has no retryable variant to put it in,
-                    // which is P0.5's job and not this change's.
+                    // The code byte says retryable and the message says why:
+                    // this refusal happens before any request exists, so
+                    // there is no negotiated version to gate the byte on and
+                    // none is asked for.
                     RefusalWire::Native => {
-                        skeg_proto::encode_err(0, skeg_proto::ErrCode::Internal, &message).to_vec()
+                        skeg_proto::encode_err(0, admission.code(), &admission.to_string()).to_vec()
                     }
                 };
                 let write = async {

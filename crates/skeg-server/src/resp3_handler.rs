@@ -1272,19 +1272,27 @@ async fn skeg_vmset(
     // allocation this cap exists to prevent had already happened.
     let n_items = (args.len() - 1) / 3;
     if n_items > MAX_VMSET_ITEMS {
-        return Frame::Error(format!(
-            "ERR SKEG.VMSET takes at most {MAX_VMSET_ITEMS} items, got {n_items}; send it in \
-             smaller batches"
-        ));
+        return Frame::Error(
+            crate::admission::AdmissionError::RequestTooLarge {
+                what: "SKEG.VMSET items",
+                limit: MAX_VMSET_ITEMS as u64,
+                got: n_items as u64,
+            }
+            .wire_message(),
+        );
     }
     // Lengths, not contents: no copy has happened yet, and this is what stops
     // one from happening.
     let vector_bytes: usize = args[1..].iter().skip(1).step_by(3).map(Bytes::len).sum();
     if vector_bytes > MAX_VMSET_BYTES {
-        return Frame::Error(format!(
-            "ERR SKEG.VMSET takes at most {MAX_VMSET_BYTES} vector bytes, got {vector_bytes}; \
-             send it in smaller batches"
-        ));
+        return Frame::Error(
+            crate::admission::AdmissionError::RequestTooLarge {
+                what: "SKEG.VMSET vector bytes",
+                limit: MAX_VMSET_BYTES as u64,
+                got: vector_bytes as u64,
+            }
+            .wire_message(),
+        );
     }
     let raw_name = match parse_utf8_arg(&args[0], "name") {
         Ok(s) => s,
@@ -2037,26 +2045,34 @@ async fn skeg_stats(shards: &ShardSet, ingress: &Arc<crate::ingress::IngressBudg
     }
 }
 
-/// Error codes a shard may already carry, which must reach the client intact.
+/// The RESP3 error line for a shard error.
 ///
-/// The first word of a RESP error IS the code - `ERR`, `WRONGTYPE`, `LOADING` -
-/// and that is what a client routes on. Prefixing `ERR` in front of a code the
-/// engine chose turns a condition the caller should RETRY into a generic
-/// failure it should not, which is the whole difference between backpressure
-/// and an error.
-const SHARD_ERROR_CODES: &[&str] = &["BACKPRESSURE "];
-
+/// The first word of a RESP error IS the code - `ERR`, `WRONGTYPE`,
+/// `LOADING` - and that is what a client routes on. Prefixing `ERR` in front
+/// of a condition the caller should RETRY turns it into a generic failure it
+/// should not, which is the whole difference between backpressure and an
+/// error.
+///
+/// This used to be decided by looking at the FIRST FOURTEEN BYTES of a string
+/// a shard had written, against a table of known code words. Two things were
+/// wrong with that beyond the obvious: a refusal that forgot to write the
+/// word lost its classification silently (the quota did, for its whole life),
+/// and the native handler had no equivalent - a prefix is not something an
+/// error code byte can be derived from. Now the refusal arrives typed and
+/// composes its own line, and the native handler derives its byte from the
+/// same classification.
+///
+/// Exhaustive: a variant added to `ShardError` does not compile until
+/// somebody says which code word it carries.
 fn shard_error(e: &crate::shard::ShardError) -> Frame {
     warn!("shard error: {e}");
-    // The payload, not the Display: `Storage` renders as "storage error: ..."
-    // and a code buried behind that prose is not a code. Checked against the
-    // variant so the test cannot pass on a formatting assumption.
-    if let crate::shard::ShardError::Storage(msg) = e
-        && SHARD_ERROR_CODES.iter().any(|c| msg.starts_with(c))
-    {
-        return Frame::Error(msg.clone());
+    match e {
+        crate::shard::ShardError::Admission(a) => Frame::Error(a.wire_message()),
+        crate::shard::ShardError::InvalidRequest(msg) => Frame::Error(format!("ERR {msg}")),
+        crate::shard::ShardError::Unavailable
+        | crate::shard::ShardError::Busy
+        | crate::shard::ShardError::Storage(_) => Frame::Error(format!("ERR {e}")),
     }
-    Frame::Error(format!("ERR {e}"))
 }
 
 /// `INCRBY` / `DECRBY` body after the parser has unpacked the delta
@@ -2648,16 +2664,45 @@ mod tests {
     }
 
     #[test]
-    fn a_retryable_code_reaches_the_client_as_the_code() {
+    fn a_retryable_refusal_reaches_the_client_as_the_code() {
         // ERR in front of BACKPRESSURE tells a client not to retry something
-        // it should retry.
-        let f = shard_error(&crate::shard::ShardError::Storage(
-            "BACKPRESSURE out of memory budget: reserved=1 requested=2 usable=1".to_owned(),
+        // it should retry. The refusal arrives typed now, so the code word is
+        // derived from the classification rather than read off the front of a
+        // string somebody remembered to write.
+        let f = shard_error(&crate::shard::ShardError::Admission(
+            crate::admission::AdmissionError::MemoryAtWrite(
+                crate::memory::MemoryRejected::NoHeadroom {
+                    reserved: 1,
+                    requested: 2,
+                    usable: 1,
+                },
+            ),
         ));
         let Frame::Error(s) = f else {
             panic!("an error frame");
         };
         assert!(s.starts_with("BACKPRESSURE "), "the code was buried: {s}");
+    }
+
+    #[test]
+    fn a_permanent_refusal_reaches_the_client_as_a_plain_error() {
+        // The other half of the same rule, and the reason the classification
+        // has to be one decision: a permanent refusal dressed as backpressure
+        // is a client that loops.
+        let f = shard_error(&crate::shard::ShardError::Admission(
+            crate::admission::AdmissionError::QuotaExceeded {
+                tenant: 3,
+                limit: 10,
+            },
+        ));
+        let Frame::Error(s) = f else {
+            panic!("an error frame");
+        };
+        assert!(
+            s.starts_with("ERR "),
+            "a quota does not clear on a retry: {s}"
+        );
+        assert!(s.contains("quota exceeded"), "{s}");
     }
 
     #[test]
