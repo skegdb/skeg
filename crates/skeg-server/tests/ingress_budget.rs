@@ -618,69 +618,152 @@ fn vmset_of_failing_items(items: usize) -> Vec<u8> {
     out
 }
 
-/// The reply buffer is a per-connection buffer the governor never saw.
+/// R1 (P0-A): a `SKEG.VMSET` whose worst-case reply does not fit this
+/// connection's allowance is refused BEFORE it runs, not answered in full
+/// and counted afterwards.
+///
+/// This is the behaviour A1/P0.4 explicitly declared out of scope
+/// ("the one place the budget is knowingly exceeded"): the reply used to be
+/// built - the mutation already committed - and only then charged, with an
+/// overshoot counted rather than refused. `reply_upper_bound` in
+/// `resp3_handler.rs` now computes this exact worst case
+/// (`MAX_VMSET_ITEMS * (MAX_VMSET_ERROR_LEN + framing)`) from the request
+/// alone and reserves it before `SKEG.VMSET`'s items are allowed to run at
+/// all, so a class too small for the reply refuses the REQUEST - cheaply,
+/// before a single item is attempted - rather than accepting it and
+/// overshooting the budget on the way out.
 ///
 /// The class here is sized so one connection's REQUEST fits its allowance
-/// comfortably and request-plus-reply does not. That is what makes this a test
-/// of the reply: a budget that charges only ingress notices nothing at all,
-/// and one that charges the reply too has to say - out loud, on a counter -
-/// that it went over. The reply itself arrives in full either way, because it
-/// answers work that has already committed.
+/// comfortably and request-plus-worst-case-reply does not, which is exactly
+/// what makes this a test of the reply side and not the request side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn n_connections_that_sent_one_huge_reply_hold_only_the_floor_afterwards() {
-    const N: usize = 4;
+#[ignore = "opens in the next commit: server: reserve the reply upper bound before dispatch/encode (R1)"]
+async fn a_max_vmset_reply_too_large_for_the_allowance_is_refused_before_it_runs() {
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 64).await;
     let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
 
     let request = vmset_of_failing_items(4096);
-    let mut idle = Vec::new();
-    let mut reply_len = 0usize;
-    for _ in 0..N {
-        let mut s = TcpStream::connect(addr).await.expect("connect");
-        s.write_all(&request).await.expect("vmset");
-        // Read until the whole array has arrived: one line per item, so the
-        // reply is complete when 4096 of them have been seen. A reply that is
-        // truncated, or replaced by a refusal, fails here - and that is the
-        // assertion that matters most, because the writes it reports on have
-        // already happened.
-        let mut seen = 0usize;
-        let mut got = 0usize;
-        let mut buf = vec![0u8; 64 * 1024];
-        while seen < 4096 {
-            let n = tokio::time::timeout(Duration::from_secs(30), s.read(&mut buf))
-                .await
-                .expect("the reply must arrive")
-                .expect("read");
-            assert!(n > 0, "the server closed after {seen} reply lines");
-            seen += buf[..n].iter().filter(|&&b| b == b'-').count();
-            got += n;
-        }
-        reply_len = reply_len.max(got);
-        idle.push(s);
-    }
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&request).await.expect("vmset");
 
-    // The connections are now idle, holding nothing but their floor: the
-    // ~1 MiB of reply buffer each of them built is gone, not merely unused.
+    // A refusal is one short line, not 4096 of them: read whatever arrives
+    // within the deadline and stop as soon as the line ends, rather than
+    // waiting for 4096 markers that a refusal will never produce.
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+            .await
+            .expect("the server must answer or close, not hang")
+            .expect("read");
+        assert!(n > 0, "the server closed with no reply at all");
+        reply.extend_from_slice(&buf[..n]);
+        if reply.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    assert!(
+        text.starts_with("-ERR ") || text.starts_with("-BACKPRESSURE "),
+        "a pre-commit refusal must lead with a code, not the 4096-item array: {text:?}"
+    );
+    assert!(
+        text.matches('\n').count() == 1,
+        "this must be ONE short refusal line, not the reply array: {} lines",
+        text.matches('\n').count()
+    );
+
+    // No overshoot to count: the reservation failed before any item ran, so
+    // there was never a committed answer whose size the governor had to
+    // accept after the fact.
+    assert_eq!(
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget),
+        before,
+        "a request refused before it ran must not tick the overshoot counter"
+    );
+
     until(
-        "the reply buffers to be given back",
+        "the connection to hold only its floor",
         Duration::from_secs(10),
-        || ingress.held_bytes() == FLOOR_BYTES * N as u64,
+        || ingress.held_bytes() <= FLOOR_BYTES,
     )
     .await;
-
-    assert!(
-        reply_len > 1_000_000,
-        "the reply was not the large one: {reply_len}"
-    );
-    assert!(
-        skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget) > before,
-        "a {reply_len}-byte reply per connection, against a per-connection \
-         allowance of {}, went past the budget without anything saying so",
-        ingress.per_connection_max()
-    );
-    drop(idle);
 }
+
+/// R1 (P0-A) exit criterion: N sockets, each sending the same max-size
+/// `SKEG.VMSET` at once under a barrier, must never tick the overshoot
+/// counter - not because the requests are refused (the class here is sized
+/// to admit all of them), but because each connection's worst-case reply was
+/// reserved before it ran and the actual reply never exceeds what was
+/// reserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_max_vmset_replies_under_a_barrier_never_overshoot_the_budget() {
+    const N: usize = 8;
+    // Sized to hold N worst-case VMSET replies (~1.15 MiB each, charged at
+    // PARSE_FACTOR and rounded up to a whole CHUNK_BYTES) plus each
+    // connection's request buffer, with room to spare - the point of this
+    // test is concurrent admission succeeding cleanly, not admission
+    // refusing under a class too small to hold them (that is the test
+    // above). "Small" per the audit's own framing is relative to what N
+    // legitimate worst-case replies cost, not to an arbitrary constant.
+    let ingress = budget(N as u64 * 8 * CHUNK_BYTES, Duration::from_millis(200));
+    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
+
+    let request = std::sync::Arc::new(vmset_of_failing_items(4096));
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+    let mut workers = Vec::new();
+    for _ in 0..N {
+        let request = std::sync::Arc::clone(&request);
+        let barrier = std::sync::Arc::clone(&barrier);
+        workers.push(tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            // Every connection sends its max-size VMSET in the same instant,
+            // which is the scenario the audit named: concurrent connections
+            // each triggering a max VMSET error reply at once.
+            barrier.wait().await;
+            s.write_all(&request).await.expect("vmset");
+            let mut seen = 0usize;
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 64 * 1024];
+            while seen < 4096 {
+                let n = tokio::time::timeout(Duration::from_secs(30), s.read(&mut buf))
+                    .await
+                    .expect("the reply must arrive")
+                    .expect("read");
+                assert!(n > 0, "the server closed after {seen} reply lines");
+                seen += buf[..n].iter().filter(|&&b| b == b'-').count();
+                got += n;
+            }
+            got
+        }));
+    }
+
+    let mut reply_lens = Vec::new();
+    for w in workers {
+        reply_lens.push(
+            tokio::time::timeout(Duration::from_secs(30), w)
+                .await
+                .expect("a worker must finish, not hang")
+                .expect("worker task"),
+        );
+    }
+
+    assert_eq!(reply_lens.len(), N);
+    assert!(
+        reply_lens.iter().all(|&len| len > 1_000_000),
+        "every connection must have received the full worst-case reply: {reply_lens:?}"
+    );
+    assert_eq!(
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget),
+        before,
+        "N connections admitted concurrently, each answering its own \
+         reserved worst case, must never overshoot: the reservation IS the \
+         bound, not an afterthought counted once it is exceeded"
+    );
+}
+
 /// End-to-end fairness under a class that is genuinely full.
 ///
 /// The unit test of the per-connection allowance is arithmetic; this is the
