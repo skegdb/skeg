@@ -681,3 +681,138 @@ async fn n_connections_that_sent_one_huge_reply_hold_only_the_floor_afterwards()
     );
     drop(idle);
 }
+/// End-to-end fairness under a class that is genuinely full.
+///
+/// The unit test of the per-connection allowance is arithmetic; this is the
+/// socket version, and it is the one that says a saturated class still serves
+/// the connections that are behaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saturated_class_still_answers_ping_and_refuses_a_grower_by_name() {
+    let cap = 16 * CHUNK_BYTES;
+    let stall = Duration::from_millis(300);
+    let ingress = budget(cap, stall);
+    let (addr, _dir) = resp3_server(&ingress, 128).await;
+
+    // A connection that exists before the class fills, and must go on being
+    // served after it does.
+    let mut early = TcpStream::connect(addr).await.expect("connect");
+    early
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("ping");
+    let mut pong = [0u8; 7];
+    tokio::time::timeout(Duration::from_secs(5), early.read_exact(&mut pong))
+        .await
+        .expect("the early connection must be served")
+        .expect("read");
+
+    // Holders: real connections, each buffering a partial frame and settling
+    // at one growth chunk. Small on purpose - the read loop reserves the next
+    // 256 KiB BEFORE it reads, so a connection holding a lot is one read-ahead
+    // away from asking past its own allowance and being expelled for it, which
+    // is correct behaviour and useless as a fixture.
+    let body = vec![b'x'; 64 * 1024];
+    let mut holders = Vec::new();
+    for _ in 0..24 {
+        if ingress.cap().bytes() - ingress.held_bytes() < 4 * CHUNK_BYTES {
+            break;
+        }
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(&dribbled_command_head(64 << 20))
+            .await
+            .expect("head");
+        s.write_all(&body).await.expect("body");
+        holders.push(s);
+        // Let the server read it before deciding whether to add another.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    let held = ingress.held_bytes();
+    assert!(
+        held > cap / 4,
+        "the holders never took the class anywhere ({held} of {cap}), so \
+         nothing below is a test of a full class"
+    );
+
+    // The last of the room, taken by the test itself in floor-sized steps, so
+    // what is left is EXACTLY the state the assertions are about: too little
+    // for any connection to grow, enough for one to be accepted. Sockets
+    // cannot be aimed that precisely - a holder refused mid-flight closes and
+    // gives everything back - and a test that could not aim would be asserting
+    // about whatever the last holder happened to leave.
+    let mut filler = Vec::new();
+    while ingress.cap().bytes() - ingress.held_bytes() >= CHUNK_BYTES {
+        match ingress.try_accept() {
+            Ok(b) => filler.push(b),
+            Err(_) => break,
+        }
+    }
+    while ingress.cap().bytes() - ingress.held_bytes() < 8 * FLOOR_BYTES && filler.pop().is_some() {
+    }
+    let free = ingress.cap().bytes() - ingress.held_bytes();
+    // Printed, because "the class was full" is the premise of everything
+    // below and a reader should not have to take it on trust.
+    println!(
+        "saturated: {} holders, {held} of {cap} held by them, {free} free, \
+         one growth chunk is {CHUNK_BYTES}",
+        holders.len()
+    );
+    assert!(
+        (8 * FLOOR_BYTES..CHUNK_BYTES).contains(&free),
+        "the class is not in the state this test is about: {free} free"
+    );
+
+    // A brand new connection still gets its floor and its answer...
+    let mut fresh = TcpStream::connect(addr).await.expect("connect");
+    fresh
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("ping");
+    tokio::time::timeout(Duration::from_secs(5), fresh.read_exact(&mut pong))
+        .await
+        .expect("a full class must still accept and answer a small request")
+        .expect("read");
+    assert_eq!(&pong, b"+PONG\r\n");
+
+    // ...and so does the one that was already there.
+    early
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("ping");
+    tokio::time::timeout(Duration::from_secs(5), early.read_exact(&mut pong))
+        .await
+        .expect("a connection already served must not be starved by a full class")
+        .expect("read");
+    assert_eq!(&pong, b"+PONG\r\n");
+
+    // But one more connection that wants to GROW is told to retry, after the
+    // stall and not before it, and is not left hanging.
+    let started = Instant::now();
+    let mut grower = TcpStream::connect(addr).await.expect("connect");
+    grower
+        .write_all(&dribbled_command_head(64 << 20))
+        .await
+        .expect("head");
+    // Enough to need ONE growth chunk and no more: the refusal has to come
+    // from the class being full, not from this connection asking past its own
+    // allowance - different refusals with different codes, and only the first
+    // is retryable.
+    let reply = tokio::time::timeout(Duration::from_secs(30), async move {
+        let _ = grower.write_all(&vec![b'x'; 200 * 1024]).await;
+        let mut reply = Vec::new();
+        let _ = grower.read_to_end(&mut reply).await;
+        reply
+    })
+    .await
+    .expect("a full class must refuse, not hang");
+    let waited = started.elapsed();
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    assert!(
+        text.starts_with("-BACKPRESSURE "),
+        "a full class is momentary and must say so: {text:?}"
+    );
+    assert!(
+        waited >= stall,
+        "refused without waiting out the stall: {waited:?}"
+    );
+    drop((holders, filler));
+}
