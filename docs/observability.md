@@ -93,10 +93,18 @@ budget could not be established).
 
 #### The three charges, and why they do not overlap
 
-1. **Ingress**: the CAPACITY of a connection's read buffer, times two for
-   the copy the parser makes out of it while the buffer still holds it.
-   Charged for as long as the buffer is that big, given back when it
-   drains or the connection closes.
+1. **Ingress and egress**: the CAPACITY of a connection's read buffer and
+   of its reply buffer, times two. That factor of two carries two
+   passengers, not one - the copies the parser makes out of the buffer
+   while the buffer still holds them, AND the over-allocation of
+   `BytesMut::reserve`, which doubles and can leave capacity above the
+   figure just charged. Measured at eight full `SKEG.VMSET`s of 623 KiB
+   each (2026-09-03, macOS arm64): class peak 1.5 MiB against RSS
+   +2.0 MiB, so the resident cost was 1.35x the charge. The factor holds,
+   with no margin to spare if either passenger grows.
+   Charged for as long as the buffers are that big, given back when they
+   drain or the connection closes - the reply buffer as soon as the reply
+   is on the wire.
 2. **Delta**: the rows a committed write puts in the in-memory delta,
    charged per megabyte as it grows. A row reaches it only after it has
    stopped being wire bytes; the buffer it arrived in is drained before
@@ -115,7 +123,7 @@ budget could not be established).
 | `SKEG_INGRESS_FRACTION` | 25 | percent of usable headroom the network may hold |
 | `SKEG_INGRESS_BUDGET_BYTES` | derived | an explicit class cap, replacing the fraction |
 | `SKEG_INGRESS_STALL_MS` | 500 | how long a connection waits for room before its frame is refused |
-| `SKEG_MAX_CONNECTIONS` | 1024 | concurrent connections per listener, both protocols |
+| `SKEG_MAX_CONNECTIONS` | 1024 | concurrent connections per listener, both protocols. **In `unreadable` mode this is the only ceiling** - see below |
 | `SKEG_MAX_FDS` | 65536 | descriptor limit raised at boot |
 
 Worked example, a 256 MiB container with about 100 MiB resident:
@@ -138,6 +146,17 @@ Off Linux there is no cgroup to read, so the class cap is a static
 default: 1 GiB, or four maximum frames if that is larger. It is the
 larger, by three per cent, so a machine with no memory limit at all still
 admits a frame at the protocol ceiling.
+
+**`unreadable` has no class cap.** When a limit applies and its headroom
+cannot be read, the governor has no answer to give, so each connection is
+granted its 8 KiB floor WITHOUT a reservation and nothing may grow past
+it. What bounds the total is then `SKEG_MAX_CONNECTIONS` alone:
+`max_connections x 8 KiB`, which is 8 MiB at the default and rises with
+the flag, counted by nothing. Treat that product as the constraint on
+raising the flag, not the 8 MiB the default happens to give. Set
+`SKEG_MEMORY_LIMIT_BYTES` or `SKEG_INGRESS_BUDGET_BYTES` to get a real
+cap back; `skeg_ingress_budget_unreadable_total` counts every connection
+served in this state.
 
 ## Prometheus scrape config
 

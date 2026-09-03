@@ -84,6 +84,23 @@ to read, the class cap is a static 1 GiB or four maximum frames if that
 is larger - it is the larger, so nothing narrows on a machine with no
 limit at all.
 
+**When the headroom cannot be read there is no class cap at all.** A
+limit applies, the governor cannot say how much room is left, and
+refusing every connection would turn an accounting fault into an outage -
+so each connection gets its 8 KiB floor without a reservation and nothing
+may grow past it. The only ceiling left is `SKEG_MAX_CONNECTIONS`: the
+floors total `max_connections x 8 KiB`, counted by nothing, which is
+8 MiB at the default and whatever the flag says otherwise. That product,
+not the 8 MiB, is the constraint when raising it.
+
+One more number worth stating: the factor of two in the charge covers
+both the parser's copies and `BytesMut::reserve`'s over-allocation, which
+doubles and can leave capacity above the figure just charged. Measured at
+eight full `SKEG.VMSET`s of 623 KiB each (2026-09-03, macOS arm64) the
+resident cost was 1.35x the charge - class peak 1.5 MiB against RSS
++2.0 MiB. The factor holds, with no margin to spare if either passenger
+grows.
+
 `SKEG.STATS` reports `skeg_ingress_state` (known / default /
 unreadable), `_cap_bytes`, `_held_bytes` and
 `_per_connection_max_bytes`. Five counters - refusals at accept,
@@ -101,11 +118,12 @@ Measured 2026-09-03, macOS arm64, release build:
   connections each dribbling a 64 MiB bulk peak inside the class cap
   instead of at sixteen times one connection's ceiling.
 - Pipelined RESP3 throughput, one connection, 20,000 `SKEG.VSET` at
-  dim 128, eight runs of each build back to back: best 135,246 ops/s
-  before against 136,335 after, medians 132k against 128k. The spread
-  within one build (99k to 135k on the unchanged one) is several times
-  the difference between the two, so this measures "no regression the
-  probe can see", not a speedup or a slowdown.
+  dim 128, eight runs of each build back to back: best 135,246 ops/s on
+  the unchanged build against 136,335 here, medians 132k against 128k;
+  re-measured after the reply buffer joined the budget, best 137,848. The
+  spread within one build (99k to 138k) is several times the difference
+  between builds, so this measures "no regression the probe can see", not
+  a speedup or a slowdown.
 
 ### A tenant is not something a client can spell
 
