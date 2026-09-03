@@ -10,6 +10,7 @@
 //! `tenant` module docs) can install a multi-tenant layer at runtime
 //! via [`Server::with_tenant_backend`].
 
+pub mod admission;
 pub mod bind_policy;
 pub mod catalog_intent;
 pub mod failpoint;
@@ -34,6 +35,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+pub use admission::{AdmissionError, Retryability};
 pub use bind_policy::{ALLOW_ENV, ALLOW_FLAG, check_unauthenticated_bind};
 use handler::handle_connection;
 pub use ingress::{ConnectionBudget, IngressBudget, IngressCap, IngressRejected};

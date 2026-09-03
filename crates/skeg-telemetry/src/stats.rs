@@ -92,6 +92,8 @@ pub fn dump_text() -> String {
     // Dynamic registry - downstream-registered metrics. Appended at the
     // end so the engine's own schema is grep-stable across releases even
     // as consumers add their own counters.
+    crate::sources::dump_text(&mut out);
+
     dynamic::dump_text(&mut out);
 
     out

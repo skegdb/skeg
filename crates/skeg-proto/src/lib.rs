@@ -25,11 +25,12 @@ pub use request::{
     encode_mget, encode_native_hello, encode_ping, encode_set, encode_shards, encode_stats,
 };
 pub use response::{
-    ErrCode, NativeCapabilities, ServerStats, ShardStats, VindexInfo, decode_bool_response,
-    decode_mget_response, decode_native_capabilities_response, decode_shards_response,
-    decode_stats_response, decode_u64_response, decode_value_response, decode_vindex_list_response,
-    encode_err, encode_ok, encode_ok_bool, encode_ok_mget, encode_ok_native_capabilities,
-    encode_ok_shards, encode_ok_stats, encode_ok_u64, encode_ok_value, encode_ok_vindex_list,
+    ErrCode, ErrResponse, NativeCapabilities, ServerStats, ShardStats, VindexInfo,
+    decode_bool_response, decode_err_response, decode_mget_response,
+    decode_native_capabilities_response, decode_shards_response, decode_stats_response,
+    decode_u64_response, decode_value_response, decode_vindex_list_response, encode_err, encode_ok,
+    encode_ok_bool, encode_ok_mget, encode_ok_native_capabilities, encode_ok_shards,
+    encode_ok_stats, encode_ok_u64, encode_ok_value, encode_ok_vindex_list,
 };
 pub use vector::{
     NativeVectorKindV2, bytes_to_f32_vec, decode_vindex_create_payload, decode_vname_id_payload,

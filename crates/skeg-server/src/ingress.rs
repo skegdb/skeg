@@ -440,6 +440,18 @@ impl IngressBudget {
     }
 }
 
+/// The ingress class reports its own gauges, pulled at dump time. Same
+/// reason as [`MemoryGovernor`]'s: the held figure is this class's share of
+/// the governor's total, and an operator who cannot see the two together
+/// cannot tell whether the sockets or the delta are filling the budget.
+impl skeg_telemetry::GaugeSource for IngressBudget {
+    fn sample(&self, out: &mut Vec<skeg_telemetry::GaugeSample>) {
+        // Stub: opened by `server: the governor and the budget report their
+        // own gauges`.
+        let _ = out;
+    }
+}
+
 /// One granted step of a connection's charge, and the governor reservation
 /// standing behind it.
 ///
@@ -940,5 +952,88 @@ mod tests {
             err.wire_message()
         );
         assert_eq!(conn.held_bytes(), FLOOR_BYTES, "the floor stays");
+    }
+
+    // ── P0.5: the class reports its own gauges ──────────────────────────────
+
+    fn gauges_of(b: &Arc<IngressBudget>) -> Vec<skeg_telemetry::GaugeSample> {
+        let mut out = Vec::new();
+        skeg_telemetry::GaugeSource::sample(b.as_ref(), &mut out);
+        out
+    }
+
+    #[test]
+    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
+    fn the_ingress_state_is_a_set_of_three_series_with_exactly_one_at_one() {
+        for (headroom, explicit, live) in [
+            (Headroom::Known(64 * 1024 * 1024), None, "known"),
+            (Headroom::Unlimited, None, "default"),
+            (Headroom::Unknown, None, "unreadable"),
+        ] {
+            let b = Arc::new(IngressBudget::new(
+                governor(headroom),
+                None,
+                explicit,
+                None,
+                u64::from(u32::MAX),
+            ));
+            let samples = gauges_of(&b);
+            let states: Vec<(&str, u64)> = ["known", "default", "unreadable"]
+                .iter()
+                .map(|s| {
+                    let labels = match *s {
+                        "known" => "state=\"known\"",
+                        "default" => "state=\"default\"",
+                        _ => "state=\"unreadable\"",
+                    };
+                    (
+                        *s,
+                        samples
+                            .iter()
+                            .find(|g| g.name == "skeg_ingress_state" && g.labels == labels)
+                            .unwrap_or_else(|| panic!("{s} is absent for {headroom:?}"))
+                            .value,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                states.iter().filter(|(_, v)| *v == 1).count(),
+                1,
+                "{headroom:?}: exactly one state is true, got {states:?}"
+            );
+            assert_eq!(
+                states.iter().find(|(_, v)| *v == 1).map(|(s, _)| *s),
+                Some(live)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
+    fn the_class_reports_the_numbers_stats_used_to_assemble_by_hand() {
+        let b = Arc::new(IngressBudget::new(
+            governor(Headroom::Known(150 * 1024 * 1024)),
+            None,
+            None,
+            None,
+            crate::resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
+        let held = b.try_accept().expect("a floor");
+        let samples = gauges_of(&b);
+        let value = |name: &str| {
+            samples
+                .iter()
+                .find(|g| g.name == name && g.labels.is_empty())
+                .unwrap_or_else(|| panic!("{name} is absent"))
+                .value
+        };
+        assert_eq!(value("skeg_ingress_cap_bytes"), b.cap().bytes());
+        assert_eq!(value("skeg_ingress_held_bytes"), b.held_bytes());
+        assert_eq!(
+            value("skeg_ingress_per_connection_max_bytes"),
+            b.per_connection_max()
+        );
+        assert_eq!(b.held_bytes(), FLOOR_BYTES, "one connection, one floor");
+        drop(held);
     }
 }

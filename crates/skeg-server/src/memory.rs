@@ -426,6 +426,20 @@ impl MemoryGovernor {
 /// a separate question, answered by the cgroup's own headroom on the next
 /// reservation - which is why a fold that really did grow the heap does not
 /// get its budget back just because its job object went away.
+/// The governor reports its own gauges, pulled at dump time.
+///
+/// The alternative is what `SKEG.STATS` used to do: read the governor by hand
+/// in one handler and format the lines there, which is why `/metrics` - the
+/// surface an operator actually scrapes - could not see the budget at all.
+/// Nothing on the reserve path changes; this is a reader.
+impl skeg_telemetry::GaugeSource for MemoryGovernor {
+    fn sample(&self, out: &mut Vec<skeg_telemetry::GaugeSample>) {
+        // Stub: opened by `server: the governor and the budget report their
+        // own gauges`.
+        let _ = out;
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryReservation {
     governor: Arc<MemoryGovernor>,
@@ -728,5 +742,82 @@ mod tests {
                 requested: u64::MAX
             }
         );
+    }
+
+    // ── P0.5: the governor reports its own gauges ───────────────────────────
+
+    /// The samples one governor reports, isolated from every other source in
+    /// the process by filtering on the names this object owns.
+    fn gauges_of(g: &Arc<MemoryGovernor>) -> Vec<skeg_telemetry::GaugeSample> {
+        let mut out = Vec::new();
+        skeg_telemetry::GaugeSource::sample(g.as_ref(), &mut out);
+        out
+    }
+
+    fn value_of(samples: &[skeg_telemetry::GaugeSample], name: &str, labels: &str) -> Option<u64> {
+        samples
+            .iter()
+            .find(|s| s.name == name && s.labels == labels)
+            .map(|s| s.value)
+    }
+
+    #[test]
+    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
+    fn the_budget_state_is_a_set_of_three_series_with_exactly_one_at_one() {
+        for (headroom, live) in [
+            (Headroom::Known(1000), "known"),
+            (Headroom::Unlimited, "unlimited"),
+            (Headroom::Unknown, "unknown"),
+        ] {
+            let g = gov(headroom, 0);
+            let samples = gauges_of(&g);
+            let states: Vec<(&str, u64)> = ["known", "unlimited", "unknown"]
+                .iter()
+                .map(|s| {
+                    (
+                        *s,
+                        value_of(
+                            &samples,
+                            "skeg_memory_budget_state",
+                            match *s {
+                                "known" => "state=\"known\"",
+                                "unlimited" => "state=\"unlimited\"",
+                                _ => "state=\"unknown\"",
+                            },
+                        )
+                        .unwrap_or_else(|| panic!("{s} is absent for {headroom:?}")),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                states.iter().filter(|(_, v)| *v == 1).count(),
+                1,
+                "{headroom:?}: exactly one state is true, got {states:?}"
+            );
+            assert_eq!(
+                states.iter().find(|(_, v)| *v == 1).map(|(s, _)| *s),
+                Some(live),
+                "{headroom:?} is state {live}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
+    fn headroom_is_absent_when_nobody_could_read_it() {
+        let known = gauges_of(&gov(Headroom::Known(1000), 0));
+        assert_eq!(
+            value_of(&known, "skeg_memory_headroom_bytes", ""),
+            Some(1000),
+            "a readable headroom is a number"
+        );
+        for headroom in [Headroom::Unlimited, Headroom::Unknown] {
+            let samples = gauges_of(&gov(headroom, 0));
+            assert!(
+                value_of(&samples, "skeg_memory_headroom_bytes", "").is_none(),
+                "{headroom:?}: publishing 0 for a headroom nobody could read \
+                 reads as 'no room left', which is a different fact"
+            );
+        }
     }
 }
