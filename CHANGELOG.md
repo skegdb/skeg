@@ -70,14 +70,27 @@ with nothing written, instead of being committed shard by shard. It is a
 permanent refusal (`ErrCode::InvalidRequest` = `2` on the native wire) and a
 client must not retry it unchanged. **On a default deployment the shard count
 is the host's performance-core count, so most multi-key `MSET`s will be
-refused**: assume every batch of more than one key needs changing. The two
-supported shapes are one key per `MSET`, or a batch per shard grouped by
-`xxh3_64(key) % n_shards` (`SKEG.SHARDS` reports the count, and
-`skeg_crossslot_refused_total` counts the refusals). There are no Redis hash
-tags: `{tag}` is an ordinary part of the key and does not steer routing, so a
-client cannot force two keys onto one shard the way a Redis Cluster client
-can. `is_retryable` tables gain a third word, `CROSSSLOT`, on the permanent
-side.
+refused**: assume every batch of more than one key needs changing. With `c`
+shards, a batch of `k` unrelated keys survives with probability `c^(1-k)` -
+at eight shards that is 1.6% for three keys and effectively never for ten.
+
+**The shape that always works is one key per `MSET`** (or `SET`), and it is
+the one to reach for. Grouping keys into a batch per shard is possible only
+where the client can reproduce the routing - `xxh3_64(key) % n_shards`, with
+the shard count being the number of rows `SKEG.SHARDS` returns - and on a
+multi-tenant deployment it cannot in practice, because the key that routes is
+the one the server scoped with a sixteen-byte tenant prefix, not the one the
+client sent. `skeg_crossslot_refused_total` counts the refusals so an
+operator can see a client that has not been updated.
+
+There are no Redis hash tags: `{tag}` is an ordinary part of the key and does
+not steer routing, so a client cannot force two keys onto one shard the way a
+Redis Cluster client can. Note also that skeg's "slot" is the shard index,
+not Redis's `CRC16 mod 16384`: a key pair accepted by one deployment can be
+refused by another with a different shard count, and unlike Redis a client
+cannot compute the slot from the key alone. The word is shared because the
+remedy is - split the batch. `is_retryable` tables gain a third word,
+`CROSSSLOT`, on the permanent side.
 
 Why a refusal and not a fix: `MSET` is exposed under a name whose public
 meaning is all-or-nothing, and the engine only ever gave it per shard. Each

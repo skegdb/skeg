@@ -210,9 +210,18 @@ impl AdmissionError {
     /// permanent refusal can ever ask a client to loop.
     #[must_use]
     pub fn resp3_code(&self) -> &'static str {
+        // Exhaustive, no `_` arm, for the same reason `retryability` is: the
+        // exception exists, so a new variant must be made to say whether it
+        // is one rather than inheriting an answer nobody chose.
         match self {
             Self::CrossSlot => "CROSSSLOT",
-            other => match other.retryability() {
+            Self::Ingress(_)
+            | Self::MemoryAtWrite(_)
+            | Self::QuotaExceeded { .. }
+            | Self::DiskQuota { .. }
+            | Self::RequestTooLarge { .. }
+            | Self::Busy
+            | Self::Backend { .. } => match self.retryability() {
                 Retryability::Retryable => "BACKPRESSURE",
                 Retryability::Permanent => "ERR",
             },
