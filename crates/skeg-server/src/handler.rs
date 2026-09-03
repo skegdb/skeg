@@ -421,4 +421,63 @@ mod tests {
             "the refused name must not exist: {rows:?}"
         );
     }
+
+    #[tokio::test]
+    #[ignore = "red until every native arm refuses the scope separator"]
+    async fn no_native_op_can_address_a_tenant_scoped_index() {
+        // Closing the CREATE door stops a client MAKING a key that reads as
+        // another tenant's. It does not stop one NAMING a key that already
+        // exists: a tenant's index, created over RESP3 from an authenticated
+        // id, is a plain string to the native listener, which has no tenant of
+        // its own and passes the name straight through. So VGET reads that
+        // tenant's vectors, VSET writes into its index, and VDEL / VINDEX.DROP
+        // destroy them - from a connection that never authenticated as anyone.
+        //
+        // Every native arm that takes an index name refuses the separator, and
+        // this walks all of them: one arm left out is one whole op still open.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        // The victim: created the way the RESP3 layer creates it, with a
+        // prefix the server wrote from an id it authenticated.
+        let theirs = format!("{}::idx", "2a".repeat(16));
+        shards.vindex_create_scoped(&theirs, 4, 0, 0).await.unwrap();
+        shards
+            .vset(&theirs, 1, vec![1.0, 0.0, 0.0, 0.0], 0x2a2a, None, None)
+            .await
+            .unwrap();
+
+        for (op, request) in [
+            ("VGET", skeg_proto::encode_vget(1, &theirs, 1)),
+            (
+                "VSET",
+                skeg_proto::encode_vset(2, &theirs, 1, &[0.0, 1.0, 0.0, 0.0], Flags::empty()),
+            ),
+            ("VDEL", skeg_proto::encode_vdel(3, &theirs, 1)),
+            (
+                "VSEARCH",
+                skeg_proto::encode_vsearch(4, &theirs, 1, &[1.0, 0.0, 0.0, 0.0]),
+            ),
+            ("VINDEX.DROP", skeg_proto::encode_vindex_drop(5, &theirs)),
+        ] {
+            let frame = native_roundtrip(&shards, request).await;
+            let msg = err_message(&frame);
+            assert!(
+                msg.contains("must not contain '::'"),
+                "native {op} reached another tenant's index; answered: {msg}"
+            );
+        }
+
+        // Nothing moved: the index is still catalogued and the row still holds
+        // the vector it was written with.
+        let rows = shards.vindex_list().await.unwrap();
+        assert!(
+            rows.iter().any(|r| r.name == theirs),
+            "the tenant's index was dropped from the native listener: {rows:?}"
+        );
+        assert_eq!(
+            shards.vget(&theirs, 1).await.unwrap(),
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+            "the tenant's row was overwritten or deleted from the native listener"
+        );
+    }
 }

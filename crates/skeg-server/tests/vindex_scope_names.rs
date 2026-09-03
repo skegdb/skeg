@@ -198,3 +198,77 @@ fn rename_registry_entry(path: &std::path::Path, from: &str, to: &str) {
     assert_eq!(renamed, 1, "expected exactly one '{from}' entry to rename");
     std::fs::write(path, out).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "red until erase_tenant builds the router prefix with scope_key"]
+async fn erasing_a_tenant_takes_its_semantic_router_with_it() {
+    // A router is centroids TRAINED ON the tenant's vectors: it survives the
+    // index it describes, it is written to a sidecar in the shard-set root,
+    // and `vindex_drop` therefore removes it explicitly. `erase_tenant` does
+    // not take that path - it drops the tenant's indexes inside each shard and
+    // then sweeps the router map itself, by prefix.
+    //
+    // The prefix was `format!("{tenant}::")`, and `tenant` is a `u128`, whose
+    // Display is DECIMAL - `42::`, where every key carries 32 hex digits. It
+    // could not match anything, so no non-zero tenant ever lost a router, and
+    // an erasure that reported success left the centroids of the erased
+    // vectors on disk.
+    let dir = tempfile::TempDir::new().unwrap();
+    // Two shards: `train_router` puts one centroid per shard and refuses to
+    // train with fewer live vectors than shards.
+    let shards = ShardSet::open(dir.path(), 2).unwrap();
+
+    let theirs = scoped(TENANT_B, "routed");
+    shards
+        .vindex_create_scoped(&theirs, DIM, 4, 1)
+        .await
+        .unwrap();
+    shards.vindex_create("mine", DIM, 4, 1).await.unwrap();
+    for id in 0..16u64 {
+        shards
+            .vset(&theirs, id, vec_for(id), TENANT_B, None, None)
+            .await
+            .unwrap();
+        shards
+            .vset("mine", id, vec_for(id), 0, None, None)
+            .await
+            .unwrap();
+    }
+    shards
+        .train_router(&theirs, 0.25, 10)
+        .await
+        .expect("train B");
+    shards
+        .train_router("mine", 0.25, 10)
+        .await
+        .expect("train 0");
+    assert!(
+        shards.router(&theirs).is_some() && shards.router("mine").is_some(),
+        "fixture: both routers must exist before the erase"
+    );
+
+    shards
+        .erase_tenant(TENANT_B, skeg_core::Durability::Relaxed)
+        .await
+        .expect("erase");
+
+    assert!(
+        shards.router(&theirs).is_none(),
+        "the erased tenant's router survived: centroids trained on erased \
+         vectors are still loaded"
+    );
+    let sidecar = dir.path().join(format!("router-{theirs}.bin"));
+    assert!(
+        !sidecar.exists(),
+        "the erased tenant's router sidecar is still on disk: {}",
+        sidecar.display()
+    );
+    // And the sweep is aimed, not indiscriminate: tenant 0's router is not
+    // this tenant's to erase. (`scope_key(0, "")` is the empty string, which
+    // every key starts with - `erase_tenant` refuses tenant 0 before it gets
+    // here, and this pins that the aim stays narrow.)
+    assert!(
+        shards.router("mine").is_some(),
+        "erasing tenant B removed another tenant's router"
+    );
+}
