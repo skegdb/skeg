@@ -282,6 +282,31 @@ const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 /// Exposed via HELLO response and (future) CLIENT ID.
 static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
 
+/// Encode one reply into `out`, write it, and account for what it cost.
+///
+/// The reply buffer is a per-connection buffer exactly like the decoder's, and
+/// it was in no budget at all. `BytesMut` never returns capacity on its own,
+/// so a single `SKEG.VMSET` of 4096 failing items - one reply line each, each
+/// capped at 256 bytes - left about 1.03 MiB allocated for the rest of the
+/// connection's life, and 1024 connections is a gigabyte the governor cannot
+/// see. Ingress was charged; egress was not, and both are buffers the same
+/// socket holds.
+///
+/// Scaffolding: this writes the reply and nothing else yet.
+async fn flush_reply(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    out: &mut BytesMut,
+    frame: &Frame,
+    version: skeg_resp3::ProtoVersion,
+    budget: &mut ConnectionBudget,
+    other_capacity: usize,
+) -> bool {
+    let _ = (&budget, other_capacity);
+    out.clear();
+    encode_frame(frame, version, out);
+    stream.write_all(out).await.is_ok()
+}
+
 /// Per-connection driver. Loops until EOF / write error / fatal parse error.
 ///
 /// `budget` is this connection's share of the ingress class, taken at accept
@@ -321,9 +346,16 @@ pub async fn handle_connection_resp3(
                 let resp = h
                     .await
                     .unwrap_or_else(|_| Frame::Error("ERR internal task failure".into()));
-                out.clear();
-                encode_frame(&resp, state.version, &mut out);
-                ok = stream.write_all(&out).await.is_ok();
+                let held = decoder.capacity();
+                ok = flush_reply(
+                    &mut stream,
+                    &mut out,
+                    &resp,
+                    state.version,
+                    &mut budget,
+                    held,
+                )
+                .await;
             }
             ok
         }};
@@ -362,9 +394,17 @@ pub async fn handle_connection_resp3(
                         }
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     };
-                    out.clear();
-                    encode_frame(&response, state.version, &mut out);
-                    if stream.write_all(&out).await.is_err() {
+                    let held = decoder.capacity();
+                    if !flush_reply(
+                        &mut stream,
+                        &mut out,
+                        &response,
+                        state.version,
+                        &mut budget,
+                        held,
+                    )
+                    .await
+                    {
                         break 'conn;
                     }
                 }
@@ -410,9 +450,15 @@ pub async fn handle_connection_resp3(
                     skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
                     warn!(?peer, "ingress refused: {e}");
                     let err = Frame::Error(e.wire_message());
-                    out.clear();
-                    encode_frame(&err, state.version, &mut out);
-                    let _ = stream.write_all(&out).await;
+                    let _ = flush_reply(
+                        &mut stream,
+                        &mut out,
+                        &err,
+                        state.version,
+                        &mut budget,
+                        4096,
+                    )
+                    .await;
                     break 'conn;
                 }
                 decoder.buf_mut().reserve(reserve);
@@ -432,9 +478,15 @@ pub async fn handle_connection_resp3(
                             );
                             warn!(?peer, "ingress refused after read: {e}");
                             let err = Frame::Error(e.wire_message());
-                            out.clear();
-                            encode_frame(&err, state.version, &mut out);
-                            let _ = stream.write_all(&out).await;
+                            let _ = flush_reply(
+                                &mut stream,
+                                &mut out,
+                                &err,
+                                state.version,
+                                &mut budget,
+                                4096,
+                            )
+                            .await;
                             break 'conn;
                         }
                         // Bound per-connection buffering. A frame that never
@@ -463,9 +515,16 @@ pub async fn handle_connection_resp3(
                 }
                 warn!(?peer, "RESP3 parse error: {e}");
                 let err = Frame::Error(format!("ERR protocol: {e}"));
-                out.clear();
-                encode_frame(&err, state.version, &mut out);
-                let _ = stream.write_all(&out).await;
+                let held = decoder.capacity();
+                let _ = flush_reply(
+                    &mut stream,
+                    &mut out,
+                    &err,
+                    state.version,
+                    &mut budget,
+                    held,
+                )
+                .await;
                 break;
             }
         }
@@ -2256,6 +2315,33 @@ mod tests {
         ))
     }
 
+    /// An ingress budget whose class is far too small for a maximum reply, so
+    /// the overshoot path can be driven without a megabyte-sized fixture.
+    fn tiny_ingress() -> Arc<crate::ingress::IngressBudget> {
+        #[derive(Debug)]
+        struct Fixed(crate::memory::Headroom);
+        impl crate::memory::MemorySource for Fixed {
+            fn headroom(&self) -> crate::memory::Headroom {
+                self.0
+            }
+        }
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(
+                Arc::new(Fixed(crate::memory::Headroom::Known(1 << 20))),
+                None,
+                Some(0),
+            )
+            .expect("a governor"),
+        );
+        Arc::new(crate::ingress::IngressBudget::new(
+            governor,
+            None,
+            Some(crate::ingress::CHUNK_BYTES),
+            None,
+            u64::from(u32::MAX),
+        ))
+    }
+
     #[test]
     fn read_reserve_idle_is_small() {
         assert!(super::read_reserve(0) <= 4096);
@@ -2447,6 +2533,99 @@ mod tests {
             "the held figure did not follow the accepted connection: {text}"
         );
         drop(held);
+    }
+
+    /// The reply buffer is the other half of "one budget", and it was in no
+    /// budget at all. A VMSET of 4096 failing items is about 1.03 MiB of
+    /// reply, `BytesMut` never gives capacity back, and 1024 connections that
+    /// each sent one such batch pin a gigabyte the governor cannot see.
+    #[tokio::test]
+    #[ignore = "opens in commit 10 (the reply buffer joins the budget)"]
+    async fn a_reply_buffer_is_charged_and_given_back_after_the_flush() {
+        let budget = test_ingress();
+        let mut conn = budget.try_accept().expect("the floor");
+        let mut out = BytesMut::with_capacity(4096);
+        let mut sink: Vec<u8> = Vec::new();
+
+        // The worst reply this server can build: one line per item, each the
+        // longest error the item cap allows.
+        let reply = Frame::Array(
+            (0..MAX_VMSET_ITEMS)
+                .map(|_| Frame::Error("E".repeat(MAX_VMSET_ERROR_LEN)))
+                .collect(),
+        );
+        assert!(
+            flush_reply(
+                &mut sink,
+                &mut out,
+                &reply,
+                skeg_resp3::ProtoVersion::Resp3,
+                &mut conn,
+                4096,
+            )
+            .await
+        );
+        assert!(
+            sink.len() > 1_000_000,
+            "the reply was not the large one: {}",
+            sink.len()
+        );
+        assert!(
+            out.capacity() <= 4096,
+            "the reply buffer was not given back: {} bytes still allocated",
+            out.capacity()
+        );
+        assert_eq!(
+            conn.held_bytes(),
+            crate::ingress::FLOOR_BYTES,
+            "the charge did not come back with the buffer"
+        );
+    }
+
+    /// A reply is the answer to work that has already committed. When the
+    /// class cannot cover its buffer the answer still goes out - withdrawing
+    /// it would make a client retry a VMSET that has been applied - so the
+    /// overshoot is COUNTED rather than turned into an error.
+    #[tokio::test]
+    #[ignore = "opens in commit 10 (the reply buffer joins the budget)"]
+    async fn a_reply_too_large_for_the_class_is_still_delivered_and_counted() {
+        let budget = tiny_ingress();
+        let mut conn = budget.try_accept().expect("the floor");
+        let mut out = BytesMut::with_capacity(4096);
+        let mut sink: Vec<u8> = Vec::new();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
+
+        let reply = Frame::Array(
+            (0..MAX_VMSET_ITEMS)
+                .map(|_| Frame::Error("E".repeat(MAX_VMSET_ERROR_LEN)))
+                .collect(),
+        );
+        assert!(
+            flush_reply(
+                &mut sink,
+                &mut out,
+                &reply,
+                skeg_resp3::ProtoVersion::Resp3,
+                &mut conn,
+                4096,
+            )
+            .await,
+            "the reply must be written even when the class cannot cover it"
+        );
+        assert!(
+            sink.len() > 1_000_000,
+            "the reply was truncated: {}",
+            sink.len()
+        );
+        assert!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget) > before,
+            "the budget was exceeded in silence"
+        );
+        assert!(
+            out.capacity() <= 4096,
+            "the buffer was not given back: {}",
+            out.capacity()
+        );
     }
 
     #[test]

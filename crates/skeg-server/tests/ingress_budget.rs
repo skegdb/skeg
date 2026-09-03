@@ -588,3 +588,97 @@ fn read_ingress_held(addr: std::net::SocketAddr) -> u64 {
         );
     }
 }
+
+// ------------------------------------------------- the reply side (A1)
+
+/// A `SKEG.VMSET` whose every item fails against a missing index whose name is
+/// as long as the server allows: 4096 reply lines, each at the item error cap,
+/// from a request an order of magnitude smaller.
+///
+/// The long name is what makes the test about the REPLY. Each item's error is
+/// "vindex '<255 chars>' not found", capped at 256 bytes, so the answer is
+/// about 1 MiB while the request stays around 100 KiB - and the request is
+/// already charged today.
+fn vmset_of_failing_items(items: usize) -> Vec<u8> {
+    let name = "n".repeat(255); // MAX_VINDEX_NAME_LEN
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("*{}\r\n", 2 + items * 3).as_bytes());
+    let bulk = |arg: &[u8], out: &mut Vec<u8>| {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    };
+    bulk(b"SKEG.VMSET", &mut out);
+    bulk(name.as_bytes(), &mut out);
+    for id in 0..items {
+        bulk(id.to_string().as_bytes(), &mut out);
+        bulk(&1.0f32.to_le_bytes(), &mut out);
+        bulk(b"", &mut out);
+    }
+    out
+}
+
+/// The reply buffer is a per-connection buffer the governor never saw.
+///
+/// The class here is sized so one connection's REQUEST fits its allowance
+/// comfortably and request-plus-reply does not. That is what makes this a test
+/// of the reply: a budget that charges only ingress notices nothing at all,
+/// and one that charges the reply too has to say - out loud, on a counter -
+/// that it went over. The reply itself arrives in full either way, because it
+/// answers work that has already committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens in commit 10 (the reply buffer joins the budget)"]
+async fn n_connections_that_sent_one_huge_reply_hold_only_the_floor_afterwards() {
+    const N: usize = 4;
+    let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
+    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
+
+    let request = vmset_of_failing_items(4096);
+    let mut idle = Vec::new();
+    let mut reply_len = 0usize;
+    for _ in 0..N {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(&request).await.expect("vmset");
+        // Read until the whole array has arrived: one line per item, so the
+        // reply is complete when 4096 of them have been seen. A reply that is
+        // truncated, or replaced by a refusal, fails here - and that is the
+        // assertion that matters most, because the writes it reports on have
+        // already happened.
+        let mut seen = 0usize;
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        while seen < 4096 {
+            let n = tokio::time::timeout(Duration::from_secs(30), s.read(&mut buf))
+                .await
+                .expect("the reply must arrive")
+                .expect("read");
+            assert!(n > 0, "the server closed after {seen} reply lines");
+            seen += buf[..n].iter().filter(|&&b| b == b'-').count();
+            got += n;
+        }
+        reply_len = reply_len.max(got);
+        idle.push(s);
+    }
+
+    // The connections are now idle, holding nothing but their floor: the
+    // ~1 MiB of reply buffer each of them built is gone, not merely unused.
+    until(
+        "the reply buffers to be given back",
+        Duration::from_secs(10),
+        || ingress.held_bytes() == FLOOR_BYTES * N as u64,
+    )
+    .await;
+
+    assert!(
+        reply_len > 1_000_000,
+        "the reply was not the large one: {reply_len}"
+    );
+    assert!(
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget) > before,
+        "a {reply_len}-byte reply per connection, against a per-connection \
+         allowance of {}, went past the budget without anything saying so",
+        ingress.per_connection_max()
+    );
+    drop(idle);
+}

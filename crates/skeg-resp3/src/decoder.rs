@@ -56,6 +56,16 @@ impl FrameDecoder {
         self.buf.len()
     }
 
+    /// Bytes currently ALLOCATED, which is what the process pays for.
+    ///
+    /// `BytesMut` never gives capacity back on its own, so this and
+    /// [`FrameDecoder::buffered`] can be far apart after a burst - and it is
+    /// this one that a memory budget has to charge.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Try to decode one frame.
     ///
     /// # Returns

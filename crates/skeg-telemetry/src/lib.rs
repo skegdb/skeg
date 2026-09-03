@@ -404,10 +404,20 @@ pub enum Counter {
     /// serving small frames only, which a client experiences as refusals it
     /// cannot explain.
     IngressBudgetUnreadable = 51,
+    /// Replies whose buffer the ingress class could not cover.
+    ///
+    /// The reply is still written - it is the answer to work that has already
+    /// committed, and withdrawing it would make a client retry something that
+    /// has happened - so this is the one place the budget is knowingly
+    /// exceeded. Counted rather than enforced, and the buffer is handed back
+    /// immediately afterwards. A climb means replies are outgrowing the
+    /// per-connection allowance: the batch sizes clients send are too large
+    /// for the budget they are being served under.
+    IngressReplyOverBudget = 52,
 }
 
 impl Counter {
-    pub const COUNT: usize = 52;
+    pub const COUNT: usize = 53;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -461,6 +471,7 @@ impl Counter {
         Counter::IngressRefusedGrowth,
         Counter::IngressStalls,
         Counter::IngressBudgetUnreadable,
+        Counter::IngressReplyOverBudget,
     ];
 
     #[inline]
@@ -518,6 +529,7 @@ impl Counter {
             Counter::IngressRefusedGrowth => "skeg_ingress_refused_growth_total",
             Counter::IngressStalls => "skeg_ingress_stalls_total",
             Counter::IngressBudgetUnreadable => "skeg_ingress_budget_unreadable_total",
+            Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
         }
     }
 }
