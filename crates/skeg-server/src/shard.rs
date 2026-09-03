@@ -801,6 +801,24 @@ pub enum ShardError {
     Busy,
     #[error("storage error: {0}")]
     Storage(String),
+    /// The request was REFUSED before any of it happened, and the refusal
+    /// carries its own classification.
+    ///
+    /// Typed rather than rendered. Both of these used to travel as a
+    /// `Storage` string with a code word written into the front of it, which
+    /// left the RESP3 handler matching on a prefix and the native handler
+    /// with nothing to match on at all.
+    #[error("{0}")]
+    Admission(#[from] crate::admission::AdmissionError),
+    /// The request itself is wrong for this index - a vector of the wrong
+    /// dimension - and no amount of room would change that.
+    ///
+    /// Not admission: nothing was refused for want of capacity. It has its
+    /// own variant because it is the one refusal on this path that both wires
+    /// must call permanent whatever the classification does, which is what
+    /// makes it the control row of the parity table.
+    #[error("{0}")]
+    InvalidRequest(String),
 }
 
 // ── Channel protocol ──────────────────────────────────────────────────────────
@@ -1226,7 +1244,28 @@ enum ShardResp {
     /// Per-index stats for this shard: `(scoped_name, resident_bytes,
     /// last_access_ms, n_vectors, evictable)`.
     IndexStats(Vec<(String, usize, u64, usize, bool)>),
+    /// A failure, as prose.
+    ///
+    /// NOT the place for a refusal. A refusal written here reaches the client
+    /// as `ERR <text>` on RESP3 and `ErrCode::Internal` on the native wire,
+    /// whatever it was about, and walks past the classification in
+    /// [`crate::admission`] without anything saying so - which is exactly the
+    /// hole this branch was opened to close, in the one shape the type system
+    /// still allows. Anything the server DECIDES to decline goes in
+    /// [`ShardResp::Refused`]; this carries what went wrong while it tried.
     Err(String),
+    /// A refusal decided before any of the work happened, carried TYPED so
+    /// the handler that answers the client can classify it rather than parse
+    /// it.
+    ///
+    /// Produced ONLY by the admission block of the `Vset` worker arm - the
+    /// dimension check, the quota and the memory governor - so the sites that
+    /// must handle it are exactly the ones that send a `Vset` or a `Vdel`:
+    /// `vset`, `vmset`, `vdel`, and the internal relocation paths (reshard,
+    /// overlap, the overwrite cleanup). Each of those names this variant
+    /// explicitly; anywhere else its `_` arm would turn a quota refusal into
+    /// "shard unavailable", which is why it is not folded into `Err`.
+    Refused(ShardError),
 }
 
 struct ShardMsg {
@@ -4426,14 +4465,14 @@ async fn process(
             // it must be - a parking_lot guard cannot be held across an
             // await - and the coordinator holds this row's stripe for the
             // whole span, so nothing else can write this id in between.
-            let admitted = {
+            let admitted: Result<Option<Admitted>, ShardError> = {
                 let mut idx = arc.write();
                 if idx.backend.dim() != vector.len() {
-                    Err(format!(
+                    Err(ShardError::InvalidRequest(format!(
                         "vindex '{name}' dim {} but vector has {}",
                         idx.backend.dim(),
                         vector.len()
-                    ))
+                    )))
                 } else if version.is_some_and(|v| v < idx.backend.version_of(id).get()) {
                     // A relocation carrying a copy this shard has already
                     // moved past. The engine would refuse the vector by
@@ -4467,11 +4506,29 @@ async fn process(
                     let version =
                         version.unwrap_or_else(|| VectorVersion::new(previous).next().get());
                     let was_new = effect.charges(!existed_before);
+                    // The failpoint supplies a LIMIT, not a refusal: with a
+                    // ceiling of zero the real `try_add` below does the
+                    // refusing, so what a test exercises is the production
+                    // path and not a branch beside it. It exists because the
+                    // native listener is always tenant `0`, which has no
+                    // limits to be at, and putting the same refusal on both
+                    // wires is the whole question.
+                    let limit = if crate::fp_admission!(
+                        crate::failpoint::AdmissionFailpoint::QuotaRefusedAtVset,
+                        &name
+                    ) {
+                        Some(0)
+                    } else {
+                        limit
+                    };
                     if was_new
                         && let Some(max) = limit
                         && quota.try_add(tenant, 1, max).is_err()
                     {
-                        return ShardResp::Err("tenant vector quota exceeded".to_owned());
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::QuotaRefused);
+                        return ShardResp::Refused(ShardError::Admission(
+                            crate::admission::AdmissionError::QuotaExceeded { tenant, limit: max },
+                        ));
                     }
                     // Memory admission, same shape as the quota above and for
                     // the same reason: refuse BEFORE storing. The cost is what
@@ -4481,13 +4538,31 @@ async fn process(
                     // the request.
                     let want = idx.backend.resident_bytes()
                         + (vector.len() * std::mem::size_of::<f32>()) as u64;
-                    if let Err(rejected) = idx.reserve_memory(memory, want) {
+                    // The failpoint stands in for the governor's answer, the
+                    // way the ingress one stands in for a full class: really
+                    // exhausting a process-wide headroom from inside a test
+                    // that runs beside others is not something a test may do.
+                    // What it does NOT stand in for is anything after this
+                    // point - the refund, the counter, the reply - which is
+                    // the part under test.
+                    let forced = crate::fp_admission!(
+                        crate::failpoint::AdmissionFailpoint::MemoryRefusedAtVset,
+                        &name
+                    )
+                    .then_some(crate::memory::MemoryRejected::NoHeadroom {
+                        reserved: 0,
+                        requested: want,
+                        usable: 0,
+                    });
+                    if let Some(rejected) =
+                        forced.or_else(|| idx.reserve_memory(memory, want).err())
+                    {
                         if was_new && limit.is_some() {
                             quota.sub(tenant, 1);
                         }
                         skeg_telemetry::tick_counter(skeg_telemetry::Counter::MemoryRefused);
-                        return ShardResp::Err(format!(
-                            "BACKPRESSURE out of memory budget: {rejected}"
+                        return ShardResp::Refused(ShardError::Admission(
+                            crate::admission::AdmissionError::MemoryAtWrite(rejected),
                         ));
                     }
                     Ok(Some(Admitted {
@@ -4499,7 +4574,10 @@ async fn process(
                 }
             };
             let admitted = match admitted {
-                Err(e) => return ShardResp::Err(e),
+                // Typed all the way out: what refused is a fact about the
+                // request, and turning it into prose here is what left the
+                // two wires unable to agree about it.
+                Err(e) => return ShardResp::Refused(e),
                 // Not an error. The caller is a relocation and what it wants
                 // is for the newest copy of the row to be the one that
                 // stands, which it is.
@@ -5387,6 +5465,10 @@ impl ShardSet {
     ) -> std::io::Result<Self> {
         let memory =
             Arc::new(crate::memory::MemoryGovernor::from_env().map_err(std::io::Error::other)?);
+        // Both telemetry surfaces read the governor from here on. A test that
+        // supplies its own governor registers it itself, through the seam
+        // below.
+        memory.register_metrics();
         Self::open_full_with_memory(
             base_dir, n_shards, read_only, tier, workers, mmap_tier, mmap_graph, memory,
         )
@@ -5715,6 +5797,7 @@ impl ShardSet {
         {
             ShardResp::Value(v) => Ok(v),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -5752,6 +5835,7 @@ impl ShardSet {
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -5789,6 +5873,7 @@ impl ShardSet {
             {
                 ShardResp::Done => {}
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -5806,6 +5891,7 @@ impl ShardSet {
         match self.call(shard, req).await? {
             ShardResp::Existed(b) => Ok(b),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -5829,6 +5915,7 @@ impl ShardSet {
         match self.call(shard, req).await? {
             ShardResp::Len(n) => Ok(n),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -5881,6 +5968,7 @@ impl ShardSet {
                     }
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -5912,6 +6000,7 @@ impl ShardSet {
             match self.call(shard, ShardReq::TenantCacheBytes(tenant)).await? {
                 ShardResp::CacheBytes(b) => total += b,
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -5934,6 +6023,7 @@ impl ShardSet {
                     acc.cache_budget += budget;
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -5962,6 +6052,7 @@ impl ShardSet {
                     });
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -5983,18 +6074,24 @@ impl ShardSet {
                 .map_err(|_| ShardError::Unavailable)?;
             pending.push(rx);
         }
-        let mut first_err = None;
+        // Typed, because `make_req` is a closure: this helper carries
+        // whatever request its caller hands it, so a refusal reaching it must
+        // survive rather than be flattened into a string on the way out.
+        let mut first_err: Option<ShardError> = None;
         for rx in pending {
             match rx.await.map_err(|_| ShardError::Unavailable)? {
                 ShardResp::Done => {}
                 ShardResp::Err(e) => {
+                    first_err.get_or_insert(ShardError::Storage(e));
+                }
+                ShardResp::Refused(e) => {
                     first_err.get_or_insert(e);
                 }
                 _ => return Err(ShardError::Unavailable),
             }
         }
         match first_err {
-            Some(e) => Err(ShardError::Storage(e)),
+            Some(e) => Err(e),
             None => Ok(()),
         }
     }
@@ -6596,6 +6693,7 @@ impl ShardSet {
                     out.extend(p.into_iter().map(|line| format!("shard {shard}: {line}")));
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -6668,6 +6766,7 @@ impl ShardSet {
             match self.call(shard, ShardReq::CountTenantKeys(tenant)).await? {
                 ShardResp::Count(n) => total += n,
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -6709,6 +6808,7 @@ impl ShardSet {
                     keys += k;
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -6788,6 +6888,7 @@ impl ShardSet {
             match self.call(shard, req).await? {
                 ShardResp::Erased { keys: k, .. } => keys += k,
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -6817,6 +6918,7 @@ impl ShardSet {
             match self.call(shard, ShardReq::Reclaim).await? {
                 ShardResp::Reclaimed(n) => freed += n,
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -6854,6 +6956,7 @@ impl ShardSet {
                     }
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -6912,7 +7015,7 @@ impl ShardSet {
             // panic=abort, kill the whole process for every tenant. Reject it
             // as a clean error here (found by the security review, C1).
             if vector.len() != router.dim {
-                return Err(ShardError::Storage(format!(
+                return Err(ShardError::InvalidRequest(format!(
                     "vector has {} dims, index has {}",
                     vector.len(),
                     router.dim
@@ -6950,6 +7053,7 @@ impl ShardSet {
                 // Nothing has been removed yet, so a refusal here leaves the
                 // committed version exactly where it was.
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 ShardResp::Done => {}
                 _ => return Err(ShardError::Unavailable),
             }
@@ -7050,6 +7154,7 @@ impl ShardSet {
         match self.call(shard, req).await? {
             ShardResp::Done => Ok(()),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -7171,6 +7276,7 @@ impl ShardSet {
             match self.call(shard, req).await? {
                 ShardResp::Count(n) => total += n,
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -7210,6 +7316,7 @@ impl ShardSet {
         match self.call(shard, req).await? {
             ShardResp::Vector(v) => Ok(v),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -7250,6 +7357,7 @@ impl ShardSet {
                     data.extend_from_slice(&rows);
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -7314,6 +7422,7 @@ impl ShardSet {
                 let (batch, cursor) = match self.call(source, req).await? {
                     ShardResp::Moves(b, c) => (b, c),
                     ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                    ShardResp::Refused(e) => return Err(e),
                     _ => return Err(ShardError::Unavailable),
                 };
                 for (id, vector, payload, owner, version) in batch {
@@ -7371,6 +7480,7 @@ impl ShardSet {
                         ShardResp::Existed(true) => {}
                         ShardResp::Existed(false) => continue,
                         ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                        ShardResp::Refused(e) => return Err(e),
                         _ => return Err(ShardError::Unavailable),
                     }
                     let already_there = current.is_some_and(|(p, _, _)| p == owner);
@@ -7395,6 +7505,7 @@ impl ShardSet {
                         match self.call(usize::from(owner), req).await? {
                             ShardResp::Done => {}
                             ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                            ShardResp::Refused(e) => return Err(e),
                             _ => return Err(ShardError::Unavailable),
                         }
                     }
@@ -7429,6 +7540,7 @@ impl ShardSet {
                     {
                         ShardResp::Existed(_) => {}
                         ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                        ShardResp::Refused(e) => return Err(e),
                         _ => return Err(ShardError::Unavailable),
                     }
                     self.inner
@@ -7486,6 +7598,7 @@ impl ShardSet {
                 let (batch, cursor) = match self.call(source, req).await? {
                     ShardResp::Moves(b, c) => (b, c),
                     ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                    ShardResp::Refused(e) => return Err(e),
                     _ => return Err(ShardError::Unavailable),
                 };
                 for (id, vector, payload, second, version) in batch {
@@ -7535,6 +7648,7 @@ impl ShardSet {
                     let outcome = match self.call(usize::from(second), req).await {
                         Ok(ShardResp::Done) => Ok(()),
                         Ok(ShardResp::Err(e)) => Err(ShardError::Storage(e)),
+                        Ok(ShardResp::Refused(e)) => Err(e),
                         Ok(_) => Err(ShardError::Unavailable),
                         Err(e) => Err(e),
                     };
@@ -7684,6 +7798,7 @@ impl ShardSet {
                         )));
                     }
                     ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                    ShardResp::Refused(e) => return Err(e),
                     _ => return Err(ShardError::Unavailable),
                 }
             }
@@ -7719,6 +7834,7 @@ impl ShardSet {
         match self.call(shard, req).await? {
             ShardResp::Graph(n, e) => Ok((n, e)),
             ShardResp::Err(e) => Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => Err(e),
             _ => Err(ShardError::Unavailable),
         }
     }
@@ -7834,6 +7950,7 @@ impl ShardSet {
         let existed = match self.call(shard, req).await? {
             ShardResp::Existed(b) => b,
             ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => return Err(e),
             _ => return Err(ShardError::Unavailable),
         };
         // A replicated id dies everywhere: the replica must not survive as a
@@ -7866,6 +7983,7 @@ impl ShardSet {
             {
                 ShardResp::Existed(_) => {}
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }
@@ -7926,6 +8044,15 @@ impl ShardSet {
         filter: Option<Filter>,
         probe: usize,
     ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
+        // Armed only by a test. Saturating the real pool from a socket test
+        // means racing its semaphore against the search that is supposed to
+        // find it full, which is not a thing a deterministic test can do.
+        if crate::fp_admission!(
+            crate::failpoint::AdmissionFailpoint::VsearchQueueFullAtSearch,
+            name
+        ) {
+            return Err(ShardError::Busy);
+        }
         let _permit = self
             .inner
             .vsearch_admission
@@ -8203,6 +8330,7 @@ impl ControlHandle {
             {
                 ShardResp::Evicted(b) => any |= b,
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
                 _ => return Err(ShardError::Unavailable),
             }
         }

@@ -10,6 +10,7 @@
 //! `tenant` module docs) can install a multi-tenant layer at runtime
 //! via [`Server::with_tenant_backend`].
 
+pub mod admission;
 pub mod bind_policy;
 pub mod catalog_intent;
 pub mod failpoint;
@@ -34,6 +35,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+pub use admission::{AdmissionError, Retryability};
 pub use bind_policy::{ALLOW_ENV, ALLOW_FLAG, check_unauthenticated_bind};
 use handler::handle_connection;
 pub use ingress::{ConnectionBudget, IngressBudget, IngressCap, IngressRejected};
@@ -154,6 +156,7 @@ impl Server {
             Arc::clone(shards.memory()),
             resp3_handler::MAX_CONN_BUFFER as u64,
         ));
+        ingress.register_metrics();
         Ok(Self {
             listener,
             shards,
@@ -182,6 +185,10 @@ impl Server {
     /// the same reason, as `ShardSet::open_full_with_memory`.
     #[must_use]
     pub fn with_ingress_budget(mut self, budget: Arc<IngressBudget>) -> Self {
+        // The gauges follow the budget the server actually admits against,
+        // not the one it was built with; otherwise a test that injects a
+        // budget scrapes numbers belonging to a budget nothing uses.
+        budget.register_metrics();
         self.ingress = budget;
         self
     }
@@ -282,6 +289,7 @@ impl Server {
             Arc::clone(shards.memory()),
             resp3_handler::MAX_CONN_BUFFER as u64,
         ));
+        ingress.register_metrics();
         Ok(Self {
             listener,
             shards,
@@ -467,18 +475,19 @@ async fn admit_or_refuse(
         Err(e) => {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedAccept);
             warn!("ingress refused a connection: {e}");
-            let message = e.wire_message();
+            let admission = crate::admission::AdmissionError::from(e);
             tokio::spawn(async move {
                 let mut stream = stream;
                 let bytes = match wire {
-                    RefusalWire::Resp3 => format!("-{message}\r\n").into_bytes(),
+                    RefusalWire::Resp3 => format!("-{}\r\n", admission.wire_message()).into_bytes(),
                     // req_id 0: there is no request yet, and inventing one
                     // would make a client match this to something it sent.
-                    // The message carries the BACKPRESSURE code as text; the
-                    // native error enum has no retryable variant to put it in,
-                    // which is P0.5's job and not this change's.
+                    // The code byte says retryable and the message says why:
+                    // this refusal happens before any request exists, so
+                    // there is no negotiated version to gate the byte on and
+                    // none is asked for.
                     RefusalWire::Native => {
-                        skeg_proto::encode_err(0, skeg_proto::ErrCode::Internal, &message).to_vec()
+                        skeg_proto::encode_err(0, admission.code(), &admission.to_string()).to_vec()
                     }
                 };
                 let write = async {

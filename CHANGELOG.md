@@ -9,6 +9,109 @@ repository.
 
 ## [Unreleased]
 
+### A refusal now says whether retrying is worth it, on both wires
+
+A request can be refused before it runs for half a dozen reasons, and the
+only thing a client needs from any of them is whether sending the same
+request again is worth doing. That bit was decided in three unconnected
+places and spelled in two unconnected ways. The ingress budget wrote the
+word `BACKPRESSURE` at the front of a string and the RESP3 handler
+passed it through by matching on that PREFIX; the shard worker wrote the
+same word at the front of a different string for the memory governor and
+wrote nothing at all for the quota, so a tenant at its ceiling got a
+plain `ERR` and looked, from outside, exactly like one that had stopped
+writing. The binary protocol had no way to say it: every refusal arrived
+as `ErrCode::Internal`, which tells a caller to give up, with the word
+buried as prose at byte 16 of a message.
+
+**One classification, two spellings.** `AdmissionError::retryability` is
+now the only place the bit is decided, and both the RESP3 code word and
+the native error code are DERIVED from it rather than chosen beside it -
+there is no way to write a retryable refusal that does not carry the
+retryable code. Every match in it is exhaustive, so a refusal added later
+does not compile until somebody classifies it. No code outside a test now
+decides anything from the text of an error.
+
+**`ErrCode::Backpressure = 0x04`, additive, no version gate.** The three
+existing codes keep their bytes. It has no gate on purpose: the refusal
+that matters most is taken at accept, before any request exists, so
+there is no negotiated version to gate on - and released clients carry
+the byte rather than match it exhaustively, so a build that has not been
+updated behaves exactly as it does today. `ErrCode::from_u8` answers
+`None` for a byte it cannot name, never a substitution: handing back
+`Internal` for an unknown code is a client inventing a classification the
+server never sent. Full table in `docs/observability.md`.
+
+**A full VSEARCH pool now says `BACKPRESSURE`, not `ERR`.** *(RESP3 wire
+change, one error line.)* The bounded search pool refusing before it
+scatters is the most obviously momentary refusal the server has - what
+fills it is other traffic, and other traffic ends - and both wires agreed
+it was permanent. They agreed on the wrong answer: a client told `ERR` on a
+full queue does not retry, which is the only sensible thing to do. RESP3
+now sends `BACKPRESSURE vsearch queue is full` (the text is unchanged, only
+the code word in front of it) and the native wire sends `0x04`.
+
+**A frame over the connection's allowance is refused by name.** The
+parser catches a declared payload larger than the allowance on the 24
+bytes that declared it, and the server then closed the socket without a
+word - which a client reads as a network fault and answers by
+reconnecting and sending the same frame. That is a loop. It now gets one
+`Err` frame naming the limit and the length.
+
+**How far the classification reaches.** It covers every refusal the SERVER
+decides. For one a tenant backend decides it covers the leading code word
+and nothing more: `AdmitRejected` is `struct { message: String }`, written
+by a backend outside this tree, and its contract promises only that the
+string is a complete RESP3 error line beginning with an uppercase code. The
+engine reads that word, passes the line through **untouched** - a client
+that routes on `RATELIMITED` keeps routing on it - and derives the native
+byte from it, so a rate limit is `0x04` there. A message with no code word,
+or one this build does not know, is treated as permanent (the safe answer:
+guessing that an unclassified refusal clears is how a client loops) and
+counted by `skeg_backend_refusal_unclassified_total`, with a warning naming
+the message. Giving `AdmitRejected` a typed `Retryability` is the straight
+fix and belongs to a revision that may break the trait; it is deliberately
+not this one.
+
+**SDK note.** Clients that want the distinction need one change each:
+`skeg-client-rs` currently maps any unknown code byte to
+`ErrCode::Internal`, and `skeg-py` and `skeg-gleam` carry the raw
+integer and need a constant plus a `retryable` accessor. Until then a
+retryable refusal is reported as an ordinary error, which is what
+happens today.
+
+**On RESP3, `is_retryable` must be a table, not a prefix.** There are now
+TWO retryable code words: `BACKPRESSURE` for every refusal the server
+decides, and `RATELIMITED` for a tenant backend's rate limit, which is
+passed through exactly as the backend wrote it so existing clients keep
+routing on it. A backend may also emit a third word this server has never
+seen; the server calls that permanent and counts it in
+`skeg_backend_refusal_unclassified_total`, and a client should do the same
+rather than guess. `starts_with("BACKPRESSURE")` is not the rule and never
+was on the backend path. The native wire has no such ambiguity - one byte,
+and `ErrCode::is_retryable` answers for it.
+
+### The memory budget and the ingress class reach `/metrics`
+
+`SKEG.STATS` assembled them by hand in its own handler, so the two
+numbers that say whether the server is about to start refusing were
+visible only to whoever typed a Redis command; a Prometheus scrape saw
+neither. Both objects publish themselves now, to the registry both
+surfaces read, so the reply and the scrape carry the same series by
+construction rather than because two blocks of formatting were kept in
+step.
+
+Both state gauges become **state sets**: all their series on every
+scrape, exactly one at 1. Alert on
+`skeg_memory_budget_state{state="unknown"} == 1` rather than on
+`absent()` - which is what an alert had to use when only the true state
+was emitted, and which also left a dashboard showing the previous state
+until its series went stale. `skeg_memory_headroom_bytes` stays absent in
+the states where nobody could read it: publishing 0 there says "no room
+left", which is a different fact.
+
+New counter `skeg_quota_refused_total`.
+
 ### What the network may hold is now part of the memory budget
 
 Every limit on incoming bytes was per connection, and the connection

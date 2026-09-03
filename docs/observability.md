@@ -58,30 +58,41 @@ is grep-stable across patch releases.
 
 Two gauge families report what the process has promised and to whom.
 
-**Where to read them.** The gauges below are composed by the `SKEG.STATS`
-command and appear in its reply only; `/metrics` carries the counters but
-not these gauges, because the exporter serves the telemetry registry and
-these are assembled at the point the command runs. Scrape them with a
-`SKEG.STATS` probe until that is unified.
+**Where to read them.** Both places, and the same values.  The governor
+and the ingress class publish themselves to the telemetry registry, which
+is what `/metrics` serves and what `SKEG.STATS` appends to its reply, so
+a scrape and a probe carry the same series. (Until 0.7.4 these were
+assembled by hand inside the `SKEG.STATS` handler and `/metrics` did not
+carry them at all.)
 
 `skeg_memory_budget_state{state="known"|"unlimited"|"unknown"}` is the
 governor: whether a ceiling applies, whether none does, and whether one
 applies whose headroom could not be read. The third is a refusal, not a
 licence - it is the state in which writes are declined - so `unknown` is
-the one to alert on. `skeg_memory_headroom_bytes` is what is left when
-the state is `known`, `skeg_memory_reserved_bytes` what is promised and
-not yet allocated, and `skeg_memory_reserve_bytes` the margin
-deliberately held back.
+the one to alert on.
+
+These are **state sets**: all three series are present on every scrape,
+exactly one of them at 1. Alert on `skeg_memory_budget_state{state="unknown"} == 1`,
+not on `absent()`. Earlier builds emitted only the series that was true,
+which left `absent()` as the only way to write that alert and left the
+previous state showing on a dashboard until its series went stale.
+
+`skeg_memory_headroom_bytes` is what is left when the state is `known`.
+It is **absent** in the other two states, deliberately: publishing 0 for
+a headroom nobody could read says "no room left", which is a different
+fact and the one you would page on. `skeg_memory_reserved_bytes` is what
+is promised and not yet allocated, and `skeg_memory_reserve_bytes` the
+margin deliberately held back.
 
 `skeg_ingress_state{state="known"|"default"|"unreadable"}` is the share
-of that budget the network may hold, with `skeg_ingress_cap_bytes`,
+of that budget the network may hold - a state set too, same rule - with `skeg_ingress_cap_bytes`,
 `skeg_ingress_held_bytes` and
 `skeg_ingress_per_connection_max_bytes`. `held` is a SUBSET of
 `skeg_memory_reserved_bytes`: the two are one total seen whole and seen
 by class, which is how you tell a store that is full of buffered requests
 from one that is full of data.
 
-Five counters go with them, and these DO reach `/metrics`:
+Six counters go with them:
 `skeg_ingress_refused_accept_total` (peers
 turned away because the class was full - too many clients),
 `skeg_ingress_refused_growth_total` (frames refused because the buffer
@@ -89,8 +100,11 @@ they needed was not available - frames too large, or too much other
 traffic), `skeg_ingress_stalls_total` (reads paused waiting for room; a
 stall that ends in room shows up to a client only as latency),
 `skeg_ingress_budget_unreadable_total` (connections served while the
-budget could not be established), and
-`skeg_ingress_reply_over_budget_total`.
+budget could not be established),
+`skeg_ingress_reply_over_budget_total`, and
+`skeg_quota_refused_total` (writes declined because the tenant already
+held every vector its limit allows - a tenant at its ceiling used to look
+from outside exactly like a tenant that had stopped writing).
 
 **Read that last one as "a reply could not be charged", not "a reply was
 large".** A reply is written whether or not the class can cover its
@@ -186,6 +200,66 @@ raising the flag, not the 8 MiB the default happens to give. Set
 `SKEG_MEMORY_LIMIT_BYTES` or `SKEG_INGRESS_BUDGET_BYTES` to get a real
 cap back; `skeg_ingress_budget_unreadable_total` counts every connection
 served in this state.
+
+## What a refusal tells a client
+
+Every refusal taken BEFORE a request runs answers one question: is
+sending the same request again worth doing? One classification answers it
+(`crates/skeg-server/src/admission.rs`), and both wires derive their
+spelling from it, so they cannot say different things.
+
+| condition | retry? | RESP3 | native `ErrCode` |
+| --- | --- | --- | --- |
+| ingress class full (at accept, or mid-frame) | yes | `-BACKPRESSURE ingress budget: ...` | `4` Backpressure |
+| ingress budget unreadable | yes | `-BACKPRESSURE ...` | `4` Backpressure |
+| memory governor out of headroom | yes | `-BACKPRESSURE out of budget at the write: ...` | `4` Backpressure |
+| VSEARCH pool saturated | yes | `-BACKPRESSURE vsearch queue is full` | `4` Backpressure |
+| tenant backend refused, `RATELIMITED ...` | yes | the backend's own line, verbatim | `4` Backpressure |
+| tenant backend refused, any other message | no | the backend's own line, verbatim | `3` Internal |
+| frame over the connection allowance | no | `-ERR ingress budget: this connection may hold at most N ...` | `2` InvalidRequest |
+| tenant vector quota exceeded | no | `-ERR tenant vector quota exceeded: ...` | `2` InvalidRequest |
+| request over a fixed ceiling (`SKEG.VMSET` items or bytes, native frame payload) | no | `-ERR ...: at most N, got M ...` | `2` InvalidRequest |
+| headroom could not be read at all | no | `-ERR ...` | `3` Internal |
+| vector of the wrong dimension | no | `-ERR vindex '...' dim N but vector has M` | `2` InvalidRequest |
+
+**RESP3: two words mean retry, not one.** `BACKPRESSURE` for everything the
+server decides, and `RATELIMITED` for a tenant backend's rate limit, which is
+passed through as the backend wrote it. A client's `is_retryable` must
+therefore be a TABLE of code words, not `starts_with("BACKPRESSURE")` - and a
+backend can introduce a fourth word this server has never seen, which it
+classifies as permanent and counts in
+`skeg_backend_refusal_unclassified_total`. On the native wire there is no such
+ambiguity: one byte, `0x04`.
+
+An unclassified backend refusal is `3` Internal there, not `2`: what failed
+is the server's reading of the backend's answer, and the caller's request may
+have been perfectly fine.
+
+**The quota row is RESP3-only in practice.** The native listener has no
+tenant backend - `Server::run` drops it and every request on that wire is
+tenant `0` - so `handler.rs` passes `limit: None` and the vector quota is
+never active there. The row above says what the byte WOULD be, and a test
+arms the limit to prove it, but no production native deployment reaches it.
+The same applies to a tenant backend's refusal, which cannot arrive on that
+wire at all.
+
+**Native:** the code is the first byte of the `Err` payload.
+`0x04 Backpressure` was added in 0.7.4 and is the only retryable code.
+It is emitted without a version gate: the refusal that matters most is
+taken at accept, before any request exists, so there is no negotiated
+version to gate it on. Released clients carry the byte rather than match
+it exhaustively - `skeg-py` hands back the integer, `skeg-gleam` keeps it
+in a plain `Int`, `skeg-client-rs` falls through to `Internal` - so a
+build that has not been updated behaves exactly as it does today, and a
+client that wants the distinction reads
+`ErrCode::from_u8(byte).is_some_and(ErrCode::is_retryable)`. A code a
+build does not know is NOT retryable: guessing that an unknown refusal
+clears on its own is how a client loops on a permanent one.
+
+A frame declaring more than the connection may ever hold is now refused
+by name on the header. Before 0.7.4 the server closed the socket without
+a word, which a client reads as a network fault and answers by
+reconnecting and sending the same frame.
 
 ## Prometheus scrape config
 

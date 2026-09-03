@@ -158,35 +158,26 @@ pub enum IngressRejected {
 impl IngressRejected {
     /// Should the client try the same frame again?
     ///
-    /// The whole difference between backpressure and an error. A class that is
-    /// momentarily full, or a governor whose headroom the delta has taken,
-    /// clears on its own; a frame larger than one connection may hold does
-    /// not, and telling a client to retry it is telling it to loop.
+    /// Not decided here. This is one of several ways a request can be refused
+    /// before it runs, and the whole point of
+    /// [`crate::admission::AdmissionError`] is that they are classified in
+    /// ONE place: a second opinion living next to the ingress budget is how
+    /// the RESP3 wire and the native wire came to disagree in the first
+    /// place.
     #[must_use]
-    pub fn is_retryable(self) -> bool {
-        match self {
-            IngressRejected::ClassFull { .. } | IngressRejected::Unreadable { .. } => true,
-            IngressRejected::OverConnectionAllowance { .. } => false,
-            IngressRejected::Governor(e) => match e {
-                MemoryRejected::NoHeadroom { .. } => true,
-                MemoryRejected::Unknown | MemoryRejected::ArithmeticOverflow { .. } => false,
-            },
-        }
+    pub fn retryability(self) -> crate::admission::Retryability {
+        crate::admission::AdmissionError::from(self).retryability()
     }
 
     /// The error line a client sees, code first.
     ///
     /// The first word IS the code, so a retryable refusal must not be dressed
     /// as `ERR`: that turns backpressure into a failure the caller gives up
-    /// on.
+    /// on. Composed by the classifier, so this line and the native error code
+    /// cannot say different things.
     #[must_use]
     pub fn wire_message(self) -> String {
-        let code = if self.is_retryable() {
-            "BACKPRESSURE"
-        } else {
-            "ERR"
-        };
-        format!("{code} {self}")
+        crate::admission::AdmissionError::from(self).wire_message()
     }
 }
 
@@ -440,6 +431,48 @@ impl IngressBudget {
     }
 }
 
+/// The ingress class reports its own gauges, pulled at dump time. Same
+/// reason as [`MemoryGovernor`]'s: the held figure is this class's share of
+/// the governor's total, and an operator who cannot see the two together
+/// cannot tell whether the sockets or the delta are filling the budget.
+impl skeg_telemetry::GaugeSource for IngressBudget {
+    fn sample(&self, out: &mut Vec<skeg_telemetry::GaugeSample>) {
+        use skeg_telemetry::GaugeSample as S;
+        // The same state-set rule as the governor's, and for the same
+        // reasons: three series, exactly one at 1.
+        let cap = self.cap();
+        for (labels, matches) in [
+            ("state=\"known\"", matches!(cap, IngressCap::Room(_))),
+            ("state=\"default\"", matches!(cap, IngressCap::Default(_))),
+            ("state=\"unreadable\"", matches!(cap, IngressCap::FloorOnly)),
+        ] {
+            out.push(S::labelled(
+                "skeg_ingress_state",
+                labels,
+                u64::from(matches),
+            ));
+        }
+        out.push(S::new("skeg_ingress_cap_bytes", cap.bytes()));
+        out.push(S::new("skeg_ingress_held_bytes", self.held_bytes()));
+        out.push(S::new(
+            "skeg_ingress_per_connection_max_bytes",
+            self.per_connection_max(),
+        ));
+    }
+}
+
+impl IngressBudget {
+    /// Publish this class's gauges on both telemetry surfaces. Called once
+    /// where the `Arc` is made; keyed, so the last budget built wins rather
+    /// than every budget ever built reporting at once.
+    pub fn register_metrics(self: &Arc<Self>) {
+        skeg_telemetry::register_gauge_source(
+            "skeg-server::ingress",
+            Arc::downgrade(self) as std::sync::Weak<dyn skeg_telemetry::GaugeSource>,
+        );
+    }
+}
+
 /// One granted step of a connection's charge, and the governor reservation
 /// standing behind it.
 ///
@@ -617,7 +650,7 @@ pub async fn grow_or_stall(
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
-    if !last.is_retryable() {
+    if last.retryability() == crate::admission::Retryability::Permanent {
         return Err(last);
     }
     skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressStalls);
@@ -866,7 +899,11 @@ mod tests {
             matches!(err, IngressRejected::OverConnectionAllowance { .. }),
             "wrong refusal: {err:?}"
         );
-        assert!(!err.is_retryable(), "retrying will not make it fit");
+        assert_eq!(
+            err.retryability(),
+            crate::admission::Retryability::Permanent,
+            "retrying will not make it fit"
+        );
         assert!(
             err.wire_message().starts_with("ERR "),
             "a permanent refusal must not wear a retryable code: {}",
@@ -940,5 +977,86 @@ mod tests {
             err.wire_message()
         );
         assert_eq!(conn.held_bytes(), FLOOR_BYTES, "the floor stays");
+    }
+
+    // ── P0.5: the class reports its own gauges ──────────────────────────────
+
+    fn gauges_of(b: &Arc<IngressBudget>) -> Vec<skeg_telemetry::GaugeSample> {
+        let mut out = Vec::new();
+        skeg_telemetry::GaugeSource::sample(b.as_ref(), &mut out);
+        out
+    }
+
+    #[test]
+    fn the_ingress_state_is_a_set_of_three_series_with_exactly_one_at_one() {
+        for (headroom, explicit, live) in [
+            (Headroom::Known(64 * 1024 * 1024), None, "known"),
+            (Headroom::Unlimited, None, "default"),
+            (Headroom::Unknown, None, "unreadable"),
+        ] {
+            let b = Arc::new(IngressBudget::new(
+                governor(headroom),
+                None,
+                explicit,
+                None,
+                u64::from(u32::MAX),
+            ));
+            let samples = gauges_of(&b);
+            let states: Vec<(&str, u64)> = ["known", "default", "unreadable"]
+                .iter()
+                .map(|s| {
+                    let labels = match *s {
+                        "known" => "state=\"known\"",
+                        "default" => "state=\"default\"",
+                        _ => "state=\"unreadable\"",
+                    };
+                    (
+                        *s,
+                        samples
+                            .iter()
+                            .find(|g| g.name == "skeg_ingress_state" && g.labels == labels)
+                            .unwrap_or_else(|| panic!("{s} is absent for {headroom:?}"))
+                            .value,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                states.iter().filter(|(_, v)| *v == 1).count(),
+                1,
+                "{headroom:?}: exactly one state is true, got {states:?}"
+            );
+            assert_eq!(
+                states.iter().find(|(_, v)| *v == 1).map(|(s, _)| *s),
+                Some(live)
+            );
+        }
+    }
+
+    #[test]
+    fn the_class_reports_the_numbers_stats_used_to_assemble_by_hand() {
+        let b = Arc::new(IngressBudget::new(
+            governor(Headroom::Known(150 * 1024 * 1024)),
+            None,
+            None,
+            None,
+            crate::resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
+        let held = b.try_accept().expect("a floor");
+        let samples = gauges_of(&b);
+        let value = |name: &str| {
+            samples
+                .iter()
+                .find(|g| g.name == name && g.labels.is_empty())
+                .unwrap_or_else(|| panic!("{name} is absent"))
+                .value
+        };
+        assert_eq!(value("skeg_ingress_cap_bytes"), b.cap().bytes());
+        assert_eq!(value("skeg_ingress_held_bytes"), b.held_bytes());
+        assert_eq!(
+            value("skeg_ingress_per_connection_max_bytes"),
+            b.per_connection_max()
+        );
+        assert_eq!(b.held_bytes(), FLOOR_BYTES, "one connection, one floor");
+        drop(held);
     }
 }

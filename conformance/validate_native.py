@@ -78,8 +78,15 @@ def build_payload(op: str, a: dict) -> bytes:
     raise ValueError(f"no payload builder for op {op!r}")
 
 
-def build_frame(op: str, version: int, req_id: int, payload: bytes) -> bytes:
-    return struct.pack("<HBBIQII", MAGIC, version, OPS[op], 0, req_id, len(payload), 0) + payload
+def build_frame(op: str, version: int, req_id: int, payload: bytes, declared: int | None = None) -> bytes:
+    """`declared` overrides the header's payload_len without changing the body.
+
+    Only one case needs it, and it is the reason it exists: a header that
+    declares more than the connection may ever hold is refused ON THE HEADER,
+    before a byte of body arrives, and there is no other way to send one.
+    """
+    length = len(payload) if declared is None else declared
+    return struct.pack("<HBBIQII", MAGIC, version, OPS[op], 0, req_id, length, 0) + payload
 
 
 class Reply:
@@ -167,9 +174,30 @@ def decode_hits(payload: bytes):
     return [struct.unpack_from("<Qf", payload, 4 + i * 12) for i in range(n)]
 
 
+ERR_CODE_BACKPRESSURE = 0x04
+
+
+def retryability(reply: Reply) -> bool:
+    """Does this reply tell the client the same request is worth resending?
+
+    One byte, and only one value of it. A code this build does not know is
+    NOT retryable: guessing that an unknown refusal clears on its own is how
+    a client ends up looping on a permanent one.
+    """
+    return reply.is_error and reply.error_code() == ERR_CODE_BACKPRESSURE
+
+
 def check(reply: Reply, want: dict, case: dict) -> str | None:
     # Checked first, and for errors too: the server promises every reply keeps
     # the request's frame version.
+    # Retryability is a property of the same reply another matcher is about,
+    # so it is checked alongside them rather than instead of them. The RESP3
+    # cases carry the identical key against the first word of the error line.
+    if "retryable" in want and retryability(reply) != want["retryable"]:
+        return (
+            f"reply {reply} is {'retryable' if retryability(reply) else 'permanent'}, "
+            f"want {'retryable' if want['retryable'] else 'permanent'}"
+        )
     if "version" in want and reply.version != want["version"]:
         return f"reply version {reply.version} != {want['version']}"
     if "req_id" in want and reply.req_id != want["req_id"]:
@@ -259,7 +287,13 @@ def main() -> int:
                     if "raw_payload" in case
                     else build_payload(case["op"], case.get("args", {}))
                 )
-                frame = build_frame(case["op"], case.get("version", 1), case.get("req_id", i), payload)
+                frame = build_frame(
+                    case["op"],
+                    case.get("version", 1),
+                    case.get("req_id", i),
+                    payload,
+                    case.get("declared_payload_len"),
+                )
                 reply = conn.call(frame)
                 reason = check(reply, want, case)
             except Exception as e:  # noqa: BLE001

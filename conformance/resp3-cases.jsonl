@@ -119,3 +119,6 @@
 {"id": "cleanup.drop.f32", "cmd": ["SKEG.VINDEX.DROP", "cfidxf32"], "want": {"simple": "OK"}}
 {"id": "cleanup.drop.absent", "cmd": ["SKEG.VINDEX.DROP", "cfidxabsent"], "want": {"error_contains": "ERR"}}
 {"id": "cleanup.drop.arity", "cmd": ["SKEG.VINDEX.DROP"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "admission.setup.index", "cmd": ["SKEG.VINDEX.CREATE", "cfadm", "4", "f32", "flat"], "want": {"simple": "OK"}}
+{"id": "admission.dim.mismatch.is.permanent", "cmd": ["SKEG.VSET", "cfadm", "1", "f32:[1.0,2.0,3.0]"], "want": {"error_contains": "dim", "retryable": false}, "note": "the control row of the admission table: a request that is wrong stays wrong, so a classification that called everything retryable would show up here"}
+{"id": "admission.unknown.command.is.permanent", "cmd": ["SKEG.NOSUCHVERB"], "want": {"error_contains": "unknown command", "retryable": false}, "note": "not admission at all, and that is the point: BACKPRESSURE is the exception and everything else must not claim it"}

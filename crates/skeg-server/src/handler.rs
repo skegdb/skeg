@@ -96,8 +96,11 @@ pub async fn handle_connection(
                     warn!(?peer, "ingress refused: {e}");
                     // req_id 0: the frame that would have carried one has not
                     // been parsed, and inventing an id would make a client
-                    // match this to something it sent.
-                    let body = encode_err(0, ErrCode::Internal, &e.wire_message());
+                    // match this to something it sent. The code is derived
+                    // from the same classification the RESP3 line uses, so a
+                    // client that retries on one wire retries on the other.
+                    let admission = crate::admission::AdmissionError::from(e);
+                    let body = encode_err(0, admission.code(), &admission.to_string());
                     let _ = stream.write_all(&body).await;
                     break;
                 }
@@ -112,7 +115,8 @@ pub async fn handle_connection(
                                 skeg_telemetry::Counter::IngressRefusedGrowth,
                             );
                             warn!(?peer, "ingress refused after read: {e}");
-                            let body = encode_err(0, ErrCode::Internal, &e.wire_message());
+                            let admission = crate::admission::AdmissionError::from(e);
+                            let body = encode_err(0, admission.code(), &admission.to_string());
                             let _ = stream.write_all(&body).await;
                             break;
                         }
@@ -125,6 +129,31 @@ pub async fn handle_connection(
             }
             Err(e) => {
                 warn!(?peer, "protocol error: {e}");
+                // A frame larger than this connection may ever hold is
+                // REFUSED, not ignored. The parser catches it on the 24 bytes
+                // that declared the length - which is the only place the
+                // refusal is free - and the connection then closed without a
+                // word, which a client reads as a network fault and answers
+                // with a reconnect and the same frame. Saying so by name
+                // costs one frame and turns an infinite loop into an error
+                // the caller can act on.
+                //
+                // Only this one. The other parse errors mean the peer is not
+                // speaking this protocol at all, and a reply to a stream that
+                // is already desynced is a guess about where it restarts.
+                //
+                // req_id 0: the header that would have carried one did not
+                // parse, and inventing an id would make a client match this
+                // to something it sent.
+                if let skeg_proto::ParseError::FrameTooLarge { len, max } = e {
+                    let refusal = crate::admission::AdmissionError::RequestTooLarge {
+                        what: "native frame payload bytes",
+                        limit: u64::from(max),
+                        got: u64::from(len),
+                    };
+                    let body = encode_err(0, refusal.code(), &refusal.to_string());
+                    let _ = stream.write_all(&body).await;
+                }
                 break;
             }
         }
@@ -171,9 +200,40 @@ fn native_vindex_kind_is_allowed(version: u8, kind: u8) -> Result<(), &'static s
     }
 }
 
+/// The native error frame for a shard error.
+///
+/// Every one of these used to be [`ErrCode::Internal`], which tells a client
+/// to give up - including the two refusals that were momentary and had
+/// written the word `BACKPRESSURE` into their message, where it arrived as
+/// prose at byte 16 of a string a client is not supposed to parse. The
+/// classification is a byte now, and it comes from the same function the
+/// RESP3 code word comes from.
+///
+/// Exhaustive: a variant added to `ShardError` does not compile until
+/// somebody says which code it carries.
 fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
     warn!("shard error: {e}");
-    encode_err(req_id, ErrCode::Internal, &e.to_string())
+    let (code, message) = match e {
+        // The message WITHOUT the code word: the byte carries it here, and
+        // repeating it in the text is how a client ends up parsing both.
+        ShardError::Admission(a) => (a.code(), a.to_string()),
+        // Same mapping as the RESP3 handler's, to the same classification:
+        // a full pool is momentary, and the code says so.
+        ShardError::Busy => {
+            let busy = crate::admission::AdmissionError::Busy;
+            (busy.code(), busy.to_string())
+        }
+        ShardError::InvalidRequest(msg) => {
+            crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            (ErrCode::InvalidRequest, msg.clone())
+        }
+        ShardError::Unavailable => (ErrCode::Internal, e.to_string()),
+        ShardError::Storage(msg) => {
+            crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            (ErrCode::Internal, e.to_string())
+        }
+    };
+    encode_err(req_id, code, &message)
 }
 
 /// The index name of a native request: UTF-8, and free of the tenant-scope

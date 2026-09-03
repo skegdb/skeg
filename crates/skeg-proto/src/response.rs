@@ -12,6 +12,86 @@ pub enum ErrCode {
     NotFound = 0x01,
     InvalidRequest = 0x02,
     Internal = 0x03,
+    /// The server had no room for this request and the SAME request may
+    /// succeed later: the class budget was full, the governor had no
+    /// headroom, a queue was saturated.
+    ///
+    /// Additive, and deliberately without a version gate. The RESP3 wire has
+    /// carried this distinction since the ingress budget landed - the first
+    /// word of the error line is `BACKPRESSURE` rather than `ERR` - and a
+    /// native client had no way to see it: every refusal arrived as
+    /// [`ErrCode::Internal`], which tells a caller to give up. Released
+    /// clients decode the code byte as an integer or fall through to
+    /// "internal", so a byte they have never seen degrades to exactly the
+    /// behaviour they have today; and the refusal that matters most - the one
+    /// taken at accept, before a request exists - has no negotiated version
+    /// to gate on.
+    Backpressure = 0x04,
+}
+
+impl ErrCode {
+    /// The code carried by `byte`, or `None` if this build does not know it.
+    ///
+    /// `None`, never a panic and never a silent substitution: the enum is
+    /// `#[non_exhaustive]` and grows, so a decoder built against an older
+    /// release WILL meet bytes it cannot name. Handing back "internal" for
+    /// one of them would be a client inventing a classification the server
+    /// never sent.
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Self::NotFound),
+            0x02 => Some(Self::InvalidRequest),
+            0x03 => Some(Self::Internal),
+            0x04 => Some(Self::Backpressure),
+            _ => None,
+        }
+    }
+
+    /// May the caller send the same request again and expect a different
+    /// answer?
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        // Exhaustive, no `_` arm: a code added later does not compile until
+        // somebody decides whether retrying it is worth doing, which is the
+        // one question this byte exists to answer.
+        match self {
+            Self::Backpressure => true,
+            Self::NotFound | Self::InvalidRequest | Self::Internal => false,
+        }
+    }
+}
+
+/// A decoded `Err` response body.
+///
+/// `code` is `None` when the server sent a code this build cannot name;
+/// `raw` always carries the byte, so a client can log what it did not
+/// understand instead of pretending it was something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrResponse {
+    pub code: Option<ErrCode>,
+    pub raw: u8,
+    pub message: String,
+}
+
+/// Decode an `Err` response payload `[u8 code][u8 msg_len][msg]`.
+///
+/// Returns `None` only when the payload is not an error body at all (shorter
+/// than the two-byte prefix, or a length the payload does not cover).
+#[must_use]
+pub fn decode_err_response(payload: &Bytes) -> Option<ErrResponse> {
+    let [raw, msg_len, ..] = *payload.as_ref() else {
+        return None;
+    };
+    let msg_len = msg_len as usize;
+    if payload.len() < 2 + msg_len {
+        return None;
+    }
+    Some(ErrResponse {
+        code: ErrCode::from_u8(raw),
+        raw,
+        message: String::from_utf8_lossy(&payload[2..2 + msg_len]).into_owned(),
+    })
 }
 
 /// Native protocol v2 feature set returned by `Op::NativeHello`.
@@ -523,5 +603,109 @@ mod tests {
     #[test]
     fn decode_u64_short_payload_returns_zero() {
         assert_eq!(decode_u64_response(&Bytes::from_static(&[1, 2, 3])), 0);
+    }
+
+    // ── P0.5: the retryable code on the native wire ─────────────────────────
+
+    /// Every code this build knows, so a new variant is not forgotten by the
+    /// tests below. Exhaustive by construction: the match has no `_` arm, so
+    /// adding a variant fails to compile until it is listed here.
+    fn every_code() -> Vec<ErrCode> {
+        let all = vec![
+            ErrCode::NotFound,
+            ErrCode::InvalidRequest,
+            ErrCode::Internal,
+            ErrCode::Backpressure,
+        ];
+        for c in &all {
+            let _: &'static str = match c {
+                ErrCode::NotFound => "not_found",
+                ErrCode::InvalidRequest => "invalid_request",
+                ErrCode::Internal => "internal",
+                ErrCode::Backpressure => "backpressure",
+            };
+        }
+        all
+    }
+
+    #[test]
+    fn the_three_original_codes_keep_the_bytes_they_have_always_had() {
+        // Pinned as BYTES, not as an ordering. A released client reads the
+        // first byte of the payload and compares it to a literal; renumbering
+        // one of these silently turns every "key not found" into something
+        // else on a client nobody rebuilt.
+        assert_eq!(ErrCode::NotFound as u8, 0x01);
+        assert_eq!(ErrCode::InvalidRequest as u8, 0x02);
+        assert_eq!(ErrCode::Internal as u8, 0x03);
+        assert_eq!(ErrCode::Backpressure as u8, 0x04, "additive, at the end");
+    }
+
+    #[test]
+    fn every_code_round_trips_through_its_byte() {
+        for code in every_code() {
+            assert_eq!(
+                ErrCode::from_u8(code as u8),
+                Some(code),
+                "{code:?} must come back as itself from its own byte"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_code_byte_is_none_and_never_a_panic() {
+        let known: Vec<u8> = every_code().iter().map(|c| *c as u8).collect();
+        for byte in 0u8..=255 {
+            let got = ErrCode::from_u8(byte);
+            if known.contains(&byte) {
+                assert!(got.is_some(), "byte {byte:#04x} is a code this build has");
+            } else {
+                assert_eq!(
+                    got, None,
+                    "byte {byte:#04x} is not a code this build has, and \
+                     guessing one is how a client invents a classification"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backpressure_is_the_only_retryable_code() {
+        for code in every_code() {
+            let want = code == ErrCode::Backpressure;
+            assert_eq!(
+                code.is_retryable(),
+                want,
+                "{code:?}: retrying is worth it only when the server said it \
+                 had no room, not when it said the request was wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn an_err_frame_decodes_to_its_code_and_its_message() {
+        let frame = parse_one(encode_err(7, ErrCode::Backpressure, "no room right now"));
+        let decoded = decode_err_response(&frame.payload).expect("an Err body decodes");
+        assert_eq!(decoded.code, Some(ErrCode::Backpressure));
+        assert_eq!(decoded.raw, 0x04);
+        assert_eq!(decoded.message, "no room right now");
+    }
+
+    #[test]
+    fn an_err_frame_with_an_unknown_code_keeps_its_byte_and_its_message() {
+        let mut payload = BytesMut::new();
+        payload.extend_from_slice(&[0x7F, 5]);
+        payload.extend_from_slice(b"hello");
+        let decoded = decode_err_response(&payload.freeze()).expect("an Err body decodes");
+        assert_eq!(decoded.code, None, "this build cannot name 0x7F");
+        assert_eq!(decoded.raw, 0x7F, "but it must not lose the byte");
+        assert_eq!(decoded.message, "hello");
+    }
+
+    #[test]
+    fn a_truncated_err_body_is_none_not_a_panic() {
+        assert!(decode_err_response(&Bytes::new()).is_none());
+        assert!(decode_err_response(&Bytes::from_static(&[0x01])).is_none());
+        // Declares five message bytes and carries two.
+        assert!(decode_err_response(&Bytes::from_static(&[0x01, 5, b'a', b'b'])).is_none());
     }
 }

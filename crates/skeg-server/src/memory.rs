@@ -426,6 +426,59 @@ impl MemoryGovernor {
 /// a separate question, answered by the cgroup's own headroom on the next
 /// reservation - which is why a fold that really did grow the heap does not
 /// get its budget back just because its job object went away.
+/// The governor reports its own gauges, pulled at dump time.
+///
+/// The alternative is what `SKEG.STATS` used to do: read the governor by hand
+/// in one handler and format the lines there, which is why `/metrics` - the
+/// surface an operator actually scrapes - could not see the budget at all.
+/// Nothing on the reserve path changes; this is a reader.
+impl skeg_telemetry::GaugeSource for MemoryGovernor {
+    fn sample(&self, out: &mut Vec<skeg_telemetry::GaugeSample>) {
+        use skeg_telemetry::GaugeSample as S;
+        // A STATE SET: all three series, every time, exactly one at 1.
+        //
+        // This used to emit only the state that was true. Two things go wrong
+        // with that in production: an alert on "the budget went unreadable"
+        // can only be written with `absent()`, and after a transition the
+        // series that WAS true keeps its last value until it goes stale, so a
+        // dashboard shows two states at once.
+        let budget = self.budget();
+        for (labels, matches) in [
+            ("state=\"known\"", matches!(budget, Budget::Room(_))),
+            ("state=\"unlimited\"", matches!(budget, Budget::Unlimited)),
+            ("state=\"unknown\"", matches!(budget, Budget::Unreadable)),
+        ] {
+            out.push(S::labelled(
+                "skeg_memory_budget_state",
+                labels,
+                u64::from(matches),
+            ));
+        }
+        // ABSENT when nobody could read it. Publishing 0 for a headroom that
+        // could not be read says "no room left", which is a different fact
+        // and the one an operator would page on.
+        if let Budget::Room(usable) = budget {
+            out.push(S::new("skeg_memory_headroom_bytes", usable));
+        }
+        out.push(S::new("skeg_memory_reserved_bytes", self.reserved_bytes()));
+        out.push(S::new("skeg_memory_reserve_bytes", self.reserve_bytes()));
+    }
+}
+
+impl MemoryGovernor {
+    /// Publish this governor's gauges on both telemetry surfaces.
+    ///
+    /// Called once where the `Arc` is made. Keyed, so a process that opens
+    /// several shard sets - every integration test does - ends with one
+    /// governor reporting rather than one series per shard set ever opened.
+    pub fn register_metrics(self: &Arc<Self>) {
+        skeg_telemetry::register_gauge_source(
+            "skeg-server::memory",
+            Arc::downgrade(self) as std::sync::Weak<dyn skeg_telemetry::GaugeSource>,
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryReservation {
     governor: Arc<MemoryGovernor>,
@@ -728,5 +781,80 @@ mod tests {
                 requested: u64::MAX
             }
         );
+    }
+
+    // ── P0.5: the governor reports its own gauges ───────────────────────────
+
+    /// The samples one governor reports, isolated from every other source in
+    /// the process by filtering on the names this object owns.
+    fn gauges_of(g: &Arc<MemoryGovernor>) -> Vec<skeg_telemetry::GaugeSample> {
+        let mut out = Vec::new();
+        skeg_telemetry::GaugeSource::sample(g.as_ref(), &mut out);
+        out
+    }
+
+    fn value_of(samples: &[skeg_telemetry::GaugeSample], name: &str, labels: &str) -> Option<u64> {
+        samples
+            .iter()
+            .find(|s| s.name == name && s.labels == labels)
+            .map(|s| s.value)
+    }
+
+    #[test]
+    fn the_budget_state_is_a_set_of_three_series_with_exactly_one_at_one() {
+        for (headroom, live) in [
+            (Headroom::Known(1000), "known"),
+            (Headroom::Unlimited, "unlimited"),
+            (Headroom::Unknown, "unknown"),
+        ] {
+            let g = gov(headroom, 0);
+            let samples = gauges_of(&g);
+            let states: Vec<(&str, u64)> = ["known", "unlimited", "unknown"]
+                .iter()
+                .map(|s| {
+                    (
+                        *s,
+                        value_of(
+                            &samples,
+                            "skeg_memory_budget_state",
+                            match *s {
+                                "known" => "state=\"known\"",
+                                "unlimited" => "state=\"unlimited\"",
+                                _ => "state=\"unknown\"",
+                            },
+                        )
+                        .unwrap_or_else(|| panic!("{s} is absent for {headroom:?}")),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                states.iter().filter(|(_, v)| *v == 1).count(),
+                1,
+                "{headroom:?}: exactly one state is true, got {states:?}"
+            );
+            assert_eq!(
+                states.iter().find(|(_, v)| *v == 1).map(|(s, _)| *s),
+                Some(live),
+                "{headroom:?} is state {live}"
+            );
+        }
+    }
+
+    #[test]
+    fn headroom_is_absent_when_nobody_could_read_it() {
+        let known = gauges_of(&gov(Headroom::Known(1000), 0));
+        assert_eq!(
+            value_of(&known, "skeg_memory_headroom_bytes", ""),
+            Some(1000),
+            "a readable headroom is a number"
+        );
+        for headroom in [Headroom::Unlimited, Headroom::Unknown] {
+            let samples = gauges_of(&gov(headroom, 0));
+            assert!(
+                value_of(&samples, "skeg_memory_headroom_bytes", "").is_none(),
+                "{headroom:?}: publishing 0 for a headroom nobody could read \
+                 reads as 'no room left', which is a different fact"
+            );
+        }
     }
 }

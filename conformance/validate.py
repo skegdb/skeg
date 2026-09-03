@@ -123,8 +123,27 @@ class Conn:
         return self.read()
 
 
+def retryability(reply: Reply) -> bool:
+    """Does this reply tell the client the same command is worth resending?
+
+    The first word of a RESP error IS its code, and `BACKPRESSURE` is the only
+    one that means "no room right now". Everything else - including a plain
+    `ERR` in front of a condition that clears - means give up.
+    """
+    return reply.kind == "error" and reply.value.split(" ", 1)[0] == "BACKPRESSURE"
+
+
 def check(reply: Reply, want: dict) -> str | None:
     """Return None when the reply satisfies `want`, else a failure reason."""
+    # Checked first and alongside the rest: retryability is a property of the
+    # SAME reply another matcher is about, not a matcher of its own. The
+    # native cases carry the identical key against the error code byte, which
+    # is what makes the two wires comparable case by case.
+    if "retryable" in want and retryability(reply) != want["retryable"]:
+        return (
+            f"reply {reply} is {'retryable' if retryability(reply) else 'permanent'}, "
+            f"want {'retryable' if want['retryable'] else 'permanent'}"
+        )
     if "any" in want:
         return None if reply.kind != "error" else f"unexpected error {reply.value!r}"
     if "error_contains" in want:

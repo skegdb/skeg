@@ -413,6 +413,115 @@ mod ingress_at_state {
 #[cfg(any(test, feature = "failpoints"))]
 pub use ingress_at_state::{arm_ingress_at, armed_ingress_at, disarm_ingress_at, fired_ingress_at};
 
+/// A point where a write is REFUSED before any of it happens.
+///
+/// Its own family, next to [`WriteFailpoint`] and [`IngressFailpoint`], and
+/// for the same reason as those two: the bits must not collide and an
+/// admission test must not be able to arm a point a durable write reads.
+///
+/// The conditions here are real and reachable, but not on demand. A memory
+/// refusal needs a governor with no headroom while a write is in flight; a
+/// quota refusal needs a tenant already at its ceiling, and the native
+/// listener - which is always tenant `0` - has no limits to be at. Arming the
+/// point is how the SAME condition is put on both wires, which is the whole
+/// question P0.5 asks.
+///
+/// KEYED on the vindex name, like [`WriteFailpoint`]: the site runs inside a
+/// shard worker, never on the thread that armed it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionFailpoint {
+    /// The memory governor's answer at the VSET admission step: refuse as if
+    /// the headroom were gone.
+    MemoryRefusedAtVset,
+    /// The tenant vector quota's answer at the VSET admission step: refuse as
+    /// if the tenant were at its limit.
+    QuotaRefusedAtVset,
+    /// The bounded VSEARCH pool's answer: refuse as if every worker permit
+    /// were taken. Saturating a real pool from a socket test means racing a
+    /// semaphore, which is not something a deterministic test may do.
+    VsearchQueueFullAtSearch,
+}
+
+impl AdmissionFailpoint {
+    /// This point's bit in its own registry. Exhaustive on purpose: a new
+    /// variant does not compile until it is given a bit.
+    #[cfg(any(test, feature = "failpoints"))]
+    const fn bit(self) -> u64 {
+        match self {
+            AdmissionFailpoint::MemoryRefusedAtVset => 1 << 0,
+            AdmissionFailpoint::QuotaRefusedAtVset => 1 << 1,
+            AdmissionFailpoint::VsearchQueueFullAtSearch => 1 << 2,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+mod admission_at_state {
+    use super::AdmissionFailpoint;
+    use super::keyed_state::KeyedRegistry;
+
+    static ADMISSION: KeyedRegistry = KeyedRegistry::new();
+
+    /// Make `fp` refuse for the vindex named `key`, until it is disarmed.
+    ///
+    /// # Panics
+    ///
+    /// If `fp` is ALREADY armed for `key`; see [`KeyedRegistry::arm`].
+    pub fn arm_admission_at(fp: AdmissionFailpoint, key: &str) {
+        ADMISSION.arm(fp.bit(), key, &fp);
+    }
+
+    /// Stop `fp` refusing for `key`. The fired flag is left for the assertion.
+    pub fn disarm_admission_at(fp: AdmissionFailpoint, key: &str) {
+        ADMISSION.disarm(fp.bit(), key);
+    }
+
+    /// Is `fp` armed for `key`? Records the hit.
+    #[must_use]
+    pub fn armed_admission_at(fp: AdmissionFailpoint, key: &str) -> bool {
+        ADMISSION.armed(fp.bit(), key)
+    }
+
+    /// Did `fp` fire for `key` since it was armed? Every admission failpoint
+    /// test asserts this: a refusal that never happened proves nothing about
+    /// how a refusal is reported.
+    #[must_use]
+    pub fn fired_admission_at(fp: AdmissionFailpoint, key: &str) -> bool {
+        ADMISSION.fired(fp.bit(), key)
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+pub use admission_at_state::{
+    arm_admission_at, armed_admission_at, disarm_admission_at, fired_admission_at,
+};
+
+/// Is `$fp` armed for `$key`, as a boolean?
+///
+/// The admission family's form, shaped like [`fp_ingress!`] rather than
+/// [`fp_at!`]: an admission site turns the hit into the SAME typed refusal
+/// the real condition produces, so the value - not a `return` - is what the
+/// caller needs.
+#[macro_export]
+#[cfg(any(test, feature = "failpoints"))]
+macro_rules! fp_admission {
+    ($fp:expr, $key:expr) => {
+        $crate::failpoint::armed_admission_at($fp, $key)
+    };
+}
+
+/// The disabled expansion: still names the variant, so a renamed point fails
+/// to compile instead of quietly never firing.
+#[macro_export]
+#[cfg(not(any(test, feature = "failpoints")))]
+macro_rules! fp_admission {
+    ($fp:expr, $key:expr) => {{
+        let _: $crate::failpoint::AdmissionFailpoint = $fp;
+        let _ = &$key;
+        false
+    }};
+}
+
 /// Is `$fp` armed for `$key`, as a boolean?
 ///
 /// The ingress family's form. Unlike [`fp_at!`] it does not `return`: an

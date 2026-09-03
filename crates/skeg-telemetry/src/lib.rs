@@ -32,6 +32,8 @@ pub mod histograms;
 #[cfg(any(feature = "stats", feature = "http"))]
 pub mod metrics;
 #[cfg(any(feature = "stats", feature = "http"))]
+pub mod sources;
+#[cfg(any(feature = "stats", feature = "http"))]
 pub mod stats;
 
 #[cfg(feature = "http")]
@@ -48,6 +50,9 @@ pub use dynamic::{DynHistogram, DynOp, register_counter, register_gauge, registe
 
 #[cfg(any(feature = "stats", feature = "http"))]
 pub use metrics::MAX_SHARDS;
+
+#[cfg(any(feature = "stats", feature = "http"))]
+pub use sources::{GaugeSample, GaugeSource, register_gauge_source};
 
 /// Enumeration of operations tracked on the hot path.
 ///
@@ -417,10 +422,26 @@ pub enum Counter {
     /// next to `IngressRefusedGrowth` as a signal that the class is full, and
     /// not as a measure of how big replies are getting.
     IngressReplyOverBudget = 52,
+    /// Writes refused because the tenant was at its vector limit.
+    ///
+    /// The quota was the one admission decision with no number attached: it
+    /// refused, the client saw a line of text, and nothing counted it - so a
+    /// tenant hitting its ceiling looked from outside exactly like a tenant
+    /// that had stopped writing.
+    QuotaRefused = 53,
+    /// Tenant-backend refusals whose message carried no code word this build
+    /// knows.
+    ///
+    /// The backend trait asks for a leading uppercase code and the engine
+    /// classifies the refusal from it. A backend that sends prose, or a word
+    /// this build has never heard of, gets the safe answer - permanent - and
+    /// this counter, because the alternative is a rate limit that silently
+    /// reads as "give up" to every client of that deployment.
+    BackendRefusalUnclassified = 54,
 }
 
 impl Counter {
-    pub const COUNT: usize = 53;
+    pub const COUNT: usize = 55;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -475,6 +496,8 @@ impl Counter {
         Counter::IngressStalls,
         Counter::IngressBudgetUnreadable,
         Counter::IngressReplyOverBudget,
+        Counter::QuotaRefused,
+        Counter::BackendRefusalUnclassified,
     ];
 
     #[inline]
@@ -533,6 +556,8 @@ impl Counter {
             Counter::IngressStalls => "skeg_ingress_stalls_total",
             Counter::IngressBudgetUnreadable => "skeg_ingress_budget_unreadable_total",
             Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
+            Counter::QuotaRefused => "skeg_quota_refused_total",
+            Counter::BackendRefusalUnclassified => "skeg_backend_refusal_unclassified_total",
         }
     }
 }
