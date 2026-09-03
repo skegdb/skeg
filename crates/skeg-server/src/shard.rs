@@ -1096,7 +1096,6 @@ pub struct VindexRow {
     pub base: u64,
 }
 
-/// Load every `router-<name>.bin` under the shard-set root.
 /// Default probe width for routed searches: `SKEG_PROBE` (0 = full
 /// fan-out). Ships at 0 until the probe gate clears on the live corpus.
 fn probe_default() -> usize {
@@ -1109,11 +1108,35 @@ fn probe_default() -> usize {
     })
 }
 
-fn load_routers(root: &Path) -> HashMap<String, Arc<crate::router::Router>> {
+/// Load every `router-<name>.bin` under the shard-set root.
+///
+/// FAIL CLOSED on a sidecar that is there and will not read. It used to warn
+/// and skip, which is not a smaller failure - it is a silent change of how the
+/// store behaves. The index comes back UNROUTED, so point ops fall through to
+/// hash placement on rows that have been physically re-partitioned, and the
+/// vector-quota rebuild adds the shards' counts instead of deduplicating their
+/// ids: measured at 119 against 60 logical rows, after which the tenant is
+/// refused at half its limit. An open that cannot know how the store is routed
+/// has no serviceable state to offer, and the same stance is already taken by
+/// the registry that will not round-trip and by the owner-map rebuild that
+/// cannot read a shard.
+///
+/// A MISSING sidecar is a different thing and stays legal: an index that was
+/// never resharded has none, and `read_dir` simply does not yield one. Only a
+/// file that exists under the name and does not parse refuses, and the error
+/// names it, because renaming or removing that file is the whole repair.
+fn load_routers(root: &Path) -> std::io::Result<HashMap<String, Arc<crate::router::Router>>> {
     let mut out = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
-    };
+    // The root is created by the layout manifest before this runs, so a
+    // directory that will not list is itself a store this open cannot
+    // describe - and "no sidecars" is exactly the wrong thing to conclude
+    // from it.
+    let entries = std::fs::read_dir(root).map_err(|e| {
+        std::io::Error::other(format!(
+            "vindex router sidecars in {} cannot be listed: {e}",
+            root.display()
+        ))
+    })?;
     for entry in entries.flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
         if let Some(name) = file
@@ -1124,11 +1147,18 @@ fn load_routers(root: &Path) -> HashMap<String, Arc<crate::router::Router>> {
                 Ok(r) => {
                     out.insert(name.to_owned(), Arc::new(r));
                 }
-                Err(e) => tracing::warn!("router sidecar {file} unreadable, ignored: {e}"),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "vindex router sidecar {file} will not read ({e}); refusing to \
+                         open '{name}' as an unrouted index, which would place its point \
+                         ops by hash over rows the reshard moved and count its rows twice. \
+                         Restore the file from a backup, or remove it and reshard again."
+                    )));
+                }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 enum ShardResp {
@@ -5404,7 +5434,7 @@ impl ShardSet {
         // shard has to report its rows for the quota rebuild, and a shard
         // cannot know - the sidecars sit beside the shard directories, not
         // inside them.
-        let routers = load_routers(base_dir);
+        let routers = load_routers(base_dir)?;
         let routed: Arc<HashSet<String>> = Arc::new(routers.keys().cloned().collect());
         let vsearch_admission = (workers > 0).then(|| Arc::new(Semaphore::new(workers)));
         // One disk counter shared across all shards, so the disk quota is global
@@ -11041,7 +11071,6 @@ mod tests {
     /// file. A sidecar that is ABSENT is a different thing entirely - an index
     /// that was never resharded has none - and still opens.
     #[tokio::test]
-    #[ignore = "opens in: shard: an unreadable router sidecar fails the open"]
     async fn test_a_corrupt_router_sidecar_fails_the_open() {
         const T: u128 = 61;
         const N: u64 = 60;
