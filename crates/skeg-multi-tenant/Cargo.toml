@@ -46,7 +46,7 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = "3"
 # The engine the tenants must reopen with: the workspace one.
-skeg-vector = { path = "../skeg-vector", version = "0.1.9" }
+skeg-vector = { path = "../skeg-vector", version = "0.2" }
 bytes = "1"
 skeg-resp3 = "0.1"
 skeg-rigging-net = "0.1.1"

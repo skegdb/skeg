@@ -15,7 +15,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
-ORDER=(skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core skeg-vector skeg-tenant skeg-server skeg-server-tenant skeg-multi-tenant)
+# skeg-multi-tenant is out of this release (see release.yml): pass it explicitly to check it.
+ORDER=(skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core skeg-vector skeg-tenant skeg-server skeg-server-tenant)
 [ $# -gt 0 ] && ORDER=("$@")
 SCRATCH="${VERIFY_SCRATCH:-$(mktemp -d "${TMPDIR:-/tmp}/skeg-verify.XXXXXX")}"
 echo "scratch: $SCRATCH"

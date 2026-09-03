@@ -384,7 +384,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -695,7 +695,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -847,7 +847,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1472,7 +1472,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1625,7 +1625,7 @@ dependencies = [
  "skeg-rigging-net-resp3",
  "skeg-rigging-skeg",
  "skeg-tenant",
- "skeg-vector",
+ "skeg-vector 0.2.0",
  "tempfile",
  "thiserror",
 ]
@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags",
  "bytes",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-resp3"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -1725,13 +1725,13 @@ dependencies = [
  "serde",
  "serde_json",
  "skeg-rigging",
- "skeg-vector",
+ "skeg-vector 0.1.8",
  "thiserror",
 ]
 
 [[package]]
 name = "skeg-server"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -1744,10 +1744,10 @@ dependencies = [
  "skeg-core",
  "skeg-platform",
  "skeg-proto",
- "skeg-resp3 0.2.5",
+ "skeg-resp3 0.3.0",
  "skeg-server",
  "skeg-telemetry",
- "skeg-vector",
+ "skeg-vector 0.2.0",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
@@ -1761,13 +1761,13 @@ dependencies = [
 
 [[package]]
 name = "skeg-server-tenant"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "parking_lot",
  "skeg-platform",
  "skeg-server",
  "skeg-tenant",
- "skeg-vector",
+ "skeg-vector 0.2.0",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-simd"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "criterion",
  "proptest",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-telemetry"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "tiny_http",
@@ -1815,7 +1815,28 @@ dependencies = [
 
 [[package]]
 name = "skeg-vector"
-version = "0.1.9"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7916fe3d55122a9cee65d59538663c168d5a86020c442f1140f95941f6b171cc"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "crc32c",
+ "fixedbitset",
+ "ordered-float",
+ "parking_lot",
+ "rand",
+ "rayon",
+ "skeg-platform",
+ "skeg-simd",
+ "smallvec",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "skeg-vector"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1831,7 +1852,7 @@ dependencies = [
  "skeg-platform",
  "skeg-simd",
  "skeg-telemetry",
- "skeg-vector",
+ "skeg-vector 0.2.0",
  "smallvec",
  "tempfile",
  "thiserror",
@@ -1923,7 +1944,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2460,7 +2481,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
