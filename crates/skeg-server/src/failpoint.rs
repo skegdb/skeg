@@ -496,6 +496,318 @@ pub use admission_at_state::{
     arm_admission_at, armed_admission_at, disarm_admission_at, fired_admission_at,
 };
 
+/// A point on the PLACEMENT path - the moment an owner map is published -
+/// that a test can PARK rather than fail.
+///
+/// Its own family, its own registry, for the same reason as the three above:
+/// the bits must not collide.
+///
+/// A gate, not a failure. The other families answer "make this step fail";
+/// the question B0 asks is "what does a concurrent VSET/VDEL observe WHILE the
+/// placement of an index is being replaced", and a failure cannot express it -
+/// there is nothing wrong with the publish, the whole point is that it takes
+/// time and something else runs during it. So the site parks until the test
+/// releases it, which turns a microsecond-wide window that reproduced in
+/// 30-70% of runs (audit 18) into a window the test opens and closes by hand.
+///
+/// KEYED on the vindex name, and process-wide: the publish runs on whatever
+/// task called it, which is never the thread that armed the gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlacementFailpoint {
+    /// Inside the exclusive placement section of `rebuild_owner_maps`,
+    /// immediately before the wholesale `owners.insert(name, map)`. Every
+    /// shard has been scanned; nothing is published yet.
+    OwnerMapPublish,
+}
+
+impl PlacementFailpoint {
+    /// This point's bit in its own registry. Exhaustive on purpose: a new
+    /// variant does not compile until it is given a bit.
+    #[cfg(any(test, feature = "failpoints"))]
+    const fn bit(self) -> u64 {
+        match self {
+            PlacementFailpoint::OwnerMapPublish => 1 << 0,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+mod gate_state {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// How long a parked site waits before it gives up and panics. A gate a
+    /// test forgets to release must not turn into a suite that hangs until CI
+    /// kills it with no name attached to the hang.
+    const MAX_PARK: Duration = Duration::from_secs(60);
+    /// How often the park loop re-checks. Only reached when the watch channel
+    /// says nothing, which is every 250 ms of a legitimate park.
+    const POLL: Duration = Duration::from_millis(250);
+
+    /// One armed (point, key) pair, plus the two signals a gate needs that a
+    /// failure point does not: "the site was reached" and "the site may go on".
+    struct Entry {
+        bit: u64,
+        key: String,
+        armed: bool,
+        /// The site was actually REACHED. Same role as `fired` in
+        /// [`super::keyed_state::KeyedRegistry`]: a gate nothing ever entered
+        /// makes its test pass for the wrong reason.
+        fired: bool,
+        /// Flipped true when the site is entered, so [`KeyedGate::wait_reached`]
+        /// can await it without polling a boolean.
+        reached: tokio::sync::watch::Sender<bool>,
+        /// Flipped true by [`KeyedGate::release`], which is what unparks the
+        /// site.
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    /// A process-wide, key-scoped registry of GATES for one family.
+    ///
+    /// Deliberately shaped like `KeyedRegistry` - same `any` fast path, same
+    /// "arming an armed key is a bug" rule - because the isolation story is
+    /// identical: the mask is process-wide and what keeps two tests apart is
+    /// their choosing different vindex names.
+    pub struct KeyedGate {
+        /// Bits with at least one key armed anywhere in the process. The
+        /// guarded site sits on the placement path, so a DISARMED gate has to
+        /// cost one relaxed load and nothing else.
+        any: AtomicU64,
+        state: Mutex<Vec<Entry>>,
+    }
+
+    impl KeyedGate {
+        pub const fn new() -> Self {
+            Self {
+                any: AtomicU64::new(0),
+                state: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with<R>(&self, f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
+            let mut g = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&mut g)
+        }
+
+        fn refresh_any(&self, entries: &[Entry]) {
+            let mask = entries.iter().filter(|e| e.armed).fold(0, |m, e| m | e.bit);
+            self.any.store(mask, Ordering::Relaxed);
+        }
+
+        /// Arm the gate at `bit` for `key`: the next task to reach that site
+        /// parks there until [`KeyedGate::release`].
+        ///
+        /// # Panics
+        ///
+        /// If `bit` is ALREADY armed for `key` - two tests in one binary
+        /// sharing a key can each park the other, which is exactly the
+        /// failure mode that gets rerun until it passes.
+        pub fn arm(&self, bit: u64, key: &str, what: &dyn std::fmt::Debug) {
+            self.with(|entries| {
+                match entries.iter_mut().find(|e| e.bit == bit && e.key == key) {
+                    Some(e) => {
+                        assert!(
+                            !e.armed,
+                            "{what:?} is already armed for '{key}': two tests in this \
+                             binary are sharing a gate key, so each can park the \
+                             other. Give them different keys."
+                        );
+                        e.armed = true;
+                        e.fired = false;
+                        e.reached.send_replace(false);
+                        e.release.send_replace(false);
+                    }
+                    None => entries.push(Entry {
+                        bit,
+                        key: key.to_owned(),
+                        armed: true,
+                        fired: false,
+                        reached: tokio::sync::watch::Sender::new(false),
+                        release: tokio::sync::watch::Sender::new(false),
+                    }),
+                }
+                self.refresh_any(entries);
+            });
+        }
+
+        /// Enter the gate. Records the hit, wakes anyone in
+        /// [`KeyedGate::wait_reached`], and parks until released.
+        ///
+        /// # Panics
+        ///
+        /// If the gate is never released within [`MAX_PARK`]: a forgotten
+        /// release must name itself instead of hanging the suite.
+        pub async fn enter(&self, bit: u64, key: &str, what: &(dyn std::fmt::Debug + Sync)) {
+            if self.any.load(Ordering::Relaxed) & bit == 0 {
+                return;
+            }
+            let waiter = self.with(|entries| {
+                entries
+                    .iter_mut()
+                    .find(|e| e.bit == bit && e.key == key && e.armed)
+                    .map(|e| {
+                        e.fired = true;
+                        e.reached.send_replace(true);
+                        e.release.subscribe()
+                    })
+            });
+            let Some(mut rx) = waiter else { return };
+            let since = Instant::now();
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                match tokio::time::timeout(POLL, rx.changed()).await {
+                    // Released, or the registry entry went away (it never
+                    // does - the Vec only grows - but a dead sender is not a
+                    // reason to park forever).
+                    Ok(Ok(()) | Err(_)) => {}
+                    Err(_) => assert!(
+                        since.elapsed() < MAX_PARK,
+                        "{what:?} parked at '{key}' for {:?} and was never released",
+                        since.elapsed()
+                    ),
+                }
+            }
+        }
+
+        /// Wait until the site guarded by `bit`/`key` has been ENTERED.
+        ///
+        /// # Panics
+        ///
+        /// If the site is not reached within [`MAX_PARK`].
+        pub async fn wait_reached(&self, bit: u64, key: &str, what: &(dyn std::fmt::Debug + Sync)) {
+            let waiter = self.with(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.bit == bit && e.key == key)
+                    .map(|e| e.reached.subscribe())
+            });
+            let Some(mut rx) = waiter else {
+                panic!("{what:?} was never armed for '{key}'")
+            };
+            let since = Instant::now();
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                match tokio::time::timeout(POLL, rx.changed()).await {
+                    Ok(Ok(()) | Err(_)) => {}
+                    Err(_) => assert!(
+                        since.elapsed() < MAX_PARK,
+                        "{what:?} at '{key}' was not reached in {:?}",
+                        since.elapsed()
+                    ),
+                }
+            }
+        }
+
+        /// Let the parked site go on, and disarm: a second pass through the
+        /// same site in the same test must not park again. The fired flag is
+        /// left alone for the assertion that follows.
+        pub fn release(&self, bit: u64, key: &str) {
+            self.with(|entries| {
+                if let Some(e) = entries.iter_mut().find(|e| e.bit == bit && e.key == key) {
+                    e.armed = false;
+                    e.release.send_replace(true);
+                }
+                self.refresh_any(entries);
+            });
+        }
+
+        /// Was the gate at `bit`/`key` ever entered since it was armed?
+        pub fn fired(&self, bit: u64, key: &str) -> bool {
+            self.with(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.bit == bit && e.key == key && e.fired)
+            })
+        }
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+mod placement_gate_state {
+    use super::PlacementFailpoint;
+    use super::gate_state::KeyedGate;
+
+    static PLACEMENT: KeyedGate = KeyedGate::new();
+
+    /// Park the next task that reaches `fp` for the vindex named `key`, until
+    /// [`release_gate_at`].
+    ///
+    /// # Panics
+    ///
+    /// If `fp` is ALREADY armed for `key`; see [`KeyedGate::arm`].
+    pub fn arm_gate_at(fp: PlacementFailpoint, key: &str) {
+        PLACEMENT.arm(fp.bit(), key, &fp);
+    }
+
+    /// Enter `fp` for `key`: park if armed, return immediately if not. Called
+    /// by [`crate::gate_at`], not usually by hand.
+    ///
+    /// # Panics
+    ///
+    /// If the gate is armed and never released; see [`KeyedGate::enter`].
+    pub async fn gate_at(fp: PlacementFailpoint, key: &str) {
+        PLACEMENT.enter(fp.bit(), key, &fp).await;
+    }
+
+    /// Wait until the site guarded by `fp` for `key` is parked in the gate.
+    ///
+    /// # Panics
+    ///
+    /// If `fp` was never armed for `key`, or the site is not reached in time.
+    pub async fn wait_reached(fp: PlacementFailpoint, key: &str) {
+        PLACEMENT.wait_reached(fp.bit(), key, &fp).await;
+    }
+
+    /// Let the parked site go on, and disarm it.
+    pub fn release_gate_at(fp: PlacementFailpoint, key: &str) {
+        PLACEMENT.release(fp.bit(), key);
+    }
+
+    /// Did `fp` fire for `key` since it was armed? Every gate test asserts
+    /// this: a gate nothing entered proves nothing about the window.
+    #[must_use]
+    pub fn fired_gate_at(fp: PlacementFailpoint, key: &str) -> bool {
+        PLACEMENT.fired(fp.bit(), key)
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+pub use placement_gate_state::{
+    arm_gate_at, fired_gate_at, gate_at, release_gate_at, wait_reached,
+};
+
+/// PARK at `$fp` for `$key` while the gate is armed.
+///
+/// Expands to an `.await`, so the site must be in an async fn. In a build
+/// without the failpoints it expands to a type annotation and the placement
+/// path carries no branch and no await at all.
+#[macro_export]
+#[cfg(any(test, feature = "failpoints"))]
+macro_rules! gate_at {
+    ($fp:expr, $key:expr) => {
+        $crate::failpoint::gate_at($fp, $key).await
+    };
+}
+
+/// The disabled expansion: still names the variant, so a renamed point fails
+/// to compile instead of quietly never parking.
+#[macro_export]
+#[cfg(not(any(test, feature = "failpoints")))]
+macro_rules! gate_at {
+    ($fp:expr, $key:expr) => {{
+        let _: $crate::failpoint::PlacementFailpoint = $fp;
+        let _ = &$key;
+    }};
+}
+
 /// Is `$fp` armed for `$key`, as a boolean?
 ///
 /// The admission family's form, shaped like [`fp_ingress!`] rather than
@@ -739,6 +1051,60 @@ mod tests {
         let shared = "failpoint-unit-shared";
         arm_at(WriteFailpoint::VdelBlobDelete, shared);
         arm_at(WriteFailpoint::VdelBlobDelete, shared);
+    }
+
+    /// A gate is not a failure: the site must STOP there and go on only when
+    /// the test says so. Both halves matter - a gate that never parks makes
+    /// the concurrency test it exists for prove nothing, and a gate that
+    /// never releases hangs the suite.
+    #[tokio::test]
+    async fn a_gate_parks_and_releases() {
+        use super::{
+            PlacementFailpoint, arm_gate_at, fired_gate_at, release_gate_at, wait_reached,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const FP: PlacementFailpoint = PlacementFailpoint::OwnerMapPublish;
+        let mine = "failpoint-unit-gate-mine";
+        let yours = "failpoint-unit-gate-yours";
+
+        // A DISARMED gate is a no-op, and says so.
+        assert!(!fired_gate_at(FP, mine));
+        crate::gate_at!(FP, mine);
+        assert!(!fired_gate_at(FP, mine), "a disarmed gate is not entered");
+
+        arm_gate_at(FP, mine);
+        let through = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&through);
+        let parked = tokio::spawn(async move {
+            crate::gate_at!(FP, mine);
+            flag.store(true, Ordering::SeqCst);
+        });
+        wait_reached(FP, mine).await;
+        assert!(
+            fired_gate_at(FP, mine),
+            "the site was reached, so the gate must record the hit"
+        );
+        // The whole point: it is still in there.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !through.load(Ordering::SeqCst),
+            "an armed gate must PARK the site, not merely count it"
+        );
+        // And another index is not caught by this arming.
+        crate::gate_at!(FP, yours);
+        assert!(!fired_gate_at(FP, yours), "one key each");
+
+        release_gate_at(FP, mine);
+        parked.await.unwrap();
+        assert!(through.load(Ordering::SeqCst), "released means released");
+        assert!(
+            fired_gate_at(FP, mine),
+            "releasing leaves the record of the hit for the assertion that follows"
+        );
+        // Released is also disarmed: a second pass does not park again.
+        crate::gate_at!(FP, mine);
     }
 
     /// Two families, two registries. Bit 0 of the ingress enum and bit 0 of
