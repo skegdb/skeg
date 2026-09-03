@@ -7960,7 +7960,7 @@ impl ShardSet {
         // is pre-allocated here: the shard `point_shard` names is the only
         // authority on whether it holds this id at all, and it decides that
         // under its own write lock, exactly like an unrouted `vset`
-        // (`version: None`, `shard.rs:7151`). An id neither this shard nor
+        // (`version: None`, `shard.rs:7172`). An id neither this shard nor
         // any owner map has ever seen then costs nothing - no version, no
         // WAL record, no tombstone (P0-B, audit 16).
         let known = self
