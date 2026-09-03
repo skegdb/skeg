@@ -47,7 +47,10 @@ pub enum Retryability {
 }
 
 /// A refusal decided before any of the work happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Clone` and not `Copy`: [`AdmissionError::Backend`] carries a string a
+/// backend wrote, and there is nowhere else for it to live.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionError {
     /// The ingress class, the per-connection allowance, or the governor
     /// underneath them refused the bytes.
@@ -64,13 +67,35 @@ pub enum AdmissionError {
         limit: u64,
         got: u64,
     },
+    /// A bounded queue inside the engine had no room. Momentary by
+    /// construction: what fills it is other traffic, and other traffic ends.
+    Busy,
+    /// A tenant backend refused the command.
+    ///
+    /// The message is OPAQUE. It is written by a backend that lives outside
+    /// this tree, behind a trait whose contract says only that the string is
+    /// "the full RESP3 error string (code word + human text)" and that the
+    /// backend "should format a leading uppercase code, e.g.
+    /// `RATELIMITED tenant request rate exceeded`". So the engine classifies
+    /// it from THE ONE THING the contract promises - that leading word - and
+    /// passes the string itself through untouched.
+    ///
+    /// Reading a word out of a message is exactly the pattern this module
+    /// exists to remove, and it is here for the one case where the message is
+    /// the interface: the alternative is giving `AdmitRejected` a typed
+    /// `Retryability`, which changes a public trait contract and belongs to
+    /// the revision that gets to break it. Until then this is the only place
+    /// in the engine that reads a code word out of a string, it reads it once
+    /// at the point the refusal enters, and a message it cannot classify is
+    /// counted rather than guessed at.
+    Backend { message: String },
 }
 
 impl AdmissionError {
     /// THE classification. Every other answer in this module is derived from
     /// this one, and no other module is allowed a second opinion.
     #[must_use]
-    pub fn retryability(self) -> Retryability {
+    pub fn retryability(&self) -> Retryability {
         use Retryability::{Permanent, Retryable};
         // Exhaustive, no `_` arm anywhere in it. A refusal whose
         // classification nobody chose would default to something, and both
@@ -97,13 +122,18 @@ impl AdmissionError {
             // vector or raises the limit, neither of which is a retry.
             Self::QuotaExceeded { .. } => Permanent,
             Self::RequestTooLarge { .. } => Permanent,
+            // Stub: opened by `server: a full vsearch queue is backpressure`.
+            Self::Busy => Permanent,
+            // Stub: opened by `server: a backend refusal is classified by the
+            // code word its own contract promises`.
+            Self::Backend { .. } => Permanent,
         }
     }
 
     /// The first word of the RESP3 error line, which IS the code a client
     /// routes on.
     #[must_use]
-    pub fn resp3_code(self) -> &'static str {
+    pub fn resp3_code(&self) -> &'static str {
         match self.retryability() {
             Retryability::Retryable => "BACKPRESSURE",
             Retryability::Permanent => "ERR",
@@ -111,16 +141,25 @@ impl AdmissionError {
     }
 
     /// The whole RESP3 error line: code word, then the reason.
+    ///
+    /// A backend refusal is the exception, and passes through untouched: the
+    /// string already IS a complete error line, code word included, and
+    /// putting `ERR` or `BACKPRESSURE` in front of `RATELIMITED ...` would
+    /// replace the word that deployment's clients already route on with one
+    /// they do not.
     #[must_use]
-    pub fn wire_message(self) -> String {
-        format!("{} {self}", self.resp3_code())
+    pub fn wire_message(&self) -> String {
+        match self {
+            Self::Backend { message } => message.clone(),
+            other => format!("{} {other}", other.resp3_code()),
+        }
     }
 
     /// The native error code. Retryable is always
     /// [`ErrCode::Backpressure`]; the permanent codes distinguish a request
     /// the client can fix from an accounting fault it cannot.
     #[must_use]
-    pub fn code(self) -> ErrCode {
+    pub fn code(&self) -> ErrCode {
         match self.retryability() {
             // Structural, not asserted: there is no way to write a retryable
             // refusal that does not carry the retryable code.
@@ -132,7 +171,7 @@ impl AdmissionError {
     /// Which kind of permanent, for a client deciding what to do next: fix
     /// the request, or tell an operator. Exhaustive for the same reason
     /// [`AdmissionError::retryability`] is.
-    fn permanent_code(self) -> ErrCode {
+    fn permanent_code(&self) -> ErrCode {
         match self {
             // Headroom nobody could read is an accounting fault of this
             // process. The client cannot fix it by sending anything else, so
@@ -154,9 +193,70 @@ impl AdmissionError {
                 MemoryRejected::NoHeadroom { .. } | MemoryRejected::ArithmeticOverflow { .. },
             )
             | Self::QuotaExceeded { .. }
-            | Self::RequestTooLarge { .. } => ErrCode::InvalidRequest,
+            | Self::RequestTooLarge { .. }
+            | Self::Busy
+            // A refusal the engine could not classify is the request's, not
+            // the server's: something about this tenant or this command was
+            // declined, and the caller is the one who can act on it.
+            | Self::Backend { .. } => ErrCode::InvalidRequest,
         }
     }
+}
+
+/// The code word a tenant backend's message must begin with for the engine to
+/// read it as "come back later".
+///
+/// One word, the one the trait's own doc names. Adding synonyms here would be
+/// the engine inventing contract on a backend's behalf; a backend that writes
+/// something else gets the safe answer and a counter, which is a signal
+/// somebody can act on rather than a guess nobody can see.
+pub const BACKEND_RETRYABLE_CODE: &str = "RATELIMITED";
+
+impl AdmissionError {
+    /// Classify a tenant backend's refusal, ONCE, where it enters the engine.
+    ///
+    /// Here and not in [`AdmissionError::retryability`] because this is where
+    /// the counter belongs: `retryability` is asked several times per refusal
+    /// (by the code word, by the error byte, by a log line) and a counter
+    /// that ticked on each would report traffic instead of refusals.
+    #[must_use]
+    pub fn from_backend(rejected: crate::tenant::AdmitRejected) -> Self {
+        // Stub: opened by `server: a backend refusal is classified by the code
+        // word its own contract promises`.
+        let classify = false;
+        if classify && backend_code_word(&rejected.message) != Some(BACKEND_RETRYABLE_CODE) {
+            // Said out loud as well as counted: a deployment whose rate limit
+            // reads as "give up" to every client is a fault in the backend,
+            // and the operator who can fix it is not reading this counter.
+            tracing::warn!(
+                message = %rejected.message,
+                "tenant backend refused without a code word this build knows; \
+                 treating it as permanent. Format the message with a leading \
+                 uppercase code - `{BACKEND_RETRYABLE_CODE} ...` for a \
+                 refusal the caller should retry."
+            );
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::BackendRefusalUnclassified);
+        }
+        Self::Backend {
+            message: rejected.message,
+        }
+    }
+}
+
+/// The leading uppercase token of a backend's message, if it has one.
+///
+/// ASCII uppercase and digits only, which is what every RESP error code is
+/// (`ERR`, `WRONGTYPE`, `LOADING`, `NOAUTH`) and what the trait's doc asks
+/// for. A message that opens with prose has no code word, which is a
+/// different answer from having an unknown one only in the log line - both
+/// are classified the same way, and both are counted.
+fn backend_code_word(message: &str) -> Option<&str> {
+    let word = message.split(' ').next()?;
+    let is_code = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    is_code.then_some(word)
 }
 
 impl From<IngressRejected> for AdmissionError {
@@ -165,8 +265,8 @@ impl From<IngressRejected> for AdmissionError {
     }
 }
 
-impl From<AdmissionError> for ErrCode {
-    fn from(e: AdmissionError) -> Self {
+impl From<&AdmissionError> for ErrCode {
+    fn from(e: &AdmissionError) -> Self {
         e.code()
     }
 }
@@ -190,6 +290,13 @@ impl fmt::Display for AdmissionError {
                 f,
                 "{what}: at most {limit}, got {got}; send it in smaller pieces"
             ),
+            // The text the shard error carried before it was classified, so
+            // only the code word in front of it changes.
+            Self::Busy => write!(f, "vsearch queue is full"),
+            // Verbatim. The backend wrote a complete error line, code word
+            // included, and rewriting it would strip the only thing a RESP3
+            // client of that deployment already routes on.
+            Self::Backend { message } => write!(f, "{message}"),
         }
     }
 }
@@ -276,23 +383,44 @@ mod tests {
                 },
                 Retryability::Permanent,
             ),
+            (AdmissionError::Busy, Retryability::Retryable),
+            (
+                AdmissionError::Backend {
+                    message: "RATELIMITED tenant request rate exceeded".to_owned(),
+                },
+                Retryability::Retryable,
+            ),
+            (
+                AdmissionError::Backend {
+                    message: "TENANTBLOCKED this tenant is suspended".to_owned(),
+                },
+                Retryability::Permanent,
+            ),
+            (
+                AdmissionError::Backend {
+                    message: "this tenant is out of credit".to_owned(),
+                },
+                Retryability::Permanent,
+            ),
         ]
     }
 
     /// The variant tag, exhaustive. A new variant fails to compile here.
-    fn tag(e: AdmissionError) -> &'static str {
+    fn tag(e: &AdmissionError) -> &'static str {
         match e {
             AdmissionError::Ingress(_) => "ingress",
             AdmissionError::MemoryAtWrite(_) => "memory_at_write",
             AdmissionError::QuotaExceeded { .. } => "quota_exceeded",
             AdmissionError::RequestTooLarge { .. } => "request_too_large",
+            AdmissionError::Busy => "busy",
+            AdmissionError::Backend { .. } => "backend",
         }
     }
 
     #[test]
     fn the_table_below_covers_every_variant() {
         let mut seen: Vec<&'static str> = every_admission_error()
-            .into_iter()
+            .iter()
             .map(|(e, _)| tag(e))
             .collect();
         seen.sort_unstable();
@@ -300,6 +428,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
+                "backend",
+                "busy",
                 "ingress",
                 "memory_at_write",
                 "quota_exceeded",
@@ -310,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opens in `server: a full vsearch queue is backpressure, not an error`"]
     fn every_admission_error_is_classified_as_the_table_says() {
         for (e, want) in every_admission_error() {
             assert_eq!(
@@ -379,6 +510,11 @@ mod tests {
     #[test]
     fn the_display_never_carries_the_code_word() {
         for (e, _) in every_admission_error() {
+            // A backend refusal is the declared exception: its message IS a
+            // complete error line and the engine passes it through.
+            if matches!(e, AdmissionError::Backend { .. }) {
+                continue;
+            }
             let text = e.to_string();
             assert!(
                 !text.starts_with("BACKPRESSURE") && !text.starts_with("ERR "),
@@ -387,6 +523,106 @@ mod tests {
                  the native message where the code is already a byte"
             );
         }
+    }
+
+    // ── the tenant backend's own refusal ────────────────────────────────
+
+    fn refused(message: &str) -> AdmissionError {
+        AdmissionError::from_backend(crate::tenant::AdmitRejected {
+            message: message.to_owned(),
+        })
+    }
+
+    #[test]
+    #[ignore = "opens in `server: a backend refusal is classified by the code word its own contract promises`"]
+    fn a_backend_rate_limit_is_retryable_and_keeps_its_own_word() {
+        let e = refused("RATELIMITED tenant request rate exceeded");
+        assert_eq!(e.retryability(), Retryability::Retryable);
+        assert_eq!(
+            e.code(),
+            ErrCode::Backpressure,
+            "the native wire has no RATELIMITED; a rate limit is what 0x04 is for"
+        );
+        assert_eq!(
+            e.wire_message(),
+            "RATELIMITED tenant request rate exceeded",
+            "verbatim: the clients of that deployment route on the backend's \
+             own word, and replacing it takes the routing away"
+        );
+    }
+
+    #[test]
+    #[ignore = "opens in `server: a backend refusal is classified by the code word its own contract promises`"]
+    fn a_backend_refusal_the_engine_cannot_classify_is_permanent_and_counted() {
+        for message in [
+            "TENANTBLOCKED this tenant is suspended",
+            "this tenant is out of credit",
+            "",
+        ] {
+            let before =
+                skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);
+            let e = refused(message);
+            let after =
+                skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);
+            assert_eq!(
+                e.retryability(),
+                Retryability::Permanent,
+                "{message:?}: guessing that an unclassified refusal clears on \
+                 its own is how a client loops"
+            );
+            assert_eq!(e.code(), ErrCode::InvalidRequest, "{message:?}");
+            assert!(
+                after > before,
+                "{message:?}: a rate limit that reads as 'give up' to every \
+                 client must not be invisible (delta {})",
+                after - before
+            );
+            assert_eq!(e.wire_message(), message, "still passed through untouched");
+        }
+    }
+
+    #[test]
+    #[ignore = "opens in `server: a backend refusal is classified by the code word its own contract promises`"]
+    fn a_classified_backend_refusal_is_not_counted_as_unclassified() {
+        let before =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);
+        let _ = refused("RATELIMITED slow down");
+        let after =
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);
+        assert_eq!(
+            after, before,
+            "the counter names a fault in the backend, not backend traffic"
+        );
+    }
+
+    #[test]
+    fn the_code_word_is_the_leading_uppercase_token_and_nothing_else() {
+        assert_eq!(backend_code_word("RATELIMITED x"), Some("RATELIMITED"));
+        assert_eq!(backend_code_word("ERR2 x"), Some("ERR2"));
+        assert_eq!(backend_code_word("RATELIMITED"), Some("RATELIMITED"));
+        assert_eq!(backend_code_word("ratelimited x"), None);
+        assert_eq!(backend_code_word("Ratelimited x"), None);
+        assert_eq!(
+            backend_code_word(" RATELIMITED x"),
+            None,
+            "no leading space"
+        );
+        assert_eq!(backend_code_word(""), None);
+    }
+
+    // ── a full queue ────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "opens in `server: a full vsearch queue is backpressure, not an error`"]
+    fn a_full_queue_is_momentary() {
+        let e = AdmissionError::Busy;
+        assert_eq!(
+            e.retryability(),
+            Retryability::Retryable,
+            "what fills a bounded queue is other traffic, and other traffic ends"
+        );
+        assert_eq!(e.code(), ErrCode::Backpressure);
+        assert_eq!(e.wire_message(), "BACKPRESSURE vsearch queue is full");
     }
 
     #[test]

@@ -34,6 +34,7 @@ use skeg_server::failpoint::{
 };
 use skeg_server::ingress::{FLOOR_BYTES, IngressBudget, PARSE_FACTOR};
 use skeg_server::memory::{Headroom, MemoryGovernor, MemorySource};
+use skeg_server::tenant::{Admission, AdmitGuard, AdmitRejected, TenantBackend, TenantId};
 
 // ---------------------------------------------------------------- fixtures
 
@@ -88,6 +89,24 @@ async fn resp3_server(ingress: &Arc<IngressBudget>, max_connections: usize) -> R
         .expect("bind")
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
+    let addr = server.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = server.run_resp3().await;
+    });
+    Running { addr, _dir: dir }
+}
+
+async fn resp3_server_with_backend(
+    ingress: &Arc<IngressBudget>,
+    backend: Arc<dyn TenantBackend>,
+) -> Running {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = Server::bind_with_shards("127.0.0.1:0", dir.path(), 1, 0)
+        .await
+        .expect("bind")
+        .with_ingress_budget(Arc::clone(ingress))
+        .with_tenant_backend(backend)
+        .with_max_connections(16);
     let addr = server.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = server.run_resp3().await;
@@ -216,6 +235,20 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// A four-dimensional flat index, asserted created.
+async fn create_index(conn: &mut TcpStream, name: &str) {
+    let _ = conn
+        .write_all(&resp3_command(&[
+            b"SKEG.VINDEX.CREATE",
+            name.as_bytes(),
+            b"4",
+            b"flat",
+        ]))
+        .await;
+    let created = read_resp3_line(conn).await.expect("create replies");
+    assert!(created.starts_with('+'), "create said {created}");
+}
+
 // ---------------------------------------------------------------- the table
 
 /// Every condition a request can be refused for before it runs.
@@ -238,10 +271,17 @@ enum Condition {
     /// both wires whatever the classification does, or a table where
     /// everything is retryable would look correct.
     DimMismatch,
+    /// The bounded VSEARCH pool had no permit left.
+    VsearchQueueFull,
+    /// A tenant backend refused, with the code word its own contract asks
+    /// for.
+    BackendRateLimited,
+    /// A tenant backend refused with a message the engine cannot classify.
+    BackendUnclassified,
 }
 
 impl Condition {
-    const ALL: [Condition; 7] = [
+    const ALL: [Condition; 10] = [
         Condition::ClassFullAtAccept,
         Condition::ClassFullMidFrame,
         Condition::OverConnectionAllowance,
@@ -249,6 +289,9 @@ impl Condition {
         Condition::QuotaRefusedAtVset,
         Condition::RequestTooLarge,
         Condition::DimMismatch,
+        Condition::VsearchQueueFull,
+        Condition::BackendRateLimited,
+        Condition::BackendUnclassified,
     ];
 
     /// What both wires must say. Exhaustive: a new condition does not compile
@@ -257,11 +300,38 @@ impl Condition {
         match self {
             Condition::ClassFullAtAccept
             | Condition::ClassFullMidFrame
-            | Condition::MemoryRefusedAtVset => (Retryability::Retryable, ErrCode::Backpressure),
+            | Condition::MemoryRefusedAtVset
+            | Condition::VsearchQueueFull
+            | Condition::BackendRateLimited => (Retryability::Retryable, ErrCode::Backpressure),
             Condition::OverConnectionAllowance
             | Condition::QuotaRefusedAtVset
             | Condition::RequestTooLarge
-            | Condition::DimMismatch => (Retryability::Permanent, ErrCode::InvalidRequest),
+            | Condition::DimMismatch
+            | Condition::BackendUnclassified => (Retryability::Permanent, ErrCode::InvalidRequest),
+        }
+    }
+
+    /// The word a RESP3 client sees at the front of the line.
+    ///
+    /// Usually the one the classification chose. A tenant backend writes its
+    /// OWN complete error line, code word included, and the engine passes it
+    /// through: replacing `RATELIMITED` with `BACKPRESSURE` would take away
+    /// the word that deployment's clients already route on. So those rows
+    /// pin the word verbatim, and their retryability is checked where it is
+    /// observable - the unit tests in `admission.rs`, and the native code
+    /// byte if that wire ever carries a backend.
+    fn resp3_word(self) -> &'static str {
+        match self {
+            Condition::ClassFullAtAccept
+            | Condition::ClassFullMidFrame
+            | Condition::MemoryRefusedAtVset
+            | Condition::VsearchQueueFull => "BACKPRESSURE",
+            Condition::OverConnectionAllowance
+            | Condition::QuotaRefusedAtVset
+            | Condition::RequestTooLarge
+            | Condition::DimMismatch => "ERR",
+            Condition::BackendRateLimited => "RATELIMITED",
+            Condition::BackendUnclassified => "TENANTBLOCKED",
         }
     }
 
@@ -272,10 +342,38 @@ impl Condition {
             Condition::ClassFullMidFrame => Some(skeg_telemetry::Counter::IngressRefusedGrowth),
             Condition::MemoryRefusedAtVset => Some(skeg_telemetry::Counter::MemoryRefused),
             Condition::QuotaRefusedAtVset => Some(skeg_telemetry::Counter::QuotaRefused),
+            Condition::BackendUnclassified => {
+                Some(skeg_telemetry::Counter::BackendRefusalUnclassified)
+            }
             Condition::OverConnectionAllowance
             | Condition::RequestTooLarge
-            | Condition::DimMismatch => None,
+            | Condition::DimMismatch
+            | Condition::VsearchQueueFull
+            | Condition::BackendRateLimited => None,
         }
+    }
+}
+
+/// A tenant backend that refuses every command with a fixed message.
+///
+/// The engine has no backend of its own - one is supplied by a separate
+/// crate - so the only way to exercise the refusal path is to be one.
+#[derive(Debug)]
+struct RefusingBackend(&'static str);
+
+impl TenantBackend for RefusingBackend {
+    fn verify_login(&self, _user: &str, _password: &[u8]) -> Option<TenantId> {
+        None
+    }
+
+    fn has_tenant(&self, _id: TenantId) -> bool {
+        false
+    }
+
+    fn admit(&self, _admission: Admission) -> Result<AdmitGuard, AdmitRejected> {
+        Err(AdmitRejected {
+            message: self.0.to_owned(),
+        })
     }
 }
 
@@ -335,16 +433,7 @@ async fn drive_resp3(cond: Condition) -> Outcome {
             let name = format!("parity_resp3_{}", server.addr.port());
             let fp = admission_failpoint(cond);
             let mut conn = TcpStream::connect(server.addr).await.expect("connect");
-            let _ = conn
-                .write_all(&resp3_command(&[
-                    b"SKEG.VINDEX.CREATE",
-                    name.as_bytes(),
-                    b"4",
-                    b"flat",
-                ]))
-                .await;
-            let created = read_resp3_line(&mut conn).await.expect("create replies");
-            assert!(created.starts_with('+'), "create said {created}");
+            create_index(&mut conn, &name).await;
             arm_admission_at(fp, &name);
             let _ = conn
                 .write_all(&resp3_command(&[
@@ -377,6 +466,45 @@ async fn drive_resp3(cond: Condition) -> Outcome {
             let borrowed: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
             let _ = conn.write_all(&resp3_command(&borrowed)).await;
             let line = read_resp3_line(&mut conn).await.expect("vmset replies");
+            Outcome::Refused(Refusal::from_resp3_line(&line))
+        }
+        Condition::VsearchQueueFull => {
+            let ingress = roomy();
+            let server = resp3_server(&ingress, 16).await;
+            let name = format!("parity_queue_{}", server.addr.port());
+            let mut conn = TcpStream::connect(server.addr).await.expect("connect");
+            create_index(&mut conn, &name).await;
+            arm_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name);
+            let _ = conn
+                .write_all(&resp3_command(&[
+                    b"SKEG.VSEARCH",
+                    name.as_bytes(),
+                    &f32_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                    b"1",
+                ]))
+                .await;
+            let line = read_resp3_line(&mut conn).await.expect("vsearch replies");
+            disarm_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name);
+            assert!(
+                fired_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name),
+                "the failpoint never fired, so this row proved nothing"
+            );
+            Outcome::Refused(Refusal::from_resp3_line(&line))
+        }
+        Condition::BackendRateLimited | Condition::BackendUnclassified => {
+            let message = if cond == Condition::BackendRateLimited {
+                "RATELIMITED tenant request rate exceeded"
+            } else {
+                "TENANTBLOCKED this tenant is suspended"
+            };
+            let ingress = roomy();
+            let server =
+                resp3_server_with_backend(&ingress, Arc::new(RefusingBackend(message))).await;
+            let mut conn = TcpStream::connect(server.addr).await.expect("connect");
+            // Any command that is not HELLO or SKEG.AUTH goes through the
+            // backend's admission, and this one refuses all of them.
+            let _ = conn.write_all(&resp3_command(&[b"PING"])).await;
+            let line = read_resp3_line(&mut conn).await.expect("ping replies");
             Outcome::Refused(Refusal::from_resp3_line(&line))
         }
         Condition::DimMismatch => {
@@ -490,6 +618,39 @@ async fn drive_native(cond: Condition) -> Outcome {
             "the native protocol has no VMSET: one frame carries one vector, \
              and its size is bounded by the frame ceiling instead",
         ),
+        Condition::BackendRateLimited | Condition::BackendUnclassified => Outcome::NotOnThisWire(
+            "the native listener carries no tenant backend - Server::run \
+                 drops it and every request is tenant 0 - so a backend \
+                 refusal cannot reach this wire at all. The classification is \
+                 pinned by the unit tests in admission.rs instead",
+        ),
+        Condition::VsearchQueueFull => {
+            let ingress = roomy();
+            let server = native_server(&ingress, 16).await;
+            let name = format!("parity_nqueue_{}", server.addr.port());
+            let mut conn = TcpStream::connect(server.addr).await.expect("connect");
+            let _ = conn
+                .write_all(&skeg_proto::encode_vindex_create(1, &name, 4, 0, 0))
+                .await;
+            let created = read_native_frame(&mut conn).await.expect("create replies");
+            assert_eq!(created.header.op, skeg_proto::Op::Ok, "create must succeed");
+            arm_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name);
+            let _ = conn
+                .write_all(&skeg_proto::encode_vsearch(
+                    2,
+                    &name,
+                    1,
+                    &[1.0, 2.0, 3.0, 4.0],
+                ))
+                .await;
+            let frame = read_native_frame(&mut conn).await.expect("vsearch replies");
+            disarm_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name);
+            assert!(
+                fired_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name),
+                "the failpoint never fired, so this row proved nothing"
+            );
+            Outcome::Refused(Refusal::from_native_frame(&frame))
+        }
         Condition::DimMismatch => {
             let ingress = roomy();
             let server = native_server(&ingress, 16).await;
@@ -531,6 +692,7 @@ fn oversized_header(payload_len: u32) -> Vec<u8> {
 // ----------------------------------------------------------------- the test
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens in `server: a full vsearch queue is backpressure, not an error`"]
 async fn every_admission_refusal_says_the_same_thing_on_both_wires() {
     for cond in Condition::ALL {
         let (want_retryability, want_code) = cond.expected();
@@ -541,13 +703,26 @@ async fn every_admission_refusal_says_the_same_thing_on_both_wires() {
 
         match &resp3 {
             Outcome::Refused(r) => {
+                // The WORD, not the classification derived from it. Most rows
+                // are the same statement twice; the backend rows are not, and
+                // that difference is the contract: the engine passes a
+                // backend's own line through, so RESP3 shows `RATELIMITED`
+                // where the native code would be 0x04.
                 assert_eq!(
-                    r.retryability(),
-                    want_retryability,
-                    "{cond:?} on RESP3: {:?} says {:?}",
-                    r.message,
-                    r.retryability()
+                    r.code_word.as_deref(),
+                    Some(cond.resp3_word()),
+                    "{cond:?} on RESP3: {:?}",
+                    r.message
                 );
+                if cond.resp3_word() == "BACKPRESSURE" || cond.resp3_word() == "ERR" {
+                    assert_eq!(
+                        r.retryability(),
+                        want_retryability,
+                        "{cond:?} on RESP3: {:?} says {:?}",
+                        r.message,
+                        r.retryability()
+                    );
+                }
             }
             Outcome::NotOnThisWire(why) => {
                 panic!("{cond:?} was declared absent from RESP3 ({why}) - unexpected")

@@ -429,10 +429,19 @@ pub enum Counter {
     /// tenant hitting its ceiling looked from outside exactly like a tenant
     /// that had stopped writing.
     QuotaRefused = 53,
+    /// Tenant-backend refusals whose message carried no code word this build
+    /// knows.
+    ///
+    /// The backend trait asks for a leading uppercase code and the engine
+    /// classifies the refusal from it. A backend that sends prose, or a word
+    /// this build has never heard of, gets the safe answer - permanent - and
+    /// this counter, because the alternative is a rate limit that silently
+    /// reads as "give up" to every client of that deployment.
+    BackendRefusalUnclassified = 54,
 }
 
 impl Counter {
-    pub const COUNT: usize = 54;
+    pub const COUNT: usize = 55;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -488,6 +497,7 @@ impl Counter {
         Counter::IngressBudgetUnreadable,
         Counter::IngressReplyOverBudget,
         Counter::QuotaRefused,
+        Counter::BackendRefusalUnclassified,
     ];
 
     #[inline]
@@ -547,6 +557,7 @@ impl Counter {
             Counter::IngressBudgetUnreadable => "skeg_ingress_budget_unreadable_total",
             Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
             Counter::QuotaRefused => "skeg_quota_refused_total",
+            Counter::BackendRefusalUnclassified => "skeg_backend_refusal_unclassified_total",
         }
     }
 }

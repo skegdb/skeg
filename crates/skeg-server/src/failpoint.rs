@@ -436,6 +436,10 @@ pub enum AdmissionFailpoint {
     /// The tenant vector quota's answer at the VSET admission step: refuse as
     /// if the tenant were at its limit.
     QuotaRefusedAtVset,
+    /// The bounded VSEARCH pool's answer: refuse as if every worker permit
+    /// were taken. Saturating a real pool from a socket test means racing a
+    /// semaphore, which is not something a deterministic test may do.
+    VsearchQueueFullAtSearch,
 }
 
 impl AdmissionFailpoint {
@@ -446,6 +450,7 @@ impl AdmissionFailpoint {
         match self {
             AdmissionFailpoint::MemoryRefusedAtVset => 1 << 0,
             AdmissionFailpoint::QuotaRefusedAtVset => 1 << 1,
+            AdmissionFailpoint::VsearchQueueFullAtSearch => 1 << 2,
         }
     }
 }
