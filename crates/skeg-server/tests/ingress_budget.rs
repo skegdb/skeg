@@ -122,48 +122,73 @@ fn dribbled_command_head(declared: usize) -> Vec<u8> {
 // ---------------------------------------------------------------- the tests
 
 /// The multiplication P0.4 is about: a per-connection ceiling times the
-/// connection semaphore. Eight connections, each holding a frame open, must
-/// pin at most the CLASS budget between them - not eight times whatever one
-/// connection may hold.
+/// connection semaphore. Sixteen connections, each holding a frame open and
+/// pushing as hard as it can, must pin at most the CLASS budget between them -
+/// not sixteen times whatever one connection may hold.
+///
+/// Sampled continuously rather than read once at the end, because the peak is
+/// the number that matters and a connection refused for growing too far is
+/// closed straight afterwards: a single reading taken a moment later would
+/// pass on a server that had briefly pinned everything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 5 (resp3: accept, grow, stall)"]
 async fn n_connections_mid_frame_pin_at_most_the_budget() {
     let cap = 16 * CHUNK_BYTES;
     let ingress = budget(cap, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 64).await;
 
-    let mut conns = Vec::new();
-    for _ in 0..8 {
-        let mut s = TcpStream::connect(addr).await.expect("connect");
-        s.write_all(&dribbled_command_head(8 << 20))
-            .await
-            .expect("head");
-        // A megabyte of the declared bulk, which no per-connection allowance
-        // in this budget can hold.
-        let _ = s.write_all(&vec![b'x'; 1 << 20]).await;
-        conns.push(s);
-    }
-    // Give the server time to read what it is willing to read.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sampler = {
+        let ingress = Arc::clone(&ingress);
+        let peak = Arc::clone(&peak);
+        tokio::spawn(async move {
+            for _ in 0..1500 {
+                peak.fetch_max(ingress.held_bytes(), std::sync::atomic::Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
 
-    let held = ingress.held_bytes();
+    let mut writers = Vec::new();
+    for _ in 0..16 {
+        writers.push(tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            if s.write_all(&dribbled_command_head(64 << 20)).await.is_err() {
+                return;
+            }
+            // Dribble the declared bulk in small pieces for a while. The frame
+            // never completes, which is the shape of the attack.
+            let chunk = vec![b'x'; 32 * 1024];
+            for _ in 0..400 {
+                if s.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }));
+    }
+    for w in writers {
+        let _ = tokio::time::timeout(Duration::from_secs(20), w).await;
+    }
+    sampler.abort();
+
+    let peak = peak.load(std::sync::atomic::Ordering::Acquire);
     assert!(
-        held > 8 * FLOOR_BYTES,
-        "no connection grew at all, so nothing was proved: {held}"
+        peak > 16 * FLOOR_BYTES,
+        "no connection grew at all, so nothing was proved: {peak}"
     );
     assert!(
-        held <= cap,
-        "eight connections pinned {held} bytes against a class cap of {cap}"
+        peak <= cap,
+        "sixteen connections pinned {peak} bytes against a class cap of {cap}"
     );
-    assert!(
-        ingress.governor().reserved_bytes() <= cap,
-        "the governor's total ran past the class cap"
-    );
-    drop(conns);
-    until("the budget to come back", Duration::from_secs(5), || {
+    until("the budget to come back", Duration::from_secs(10), || {
         ingress.held_bytes() == 0
     })
     .await;
+    assert_eq!(
+        ingress.governor().reserved_bytes(),
+        0,
+        "the governor's total did not come back with the class share"
+    );
 }
 
 /// A budget that is never given back is a leak with a nicer name. The close
@@ -171,7 +196,6 @@ async fn n_connections_mid_frame_pin_at_most_the_budget() {
 /// reached at all, rather than the assertion holding because the connection
 /// was never served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 5 (resp3: accept, grow, stall)"]
 async fn the_budget_is_released_when_a_connection_closes() {
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 64).await;
@@ -206,7 +230,6 @@ async fn the_budget_is_released_when_a_connection_closes() {
 /// Buffering it first and refusing afterwards is the bug: the refusal costs
 /// exactly what admitting it would have.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 5 (resp3: accept, grow, stall)"]
 async fn a_frame_larger_than_the_connection_allowance_is_refused_not_buffered() {
     let cap = 8 * CHUNK_BYTES;
     let ingress = budget(cap, Duration::from_millis(50));
@@ -260,7 +283,6 @@ async fn a_frame_larger_than_the_connection_allowance_is_refused_not_buffered() 
 /// sequence is exercised without arranging a real exhaustion, and asserted to
 /// have fired so it cannot pass on a growth that was never refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 5 (resp3: accept, grow, stall)"]
 async fn a_refused_growth_stalls_then_refuses_the_frame_by_name() {
     let stall = Duration::from_millis(300);
     let ingress = budget(16 * CHUNK_BYTES, stall);

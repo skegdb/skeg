@@ -349,7 +349,7 @@ impl Server {
         let Self {
             listener,
             shards,
-            ingress: _,
+            ingress,
             max_connections,
             tenant_backend,
         } = self;
@@ -384,18 +384,63 @@ impl Server {
         // (review P0). SKEG_MAX_CONNECTIONS caps it; a permit is held for the
         // connection's lifetime.
         let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let fp_key: Arc<str> = Arc::from(listener.local_addr()?.port().to_string());
         loop {
             let (stream, _) = listener.accept().await?;
+            // The floor comes FIRST, and never awaits. A budget awaited at
+            // accept is a listener that stops accepting, which turns a memory
+            // limit into an availability outage; and taking it before the
+            // permit means a connection parked on the semaphore is one that
+            // already has somewhere to put its bytes.
+            let Some(budget) = admit_or_refuse(&ingress, stream).await else {
+                continue;
+            };
+            let (budget, stream) = budget;
             // Acquire before spawning; if the pool is exhausted the accept
             // loop parks here rather than piling up unbounded tasks.
             let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
             tune_socket(&stream);
             let shards = shards.clone();
             let backend = tenant_backend.clone();
+            let fp_key = Arc::clone(&fp_key);
             tokio::spawn(async move {
                 let _permit = permit;
-                handle_connection_resp3(stream, shards, backend).await;
+                handle_connection_resp3(stream, shards, backend, budget, fp_key).await;
             });
+        }
+    }
+}
+
+/// Take the connection's floor, or refuse the connection by name.
+///
+/// Returns `None` when the peer was refused; the socket is answered and closed
+/// on a task of its own so a peer that never reads the answer cannot wedge the
+/// accept loop. That task holds one socket and one short string for at most a
+/// second, which is less than the connection would have cost admitted.
+///
+/// Answered BY NAME rather than shut in the peer's face: a connection dropped
+/// without a word looks to a client like a network fault, and the retry it
+/// schedules is the one thing a server out of room cannot afford.
+async fn admit_or_refuse(
+    ingress: &Arc<IngressBudget>,
+    stream: TcpStream,
+) -> Option<(ConnectionBudget, TcpStream)> {
+    match ingress.try_accept() {
+        Ok(budget) => Some((budget, stream)),
+        Err(e) => {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedAccept);
+            warn!("ingress refused a connection: {e}");
+            let message = e.wire_message();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let write = async {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream.write_all(format!("-{message}\r\n").as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(1), write).await;
+            });
+            None
         }
     }
 }

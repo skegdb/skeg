@@ -81,6 +81,13 @@ pub const DEFAULT_FRACTION: u64 = 25;
 /// machine and every test of it would have to fake a limit. One gigabyte is
 /// far above any legitimate ingress and far below what a thousand connections
 /// could pin unbudgeted, so the code path is the same one production takes.
+///
+/// Raised to four maximum frames where that is larger (it is, by 3%: the
+/// protocol's own frame ceiling is 129 MiB and a connection's quarter share
+/// has to hold one of those plus its parse copy). A default that narrowed a
+/// ceiling the protocol already enforces would refuse a legitimate VMSET on a
+/// machine with no memory limit at all, which is not a budget, it is a
+/// regression.
 pub const UNLIMITED_DEFAULT_CAP: u64 = 1 << 30;
 
 /// How long a connection whose growth was refused waits before the frame is
@@ -265,7 +272,9 @@ impl IngressBudget {
                     .max(MIN_CAP)
                     .min(usable),
             ),
-            (None, Budget::Unlimited) => IngressCap::Default(UNLIMITED_DEFAULT_CAP),
+            (None, Budget::Unlimited) => IngressCap::Default(
+                UNLIMITED_DEFAULT_CAP.max(4 * per_connection_ceiling.saturating_mul(PARSE_FACTOR)),
+            ),
             (None, Budget::Unreadable) => IngressCap::FloorOnly,
         };
         if matches!(cap, IngressCap::FloorOnly) {

@@ -34,6 +34,8 @@ use skeg_resp3::{
 };
 use skeg_vector::QuantKind;
 
+use crate::failpoint::IngressFailpoint;
+use crate::ingress::{ConnectionBudget, IngressRejected};
 use crate::payload::parse_filter;
 use crate::shard::ShardSet;
 use crate::tenant::{Admission, AnonymousPolicy, CommandKind, TenantBackend, TenantId};
@@ -280,11 +282,76 @@ const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 /// Exposed via HELLO response and (future) CLIENT ID.
 static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
 
+/// How often a stalled connection asks whether the room has come back.
+///
+/// Short against the stall it lives inside: the point of waiting is to let a
+/// burst on another connection finish, and those finish in milliseconds. A
+/// stalled connection is not reading, so the cost of asking often is a timer,
+/// not a syscall.
+const STALL_POLL: Duration = Duration::from_millis(10);
+
+/// Charge for the buffer the connection is about to need, waiting out the
+/// stall if the answer is a refusal that could change.
+///
+/// RESERVE BEFORE GROW. While this waits the connection does not read, which
+/// is TCP backpressure the peer feels without anything being sent - the
+/// cheapest form of "slow down" there is. Only when the room has not come back
+/// within the stall is the frame refused, and then with a retryable code,
+/// because what refused it was other traffic and not this client's request.
+///
+/// A refusal that waiting cannot change - a frame larger than the connection
+/// will ever be allowed - is returned at once: stalling on it would just make
+/// the client wait for the same answer.
+async fn grow_or_stall(
+    budget: &mut ConnectionBudget,
+    want: usize,
+    fp_key: &str,
+) -> Result<(), IngressRejected> {
+    fn attempt(
+        budget: &mut ConnectionBudget,
+        want: usize,
+        fp_key: &str,
+    ) -> Result<(), IngressRejected> {
+        if crate::fp_ingress!(IngressFailpoint::GrowRefusedMidFrame, fp_key) {
+            return Err(IngressRejected::ClassFull {
+                held: budget.budget().held_bytes(),
+                requested: crate::ingress::charge_for(want),
+                cap: budget.budget().cap().bytes(),
+            });
+        }
+        budget.grow_to(want)
+    }
+
+    let mut last = match attempt(budget, want, fp_key) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !last.is_retryable() {
+        return Err(last);
+    }
+    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressStalls);
+    let deadline = Instant::now() + budget.budget().stall();
+    while Instant::now() < deadline {
+        tokio::time::sleep(STALL_POLL).await;
+        match attempt(budget, want, fp_key) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Per-connection driver. Loops until EOF / write error / fatal parse error.
+///
+/// `budget` is this connection's share of the ingress class, taken at accept
+/// and held for the whole life of the connection. `fp_key` is the listener's
+/// port, which is what an ingress failpoint is keyed on.
 pub async fn handle_connection_resp3(
     mut stream: TcpStream,
     shards: ShardSet,
     tenant_backend: Option<Arc<dyn TenantBackend>>,
+    mut budget: ConnectionBudget,
+    fp_key: Arc<str>,
 ) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, "RESP3 connection accepted");
@@ -379,11 +446,55 @@ pub async fn handle_connection_resp3(
                 // to the large chunk after its first partial read fills the
                 // small reservation and leaves bytes buffered.
                 trim_idle(decoder.buf_mut());
+                // Give back what the trim released BEFORE asking for more:
+                // a connection that bursted once must not still be charged for
+                // its peak while it asks for the next chunk.
+                budget.shrink_to(decoder.buf_mut().capacity());
                 let reserve = read_reserve(decoder.buffered());
+                // What `BytesMut::reserve` will leave the capacity at. It never
+                // shrinks and it grows to at least len + additional, so this is
+                // the charge to hold BEFORE the buffer is allowed to get there.
+                let want = decoder
+                    .buf_mut()
+                    .capacity()
+                    .max(decoder.buffered().saturating_add(reserve));
+                if let Err(e) = grow_or_stall(&mut budget, want, &fp_key).await {
+                    // Back to the floor before the refusal goes out: the bytes
+                    // of this frame that did arrive are not worth keeping for a
+                    // frame that will not be completed, and holding them would
+                    // make the refusal cost what admitting it would have.
+                    *decoder.buf_mut() = BytesMut::with_capacity(4096);
+                    budget.shrink_to(4096);
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
+                    warn!(?peer, "ingress refused: {e}");
+                    let err = Frame::Error(e.wire_message());
+                    out.clear();
+                    encode_frame(&err, state.version, &mut out);
+                    let _ = stream.write_all(&out).await;
+                    break 'conn;
+                }
                 decoder.buf_mut().reserve(reserve);
                 match stream.read_buf(decoder.buf_mut()).await {
                     Ok(0) => break,
                     Ok(_) => {
+                        // Re-checked AFTER the read. `read_buf` fills the whole
+                        // spare capacity, and `BytesMut::chunk_mut` will add a
+                        // little more when the buffer is exactly full, so the
+                        // capacity charged for a moment ago is not necessarily
+                        // the capacity that came back.
+                        if let Err(e) = budget.grow_to(decoder.buf_mut().capacity()) {
+                            *decoder.buf_mut() = BytesMut::with_capacity(4096);
+                            budget.shrink_to(4096);
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::IngressRefusedGrowth,
+                            );
+                            warn!(?peer, "ingress refused after read: {e}");
+                            let err = Frame::Error(e.wire_message());
+                            out.clear();
+                            encode_frame(&err, state.version, &mut out);
+                            let _ = stream.write_all(&out).await;
+                            break 'conn;
+                        }
                         // Bound per-connection buffering. A frame that never
                         // completes (protocol desync, or a bulk whose declared
                         // length is dribbled forever) would otherwise let one
@@ -424,6 +535,13 @@ pub async fn handle_connection_resp3(
         }
     }
 
+    // The budget goes back HERE, and the failpoint marks that this line was
+    // reached. Without it a test asserting "the class came back to zero" would
+    // pass just as well on a connection that was never served at all.
+    if crate::fp_ingress!(IngressFailpoint::ReleaseDeferredOnClose, &fp_key) {
+        tokio::task::yield_now().await;
+    }
+    drop(budget);
     debug!(?peer, "RESP3 connection closed");
 }
 
