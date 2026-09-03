@@ -128,6 +128,74 @@ slope between those two points has not been measured. If it ever matters, the
 answer is an index on blob keys, not a return to walking `live_ids`: that cannot
 see an index which will not open.
 
+## Disk quota
+
+`max_disk_bytes` is a tenant's hard limit on live on-disk KV bytes, and a KV
+`SET` enforced it from the start. `stage_payload_blob` did not: it wrote
+straight to the vLog with no limit, so an authenticated tenant could fill the
+shared disk through `VSET`/`VMSET` payloads alone, unbounded by the number
+that already bounded everything else it wrote.
+
+A payload blob's key carries the same 16-byte tenant prefix a KV key does
+(`payload_blob_key`, above), so `VLog::tenant_disk_bytes` already counted it -
+the gap was that nothing REFUSED a write against that count. The fix reuses
+the KV path exactly: `stage_payload_blob` takes the tenant's `max_disk_bytes`
+and passes it to the same `VLog::set` builder (`.with_disk_limit`) a `SET`
+already called, checked before anything is written
+(`VLog::set_scoped`: "over-limit ... rejected ... BEFORE anything is
+written"). **Quota = live KV bytes plus live blob bytes**, by construction:
+one counter, one key format, one check, for both.
+
+Reached from two call sites, mirroring `limit` (the vector-count quota)
+exactly: `ShardSet::vset_with_disk_limit` and the per-item calls inside
+`ShardSet::vmset_with_disk_limit`, both fed from the tenant's
+`max_disk_bytes` at the RESP3 entry point. `vset`/`vmset` (no `_with_disk_limit`)
+still exist, unenforced, for every caller with no limit to enforce: every
+internal relocation, every existing test, and the native listener, which has
+no pluggable tenant backend to read a limit from at all.
+
+**The temporary physical margin.** Prepare-before-commit means a write is, for
+a while, TWO physical keys: an overwrite's staged blob at the new version's
+key while the one it supersedes is still resident (reclaimed only after the
+commit, per above), or - on a crash or a refused reclaim - an orphan that
+lives until the next open collects it. Both are real bytes on disk, and both
+are counted, because the counter is physical, not logical: it cannot tell a
+candidate or an orphan from a live blob, and it must not try to, because the
+same reclamation path that frees them is what makes the count exact again.
+The consequence is stated plainly rather than hidden: **a tenant sitting
+exactly at its `max_disk_bytes` can see a payload-less overwrite refused for
+the width of the staging-to-commit window**, because the carried-forward copy
+needs room for both keys at once. This is not a bug to route around - doing
+so would mean an overwrite could grow a tenant's resident bytes with nothing
+counting them - it is the same trade the vector-count quota already makes for
+`Move`/`Replica` (uncharged, because refusing an internal relocation can
+strand a row mid-move) inverted: here the write IS the tenant's own, so it is
+charged, and a tenant that operates payload-heavy workloads near its limit
+should leave headroom for one blob's worth of margin. `VSET`/`VMSET` staged by
+an internal relocation (a reshard move, a boundary replica) pass no disk
+limit at all, for the same reason `Move`/`Replica` pass no vector-count limit:
+they move or duplicate bytes the tenant's writes already paid for, and a
+refusal would leave a shard's data placement stuck rather than a tenant's
+disk usage smaller.
+
+**Refund.** There is no separate reservation counter to refund: the count IS
+the physical bytes on disk, so "refund" is exactly the reclamation path this
+ADR already describes - `VLog::del` decrements the same counter `VLog::set`
+incremented, called by the post-commit cleanup (superseded blob), the open-time
+reclamation (orphans, superseded blobs the cleanup failed to reach, a dropped
+index's stragglers) and nothing else. A write refused before staging never
+incremented it. Idempotent because `VLog::del` is: a key already gone is a
+no-op, not a second decrement.
+
+**Reopen.** The counter (`SharedTenantDisk`) lives in RAM. `VLog::open`
+already rebuilds it from the recovered index before `ShardSet::open`'s
+readiness barrier reclaims the shard's orphans - both steps predate this
+change (`VLog::recover_tenant_disk`, the reclamation described above) and
+needed no new scan: a payload blob is a KV key like any other, so the
+existing rebuild already covers it byte for byte, and the reclamation that
+runs after it (still inside the barrier, before `ready.send`) removes what a
+crash left staged. No request is admitted until both have run.
+
 ## Compatibility
 
 A store written before generations existed reads as `IndexGeneration::LEGACY` -

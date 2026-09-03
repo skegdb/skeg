@@ -298,12 +298,8 @@ async fn stage_payload_blob(
         scope.name,
         Err("vset payload failed: failpoint: payload staging refused".to_owned())
     );
-    // Scaffold: threaded but not yet enforced - the next commit turns this
-    // on. Kept as an explicit no-op rather than silently dropping the
-    // parameter, so `cargo clippy -D warnings` (unused variable) is the thing
-    // that would catch a rebase losing this line, not a silent regression.
-    let _ = disk_limit;
     vlog.tenant(scope.tenant)
+        .with_disk_limit(disk_limit)
         .set(&scope.key(id, version), blob, PAYLOAD_DURABILITY)
         .await
         .map(|()| {

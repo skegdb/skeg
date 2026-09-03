@@ -72,7 +72,6 @@ fn scoped_name(tenant: u128, name: &str) -> String {
 /// refused, and nothing it would have written is visible: no vector, no
 /// payload, no growth of the counter the refusal was measured against.
 #[tokio::test]
-#[ignore = "opens in 'server: enforce the tenant disk limit when staging a payload blob'"]
 async fn a_vset_whose_payload_would_exceed_the_tenant_disk_limit_is_refused() {
     const T: u128 = 0x111;
     let dir = tempfile::TempDir::new().unwrap();
@@ -147,7 +146,6 @@ async fn a_vset_within_the_tenant_disk_limit_is_admitted_and_charged() {
 /// budget must still store every OTHER item: per-item admission, same as
 /// quota and dimension checks on this path.
 #[tokio::test]
-#[ignore = "opens in 'server: enforce the tenant disk limit when staging a payload blob'"]
 async fn a_vmset_item_refused_by_disk_quota_does_not_abort_its_siblings() {
     const T: u128 = 0x113;
     let dir = tempfile::TempDir::new().unwrap();
@@ -200,7 +198,6 @@ async fn a_vmset_item_refused_by_disk_quota_does_not_abort_its_siblings() {
 /// one's key would have destroyed the old payload on a write that could
 /// still fail).
 #[tokio::test]
-#[ignore = "opens in 'server: enforce the tenant disk limit when staging a payload blob'"]
 async fn an_overwrite_needs_room_for_both_blobs_and_releases_the_old_one_after_commit() {
     const T: u128 = 0x114;
     let dir = tempfile::TempDir::new().unwrap();
@@ -450,7 +447,6 @@ async fn a_failpoint_at_drop_blob_sweep_leaves_its_blobs_reclaimed_at_the_next_o
 /// run before `ShardSet::open` returns - this pins that they land on the same
 /// answer, including a payload blob's bytes.
 #[tokio::test]
-#[ignore = "opens in 'server: enforce the tenant disk limit when staging a payload blob'"]
 async fn the_disk_counter_is_rebuilt_from_payload_blobs_at_reopen() {
     const T: u128 = 0x119;
     let dir = tempfile::TempDir::new().unwrap();
@@ -510,7 +506,6 @@ async fn the_disk_counter_is_rebuilt_from_payload_blobs_at_reopen() {
 /// tenant's budget, and the reverse: neither tenant's admission decision may
 /// read the other's usage.
 #[tokio::test]
-#[ignore = "opens in 'server: enforce the tenant disk limit when staging a payload blob'"]
 async fn two_tenants_on_one_disk_a_at_its_limit_cannot_touch_b() {
     const A: u128 = 0xA0A0;
     const B: u128 = 0xB0B0;
