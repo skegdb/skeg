@@ -20,11 +20,19 @@ ORDER=(skeg-proto skeg-simd skeg-platform skeg-telemetry skeg-resp3 skeg-core sk
 SCRATCH="${VERIFY_SCRATCH:-$(mktemp -d "${TMPDIR:-/tmp}/skeg-verify.XXXXXX")}"
 echo "scratch: $SCRATCH"
 patch_lines=""
+patch_args=()   # the same patches, for `cargo package`, which resolves the registry too
 failed=()
 for crate in "${ORDER[@]}"; do
   ver=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; m=json.load(sys.stdin); print(next(p['version'] for p in m['packages'] if p['name']=='$crate'))")
   echo "== $crate $ver"
-  cargo package -p "$crate" --no-verify --allow-dirty -q
+  # `cargo package` resolves every dependency against the index to write the
+  # package's Cargo.lock, even with --no-verify: a sibling bumped in this
+  # release but not yet published fails right here - which is exactly what
+  # publish-crates would hit if the sibling had not propagated. The siblings
+  # extracted earlier in publish order stand in for the index.
+  if ! cargo package -p "$crate" --no-verify --allow-dirty -q "${patch_args[@]}"; then
+    echo "   FAIL: $crate (cargo package)"; failed+=("$crate"); continue
+  fi
   dir="$SCRATCH/$crate"
   rm -rf "$dir"; mkdir -p "$dir"
   tar -xzf "target/package/${crate}-${ver}.crate" -C "$dir" --strip-components=1
@@ -39,6 +47,7 @@ for crate in "${ORDER[@]}"; do
   fi
   (cd "$dir" && cargo tree -e normal -d 2>/dev/null | grep -E '^skeg-' | sed 's/^/   duplicate: /' || true)
   patch_lines="${patch_lines}${crate} = { path = \"${dir}\" }\n"
+  patch_args+=(--config "patch.crates-io.${crate}.path=\"${dir}\"")
 done
 if [ ${#failed[@]} -gt 0 ]; then echo "FAILED: ${failed[*]}"; exit 1; fi
 echo "ok: every package builds and tests against the registry plus its published-order siblings"
