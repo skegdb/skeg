@@ -178,6 +178,44 @@ they move or duplicate bytes the tenant's writes already paid for, and a
 refusal would leave a shard's data placement stuck rather than a tenant's
 disk usage smaller.
 
+**Boundary replicas: a permanent, uncounted duplicate.** The reshard move
+above does not duplicate - `CollectMoves` writes the destination and deletes
+the source, verified on a single-shard reshard of 64 rows (`usage` unchanged
+before/after) - but the OTHER internal relocation does. A boundary replica
+(`ShardReq::Vset` with `effect: Replica`, `disk_limit: None`) writes a SECOND
+physical copy of the row's blob on a second shard and never deletes the
+first: the two stand side by side for as long as the row's margin keeps it
+replicated, which is not a window like the overwrite one above - it is
+indefinite, and it is real disk this tenant's quota does not see. The bound
+has a shape, even though nothing enforces it: at most one extra blob per
+row this shard's overlap boundary currently replicates, so the uncounted
+total is bounded by (replicated rows) x (their blob sizes), not by the whole
+tenant. Left open rather than closed here: fixing it means either charging
+the replica's own tenant (which the write-path shape above argues against,
+for the same reason `Move`/`Replica` are uncharged) or teaching the
+reclamation/quota rebuild at open to walk replicas as well as primaries -
+both bigger than this mandate's boundary.
+
+**Concurrent writers of one tenant.** The check above and the counter update
+happen in the SAME critical section inside `VLog::set_scoped` (no `await`
+between them), so the bound is exact, not probabilistic: N writers racing
+the same tenant's headroom can never jointly land it past `max_disk_bytes`,
+whatever N is and whatever order they finish in. Before this, the check read
+the counter and the update wrote it on either side of the write's own
+`await`, so two writers of different keys could each read the same
+pre-write total and both proceed - reproduced at 5.3x a 1.5-unit budget with
+8 concurrent writers.
+
+**The refusal is typed.** A disk-quota rejection reaches both wires as
+`AdmissionError::DiskQuota { tenant, limit, needed }`, classified exactly
+like its sibling `QuotaExceeded` (the vector-count quota): `Permanent`,
+`ERR ...` on RESP3, `InvalidRequest` on native - a tenant at its own ceiling
+is the request's fault, not the server's, and telling a client `Internal`
+sends it looking for a bug that is not there. One place builds it
+(`disk_quota_refused` in `shard.rs`) for both the payload blob path and the
+KV `SET`/`APPEND` path, so the two cannot drift the way the RESP3 and native
+wires once did before `admission.rs` existed.
+
 **Refund.** There is no separate reservation counter to refund: the count IS
 the physical bytes on disk, so "refund" is exactly the reclamation path this
 ADR already describes - `VLog::del` decrements the same counter `VLog::set`
