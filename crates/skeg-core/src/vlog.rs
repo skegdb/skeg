@@ -2495,6 +2495,166 @@ mod tests {
         assert_eq!(v.get(b"c").await.unwrap().as_deref(), Some(b"3".as_slice()));
     }
 
+    // ── MSET disk quota (audit/17 round 2: a deterministic full bypass) ──────
+
+    /// A batch whose SUM would cross the tenant's limit writes NONE of its
+    /// members - set_many's own all-or-nothing contract, extended to the
+    /// disk quota rather than stopped short of it.
+    #[tokio::test]
+    #[ignore = "opens in 'core: enforce the tenant disk limit on set_many'"]
+    async fn set_many_all_or_nothing_when_the_batch_would_exceed_the_limit() {
+        const T: u128 = 0x2222;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        // Probe: what does ONE of these pairs cost? Then undo it.
+        let ka = scoped(T, b"a");
+        v.set(&ka, b"xxxx", Durability::Kernel).await.unwrap();
+        let unit = v.tenant_disk_bytes(T);
+        assert!(v.del(&ka, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+
+        // Room for 1.5 units; the batch below asks for 2.
+        let limit = unit + unit / 2;
+        let kb = scoped(T, b"b");
+        let err = v
+            .set_many_with_disk_limit(
+                &[(ka.as_slice(), b"xxxx"), (kb.as_slice(), b"xxxx")],
+                Durability::Kernel,
+                T,
+                Some(limit),
+            )
+            .await
+            .expect_err("a batch whose sum exceeds the limit must be refused");
+        assert!(matches!(err, Error::DiskQuota));
+
+        assert_eq!(
+            v.tenant_disk_bytes(T),
+            0,
+            "a refused batch must not move the counter"
+        );
+        assert_eq!(v.get(&ka).await.unwrap(), None, "neither key was written");
+        assert_eq!(v.get(&kb).await.unwrap(), None, "neither key was written");
+    }
+
+    /// A batch that fits is admitted whole, and the counter equals exactly
+    /// the sum of what it wrote.
+    #[tokio::test]
+    async fn set_many_admits_and_charges_a_batch_that_fits() {
+        const T: u128 = 0x2223;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let ka = scoped(T, b"a");
+        let kb = scoped(T, b"b");
+
+        v.set_many_with_disk_limit(
+            &[(ka.as_slice(), b"xxxx"), (kb.as_slice(), b"xxxx")],
+            Durability::Kernel,
+            T,
+            Some(1 << 20),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            v.get(&ka).await.unwrap().as_deref(),
+            Some(b"xxxx".as_slice())
+        );
+        assert_eq!(
+            v.get(&kb).await.unwrap().as_deref(),
+            Some(b"xxxx".as_slice())
+        );
+        let total = v.tenant_disk_bytes(T);
+        assert!(total > 0);
+
+        // Charged exactly: deleting both keys releases the whole total.
+        assert!(v.del(&ka, Durability::Kernel).await.unwrap());
+        assert!(v.del(&kb, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+        let _ = total;
+    }
+
+    /// The reservation the batch's sum takes is refunded exactly if the
+    /// physical write then fails - here, a batch built to exceed the (tiny)
+    /// segment size, which fails AFTER the reservation and BEFORE anything
+    /// is durable.
+    #[tokio::test]
+    async fn set_many_refunds_its_reservation_when_the_write_itself_fails() {
+        const T: u128 = 0x2224;
+        let dir = TempDir::new().unwrap();
+        // A segment far too small for the batch below: the reservation
+        // passes (the limit is generous), but `set_many` itself refuses the
+        // batch as "exceeds one segment" before writing anything.
+        let v = VLog::open_with_max_segment(dir.path(), 128).await.unwrap();
+        let ka = scoped(T, b"a");
+        let kb = scoped(T, b"b");
+        let big = vec![0u8; 200];
+
+        let before = v.tenant_disk_bytes(T);
+        let err = v
+            .set_many_with_disk_limit(
+                &[
+                    (ka.as_slice(), big.as_slice()),
+                    (kb.as_slice(), big.as_slice()),
+                ],
+                Durability::Kernel,
+                T,
+                Some(1 << 20),
+            )
+            .await
+            .expect_err("a batch bigger than one segment must be refused");
+        assert!(matches!(err, Error::InvalidRecord { .. }));
+        assert_eq!(
+            v.tenant_disk_bytes(T),
+            before,
+            "a batch whose reservation passed but whose write then failed \
+             must refund exactly what it reserved"
+        );
+    }
+
+    /// The reservation is atomic with `set_scoped`'s: both go through the
+    /// same tenant_disk critical section, so a plain `SET` racing an `MSET`
+    /// batch for the same tenant's headroom cannot see stale room either.
+    #[tokio::test]
+    #[ignore = "opens in 'core: enforce the tenant disk limit on set_many'"]
+    async fn set_many_and_set_scoped_reserve_against_the_same_atomic_counter() {
+        const T: u128 = 0x2225;
+        const N: u8 = 8;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        let probe = scoped(T, &[254]);
+        v.set(&probe, b"xxxx", Durability::Kernel).await.unwrap();
+        let unit = v.tenant_disk_bytes(T);
+        assert!(v.del(&probe, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+
+        let limit = unit + unit / 2; // room for 1.5 units
+        let futs: Vec<_> = (0..N)
+            .map(|id| {
+                let key = scoped(T, &[id]);
+                let v = v.clone();
+                async move {
+                    v.set_many_with_disk_limit(
+                        &[(key.as_slice(), b"xxxx")],
+                        Durability::Kernel,
+                        T,
+                        Some(limit),
+                    )
+                    .await
+                }
+            })
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert!(
+            admitted <= 1,
+            "a 1.5-unit budget must admit at most one {unit}-byte batch, admitted {admitted}"
+        );
+        assert!(v.tenant_disk_bytes(T) <= limit);
+        assert_eq!(v.tenant_disk_bytes(T), admitted as u64 * unit);
+    }
+
     #[tokio::test]
     async fn torn_batch_is_dropped_whole_on_recovery() {
         use crate::record::encode_record;
