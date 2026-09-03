@@ -28,6 +28,14 @@ capacity back. One `SKEG.VMSET` of 4096 failing items - one reply line
 each, each capped at 256 bytes - left that buffer at 2 MiB for the rest
 of the connection's life.
 
+**The budget covers what a connection holds, not what a request peaks
+at.** Socket buffers in and out, for as long as the connection holds
+them - not the decoded frame tree, the parsed vectors, or the fan-out of
+one command into concurrent per-item work. That memory belongs to a
+request, is gone when the request is answered, and charging it would
+charge the same bytes twice. What bounds it is the request's own limits:
+`MAX_VMSET_ITEMS`, `MAX_VMSET_BYTES`, and now `VMSET_INFLIGHT`.
+
 **Ingress AND egress are now a class inside the same budget the delta
 uses.** A connection reserves through the same `MemoryGovernor`, so a
 byte a socket holds and a byte a delta holds compete for one headroom
@@ -45,7 +53,9 @@ make a client retry a batch that has been applied. When a reply's buffer
 takes the connection past its allowance the answer still goes out and the
 overshoot is counted on `skeg_ingress_reply_over_budget_total` - the one
 place the budget is knowingly exceeded, and it is visible rather than
-silent.
+silent. Read that counter as "a reply could not be charged", not "a reply
+was large": under a full class it ticks for any reply at all, a
+seven-byte `+PONG` included.
 
 Both listeners take the same route: a floor reserved at accept, before
 the connection permit and never awaited (a budget awaited at accept is a

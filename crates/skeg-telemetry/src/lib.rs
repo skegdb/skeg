@@ -404,15 +404,18 @@ pub enum Counter {
     /// serving small frames only, which a client experiences as refusals it
     /// cannot explain.
     IngressBudgetUnreadable = 51,
-    /// Replies whose buffer the ingress class could not cover.
+    /// Replies whose buffer the ingress class could not charge for.
     ///
-    /// The reply is still written - it is the answer to work that has already
-    /// committed, and withdrawing it would make a client retry something that
-    /// has happened - so this is the one place the budget is knowingly
-    /// exceeded. Counted rather than enforced, and the buffer is handed back
-    /// immediately afterwards. A climb means replies are outgrowing the
-    /// per-connection allowance: the batch sizes clients send are too large
-    /// for the budget they are being served under.
+    /// "Could not charge", not "was large". The reply is still written - it is
+    /// the answer to work that has already committed, and withdrawing it would
+    /// make a client retry something that has happened - so this is the one
+    /// place the budget is knowingly exceeded. Counted rather than enforced,
+    /// and the buffer is handed back immediately afterwards.
+    ///
+    /// Under a full class it therefore ticks for ANY reply, including a
+    /// seven-byte `+PONG`: what failed is the charge, not the reply. Read it
+    /// next to `IngressRefusedGrowth` as a signal that the class is full, and
+    /// not as a measure of how big replies are getting.
     IngressReplyOverBudget = 52,
 }
 

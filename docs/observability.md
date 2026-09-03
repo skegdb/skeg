@@ -81,15 +81,44 @@ of that budget the network may hold, with `skeg_ingress_cap_bytes`,
 by class, which is how you tell a store that is full of buffered requests
 from one that is full of data.
 
-Four counters go with them, and these DO reach `/metrics`:
+Five counters go with them, and these DO reach `/metrics`:
 `skeg_ingress_refused_accept_total` (peers
 turned away because the class was full - too many clients),
 `skeg_ingress_refused_growth_total` (frames refused because the buffer
 they needed was not available - frames too large, or too much other
 traffic), `skeg_ingress_stalls_total` (reads paused waiting for room; a
-stall that ends in room shows up to a client only as latency), and
+stall that ends in room shows up to a client only as latency),
 `skeg_ingress_budget_unreadable_total` (connections served while the
-budget could not be established).
+budget could not be established), and
+`skeg_ingress_reply_over_budget_total`.
+
+**Read that last one as "a reply could not be charged", not "a reply was
+large".** A reply is written whether or not the class can cover its
+buffer, because it answers work that has already committed; the counter
+records that the charge failed. Under a full class it therefore ticks for
+ANY reply, including a seven-byte `+PONG` - measured at ten ticks for ten
+`+PONG`s with the class at 1,040,384 of 1,048,576 bytes. It is a signal
+about the class being full, read alongside
+`skeg_ingress_refused_growth_total`, and not a measure of reply volume.
+
+#### What the budget covers, and what it does not
+
+It covers the socket buffers a connection holds, in and out, for as long
+as it holds them. It does NOT cover the peak a single request reaches
+while it is being served: the decoded frame tree, the parsed vectors, and
+the fan-out of one command into concurrent per-item work. That memory
+belongs to a request rather than to a connection, it is gone when the
+request is answered, and charging it would mean charging the same bytes
+twice.
+
+What bounds it instead is the request itself. `MAX_VMSET_ITEMS` (4096)
+and `MAX_VMSET_BYTES` (64 MiB) cap what one command may ask for, and
+`VMSET_INFLIGHT` (64) caps how much of it runs at once - that last one
+because an unbounded fan-out made a maximum batch 4096 concurrent item
+writes per connection, which is the same multiplication the ingress
+budget exists to close, arriving by a different door. Measured at 24
+callers with one maximum batch each (2026-09-03, macOS arm64, release):
++208 MiB resident unbounded against +25 MiB with the window.
 
 #### The three charges, and why they do not overlap
 
