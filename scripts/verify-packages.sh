@@ -30,7 +30,7 @@ for crate in "${ORDER[@]}"; do
   # release but not yet published fails right here - which is exactly what
   # publish-crates would hit if the sibling had not propagated. The siblings
   # extracted earlier in publish order stand in for the index.
-  if ! cargo package -p "$crate" --no-verify --allow-dirty -q "${patch_args[@]}"; then
+  if ! cargo package -p "$crate" --no-verify --allow-dirty -q ${patch_args[@]+"${patch_args[@]}"}; then
     echo "   FAIL: $crate (cargo package)"; failed+=("$crate"); continue
   fi
   dir="$SCRATCH/$crate"
