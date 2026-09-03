@@ -890,9 +890,14 @@ enum ShardReq {
     Get(Bytes, u128),
     /// `(key, value, durability, tenant, disk_limit)`.
     Set(Bytes, Bytes, Durability, u128, Option<u64>),
-    /// Atomic multi-key write for the keys of one MSET that route to this shard.
-    /// Keys are already tenant-scoped; the batch is all-or-nothing on this shard.
-    SetMany(Vec<(Bytes, Bytes)>, Durability),
+    /// Atomic multi-key write for the keys of one MSET that route to this
+    /// shard. Keys are already tenant-scoped; the batch is all-or-nothing on
+    /// this shard. `(pairs, durability, tenant, disk_limit)`: `tenant`/
+    /// `disk_limit` decide only whether the WHOLE batch is refused (its net
+    /// delta to `tenant`'s charge, not per pair) - every pair's bytes are
+    /// still credited to its own key-derived tenant unconditionally, same as
+    /// `Set`.
+    SetMany(Vec<(Bytes, Bytes)>, Durability, u128, Option<u64>),
     /// `(key, value, durability, tenant, disk_limit)`: append to a scoped key,
     /// reply with the new value length.
     Append(Bytes, Bytes, Durability, u128, Option<u64>),
@@ -5272,13 +5277,22 @@ async fn process(
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
-        ShardReq::SetMany(pairs, dur) => {
+        ShardReq::SetMany(pairs, dur, tenant, disk_limit) => {
+            // The sum of the batch's own values: not the exact padded
+            // on-disk total (which `set_many_with_disk_limit` computes
+            // internally, net of what each key already held), but an honest
+            // answer to "how much did this write ask for".
+            let needed: u64 = pairs.iter().map(|(_, v)| v.len() as u64).sum();
             let refs: Vec<(&[u8], &[u8])> = pairs
                 .iter()
                 .map(|(k, v)| (k.as_ref(), v.as_ref()))
                 .collect();
-            match vlog.set_many(&refs, dur).await {
+            match vlog
+                .set_many_with_disk_limit(&refs, dur, tenant, disk_limit)
+                .await
+            {
                 Ok(()) => ShardResp::Done,
+                Err(skeg_core::Error::DiskQuota) => disk_quota_refused(tenant, disk_limit, needed),
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
@@ -5948,6 +5962,11 @@ impl ShardSet {
     /// to one shard) is fully atomic. Callers wanting a global transaction must
     /// keep the keys on one shard.
     ///
+    /// No tenant disk quota: equivalent to
+    /// [`mset_with_disk_limit`](Self::mset_with_disk_limit) with
+    /// `disk_limit: None`. See [`vset`](Self::vset) for why this stays the
+    /// name every existing caller keeps using untouched.
+    ///
     /// # Errors
     ///
     /// Returns an error if a shard is unavailable or a write fails.
@@ -5955,6 +5974,30 @@ impl ShardSet {
         &self,
         pairs: &[(&[u8], &[u8])],
         durability: Durability,
+    ) -> Result<(), ShardError> {
+        self.mset_with_disk_limit(pairs, durability, 0, None).await
+    }
+
+    /// [`mset`](Self::mset), charging the batch's net delta against the
+    /// tenant's `max_disk_bytes` - per SHARD, since MSET is only atomic
+    /// per-shard to begin with (see the doc above): a batch that spans
+    /// shards is checked and admitted one shard's portion at a time, in the
+    /// global counter [`VLog::set_many_with_disk_limit`] shares with every
+    /// other write, so an earlier shard's admitted portion is already
+    /// visible to a later one's check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable, a write fails, or a
+    /// shard's portion of the batch would push the tenant over
+    /// `disk_limit` - refusing that shard's WHOLE portion, not a prefix of
+    /// it (audit/17 round 2).
+    pub async fn mset_with_disk_limit(
+        &self,
+        pairs: &[(&[u8], &[u8])],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
     ) -> Result<(), ShardError> {
         let mut by_shard: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); self.inner.n];
         for (key, value) in pairs {
@@ -5966,7 +6009,10 @@ impl ShardSet {
                 continue;
             }
             match self
-                .call(shard, ShardReq::SetMany(batch, durability))
+                .call(
+                    shard,
+                    ShardReq::SetMany(batch, durability, tenant, disk_limit),
+                )
                 .await?
             {
                 ShardResp::Done => {}

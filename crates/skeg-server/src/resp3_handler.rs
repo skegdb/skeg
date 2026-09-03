@@ -2274,7 +2274,17 @@ async fn kv_mset(
         .zip(args.chunks(2))
         .map(|(k, c)| (k.as_bytes().as_ref(), c[1].as_ref()))
         .collect();
-    match shards.mset(&pairs, DEFAULT_DURABILITY).await {
+    // Every key of one MSET is scoped under the SAME connection tenant, so
+    // one lookup covers the whole batch - same disk quota, same source, as
+    // a single SET's.
+    let accounting_tenant = scoped
+        .first()
+        .map_or(tenant_u128(tenant), ScopedKey::accounting_tenant);
+    let disk_limit = ctx.and_then(|b| b.limits(tenant).max_disk_bytes);
+    match shards
+        .mset_with_disk_limit(&pairs, DEFAULT_DURABILITY, accounting_tenant, disk_limit)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }

@@ -791,6 +791,32 @@ impl VLog {
     /// Returns an error on IO failure, or if the encoded batch exceeds one
     /// segment (`max_seg_size`) - split into smaller batches.
     pub async fn set_many(&self, pairs: &[(&[u8], &[u8])], durability: Durability) -> Result<()> {
+        self.set_many_with_disk_limit(pairs, durability, 0, None)
+            .await
+    }
+
+    /// [`set_many`](Self::set_many), enforcing `disk_limit` (if any) against
+    /// `tenant`'s disk quota - the SUM of the batch's net delta to that
+    /// tenant's charge, not a per-pair check. `tenant`/`disk_limit` decide
+    /// only whether the write is REFUSED; every pair's bytes are still
+    /// credited to its own key-derived tenant unconditionally, exactly as
+    /// [`set_scoped`](Self::set_scoped) does, so a caller with no limit to
+    /// enforce (`disk_limit: None`) is byte-for-byte [`set_many`](Self::set_many).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DiskQuota`] if the batch's sum would push `tenant`
+    /// over `disk_limit` - before a single byte is written, so a refused
+    /// batch writes NONE of its members, the same all-or-nothing contract
+    /// [`set_many`](Self::set_many) already has for a crash. Otherwise, the
+    /// same errors as [`set_many`](Self::set_many).
+    pub async fn set_many_with_disk_limit(
+        &self,
+        pairs: &[(&[u8], &[u8])],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -820,8 +846,55 @@ impl VLog {
             blob.extend_from_slice(&rec);
         }
 
+        // Reservation: the batch's net delta to EVERY tenant it touches,
+        // evaluated and applied in one atomic step under the SAME
+        // `tenant_disk` mutex `set_scoped` uses, before `maybe_rotate`'s
+        // `.await` below gives another writer a chance to run. A duplicate
+        // key inside one batch nets to its LAST occurrence only - the same
+        // fold the per-key accounting loop further down performs one key at
+        // a time, done here in one pass because every size is already known
+        // from `member_rel` and nothing has been written yet. `tenant`/
+        // `disk_limit` decide only whether the batch is REFUSED; the deltas
+        // for every tenant present are applied regardless, exactly like an
+        // unlimited `set_scoped` still accounts.
+        let mut last_new: AHashMap<&[u8], u64> = AHashMap::default();
+        for ((key, _value), (_rel, padded)) in pairs.iter().zip(&member_rel) {
+            last_new.insert(key, u64::from(*padded));
+        }
+        let deltas: AHashMap<u128, i128> = {
+            let index = self.inner.index.borrow();
+            let mut deltas: AHashMap<u128, i128> = AHashMap::default();
+            for (key, new_size) in &last_new {
+                let dtenant = tenant_from_key(key);
+                let old = index.get(key).map_or(0, |e| u64::from(e.size));
+                *deltas.entry(dtenant).or_insert(0) += i128::from(*new_size) - i128::from(old);
+            }
+            deltas
+        };
+        {
+            let mut disk = self.inner.tenant_disk.lock();
+            // Scaffold: `tenant`/`disk_limit` are threaded but not yet
+            // enforced here - the next commit turns the rejection on. The
+            // deltas below still apply unconditionally, so accounting is
+            // already correct; only the refusal is missing.
+            let _ = (tenant, disk_limit);
+            for (t, delta) in &deltas {
+                let cur = disk.get(t).copied().unwrap_or(0);
+                let updated = (i128::from(cur) + delta).max(0) as u64;
+                if updated == 0 {
+                    disk.remove(t);
+                } else {
+                    disk.insert(*t, updated);
+                }
+            }
+        }
+
         let blob_len = blob.len() as u64;
         if blob_len > self.inner.max_seg_size {
+            // The write never happens: refund exactly the deltas just
+            // reserved, relative to whatever the counter holds NOW (other
+            // writers may have reserved concurrently in between).
+            self.refund_tenant_disk_deltas(&deltas);
             return Err(Error::InvalidRecord {
                 msg: "batch exceeds one segment",
             });
@@ -831,7 +904,10 @@ impl VLog {
         // cannot be split across segments or interleaved with another writer's
         // records, which is what makes the header/member run contiguous for
         // recovery.
-        self.maybe_rotate(blob_len).await?;
+        if let Err(e) = self.maybe_rotate(blob_len).await {
+            self.refund_tenant_disk_deltas(&deltas);
+            return Err(e);
+        }
         let (committer, seg_id) = {
             // Reserve synchronously - see the matching comment in
             // `append_raw` for why this must happen in the same
@@ -841,26 +917,29 @@ impl VLog {
             a.size += blob_len;
             (a.committer.clone(), a.id)
         };
-        let (start, padded_total) = committer.append(blob, durability).await?;
+        let (start, padded_total) = match committer.append(blob, durability).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.refund_tenant_disk_deltas(&deltas);
+                return Err(Error::Io(e));
+            }
+        };
         debug_assert_eq!(
             u64::from(padded_total),
             blob_len,
             "padded write size must match the blob_len maybe_rotate checked against"
         );
 
-        // Now durable: apply each member to the index + accounting. Same steps
-        // as `set_scoped`, minus the per-key durability wait (already paid once).
+        // Now durable: apply each member to the index + live-byte bookkeeping.
+        // Same steps as `set_scoped`, minus the per-key durability wait
+        // (already paid once) and minus the disk accounting, which the
+        // reservation above already settled.
         let mut index = self.inner.index.borrow_mut();
         let mut cache = self.inner.cache.borrow_mut();
-        let mut disk = self.inner.tenant_disk.lock();
         for ((key, _value), (rel, padded)) in pairs.iter().zip(&member_rel) {
             let offset = start + u64::from(*rel);
             if let Some(prev) = index.get(key).copied() {
                 self.dec_live(prev.segment_id, prev.size);
-                let dtenant = tenant_from_key(key);
-                if let Some(e) = disk.get_mut(&dtenant) {
-                    *e = e.saturating_sub(u64::from(prev.size));
-                }
             }
             self.inc_live(seg_id, *padded);
             index.set(
@@ -882,9 +961,27 @@ impl VLog {
             // Removing rather than skipping: a key already cached would
             // otherwise keep its old value and be served stale.
             cache.remove(key);
-            *disk.entry(tenant_from_key(key)).or_insert(0) += u64::from(*padded);
         }
         Ok(())
+    }
+
+    /// Undo exactly the deltas [`set_many_with_disk_limit`](Self::set_many_with_disk_limit)
+    /// reserved, relative to whatever `tenant_disk` holds NOW - not to the
+    /// value read before the reservation, so this undoes only this batch's
+    /// own contribution when another writer has reserved concurrently in
+    /// between (the same rule [`set_scoped`](Self::set_scoped)'s refund
+    /// follows).
+    fn refund_tenant_disk_deltas(&self, deltas: &AHashMap<u128, i128>) {
+        let mut disk = self.inner.tenant_disk.lock();
+        for (t, delta) in deltas {
+            let cur = disk.get(t).copied().unwrap_or(0);
+            let refunded = (i128::from(cur) - delta).max(0) as u64;
+            if refunded == 0 {
+                disk.remove(t);
+            } else {
+                disk.insert(*t, refunded);
+            }
+        }
     }
 
     /// DEL a key at the given durability. Returns `true` if the key existed.
