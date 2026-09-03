@@ -36,8 +36,13 @@ skeg-tenant = { path = "../skeg-tenant", version = "0.1.3" }
 # tests (tests/engine_alignment.rs holds that line). At publish time
 # the patch does not apply: release.yml publishes skeg-vector before
 # this crate, and `^0.1` then resolves to the freshly published one.
-skeg-rigging = "0.1.3"
-skeg-rigging-skeg = "=0.1.4"
+skeg-rigging = { git = "https://github.com/skegdb/skeg-rigging", rev = "2578dce4d63901e1bb11f775e495537b6b16fff2" }  # same bridge rev as skeg-rigging-skeg below
+# Bridge for the 0.8.0 convergence, not a release dependency: skeg-rigging-skeg
+# 0.1.4 requires skeg-vector ^0.1, which 0.2.0 cannot satisfy, and this crate
+# is not published by the v0.8.0 tag. skeg-rigging's feat/engine-0.2 branch
+# requires skeg-vector 0.2; it becomes skeg-rigging-skeg 0.1.5 once 0.2.0 is
+# on crates.io, and this line goes back to `= "0.1.5"` in the following tag.
+skeg-rigging-skeg = { git = "https://github.com/skegdb/skeg-rigging", rev = "2578dce4d63901e1bb11f775e495537b6b16fff2" }
 skeg-rigging-net = { version = "0.1.1", optional = true }
 skeg-rigging-net-resp3 = { version = "0.1.1", optional = true }
 
