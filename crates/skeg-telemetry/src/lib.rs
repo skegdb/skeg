@@ -438,10 +438,31 @@ pub enum Counter {
     /// this counter, because the alternative is a rate limit that silently
     /// reads as "give up" to every client of that deployment.
     BackendRefusalUnclassified = 54,
+    /// Bytes of KV VALUE materialised to answer a `GET`/`MGET`, on either
+    /// wire.
+    ///
+    /// The denominator of the read-side admission story, and the only way to
+    /// see the order from outside: a read whose reply was refused before the
+    /// store was touched leaves this number exactly where it was, and a
+    /// refusal that arrived after the values had already been fetched does
+    /// not. Counted at the shard worker, next to the fetch itself, so it
+    /// cannot be true by construction in the handler that is being tested.
+    KvReadBytesFetched = 55,
+    /// `GET`/`MGET` requests refused by the read preflight: the summed value
+    /// lengths did not fit the connection's allowance, or a value grew past
+    /// the size that was reserved for it between the measurement and the
+    /// read.
+    ///
+    /// Separate from `IngressRefusedGrowth`, which counts a connection
+    /// refused a BUFFER. This one counts a request refused an ANSWER, which
+    /// an operator reads differently: it means clients are asking for more
+    /// than the class can hand back at once, not that they are sending more
+    /// than it can take in.
+    KvReadRefused = 56,
 }
 
 impl Counter {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 57;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -498,6 +519,8 @@ impl Counter {
         Counter::IngressReplyOverBudget,
         Counter::QuotaRefused,
         Counter::BackendRefusalUnclassified,
+        Counter::KvReadBytesFetched,
+        Counter::KvReadRefused,
     ];
 
     #[inline]
@@ -558,6 +581,8 @@ impl Counter {
             Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
             Counter::QuotaRefused => "skeg_quota_refused_total",
             Counter::BackendRefusalUnclassified => "skeg_backend_refusal_unclassified_total",
+            Counter::KvReadBytesFetched => "skeg_kv_read_bytes_total",
+            Counter::KvReadRefused => "skeg_kv_read_refused_total",
         }
     }
 }
