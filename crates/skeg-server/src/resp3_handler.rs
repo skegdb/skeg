@@ -292,16 +292,23 @@ const FRAME_NODE_OVERHEAD: usize = 32;
 
 /// A tight upper bound on what `encode_frame` will write for `frame`,
 /// computed by walking the `Frame` tree that dispatch already built -
-/// without encoding it. `Frame` already owns every byte it will emit (a
-/// `Bulk`'s `Bytes`, an `Array`'s child frames), so this costs a sum over
-/// data that is already resident, not a second fetch.
+/// without encoding it a second time. `Frame` already owns every byte it
+/// will emit (a `Bulk`'s `Bytes`, an `Array`'s child frames), so THIS sum is
+/// over data that is already resident, not a second fetch.
 ///
-/// This is what makes reservation-before-encode possible for a READ without
-/// guessing: by the time a dispatcher's `Frame` exists, the store has
-/// already answered, so the size is no longer speculative - it can be
-/// measured instead of estimated. `reply_upper_bound` handles the opposite
-/// case (a MUTATION, whose bound must be knowable before the store is
-/// touched at all).
+/// That is the limit of what this function buys, and it matters to say so
+/// precisely: by the time a `Frame` exists, the store has already answered -
+/// "no longer speculative" describes the SIZE, measured instead of
+/// estimated, and says nothing about whether the bytes are already
+/// allocated, because they are. `frame_upper_bound` reserves before
+/// `encode_frame`'s buffer, the SECOND allocation a reply makes; it does
+/// nothing about the FIRST, the fetch that built `Frame` in the first place
+/// (`shards.vsearch` materialising every hit's payload as `Bytes`, before
+/// this function or `flush_reply` ever runs). Reserving the first requires a
+/// bound computable BEFORE that fetch - `reply_upper_bound` covers this for
+/// every command whose worst case a request can name (`k`, `WITHPAYLOAD`, a
+/// key count) - a mutation's bound additionally has to precede its commit,
+/// a read's does not, but both need it before the store call, not after.
 fn frame_upper_bound(frame: &Frame) -> usize {
     let payload = match frame {
         Frame::Simple(s) => s.len(),
@@ -831,18 +838,103 @@ fn vmset_reply_upper_bound(args: &[Bytes]) -> usize {
         .saturating_add(FRAME_NODE_OVERHEAD)
 }
 
-/// The upper bound of `cmd`'s reply, computable from the REQUEST alone -
-/// before the command has run. This is what makes reservation-before-commit
-/// possible: a mutation's answer must be known to fit the budget before the
-/// mutation is allowed to happen, because refusing after it already
-/// committed would tell a client to retry work that is done.
+/// The upper bound of a single `GET`'s reply: one value, at the wire's own
+/// ceiling on how large a stored value may ever be (`SET`'s value is a bulk
+/// string, capped at `MAX_BULK_LEN` by the parser at write time - the same
+/// ceiling this read now assumes as its worst case). Reserved BEFORE
+/// `shards.get` runs, not after: the store answers with AT MOST this many
+/// bytes, so a class too small to ever hold the worst case refuses the
+/// request instead of allocating first and finding out.
+fn get_reply_upper_bound() -> usize {
+    skeg_resp3::MAX_BULK_LEN.saturating_add(FRAME_NODE_OVERHEAD)
+}
+
+/// The upper bound of an `MGET`'s reply: `get_reply_upper_bound` once per
+/// key. `keys.len()` is already bounded by the parser's `MAX_AGGREGATE_LEN`,
+/// but this makes no further assumption about how many of those keys hold a
+/// value anywhere near the per-value ceiling - the worst case is every one
+/// of them at once, which is the same reasoning `vmset_reply_upper_bound`
+/// applies per item.
+fn mget_reply_upper_bound(keys: &[Bytes]) -> usize {
+    keys.len()
+        .saturating_mul(get_reply_upper_bound())
+        .saturating_add(FRAME_NODE_OVERHEAD)
+}
+
+/// The largest vector `SKEG.VGET` may ever answer with, in bytes of
+/// little-endian `f32`.
 ///
-/// `None` means the reply's size depends on data the STORE holds, not on
-/// anything the request declares - which is true of every command here that
-/// does not mutate. Nothing commits on the way to answering one of those, so
-/// there is no "before commit" to keep: their bound is instead measured from
-/// the `Frame` dispatch actually built, by `frame_upper_bound`, right before
-/// `encode_frame` runs in [`flush_reply`].
+/// The honest bound is the INDEX'S OWN dim, but nothing in `ShardSet` reads
+/// it synchronously today without an async fan-out (`vindex_list`) or a
+/// router that only exists once an index has been trained
+/// (`ShardSet::router`) - neither is a per-request-shape bound, and adding a
+/// synchronous dim registry touches vindex create/drop/reopen in `shard.rs`,
+/// which is out of THIS mandate's reach (see the R1 handoff: other branches
+/// are mid-flight on that file). So this is the documented-constant fallback
+/// the mandate allows when a tighter bound needs a change bigger than the
+/// bound itself: 1 MiB is `262_144` `f32`s, an order of magnitude past any
+/// embedding dimension in production use, and the same shape of ceiling
+/// `MAX_VGET_VECTOR_BYTES` names so nobody has to rediscover the number.
+pub(crate) const MAX_VGET_VECTOR_BYTES: usize = 1024 * 1024;
+
+fn vget_reply_upper_bound() -> usize {
+    MAX_VGET_VECTOR_BYTES.saturating_add(FRAME_NODE_OVERHEAD)
+}
+
+/// The upper bound of a `SKEG.VSEARCH` reply, computed from the request
+/// alone: `k` hits (clamped to [`crate::shard::MAX_VSEARCH_K`] the same way
+/// the shard clamps it), each an id (a `u64` printed as decimal, at most 20
+/// digits), a score, and - only when `WITHPAYLOAD` is present - one payload
+/// blob at its staged ceiling ([`MAX_PAYLOAD_BYTES`], enforced at
+/// `SKEG.VSET`/`SKEG.VMSET` staging so this bound is never a guess about
+/// what a write was allowed to store). `skeg_vsearch` builds exactly this
+/// shape per hit: `(id, score[, payload])`.
+///
+/// An arity or `k` this cannot parse still gets a finite, conservative
+/// answer (`k` defaults to the maximum) rather than a panic: `skeg_vsearch`
+/// itself refuses a malformed request with a short error frame, which fits
+/// under any bound this returns.
+fn vsearch_reply_upper_bound(args: &[Bytes]) -> usize {
+    let k = args
+        .get(1)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(crate::shard::MAX_VSEARCH_K)
+        .min(crate::shard::MAX_VSEARCH_K);
+    let with_payload = args
+        .get(4..)
+        .is_some_and(|tail| tail.iter().any(|a| a.eq_ignore_ascii_case(b"WITHPAYLOAD")));
+    let per_hit = 20usize // id, decimal u64
+        .saturating_add(FRAME_NODE_OVERHEAD)
+        .saturating_add(FRAME_NODE_OVERHEAD) // score
+        .saturating_add(if with_payload {
+            MAX_PAYLOAD_BYTES.saturating_add(FRAME_NODE_OVERHEAD)
+        } else {
+            0
+        });
+    k.saturating_mul(per_hit)
+        .saturating_add(FRAME_NODE_OVERHEAD)
+}
+
+/// The upper bound of `cmd`'s reply, computable from the REQUEST alone -
+/// before the command has run, before `shards.*` is ever called. Reserving
+/// this BEFORE dispatch is what P0-A actually asks for: the allocation must
+/// not precede the budget, for a read every bit as much as a mutation. A
+/// mutation's own reservation additionally has to precede its COMMIT
+/// (refusing after the write already happened would tell a client to retry
+/// work that is done) - that is a stronger requirement a mutation carries on
+/// top of this one, not a different reason for reads to skip it.
+///
+/// `None` means the worst case cannot be sized from the request alone - it
+/// depends on how much the STORE holds (an index count, a shard count, a
+/// graph sample's edges) rather than on a number the client supplied (a `k`,
+/// a `WITHPAYLOAD` flag, a key count). For those, and ONLY those, the
+/// allocation genuinely cannot be reserved for before it happens on this
+/// server, and the bound instead falls to `frame_upper_bound` measuring the
+/// `Frame` dispatch already built, right before `encode_frame` runs in
+/// [`flush_reply`] - which bounds the SECOND allocation (the encoder's
+/// buffer), not the first (the fetch), and is not a substitute for a
+/// pre-dispatch reservation where one is computable.
 ///
 /// Exhaustive over [`Command`], no `_` arm: a new variant has to say which
 /// side of that line it is on rather than defaulting onto either one.
@@ -876,17 +968,44 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         | Command::SkegQosSet { .. } => Some(SMALL_REPLY_BOUND),
         Command::SkegVmset { args } => Some(vmset_reply_upper_bound(args)),
 
-        // ---- everything else commits nothing on the way to answering, so
-        // there is no commit for a pre-dispatch refusal to protect: `Exists`
-        // and the reads are sized by the store, `Hello`/`Select`/`SkegAuth`/
-        // `SkegWhoami`/the quota-and-QoS getters/`Unknown`/`Ping`/`Echo` are
-        // small but do not need a SEPARATE reservation on top of what they
-        // already hold - adding one here pushed an idle connection sitting
-        // exactly at its floor a few bytes over it, which a genuinely
-        // saturated class then refused, and starving an existing connection
-        // on a class that is full is the one thing admission must not do.
-        // Their bound is instead measured, exactly, from the `Frame`
-        // dispatch built - see `frame_upper_bound` in `flush_reply`. ----
+        // ---- reads whose worst-case reply IS computable from the request,
+        // even though nothing here commits. P0-A is about the allocation
+        // preceding the budget, not about a commit needing protection - a
+        // `SKEG.VSEARCH k=4096 WITHPAYLOAD` materialises its hits and their
+        // payloads (id, score, up to a megabyte of blob each) into a `Frame`
+        // BEFORE `frame_upper_bound` ever runs on it, so measuring the frame
+        // after the fact catches the SECOND allocation (`encode_frame`'s
+        // buffer) and misses the first (the fetch itself). Reserving these
+        // BEFORE `shards.vget`/`shards.vsearch`/`shards.get` runs closes
+        // that gap the same way a mutation's pre-dispatch reservation does,
+        // and it is what makes summing pipelined replies into
+        // `reply_reserved` (below) actually bound them: `reply_upper_bound`
+        // returning `None` for these let up to `PIPELINE_WINDOW` completed,
+        // fully-payload-bearing reads sit in `inflight` uncharged. ----
+        Command::Get { .. } => Some(get_reply_upper_bound()),
+        Command::Mget { keys } => Some(mget_reply_upper_bound(keys)),
+        Command::SkegVget { .. } => Some(vget_reply_upper_bound()),
+        Command::SkegVsearch { args } => Some(vsearch_reply_upper_bound(args)),
+
+        // ---- everything else commits nothing on the way to answering, and
+        // ALSO has no bound computable from the request alone: `Exists`'s
+        // reply is a bare integer regardless of how many keys it counted,
+        // `Hello`/`Select`/`SkegAuth`/`SkegWhoami`/the quota-and-QoS
+        // getters/`Unknown`/`Ping`/`Echo` are small but do not need a
+        // SEPARATE reservation on top of what they already hold - adding one
+        // pushed an idle connection sitting exactly at its floor a few bytes
+        // over it, which a genuinely saturated class then refused, and
+        // starving an existing connection on a class that is full is the one
+        // thing admission must not do. `SkegStats`/`SkegShards`/
+        // `SkegVindexList`/`SkegCheck`/`SkegVowner`/`SkegHealth`/
+        // `SkegVindexShards`/`SkegVgraph` are sized by how much the STORE
+        // holds (index count, shard count, graph sample edges), not by
+        // anything in the request - found-not-fixed by this pass, same
+        // shape of gap A1 named for the ops above, lower severity because
+        // none of them scale with an attacker-chosen per-request multiplier
+        // the way `k` or a payload blob does. Their bound is instead
+        // measured, exactly, from the `Frame` dispatch built - see
+        // `frame_upper_bound` in `flush_reply`. ----
         Command::Hello(_)
         | Command::Select { .. }
         | Command::SkegWhoami
@@ -896,8 +1015,6 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         | Command::Unknown { .. }
         | Command::Ping(_)
         | Command::Echo(_)
-        | Command::Get { .. }
-        | Command::Mget { .. }
         | Command::Exists { .. }
         | Command::SkegStats
         | Command::SkegShards
@@ -906,8 +1023,6 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         | Command::SkegVowner { .. }
         | Command::SkegHealth { .. }
         | Command::SkegVindexShards { .. }
-        | Command::SkegVsearch { .. }
-        | Command::SkegVget { .. }
         | Command::SkegVgraph { .. } => None,
     }
 }
@@ -1446,6 +1561,16 @@ async fn skeg_vset(
         if !args[3].eq_ignore_ascii_case(b"PAYLOAD") {
             return Frame::Error("ERR SKEG.VSET expected PAYLOAD before the blob".into());
         }
+        if args[4].len() > MAX_PAYLOAD_BYTES {
+            return Frame::Error(
+                crate::admission::AdmissionError::RequestTooLarge {
+                    what: "SKEG.VSET payload bytes",
+                    limit: MAX_PAYLOAD_BYTES as u64,
+                    got: args[4].len() as u64,
+                }
+                .wire_message(),
+            );
+        }
         Some(args[4].clone())
     } else {
         None
@@ -1507,6 +1632,18 @@ const MAX_VMSET_ERROR_LEN: usize = 256;
 /// which is exactly when it should.
 const MAX_VMSET_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest opaque payload blob one vector may carry: `SKEG.VSET`'s
+/// optional `PAYLOAD` blob, and each `SKEG.VMSET` item's payload field.
+/// Enforced at staging, before the write ever reaches a shard.
+///
+/// Without a ceiling here a stored payload has no bound at all, and
+/// `SKEG.VSEARCH WITHPAYLOAD`'s reply bound has nothing honest to multiply
+/// by `k`: what a read can answer starts at what a write may store. 1 MiB is
+/// generous for an opaque blob (a chunk of source text, a small image
+/// thumbnail, a JSON document) and small enough that `MAX_VSEARCH_K` hits at
+/// this cap stay a bounded reply rather than an unbounded one.
+const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 async fn skeg_vmset(
     args: &[Bytes],
     shards: &ShardSet,
@@ -1540,6 +1677,22 @@ async fn skeg_vmset(
                 what: "SKEG.VMSET vector bytes",
                 limit: MAX_VMSET_BYTES as u64,
                 got: vector_bytes as u64,
+            }
+            .wire_message(),
+        );
+    }
+    // Same shape as the vector-bytes check above, over the third field of
+    // each triple: the largest single payload, not their sum - VSEARCH
+    // WITHPAYLOAD's reply bound multiplies by this per-hit ceiling, so it is
+    // one blob at a time that has to stay bounded, not the batch's total.
+    if let Some(len) = args[1..].iter().skip(2).step_by(3).map(Bytes::len).max()
+        && len > MAX_PAYLOAD_BYTES
+    {
+        return Frame::Error(
+            crate::admission::AdmissionError::RequestTooLarge {
+                what: "SKEG.VMSET payload bytes",
+                limit: MAX_PAYLOAD_BYTES as u64,
+                got: len as u64,
             }
             .wire_message(),
         );

@@ -1017,7 +1017,6 @@ async fn read_one_reply(s: &mut TcpStream, within: Duration) -> String {
 /// a silent unbounded store. Without this cap `SKEG.VSEARCH WITHPAYLOAD`'s
 /// reply bound would have nothing honest to multiply `k` by.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opens in the next commit: server: reserve read replies (VSEARCH/VGET/GET/MGET) before the shard call (A1)"]
 async fn a_vset_payload_over_the_cap_is_refused_by_name() {
     let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 8).await;
@@ -1061,7 +1060,6 @@ async fn a_vset_payload_over_the_cap_is_refused_by_name() {
 /// an index name that does NOT exist, so a real shard call would answer
 /// "not found" and a pre-dispatch admission refusal answers something else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opens in the next commit: server: reserve read replies (VSEARCH/VGET/GET/MGET) before the shard call (A1)"]
 async fn a_max_vsearch_withpayload_reply_too_large_is_refused_before_the_shard_call() {
     // k=4096 WITHPAYLOAD needs roughly 4096 * 1 MiB - far past any
     // per-connection allowance a small class can grant.
@@ -1102,7 +1100,6 @@ async fn a_max_vsearch_withpayload_reply_too_large_is_refused_before_the_shard_c
 /// running sum is enforced (several small, real reservations exhausting a
 /// class together), not reproducing the auditor's exact numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in the next commit: server: reserve read replies (VSEARCH/VGET/GET/MGET) before the shard call (A1)"]
 async fn pipelined_vsearch_withpayload_reads_are_reserved_not_left_uncharged() {
     const DIM: usize = 8;
     const K: usize = 1;

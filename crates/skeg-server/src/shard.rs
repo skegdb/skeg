@@ -28,7 +28,7 @@ fn now_ms() -> u64 {
 /// disk-graph beam (and thus a `SmallVec::with_capacity`); `k` sizes the result
 /// set and rerank pool. Generous enough for any real query, low enough that a
 /// single request cannot drive a multi-GiB allocation into `panic=abort`.
-const MAX_VSEARCH_K: usize = 4_096;
+pub(crate) const MAX_VSEARCH_K: usize = 4_096;
 const MAX_VSEARCH_L_SEARCH: u32 = 8_192;
 
 /// How often each shard checks whether a segment needs compacting.
