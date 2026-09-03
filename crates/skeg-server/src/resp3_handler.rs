@@ -2712,7 +2712,11 @@ async fn kv_mset(
         }
     }
     // Scope every key up front (the owned keys back the borrows below), then
-    // hand the whole set to `mset`, which writes one atomic batch per shard.
+    // hand the whole set to `mset`, which writes ONE atomic batch - and
+    // refuses the command with `CROSSSLOT` if the scoped keys do not all
+    // route to one shard, before any of it runs. Scoping happens first
+    // because it is the scoped key that routes: two tenants sending the same
+    // key names do not necessarily span the same shards.
     let scoped: Vec<_> = args.chunks(2).map(|c| scope_key(tenant, &c[0])).collect();
     let pairs: Vec<(&[u8], &[u8])> = scoped
         .iter()

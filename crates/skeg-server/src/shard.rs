@@ -5973,15 +5973,24 @@ impl ShardSet {
         }
     }
 
-    /// Multi-key set. Keys are grouped by shard and each shard's group is
-    /// written as one atomic [`VLog::set_many`] batch, so a shard's portion is
-    /// all-or-nothing across a crash.
+    /// Multi-key set, all-or-nothing. Every key must route to the SAME shard;
+    /// a batch that spans shards is refused whole, before any of it runs.
     ///
-    /// It is NOT globally atomic: keys route to shards by hash, so a batch that
-    /// spans shards is several independent per-shard commits with no cross-shard
-    /// coordination. A single-shard deployment (or an MSET whose keys all hash
-    /// to one shard) is fully atomic. Callers wanting a global transaction must
-    /// keep the keys on one shard.
+    /// Keys route by hash, and each shard commits its own portion
+    /// independently ([`VLog::set_many`], atomic across a crash for that
+    /// shard). There is no cross-shard coordination and this does not add
+    /// any: a spanning batch would be several commits, so an I/O or quota
+    /// failure on a later one would leave an earlier one durable behind an
+    /// error reply. Rather than acknowledge a partial write as a failure, the
+    /// span itself is refused - [`CrossSlot`], the semantics Redis Cluster
+    /// gives the same shape, decided before the first write.
+    ///
+    /// [`CrossSlot`]: crate::admission::AdmissionError::CrossSlot
+    ///
+    /// There are no hash tags: `{tag}` is an ordinary part of the key and
+    /// does not steer routing, so a caller cannot force two keys onto one
+    /// shard. Splitting the batch by [`shard_for`] is the supported way to
+    /// write keys that do not collide.
     ///
     /// No tenant disk quota: equivalent to
     /// [`mset_with_disk_limit`](Self::mset_with_disk_limit) with
@@ -5990,7 +5999,9 @@ impl ShardSet {
     ///
     /// # Errors
     ///
-    /// Returns an error if a shard is unavailable or a write fails.
+    /// Returns [`ShardError::Admission`] with [`CrossSlot`] if the keys do
+    /// not all route to one shard, or an error if that shard is unavailable
+    /// or its write fails.
     pub async fn mset(
         &self,
         pairs: &[(&[u8], &[u8])],
@@ -6000,19 +6011,18 @@ impl ShardSet {
     }
 
     /// [`mset`](Self::mset), charging the batch's net delta against the
-    /// tenant's `max_disk_bytes` - per SHARD, since MSET is only atomic
-    /// per-shard to begin with (see the doc above): a batch that spans
-    /// shards is checked and admitted one shard's portion at a time, in the
-    /// global counter [`VLog::set_many_with_disk_limit`] shares with every
-    /// other write, so an earlier shard's admitted portion is already
-    /// visible to a later one's check.
+    /// tenant's `max_disk_bytes`. One batch is one shard's portion (a
+    /// spanning batch never gets this far), so the sum is checked and
+    /// reserved once, atomically, before the first byte is written: a batch
+    /// that would cross the limit writes NONE of its members (audit/17
+    /// round 2).
     ///
     /// # Errors
     ///
-    /// Returns an error if a shard is unavailable, a write fails, or a
-    /// shard's portion of the batch would push the tenant over
-    /// `disk_limit` - refusing that shard's WHOLE portion, not a prefix of
-    /// it (audit/17 round 2).
+    /// Returns [`ShardError::Admission`] with
+    /// [`crate::admission::AdmissionError::CrossSlot`] if the keys do not all
+    /// route to one shard, or an error if that shard is unavailable, its
+    /// write fails, or the batch would push the tenant over `disk_limit`.
     pub async fn mset_with_disk_limit(
         &self,
         pairs: &[(&[u8], &[u8])],
@@ -6020,27 +6030,41 @@ impl ShardSet {
         tenant: u128,
         disk_limit: Option<u64>,
     ) -> Result<(), ShardError> {
-        let mut by_shard: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); self.inner.n];
-        for (key, value) in pairs {
-            let s = shard_for(key, self.inner.n);
-            by_shard[s].push((Bytes::copy_from_slice(key), Bytes::copy_from_slice(value)));
+        // An empty batch touches no shard and writes nothing: the same Ok it
+        // has always returned, and not a span.
+        let Some(((first, _), rest)) = pairs.split_first() else {
+            return Ok(());
+        };
+        // Route first, over the BORROWED keys, and refuse a spanning batch
+        // here: before a byte is copied, before a shard worker is spoken to,
+        // and therefore before anything can have been made durable. An
+        // adversary sending deliberately spanning batches at line rate pays
+        // one hash per key and nothing else.
+        let shard = shard_for(first, self.inner.n);
+        if rest
+            .iter()
+            .any(|(key, _)| shard_for(key, self.inner.n) != shard)
+        {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::CrossSlotRefused);
+            return Err(ShardError::Admission(
+                crate::admission::AdmissionError::CrossSlot,
+            ));
         }
-        for (shard, batch) in by_shard.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            match self
-                .call(
-                    shard,
-                    ShardReq::SetMany(batch, durability, tenant, disk_limit),
-                )
-                .await?
-            {
-                ShardResp::Done => {}
-                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
-                ShardResp::Refused(e) => return Err(e),
-                _ => return Err(ShardError::Unavailable),
-            }
+        let mut batch: Vec<(Bytes, Bytes)> = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            batch.push((Bytes::copy_from_slice(key), Bytes::copy_from_slice(value)));
+        }
+        match self
+            .call(
+                shard,
+                ShardReq::SetMany(batch, durability, tenant, disk_limit),
+            )
+            .await?
+        {
+            ShardResp::Done => {}
+            ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+            ShardResp::Refused(e) => return Err(e),
+            _ => return Err(ShardError::Unavailable),
         }
         Ok(())
     }
@@ -10498,19 +10522,42 @@ mod tests {
         );
     }
 
+    /// The same 40 keys this test used to write in one call, now written as
+    /// one batch per shard - which is what a caller must do since a spanning
+    /// batch is refused. What is being pinned is unchanged: every member of
+    /// every batch is durable across a reopen.
+    ///
+    /// The refusal itself, and that a refused batch writes nothing on either
+    /// shard, live in `tests/mset_cross_shard.rs`.
     #[tokio::test]
-    async fn mset_writes_all_keys_across_shards_and_survives_reopen() {
+    async fn mset_per_shard_writes_every_key_and_survives_reopen() {
         let dir = TempDir::new().unwrap();
         let owned: Vec<(Vec<u8>, Vec<u8>)> = (0u32..40)
             .map(|i| (format!("mk{i}").into_bytes(), format!("v{i}").into_bytes()))
             .collect();
         {
             let shards = ShardSet::open(dir.path(), 4).unwrap();
-            let pairs: Vec<(&[u8], &[u8])> = owned
+            let spanning: Vec<(&[u8], &[u8])> = owned
                 .iter()
                 .map(|(k, v)| (k.as_slice(), v.as_slice()))
                 .collect();
-            shards.mset(&pairs, Durability::Kernel).await.unwrap();
+            assert!(
+                matches!(
+                    shards.mset(&spanning, Durability::Kernel).await,
+                    Err(ShardError::Admission(
+                        crate::admission::AdmissionError::CrossSlot
+                    ))
+                ),
+                "40 keys over 4 shards span them: the batch is refused whole"
+            );
+            for shard in 0..4 {
+                let pairs: Vec<(&[u8], &[u8])> = owned
+                    .iter()
+                    .filter(|(k, _)| shard_for(k, 4) == shard)
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
+                shards.mset(&pairs, Durability::Kernel).await.unwrap();
+            }
             for (k, v) in &owned {
                 assert_eq!(shards.get(k).await.unwrap().as_deref(), Some(v.as_slice()));
             }

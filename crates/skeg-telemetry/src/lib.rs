@@ -438,10 +438,20 @@ pub enum Counter {
     /// this counter, because the alternative is a rate limit that silently
     /// reads as "give up" to every client of that deployment.
     BackendRefusalUnclassified = 54,
+    /// `MSET` batches refused because their keys did not all route to one
+    /// shard.
+    ///
+    /// The refusal is a behaviour change for anyone who was sending multi-key
+    /// batches: before, such a batch was written shard by shard and could be
+    /// half durable behind an error. There are no hash tags, so on a
+    /// multi-shard store a client that does not split its batches by
+    /// `shard_for` is refused every time - a climb here is that client, and
+    /// it is the number an operator needs to see it.
+    CrossSlotRefused = 55,
 }
 
 impl Counter {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 56;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -498,6 +508,7 @@ impl Counter {
         Counter::IngressReplyOverBudget,
         Counter::QuotaRefused,
         Counter::BackendRefusalUnclassified,
+        Counter::CrossSlotRefused,
     ];
 
     #[inline]
@@ -558,6 +569,7 @@ impl Counter {
             Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
             Counter::QuotaRefused => "skeg_quota_refused_total",
             Counter::BackendRefusalUnclassified => "skeg_backend_refusal_unclassified_total",
+            Counter::CrossSlotRefused => "skeg_crossslot_refused_total",
         }
     }
 }

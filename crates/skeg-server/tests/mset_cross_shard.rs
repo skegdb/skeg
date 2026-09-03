@@ -78,7 +78,6 @@ async fn n_keys_per_shard(shards: &ShardSet) -> Vec<u64> {
 /// first: under the old code its shard's portion was already durable by the
 /// time the second shard's was even looked at.
 #[tokio::test]
-#[ignore = "opens in the commit that refuses a cross-shard MSET before the first write"]
 async fn a_cross_shard_mset_writes_nothing_on_either_shard() {
     let dir = tempfile::TempDir::new().unwrap();
     let shards = ShardSet::open(dir.path(), N).unwrap();
@@ -131,7 +130,6 @@ async fn a_cross_shard_mset_writes_nothing_on_either_shard() {
 /// Asserted where it is observable: the tenant's disk charge, which every
 /// admitted batch moves and this one must not, plus the key counts above.
 #[tokio::test]
-#[ignore = "opens in the commit that refuses a cross-shard MSET before the first write"]
 async fn a_refused_cross_shard_mset_costs_the_tenant_nothing() {
     const T: u128 = 0x4001;
     let dir = tempfile::TempDir::new().unwrap();
@@ -351,7 +349,6 @@ async fn read_line(stream: &mut TcpStream) -> String {
 /// End to end on the wire a client actually speaks: the exact Redis line, and
 /// neither key readable afterwards.
 #[tokio::test]
-#[ignore = "opens in the commit that refuses a cross-shard MSET before the first write"]
 async fn the_resp3_wire_answers_a_cross_shard_mset_with_the_redis_crossslot_line() {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = Server::bind_with_shards("127.0.0.1:0", dir.path(), N, 0)
