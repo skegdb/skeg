@@ -32,7 +32,6 @@ fn scoped_key(tenant: u128, raw: &[u8]) -> Vec<u8> {
 /// A batch whose sum would cross the tenant's limit writes NONE of its
 /// members and reports the typed refusal, not a Storage string.
 #[tokio::test]
-#[ignore = "opens in 'core: enforce the tenant disk limit on set_many'"]
 async fn an_mset_that_would_exceed_the_limit_is_refused_admission_typed_and_writes_nothing() {
     const T: u128 = 0x3001;
     let dir = tempfile::TempDir::new().unwrap();
@@ -133,7 +132,6 @@ async fn an_mset_that_fits_is_admitted_and_counted() {
 /// Two tenants on one disk: A pinned at its own limit cannot use the MSET
 /// path to touch B's budget, and B (unlimited) writes freely.
 #[tokio::test]
-#[ignore = "opens in 'core: enforce the tenant disk limit on set_many'"]
 async fn two_tenants_one_disk_mset_a_at_its_limit_cannot_touch_b() {
     const A: u128 = 0x3003;
     const B: u128 = 0x3004;

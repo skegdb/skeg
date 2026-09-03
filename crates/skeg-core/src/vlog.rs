@@ -873,11 +873,14 @@ impl VLog {
         };
         {
             let mut disk = self.inner.tenant_disk.lock();
-            // Scaffold: `tenant`/`disk_limit` are threaded but not yet
-            // enforced here - the next commit turns the rejection on. The
-            // deltas below still apply unconditionally, so accounting is
-            // already correct; only the refusal is missing.
-            let _ = (tenant, disk_limit);
+            if let Some(limit) = disk_limit {
+                let cur = disk.get(&tenant).copied().unwrap_or(0);
+                let delta = deltas.get(&tenant).copied().unwrap_or(0);
+                let projected = (i128::from(cur) + delta).max(0) as u64;
+                if projected > limit {
+                    return Err(Error::DiskQuota);
+                }
+            }
             for (t, delta) in &deltas {
                 let cur = disk.get(t).copied().unwrap_or(0);
                 let updated = (i128::from(cur) + delta).max(0) as u64;
@@ -2501,7 +2504,6 @@ mod tests {
     /// members - set_many's own all-or-nothing contract, extended to the
     /// disk quota rather than stopped short of it.
     #[tokio::test]
-    #[ignore = "opens in 'core: enforce the tenant disk limit on set_many'"]
     async fn set_many_all_or_nothing_when_the_batch_would_exceed_the_limit() {
         const T: u128 = 0x2222;
         let dir = TempDir::new().unwrap();
@@ -2616,7 +2618,6 @@ mod tests {
     /// same tenant_disk critical section, so a plain `SET` racing an `MSET`
     /// batch for the same tenant's headroom cannot see stale room either.
     #[tokio::test]
-    #[ignore = "opens in 'core: enforce the tenant disk limit on set_many'"]
     async fn set_many_and_set_scoped_reserve_against_the_same_atomic_counter() {
         const T: u128 = 0x2225;
         const N: u8 = 8;
