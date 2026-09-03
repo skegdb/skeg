@@ -88,7 +88,7 @@ skeg-platform = { path = "../skeg-platform", version = "0.1.6" }
 # not only for its own tests. Confined to the test profile - a release build
 # resolves without this entry - but it is why `fp!` has to be correct when
 # enabled, not merely absent when not.
-skeg-server = { path = ".", features = ["failpoints"] }
+skeg-server = { path = ".", version = "0.7.3", features = ["failpoints"] }
 
 [[bench]]
 name = "tracing_overhead"

@@ -44,7 +44,7 @@ crc32c = { workspace = true }
 # skeg-server included - not only for its own tests. Confined to the test
 # profile, and the reason `fp!` has to be correct when enabled rather than
 # merely absent when not.
-skeg-vector = { path = ".", features = ["failpoints"] }
+skeg-vector = { path = ".", version = "0.1.9", features = ["failpoints"] }
 crc32c = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
