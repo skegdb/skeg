@@ -857,6 +857,9 @@ enum ShardReq {
         /// Owning tenant, so its vector quota is credited for the dropped
         /// fragment. `0` for the unscoped default.
         tenant: u128,
+        /// Who gives the tenant its slots back. Decided by the coordinator,
+        /// which is the only place that knows whether the index is routed.
+        credit: DropCredit,
         /// Whether a shard that does not have this index is an error.
         ///
         /// True for a client's DROP: it asked for a named thing and deserves to
@@ -1016,6 +1019,33 @@ enum ShardReq {
         /// brute-force over the matching id set instead of the ANN walk.
         filter: Option<Filter>,
     },
+}
+
+/// Who gives a tenant its vector-quota slots back when an index is dropped.
+///
+/// The quota counts LOGICAL rows and a shard holds PHYSICAL ones, and for a
+/// routed index those are not the same number: an overlap keeps a second copy
+/// of every boundary row, and a crash between a move's write and its source
+/// delete leaves another. Letting each shard credit what it held therefore
+/// gave back more slots than the tenant had ever spent - the subtraction
+/// saturated at zero and the tenant could write a whole `max_vectors` on top
+/// of what it already held, until the next restart repaired the count.
+///
+/// So the decision is made where the logical cardinality is known, and this
+/// enum is how the coordinator tells the shard which of them is crediting.
+/// Exhaustive at the one site that acts on it: a third kind of drop has to
+/// say what it costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropCredit {
+    /// The shard credits what it physically holds. Correct, and cheapest,
+    /// for a hash-placed index: an id maps to exactly one shard for ever, so
+    /// its fragment IS its logical share.
+    Fragment,
+    /// The shard credits nothing; the coordinator does it once, from the
+    /// owner map. For a routed index, and for an erasure - which ends with
+    /// the tenant holding nothing, so the only number that can be right
+    /// afterwards is zero.
+    Coordinator,
 }
 
 /// One VINDEX row as the shards report it: identity plus the LSM debt the
@@ -3400,6 +3430,7 @@ async fn drop_vindex(
     quota: &Arc<crate::quota::TenantVectorQuota>,
     name: &str,
     tenant: u128,
+    credit: DropCredit,
     tier: QuantKind,
     mmap_tier: bool,
     mmap_graph: bool,
@@ -3499,19 +3530,12 @@ async fn drop_vindex(
     // Past this point the drop is COMMITTED: the catalogue no longer lists it.
     drop(arc);
     // `fragment` is what THIS shard physically held, and the quota counts
-    // LOGICAL rows. For a hash-placed index the two agree - an id lives on
-    // exactly one shard - but a routed one keeps a second physical copy of
-    // every boundary row, so dropping it credits back more slots than the
-    // tenant ever spent and leaves the counter below its own remaining
-    // contents (measured: 70 counted, 59 replicas, 0 counted after the drop,
-    // 10 rows still on disk). Crediting a logical count would have to be
-    // decided by the coordinator, which holds the owner map; a drop decides
-    // nothing there today, and `EraseTenant` reaches this from inside a
-    // shard. Recorded, not fixed here. The next open counts the rows again
-    // (`test_quota_drop_of_a_replicated_index_is_repaired_by_the_next_open`),
-    // which bounds how long a tenant can be under-counted but does not make
-    // it right.
-    quota.sub(tenant, fragment);
+    // LOGICAL rows. They are the same number only when an id lives on exactly
+    // one shard, which is why the coordinator decides who credits.
+    match credit {
+        DropCredit::Fragment => quota.sub(tenant, fragment),
+        DropCredit::Coordinator => {}
+    }
     if was_disk {
         // Cleanup, after the fact. A failure here is NOT a failed drop - the
         // commit record is already published, so the index will not come back
@@ -4195,10 +4219,11 @@ async fn process(
         ShardReq::VindexDrop {
             name,
             tenant,
+            credit,
             require_present,
         } => {
             match drop_vindex(
-                vlog, vindexes, dir, quota, &name, tenant, tier, mmap_tier, mmap_graph,
+                vlog, vindexes, dir, quota, &name, tenant, credit, tier, mmap_tier, mmap_graph,
             )
             .await
             {
@@ -4266,7 +4291,22 @@ async fn process(
             let mut dropped = 0u64;
             for name in mine {
                 match drop_vindex(
-                    vlog, vindexes, dir, quota, &name, tenant, tier, mmap_tier, mmap_graph,
+                    vlog,
+                    vindexes,
+                    dir,
+                    quota,
+                    &name,
+                    tenant,
+                    // An erasure ends with this tenant holding nothing, and
+                    // that is the only number that can be right afterwards -
+                    // certainly not the sum of the physical fragments its
+                    // indexes happened to be laid out in. The coordinator
+                    // that drives the fan-out states it once, when every
+                    // shard has answered.
+                    DropCredit::Coordinator,
+                    tier,
+                    mmap_tier,
+                    mmap_graph,
                 )
                 .await
                 {
@@ -6041,6 +6081,10 @@ impl ShardSet {
                     .broadcast(|| ShardReq::VindexDrop {
                         name: name.clone(),
                         tenant,
+                        // The create never returned, so nothing was written
+                        // to this name and there is nothing to credit either
+                        // way. `Fragment` of an empty index is zero.
+                        credit: DropCredit::Fragment,
                         require_present: false,
                     })
                     .await;
@@ -6075,6 +6119,40 @@ impl ShardSet {
         let root = self.inner.root.clone();
         let intent = |e: std::io::Error| ShardError::Storage(format!("catalogue intent: {e}"));
 
+        // How many LOGICAL rows this index holds, read before anything is
+        // removed - afterwards there is nothing left to count.
+        //
+        // For a routed index the shards must not credit their own fragments:
+        // an overlap keeps a second physical copy of every boundary row, and
+        // a crash between a move's write and its source delete leaves
+        // another, so the fragments add up to more than the tenant ever
+        // spent. The owner map is where the logical cardinality lives - one
+        // entry per id however many copies exist, the same rule the open-time
+        // rebuild applies - and `ensure_owner_map` builds it from the shards
+        // if this uptime has not needed it yet.
+        //
+        // BEST EFFORT, deliberately: a map that will not build credits
+        // nothing, and the drop still happens. A drop is destructive and sits
+        // on the erasure path; refusing one because the accounting is
+        // unavailable would trade a leak in a counter for a store that cannot
+        // delete. The tenant then stays charged for rows it no longer has
+        // until the next open counts again - the same bargain the orphan
+        // branch of `drop_vindex` already strikes, logged the same way.
+        let routed = self.inner.routers.read().contains_key(&name);
+        let logical = if routed {
+            match self.ensure_owner_map(&name).await {
+                Ok(()) => self.inner.owners.read().get(&name).map(|m| m.len() as u64),
+                Err(e) => {
+                    error!(
+                        "vector quota of '{name}' cannot be credited on drop: its owner \
+                         map would not rebuild ({e}); the count is repaired at the next open"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // A drop cannot be undone - by the time one shard refuses, the others
         // have already deleted their data - so it is recorded to be FINISHED.
         crate::catalog_intent::record(&root, crate::catalog_intent::Op::Drop, &name)
@@ -6083,11 +6161,26 @@ impl ShardSet {
             .broadcast(|| ShardReq::VindexDrop {
                 name: name.clone(),
                 tenant,
+                credit: if routed {
+                    DropCredit::Coordinator
+                } else {
+                    DropCredit::Fragment
+                },
                 require_present: true,
             })
             .await;
         match outcome {
-            Ok(()) => crate::catalog_intent::clear(&root, &name).map_err(intent)?,
+            Ok(()) => {
+                // Only once every shard has committed. A partial failure
+                // returns below having credited nothing, which leaves the
+                // tenant charged for rows that are partly gone - the safe
+                // direction, and the next open (which also finishes the drop)
+                // settles it.
+                if let Some(rows) = logical {
+                    self.inner.quota.sub(tenant, rows);
+                }
+                crate::catalog_intent::clear(&root, &name).map_err(intent)?;
+            }
             Err(e) => {
                 // The sidecar describes an index that is at least partly gone,
                 // and the record above guarantees the rest follows. Leaving it
@@ -6599,6 +6692,17 @@ impl ShardSet {
         for name in scoped {
             self.drop_router_state(&name)?;
         }
+        // Every index this tenant had is gone, so the only number that can be
+        // right is zero - and it is reached by STATING it, not by adding up
+        // what each shard happened to hold. The shards credit nothing on this
+        // path (`DropCredit::Coordinator`): a routed index keeps a second
+        // physical copy of every boundary row, so their fragments sum to more
+        // than the tenant ever spent, and the subtraction saturating at zero
+        // was the right answer only by accident.
+        //
+        // Reached only after every shard has answered `Erased`; a failure
+        // returns above and leaves the count for the next open to settle.
+        self.inner.quota.rebuild(tenant, 0);
         Ok((vindexes, keys))
     }
 
@@ -10523,7 +10627,6 @@ mod tests {
     /// Asserted BEFORE any reopen: the reopen repairs it, and a repair that
     /// arrives at the next restart is not a limit.
     #[tokio::test]
-    #[ignore = "opens in: quota: credit the logical cardinality when a routed index is dropped"]
     async fn test_quota_drop_of_a_replicated_index_credits_only_what_it_charged() {
         const T: u128 = 47;
         const LIMIT: u64 = 100;
@@ -13316,6 +13419,7 @@ mod tests {
                 ShardReq::VindexDrop {
                     name: "hp".into(),
                     tenant: 0,
+                    credit: DropCredit::Fragment,
                     require_present: true,
                 },
             )
