@@ -9,6 +9,80 @@ repository.
 
 ## [Unreleased]
 
+### A tenant is not something a client can spell
+
+A vindex map key carries its tenant as a `<32 hex>::<name>` prefix, and five
+places read the owner back OUT of that key and act on it: `ERASE TENANT` to
+decide what to destroy, the payload warm-up at open to decide whose blobs to
+read, two blob sweeps to decide what to reclaim, and the tiering stats to
+decide which tenant to report. That is sound only while the prefix can only
+have been written by the server, and it could not be - the name charset
+allowed `:`, tenant `0` is stored unscoped, and the native binary protocol is
+always tenant `0` with the client's raw name. So a client could create an
+index literally named `<another tenant's 32 hex>::x`, and all five sites read
+it as that tenant's: `ERASE TENANT` for the named tenant deleted it - vectors,
+payload blobs and quota - while reporting zero indexes erased, and that tenant
+could no longer create its own index of that name.
+
+**A raw, client-supplied vindex name containing `::` is now refused at
+create**, on the RESP3 command, on the native protocol, and on the library's
+`ShardSet::vindex_create`. A caller that has already scoped a name against a
+tenant it authenticated uses `vindex_create_scoped` instead; in this
+repository that is the RESP3 layer, which refuses the separator in the raw
+name before prepending its own prefix. Nothing else changes: a name without
+`::` behaves exactly as before, and existing indexes keep their keys.
+
+**Upgrading a store an earlier build wrote.** The door only stops NEW squats.
+A key an earlier build let tenant 0 create in the exact form
+`<32 lowercase hex>::<name>` round-trips, so it survives the registry check
+below and goes on being attributed to the tenant its name spells: `ERASE
+TENANT` for that tenant still destroys it (and now counts it). Nothing can
+distinguish it from a legitimate index of that tenant, so nothing tries: grep
+each shard's `vindexes.registry` for `::` and confirm every scoped key belongs
+to the tenant it names.
+
+At open, the registry additionally refuses any key that
+`scope_key(unscope_key(k))` does not reproduce, naming the key in the error. A
+key the server's own round trip does not reproduce cannot have been written by
+the server, so there is no owner to serve it under - and serving it under a
+guess is the misattribution the create door exists to prevent. The registry
+format is unchanged.
+
+An earlier build could write such a key - `<32 UPPERCASE hex>::x` is the
+reachable form - and the whole shard then refuses to open, naming the key.
+There is no flag to skip it and no tool to rewrite it, so the repair is by
+hand: with the server stopped, replace those bytes in the shard's
+`vindexes.registry` with a same-length name (lowercasing the hex restores the
+attribution the key was meant to have; replacing `::` makes it tenant 0's) and
+rename `vindex-<old key>/` to match. Same length keeps it a byte substitution -
+the entry carries a `u16` name length. Do not delete the registry: the next
+write rebuilds it from what it read, and an empty one drops every index on the
+shard.
+
+**`ERASE TENANT` now removes the tenant's semantic routers.** It swept the
+router map with a prefix built by hand from the tenant `u128`, whose `Display`
+is decimal (`42::`), against keys carrying the tenant's 32 hex digits. The
+prefix matched nothing, so no non-zero tenant ever lost a router: an erasure
+that reported success left the centroids trained on the erased vectors both on
+disk and loaded. The prefix now comes from the same helper that writes the
+keys.
+
+**Every native-protocol op that takes an index name refuses `::` too.** The
+create door stops a client MAKING a key that reads as another tenant's; it
+does not stop one NAMING a key that already exists. A tenant's index, created
+over RESP3 from an id the server authenticated, was just a string to the
+native listener, which has no tenant of its own - so `VGET` read that tenant's
+vectors, `VSET` wrote into its index, and `VDEL` and `VINDEX.DROP` destroyed
+them, from a connection that authenticated as nobody. `VINDEX.CREATE`,
+`VINDEX.DROP`, `VSET`, `VGET`, `VDEL` and `VSEARCH` now share one name check,
+so an op added later cannot quietly skip it. Native `VINDEX.LIST` takes no
+name but had the matching hole: it listed every index of every tenant, and a
+scoped name is the tenant id in hex, so it enumerated the tenants too. It now
+hides scoped names, the same rule RESP3 applies to an anonymous connection.
+All of this matters where the native listener is exposed over a store a
+multi-tenant RESP3 listener also serves; a single-tenant store has no such
+names.
+
 ### A vector and its payload are one write
 
 `SKEG.VSET name id vector payload` published the vector first and its blob

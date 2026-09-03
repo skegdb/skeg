@@ -856,7 +856,13 @@ async fn skeg_vindex_create(args: &[Bytes], shards: &ShardSet, tenant: TenantId)
         Ok(s) => s,
         Err(e) => return e,
     };
-    match shards.vindex_create(&scoped, dim, kind, backend).await {
+    // `scoped` came out of `scope_vindex_or_reject`, which refused the
+    // separator in the raw name and then wrote the prefix itself, so this is
+    // the pre-scoped door rather than the raw one.
+    match shards
+        .vindex_create_scoped(&scoped, dim, kind, backend)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
@@ -3195,5 +3201,124 @@ mod tests {
         assert!(matches!(r, Frame::Bulk(ref b) if &b[..] == b"3"));
         let r = kv_get(&args(&["hits"]), &shards, bob, None).await;
         assert!(matches!(r, Frame::Bulk(ref b) if &b[..] == b"5"));
+    }
+
+    #[tokio::test]
+    async fn vindex_create_refuses_a_name_carrying_the_scope_separator() {
+        // The RESP3 door. `scope_vindex_or_reject` refuses `::` before it
+        // scopes, so an anonymous connection cannot hand-write the prefix that
+        // makes a key read as another tenant's.
+        let (_dir, shards) = fresh_shards().await;
+        let victim = tid_from_name("victim");
+        let squat = format!("{victim}::x");
+
+        let f = skeg_vindex_create(
+            &args(&[&squat, "8", "f32", "disk"]),
+            &shards,
+            TenantId::ZERO,
+        )
+        .await;
+        assert!(
+            matches!(&f, Frame::Error(e) if e.contains("must not contain '::'")),
+            "expected a refusal naming the separator, got {f:?}"
+        );
+        let rows = shards.vindex_list().await.unwrap();
+        assert!(
+            !rows.iter().any(|r| r.name == squat),
+            "the refused name must not exist: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_zero_cannot_squat_the_name_another_tenant_would_use() {
+        // Name squatting, the second half of the P1: even without the erase,
+        // creating `<hex of B>::x` on tenant 0 took the map key B's own `x`
+        // would occupy, and B's create then failed with "already exists". The
+        // refusal has to leave B's create working.
+        let (_dir, shards) = fresh_shards().await;
+        let victim = tid_from_name("victim");
+
+        let squatted = skeg_vindex_create(
+            &args(&[&format!("{victim}::x"), "8", "f32", "disk"]),
+            &shards,
+            TenantId::ZERO,
+        )
+        .await;
+        assert!(
+            matches!(squatted, Frame::Error(_)),
+            "tenant 0 must not reach tenant B's namespace"
+        );
+
+        let mine = skeg_vindex_create(&args(&["x", "8", "f32", "disk"]), &shards, victim).await;
+        assert!(
+            matches!(&mine, Frame::Simple(s) if s == "OK"),
+            "the victim's own create must still succeed, got {mine:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_scoped_index_reopens_with_its_payloads_findable() {
+        // `warm_payload_indexes` reads each recovered vindex's blobs with the
+        // tenant it takes from the map key, then marks the index loaded either
+        // way. Warmed under the wrong tenant it reads zero blobs and still
+        // marks it loaded, so every filtered search for that tenant comes back
+        // empty, in silence. Tenant 0 is the one case where the scoped and the
+        // bare name coincide - which is exactly why this shape needs a test of
+        // its own.
+        let dir = TempDir::new().unwrap();
+        let t = tid_from_name("warm");
+        let q = vec_arg(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        {
+            let shards = ShardSet::open(dir.path(), 1).unwrap();
+            let created = skeg_vindex_create(&args(&["idx", "8", "f32", "disk"]), &shards, t).await;
+            assert!(matches!(&created, Frame::Simple(s) if s == "OK"));
+            for (id, who) in [("1", "user=bob"), ("2", "user=alice")] {
+                let set = skeg_vset(
+                    &[
+                        Bytes::from_static(b"idx"),
+                        Bytes::copy_from_slice(id.as_bytes()),
+                        q.clone(),
+                        Bytes::from_static(b"PAYLOAD"),
+                        Bytes::copy_from_slice(who.as_bytes()),
+                    ],
+                    &shards,
+                    t,
+                    None,
+                )
+                .await;
+                assert!(matches!(&set, Frame::Simple(s) if s == "OK"));
+            }
+            shards.write_snapshot_and_payload_indexes().await;
+        }
+
+        // Reopen: recovery warms the payload index inside the readiness
+        // barrier, before this search runs.
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let resp = skeg_vsearch(
+            &[
+                Bytes::from_static(b"idx"),
+                Bytes::from_static(b"10"),
+                Bytes::from_static(b"0"),
+                q,
+                Bytes::from_static(b"FILTER"),
+                Bytes::from_static(b"user = alice"),
+            ],
+            &shards,
+            t,
+        )
+        .await;
+        match resp {
+            Frame::Array(items) => {
+                assert_eq!(
+                    items.len(),
+                    2,
+                    "one [id, score] pair for alice; an empty answer here is the \
+                     silent-miss bug: {items:?}"
+                );
+                assert!(matches!(&items[0], Frame::Bulk(b) if &b[..] == b"2"));
+            }
+            other => panic!("expected one filtered hit, got {other:?}"),
+        }
     }
 }

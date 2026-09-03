@@ -94,6 +94,34 @@ fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
     encode_err(req_id, ErrCode::Internal, &e.to_string())
 }
 
+/// The index name of a native request: UTF-8, and free of the tenant-scope
+/// separator.
+///
+/// EVERY arm that takes an index name goes through this, and that is the whole
+/// point of it existing. The native protocol has no tenant: it calls with
+/// tenant `0` and the client's raw name. Closing the create door stops a
+/// client MAKING a key that reads as another tenant's, but not one NAMING a
+/// key that already exists - a tenant's index, created over RESP3 from an id
+/// the server authenticated, is just a string here. Without this, VGET reads
+/// that tenant's vectors, VSET writes into its index, and VDEL and
+/// VINDEX.DROP destroy them, from a connection that authenticated as nobody.
+///
+/// Returns the encoded error frame to send back, so a new arm that forgets the
+/// check is a name it cannot use rather than a hole it cannot see.
+fn native_index_name(req_id: u64, raw: &Bytes) -> Result<&str, Bytes> {
+    let Ok(name) = std::str::from_utf8(raw) else {
+        return Err(encode_err(
+            req_id,
+            ErrCode::InvalidRequest,
+            "index name not utf-8",
+        ));
+    };
+    if let Err(e) = crate::shard::reject_scope_separator(name) {
+        return Err(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string()));
+    }
+    Ok(name)
+}
+
 /// Dispatch a parsed frame to the shard set and return an optional response.
 #[allow(clippy::too_many_lines)] // one arm per protocol op; splitting hurts readability
 async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
@@ -115,6 +143,23 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
 
         skeg_proto::Op::VindexList => match shards.vindex_list().await {
             Ok(rows) => {
+                // Hide every tenant-scoped name, the same rule RESP3 applies
+                // to an anonymous connection (`skeg_vindex_list`). This
+                // listener has no tenant - it is always tenant 0 - so the
+                // names it may see are exactly the unscoped ones. Without
+                // this it handed out the scoped name, dim, kind and vector
+                // count of every index of every tenant, and a scoped name is
+                // the tenant id in hex, so the listing enumerated the tenants
+                // as well.
+                //
+                // Filtered BEFORE the v1 tier check below: that check refuses
+                // the call because the ROWS CANNOT BE REPRESENTED to this
+                // client, so it must weigh the rows this client receives, not
+                // ones it is not allowed to know exist.
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| !row.name.contains(crate::shard::SCOPE_SEP))
+                    .collect();
                 if frame.header.version == VERSION_V1 && rows.iter().any(|row| row.kind > 2) {
                     return Some(encode_err(
                         req_id,
@@ -183,12 +228,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             if let Err(message) = native_vindex_kind_is_allowed(frame.header.version, kind) {
                 return Some(encode_err(req_id, ErrCode::InvalidRequest, message));
@@ -204,12 +246,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vindex_drop(name, 0).await {
                 Ok(()) => Some(encode_ok(req_id)),
@@ -222,12 +261,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vset(name, id, vector, 0, None, None).await {
                 Ok(()) => {
@@ -246,12 +282,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vget(name, id).await {
                 Ok(Some(v)) => Some(encode_ok_value(req_id, &f32_vec_to_bytes(&v))),
@@ -265,12 +298,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vdel(name, id, 0).await {
                 Ok(existed) => Some(encode_ok_bool(req_id, existed)),
@@ -283,12 +313,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             let span = tracing::info_span!(
                 "vsearch",
@@ -365,5 +392,149 @@ mod tests {
     fn v2_turboquant_discriminators_are_accepted() {
         assert_eq!(native_vindex_kind_is_allowed(VERSION_V2, 3), Ok(()));
         assert_eq!(native_vindex_kind_is_allowed(VERSION_V2, 5), Ok(()));
+    }
+
+    /// Feed one encoded request through the real dispatcher and return the
+    /// response frame. The native path has no tenant of its own - it is always
+    /// tenant 0 with the client's raw name - so this is the door where a
+    /// crafted scope prefix used to walk straight in.
+    async fn native_roundtrip(shards: &ShardSet, request: Bytes) -> Frame {
+        let mut parser = FrameParser::new();
+        let mut buf = BytesMut::from(&request[..]);
+        let frame = parser
+            .feed(&mut buf)
+            .expect("the request must parse")
+            .expect("one whole frame");
+        let response = dispatch(&frame, shards).await.expect("a response");
+        let mut parser = FrameParser::new();
+        let mut buf = BytesMut::from(&response[..]);
+        parser
+            .feed(&mut buf)
+            .expect("the response must parse")
+            .expect("one whole frame")
+    }
+
+    /// `[u8 code][u8 len][msg]` - the shape `encode_err` writes.
+    fn err_message(frame: &Frame) -> String {
+        assert_eq!(frame.header.op, skeg_proto::Op::Err, "expected an error");
+        let n = frame.payload[1] as usize;
+        String::from_utf8_lossy(&frame.payload[2..2 + n]).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_native_create_cannot_spell_another_tenants_scope() {
+        // `VINDEX.CREATE "<32 hex of B>::x"` over the binary protocol. There is
+        // no AUTH here and never was: the handler passes the raw name to
+        // `vindex_create` with tenant 0, so the refusal has to live at the
+        // ShardSet door or it does not exist for this protocol at all.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let squat = format!("{}::x", "2a".repeat(16));
+
+        let frame = native_roundtrip(
+            &shards,
+            skeg_proto::encode_vindex_create(7, &squat, 8, 0, 0),
+        )
+        .await;
+        let msg = err_message(&frame);
+        assert!(
+            msg.contains("must not contain '::'"),
+            "the native door must refuse the scope separator, got: {msg}"
+        );
+
+        let rows = shards.vindex_list().await.unwrap();
+        assert!(
+            !rows.iter().any(|r| r.name == squat),
+            "the refused name must not exist: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_native_op_can_address_a_tenant_scoped_index() {
+        // Closing the CREATE door stops a client MAKING a key that reads as
+        // another tenant's. It does not stop one NAMING a key that already
+        // exists: a tenant's index, created over RESP3 from an authenticated
+        // id, is a plain string to the native listener, which has no tenant of
+        // its own and passes the name straight through. So VGET reads that
+        // tenant's vectors, VSET writes into its index, and VDEL / VINDEX.DROP
+        // destroy them - from a connection that never authenticated as anyone.
+        //
+        // Every native arm that takes an index name refuses the separator, and
+        // this walks all of them: one arm left out is one whole op still open.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        // The victim: created the way the RESP3 layer creates it, with a
+        // prefix the server wrote from an id it authenticated.
+        let theirs = format!("{}::idx", "2a".repeat(16));
+        shards.vindex_create_scoped(&theirs, 4, 0, 0).await.unwrap();
+        shards
+            .vset(&theirs, 1, vec![1.0, 0.0, 0.0, 0.0], 0x2a2a, None, None)
+            .await
+            .unwrap();
+
+        for (op, request) in [
+            ("VGET", skeg_proto::encode_vget(1, &theirs, 1)),
+            (
+                "VSET",
+                skeg_proto::encode_vset(2, &theirs, 1, &[0.0, 1.0, 0.0, 0.0], Flags::empty()),
+            ),
+            ("VDEL", skeg_proto::encode_vdel(3, &theirs, 1)),
+            (
+                "VSEARCH",
+                skeg_proto::encode_vsearch(4, &theirs, 1, &[1.0, 0.0, 0.0, 0.0]),
+            ),
+            ("VINDEX.DROP", skeg_proto::encode_vindex_drop(5, &theirs)),
+        ] {
+            let frame = native_roundtrip(&shards, request).await;
+            let msg = err_message(&frame);
+            assert!(
+                msg.contains("must not contain '::'"),
+                "native {op} reached another tenant's index; answered: {msg}"
+            );
+        }
+
+        // Nothing moved: the index is still catalogued and the row still holds
+        // the vector it was written with.
+        let rows = shards.vindex_list().await.unwrap();
+        assert!(
+            rows.iter().any(|r| r.name == theirs),
+            "the tenant's index was dropped from the native listener: {rows:?}"
+        );
+        assert_eq!(
+            shards.vget(&theirs, 1).await.unwrap(),
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+            "the tenant's row was overwritten or deleted from the native listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_vindex_list_does_not_name_other_tenants_indexes() {
+        // The last asymmetry between the two handlers over one store. RESP3
+        // hides every `::` name from an anonymous connection; the native arm
+        // listed the lot - scoped name, dim, kind and vector count for every
+        // index of every tenant, to a connection that authenticated as nobody.
+        // The scoped name IS the tenant id in hex, so the listing enumerates
+        // the tenants as well as their indexes.
+        //
+        // Metadata only - the ops themselves refuse `::` - but two handlers on
+        // one store answering differently is a defect, not a decision.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let theirs = format!("{}::idx", "2a".repeat(16));
+        shards.vindex_create_scoped(&theirs, 4, 0, 0).await.unwrap();
+        shards.vindex_create("mine", 4, 0, 0).await.unwrap();
+
+        let frame = native_roundtrip(&shards, skeg_proto::encode_vindex_list(1)).await;
+        assert_eq!(frame.header.op, skeg_proto::Op::Ok, "expected a listing");
+        let rows = skeg_proto::decode_vindex_list_response(&frame.payload);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("::")),
+            "the native listing names another tenant's index: {names:?}"
+        );
+        assert!(
+            names.contains(&"mine"),
+            "hiding scoped names must not hide this listener's own: {names:?}"
+        );
     }
 }

@@ -764,6 +764,34 @@ pub(crate) fn validate_vindex_name(name: &str) -> Result<(), ShardError> {
     }
 }
 
+/// The separator that carries the tenant scope inside a vindex map key: a key
+/// is either a bare name (tenant 0) or `<32 hex>::<name>`. Written by
+/// [`scope_key`], read back by [`unscope_key`].
+pub(crate) const SCOPE_SEP: &str = "::";
+
+/// Refuse the scope separator in a RAW, client-supplied vindex name.
+///
+/// A tenant is not something a client gets to spell. `unscope_key` derives the
+/// owner of an index FROM its map key, and `EraseTenant`, the payload warm-up,
+/// the blob sweeps and `IndexStat` all act on what it says. That is sound only
+/// while the `<32 hex>::` prefix can only have been put there by the server -
+/// and it could not be: `scope_key(0, name)` returns the raw name unchanged,
+/// and the native protocol always calls with tenant 0 and the client's own
+/// name. A client could therefore create `<32 hex of B>::x`, which every one
+/// of those sites then attributed to tenant B.
+///
+/// So the separator is refused at the create door, on every entry path. That
+/// is the whole guarantee: no key with a scope prefix exists unless the server
+/// wrote the prefix itself, from an authenticated tenant id.
+pub(crate) fn reject_scope_separator(name: &str) -> Result<(), ShardError> {
+    if name.contains(SCOPE_SEP) {
+        return Err(ShardError::Storage(format!(
+            "vindex name must not contain '{SCOPE_SEP}' (reserved for tenant scoping)"
+        )));
+    }
+    Ok(())
+}
+
 /// Error returned by `ShardSet` operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -1962,6 +1990,24 @@ fn read_registry(dir: &Path) -> std::io::Result<Vec<RegistryEntry>> {
                 path.display()
             ))
         })?;
+        // And a valid name is not a valid KEY. Everything downstream asks
+        // `unscope_key` who owns this index - `EraseTenant` to decide what to
+        // destroy, the warm-up to decide whose blobs to read - so a key whose
+        // owner cannot be read back unambiguously must not be served under a
+        // guess. `scope_key(unscope_key(k))` is the server's own round trip:
+        // whatever it does not reproduce, the server did not write. Fail
+        // closed and name the key, because the alternative is a silent
+        // misattribution to whichever tenant the string happens to spell.
+        let (tenant, index) = unscope_key(&name);
+        if scope_key(tenant, &index) != name {
+            return Err(bad(format!(
+                "{} entry {i} is keyed '{name}', which this build cannot \
+                 attribute to a tenant: it does not survive the scope round \
+                 trip (read back as tenant {tenant}, index '{index}'). \
+                 Refusing to open it under a guessed owner.",
+                path.display()
+            )));
+        }
         pos += nlen;
         let dim = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
@@ -5712,16 +5758,51 @@ impl ShardSet {
         }
     }
 
-    /// Create a vector index across all shards.
+    /// Create a vector index across all shards from a RAW, client-supplied
+    /// name.
     ///
     /// `kind` is the raw wire byte: 0 = f32, 1 = int8, 2 = binary. `backend`
     /// is 0 = flat (in-RAM) or 1 = disk Vamana graph.
+    ///
+    /// This is the door the native binary protocol and every admin helper
+    /// reach, and the name arrives exactly as the client wrote it, so the
+    /// tenant-scope separator is refused here (see
+    /// [`reject_scope_separator`]). A caller that has ALREADY scoped the name
+    /// against an authenticated tenant uses [`vindex_create_scoped`] instead -
+    /// the only way a `::` prefix can enter a map key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a name carrying `::`, a bad `dim`/`kind`/`backend`,
+    /// a duplicate name, or an unavailable shard.
+    ///
+    /// [`vindex_create_scoped`]: Self::vindex_create_scoped
+    pub async fn vindex_create(
+        &self,
+        name: &str,
+        dim: u32,
+        kind: u8,
+        backend: u8,
+    ) -> Result<(), ShardError> {
+        reject_scope_separator(name)?;
+        self.vindex_create_scoped(name, dim, kind, backend).await
+    }
+
+    /// [`vindex_create`](Self::vindex_create) for a name the caller has
+    /// ALREADY tenant-scoped.
+    ///
+    /// The caller is promising that the `<32 hex>::` prefix in `name` was
+    /// written by this server from a tenant id it authenticated - not copied
+    /// out of anything a client sent. In-tree that is the RESP3 layer, which
+    /// refuses the separator in the raw name before prepending its own. Pass a
+    /// client's string here and every site that reads the owner back out of
+    /// the key believes it.
     ///
     /// # Errors
     ///
     /// Returns an error for a bad `dim`/`kind`/`backend`, a duplicate name, or
     /// an unavailable shard.
-    pub async fn vindex_create(
+    pub async fn vindex_create_scoped(
         &self,
         name: &str,
         dim: u32,
@@ -6340,7 +6421,18 @@ impl ShardSet {
         // Erasure must remove derived routers too, or centroids trained on the
         // erased vectors survive on disk (review P0). Scoped names are
         // `{tenant}::name`; drop every router under this tenant's prefix.
-        let prefix = format!("{tenant}::");
+        //
+        // The prefix comes from `scope_key`, the same helper that WRITES the
+        // keys, and not from a hand-rolled `format!`. It was hand-rolled, and
+        // it rendered the `u128` in decimal - `42::` - while every key carries
+        // 32 hex digits of `to_le_bytes`. It matched nothing, so no non-zero
+        // tenant ever lost a router and this whole block was dead. One helper
+        // writes the prefix and one reads it, or they drift again.
+        //
+        // `scope_key(0, "")` is the empty string, which every key starts with:
+        // tenant 0 returned at the top of this function, before anything here.
+        debug_assert_ne!(tenant, 0, "tenant 0 is refused above; its prefix is empty");
+        let prefix = scope_key(tenant, "");
         let scoped: Vec<String> = self
             .inner
             .routers
@@ -8271,7 +8363,7 @@ mod tests {
                 1,
             )
             .unwrap();
-            shards.vindex_create(&scoped, 4, 0, 1).await.unwrap();
+            shards.vindex_create_scoped(&scoped, 4, 0, 1).await.unwrap();
             for id in 0..6u64 {
                 shards
                     .vset(
@@ -9493,7 +9585,7 @@ mod tests {
         // the index pointing at a hole, so the order is what this pins down.
         for t in [VICTIM, NEIGHBOUR] {
             let name = scope_key(t, "idx");
-            shards.vindex_create(&name, 4, 0, 0).await.unwrap();
+            shards.vindex_create_scoped(&name, 4, 0, 0).await.unwrap();
             for id in 0u64..8 {
                 shards
                     .vset(
@@ -10755,7 +10847,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         let name = scope_key(VICTIM, "idx");
-        shards.vindex_create(&name, 4, 1, 1).await.unwrap();
+        shards.vindex_create_scoped(&name, 4, 1, 1).await.unwrap();
         for id in 0u64..20 {
             shards
                 .vset(
