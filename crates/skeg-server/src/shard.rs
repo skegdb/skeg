@@ -277,18 +277,32 @@ struct Admitted {
 /// Split out because both the supplied-payload and the carry-forward paths
 /// write to the same place under the same failpoint, and a second copy of that
 /// is a second place for the key to be built differently.
+///
+/// `disk_limit` is the tenant's `max_disk_bytes`, the same limit a KV `SET`
+/// enforces (`docs/adr-payload-transaction.md`, "Disk quota covers the
+/// blob"). A blob key carries the same 16-byte tenant prefix a KV key does,
+/// so it is charged against - and can be refused against - the identical
+/// counter, by the identical check inside `VLog::set_scoped`. `None` (no
+/// backend, or the caller is an internal relocation - see the call sites)
+/// skips enforcement, matching every other admission check on this path.
 async fn stage_payload_blob(
     vlog: &VLog,
     scope: BlobScope<'_>,
     id: u64,
     version: u64,
     blob: &[u8],
+    disk_limit: Option<u64>,
 ) -> Result<bool, String> {
     crate::fp_at!(
         crate::failpoint::WriteFailpoint::PayloadPrepare,
         scope.name,
         Err("vset payload failed: failpoint: payload staging refused".to_owned())
     );
+    // Scaffold: threaded but not yet enforced - the next commit turns this
+    // on. Kept as an explicit no-op rather than silently dropping the
+    // parameter, so `cargo clippy -D warnings` (unused variable) is the thing
+    // that would catch a rebase losing this line, not a silent regression.
+    let _ = disk_limit;
     vlog.tenant(scope.tenant)
         .set(&scope.key(id, version), blob, PAYLOAD_DURABILITY)
         .await
@@ -927,6 +941,17 @@ enum ShardReq {
         tenant: u128,
         /// Tenant's max vectors, if any. `None` skips quota enforcement.
         limit: Option<u64>,
+        /// Tenant's `max_disk_bytes`, if any, applied to the payload blob
+        /// staged below - the same limit and the same physical counter a KV
+        /// `SET` is charged against (`docs/adr-payload-transaction.md`).
+        /// `None` for every internal relocation (reshard, boundary replica,
+        /// the far side of an overwrite): those move a row's bytes, they do
+        /// not grow the tenant's total, and refusing them would strand a
+        /// vector mid-move against a limit their own client write never
+        /// crossed. Set from the pluggable backend at the two entry points
+        /// that mint a NEW write - [`ShardSet::vset`] and the per-item calls
+        /// inside [`ShardSet::vmset`] - exactly where `limit` above is.
+        disk_limit: Option<u64>,
         /// What this write means for the tenant's logical cardinality. The
         /// quota counts distinct rows and a shard can only see its own, so
         /// the coordinator - which knows whether the row is arriving, being
@@ -4444,6 +4469,7 @@ async fn process(
             vector,
             tenant,
             limit,
+            disk_limit,
             effect,
             version,
             payload,
@@ -4605,19 +4631,31 @@ async fn process(
             // because the record that publishes the row is then the only step
             // that has to survive.
             let staged = match &payload {
-                Some(blob) => stage_payload_blob(vlog, scope, id, admitted.version, blob).await,
+                Some(blob) => {
+                    stage_payload_blob(vlog, scope, id, admitted.version, blob, disk_limit).await
+                }
                 // A payload-less overwrite keeps the payload the row already
                 // had, which means CARRYING it to the new version's key.
                 // Skipped for a row this shard did not already hold - every
                 // insert, and every arriving relocation - so those pay no
                 // lookup for a blob that cannot exist.
+                //
+                // Charged against the same limit as a supplied payload: the
+                // carried copy is a second physical key until W4 reclaims the
+                // one it supersedes (`docs/adr-payload-transaction.md`, "Disk
+                // quota"), so a tenant sitting exactly at its limit can see a
+                // payload-less overwrite refused for the width of that
+                // window. That is the documented margin, not a bypass -
+                // bypassing it here would let an overwrite grow a tenant's
+                // resident bytes with nothing counting them.
                 None => match admitted.previous.filter(|&v| v != admitted.version) {
                     Some(old) => match read_payload_blob(vlog, scope, id, old).await {
                         Ok(Some(blob)) => {
                             skeg_telemetry::tick_counter(
                                 skeg_telemetry::Counter::PayloadBlobsCarriedForward,
                             );
-                            stage_payload_blob(vlog, scope, id, admitted.version, &blob).await
+                            stage_payload_blob(vlog, scope, id, admitted.version, &blob, disk_limit)
+                                .await
                         }
                         Ok(None) => Ok(false),
                         Err(e) => Err(format!("vset payload failed: {e}")),
@@ -6974,6 +7012,13 @@ impl ShardSet {
 
     /// Insert a vector under `id` into `name`. Routes by `id`.
     ///
+    /// No tenant disk quota: equivalent to
+    /// [`vset_with_disk_limit`](Self::vset_with_disk_limit) with
+    /// `disk_limit: None`. Kept so every caller that has no `max_disk_bytes`
+    /// to enforce - every internal relocation, every test, the native
+    /// listener (which has no pluggable tenant backend to read one from) -
+    /// is untouched by the disk quota threaded through the RESP3 entry point.
+    ///
     /// # Errors
     ///
     /// Returns an error if the index is missing, the dim mismatches, or the
@@ -6985,6 +7030,30 @@ impl ShardSet {
         vector: Vec<f32>,
         tenant: u128,
         limit: Option<u64>,
+        payload: Option<Bytes>,
+    ) -> Result<(), ShardError> {
+        self.vset_with_disk_limit(name, id, vector, tenant, limit, None, payload)
+            .await
+    }
+
+    /// [`vset`](Self::vset), charging the staged payload blob against the
+    /// tenant's `max_disk_bytes` - the same limit and the same physical
+    /// counter (live KV bytes plus live blob bytes) a KV `SET` already
+    /// enforces. See `docs/adr-payload-transaction.md`, "Disk quota".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is missing, the dim mismatches, the
+    /// shard is unavailable, or the blob would push the tenant over
+    /// `disk_limit`.
+    pub async fn vset_with_disk_limit(
+        &self,
+        name: &str,
+        id: u64,
+        vector: Vec<f32>,
+        tenant: u128,
+        limit: Option<u64>,
+        disk_limit: Option<u64>,
         payload: Option<Bytes>,
     ) -> Result<(), ShardError> {
         // Semantic placement when a router exists: the vector picks its owner
@@ -7039,6 +7108,7 @@ impl ShardSet {
                 vector,
                 tenant,
                 limit,
+                disk_limit,
                 // An overwrite of a row the tenant already owns changes no
                 // cardinality, wherever the old copy happened to live.
                 effect: if old.is_some() {
@@ -7142,6 +7212,7 @@ impl ShardSet {
             vector,
             tenant,
             limit,
+            disk_limit,
             // Hash placement never moves a row, so the shard's own answer to
             // "did I hold this id already" is the whole truth here - which is
             // exactly what `Insert` defers to.
@@ -7182,12 +7253,35 @@ impl ShardSet {
     /// owner map. That row is durable, acknowledged by the engine, and
     /// unreachable: an acknowledged write lost because a SIBLING was
     /// malformed.
+    ///
+    /// No tenant disk quota: equivalent to
+    /// [`vmset_with_disk_limit`](Self::vmset_with_disk_limit) with
+    /// `disk_limit: None`. See [`vset`](Self::vset) for why this stays the
+    /// name every existing caller keeps using untouched.
     pub async fn vmset(
         &self,
         name: &str,
         items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
         tenant: u128,
         limit: Option<u64>,
+    ) -> Vec<Result<(), ShardError>> {
+        self.vmset_with_disk_limit(name, items, tenant, limit, None)
+            .await
+    }
+
+    /// [`vmset`](Self::vmset), charging every item's staged payload blob
+    /// against the tenant's `max_disk_bytes` - see
+    /// [`vset_with_disk_limit`](Self::vset_with_disk_limit). Each item is
+    /// admitted independently, so one item refused by the disk quota does not
+    /// abort its siblings, matching every other per-item admission check
+    /// here.
+    pub async fn vmset_with_disk_limit(
+        &self,
+        name: &str,
+        items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
+        tenant: u128,
+        limit: Option<u64>,
+        disk_limit: Option<u64>,
     ) -> Vec<Result<(), ShardError>> {
         let n = items.len();
         // Still concurrent, which is the whole point of the command: the
@@ -7220,7 +7314,10 @@ impl ShardSet {
                 let _inflight = vmset_inflight::Guard::enter();
                 (
                     i,
-                    this.vset(&name, id, vector, tenant, limit, payload).await,
+                    this.vset_with_disk_limit(
+                        &name, id, vector, tenant, limit, disk_limit, payload,
+                    )
+                    .await,
                 )
             });
             true
@@ -7497,6 +7594,12 @@ impl ShardSet {
                             vector,
                             tenant,
                             limit: None,
+                            // A relocation, not a client write growing the
+                            // tenant's bytes: it moves the blob that already
+                            // exists, and its source copy is reclaimed right
+                            // below. Charging it here would let a tenant
+                            // sitting at its disk limit get stuck mid-reshard.
+                            disk_limit: None,
                             // A reshard move: the row arrives, it is not new.
                             effect: crate::quota::QuotaEffect::Move,
                             version: Some(version),
@@ -7636,6 +7739,12 @@ impl ShardSet {
                         vector,
                         tenant,
                         limit: None,
+                        // Same reasoning as the reshard destination above: a
+                        // system-driven copy the maintenance loop decided to
+                        // make, not a client write. Refusing it here would
+                        // leave a boundary under-replicated for a tenant that
+                        // did nothing but reach its own limit.
+                        disk_limit: None,
                         // A boundary replica: a second physical copy of one
                         // logical row.
                         effect: crate::quota::QuotaEffect::Replica,
@@ -8457,6 +8566,7 @@ mod tests {
             vector,
             tenant: 0,
             limit: None,
+            disk_limit: None,
             effect: crate::quota::QuotaEffect::Move,
             version: Some(version),
             payload: Some(Bytes::from_static(blob.as_bytes())),
