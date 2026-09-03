@@ -49,7 +49,11 @@ for crate in "${ORDER[@]}"; do
   # path-only dev-dependency on itself, which the package drops; the feature
   # is the published way to get the same code.
   feats=(); grep -q '^failpoints *=' "$dir/Cargo.toml" && feats=(--features failpoints)
-  if (cd "$dir" && cargo generate-lockfile -q && cargo test --release -q ${feats[@]+"${feats[@]}"} 2>&1 | tail -n 3); then
+  # Serial: the lib suites carry a few tests on process-wide state that
+  # flap under the parallel harness (known, listed in the audits); a FAIL
+  # here must mean the package, not the scheduler. Failed test names are
+  # kept in the output so a red run says which.
+  if (cd "$dir" && cargo generate-lockfile -q && cargo test --release -q ${feats[@]+"${feats[@]}"} -- --test-threads=1 2>&1 | grep -E "FAILED|panicked at|^error|^test result" | tail -n 12); then
     echo "   ok"
   else
     echo "   FAIL: $crate"; failed+=("$crate")
