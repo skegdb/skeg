@@ -42,6 +42,15 @@ updated behaves exactly as it does today. `ErrCode::from_u8` answers
 `Internal` for an unknown code is a client inventing a classification the
 server never sent. Full table in `docs/observability.md`.
 
+**A full VSEARCH pool now says `BACKPRESSURE`, not `ERR`.** *(RESP3 wire
+change, one error line.)* The bounded search pool refusing before it
+scatters is the most obviously momentary refusal the server has - what
+fills it is other traffic, and other traffic ends - and both wires agreed
+it was permanent. They agreed on the wrong answer: a client told `ERR` on a
+full queue does not retry, which is the only sensible thing to do. RESP3
+now sends `BACKPRESSURE vsearch queue is full` (the text is unchanged, only
+the code word in front of it) and the native wire sends `0x04`.
+
 **A frame over the connection's allowance is refused by name.** The
 parser catches a declared payload larger than the allowance on the 24
 bytes that declared it, and the server then closed the socket without a

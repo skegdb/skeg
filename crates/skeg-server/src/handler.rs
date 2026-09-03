@@ -217,10 +217,14 @@ fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
         // The message WITHOUT the code word: the byte carries it here, and
         // repeating it in the text is how a client ends up parsing both.
         ShardError::Admission(a) => (a.code(), a.to_string()),
-        ShardError::InvalidRequest(msg) => (ErrCode::InvalidRequest, msg.clone()),
-        ShardError::Unavailable | ShardError::Busy | ShardError::Storage(_) => {
-            (ErrCode::Internal, e.to_string())
+        // Same mapping as the RESP3 handler's, to the same classification:
+        // a full pool is momentary, and the code says so.
+        ShardError::Busy => {
+            let busy = crate::admission::AdmissionError::Busy;
+            (busy.code(), busy.to_string())
         }
+        ShardError::InvalidRequest(msg) => (ErrCode::InvalidRequest, msg.clone()),
+        ShardError::Unavailable | ShardError::Storage(_) => (ErrCode::Internal, e.to_string()),
     };
     encode_err(req_id, code, &message)
 }

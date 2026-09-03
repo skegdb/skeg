@@ -479,8 +479,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                 .write_all(&resp3_command(&[
                     b"SKEG.VSEARCH",
                     name.as_bytes(),
-                    &f32_bytes(&[1.0, 2.0, 3.0, 4.0]),
                     b"1",
+                    b"0",
+                    &f32_bytes(&[1.0, 2.0, 3.0, 4.0]),
                 ]))
                 .await;
             let line = read_resp3_line(&mut conn).await.expect("vsearch replies");
@@ -692,7 +693,6 @@ fn oversized_header(payload_len: u32) -> Vec<u8> {
 // ----------------------------------------------------------------- the test
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in `server: a full vsearch queue is backpressure, not an error`"]
 async fn every_admission_refusal_says_the_same_thing_on_both_wires() {
     for cond in Condition::ALL {
         let (want_retryability, want_code) = cond.expected();

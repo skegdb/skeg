@@ -8035,6 +8035,15 @@ impl ShardSet {
         filter: Option<Filter>,
         probe: usize,
     ) -> Result<Vec<(u64, f32, Option<Bytes>)>, ShardError> {
+        // Armed only by a test. Saturating the real pool from a socket test
+        // means racing its semaphore against the search that is supposed to
+        // find it full, which is not a thing a deterministic test can do.
+        if crate::fp_admission!(
+            crate::failpoint::AdmissionFailpoint::VsearchQueueFullAtSearch,
+            name
+        ) {
+            return Err(ShardError::Busy);
+        }
         let _permit = self
             .inner
             .vsearch_admission

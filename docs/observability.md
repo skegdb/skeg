@@ -213,6 +213,9 @@ spelling from it, so they cannot say different things.
 | ingress class full (at accept, or mid-frame) | yes | `-BACKPRESSURE ingress budget: ...` | `4` Backpressure |
 | ingress budget unreadable | yes | `-BACKPRESSURE ...` | `4` Backpressure |
 | memory governor out of headroom | yes | `-BACKPRESSURE out of budget at the write: ...` | `4` Backpressure |
+| VSEARCH pool saturated | yes | `-BACKPRESSURE vsearch queue is full` | `4` Backpressure |
+| tenant backend refused, `RATELIMITED ...` | yes | the backend's own line, verbatim | `4` Backpressure |
+| tenant backend refused, any other message | no | the backend's own line, verbatim | `2` InvalidRequest |
 | frame over the connection allowance | no | `-ERR ingress budget: this connection may hold at most N ...` | `2` InvalidRequest |
 | tenant vector quota exceeded | no | `-ERR tenant vector quota exceeded: ...` | `2` InvalidRequest |
 | request over a fixed ceiling (`SKEG.VMSET` items or bytes, native frame payload) | no | `-ERR ...: at most N, got M ...` | `2` InvalidRequest |

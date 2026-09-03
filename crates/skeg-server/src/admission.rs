@@ -142,8 +142,10 @@ impl AdmissionError {
             // vector or raises the limit, neither of which is a retry.
             Self::QuotaExceeded { .. } => Permanent,
             Self::RequestTooLarge { .. } => Permanent,
-            // Stub: opened by `server: a full vsearch queue is backpressure`.
-            Self::Busy => Permanent,
+            // What fills a bounded queue is other traffic, and other traffic
+            // ends. Telling a client `ERR` here is telling it to give up on
+            // the one condition where waiting a moment is exactly right.
+            Self::Busy => Retryable,
             // The one place in the engine that reads a code word out of a
             // string, and only because the string IS the interface: see the
             // variant's own note. One word, the one the trait's doc names;
@@ -467,7 +469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: a full vsearch queue is backpressure, not an error`"]
     fn every_admission_error_is_classified_as_the_table_says() {
         for (e, want) in every_admission_error() {
             assert_eq!(
@@ -606,16 +607,23 @@ mod tests {
         }
     }
 
+    /// The counter names a fault in the backend, not backend traffic.
+    ///
+    /// Asserted on the PREDICATE it is derived from, not on the counter
+    /// itself: the counter is a process-wide static and this binary runs its
+    /// tests in parallel, so "it did not move" is a claim about every other
+    /// test as much as this one. A delta of zero on a shared counter is the
+    /// absolute-value mistake wearing a delta's clothes.
     #[test]
     fn a_classified_backend_refusal_is_not_counted_as_unclassified() {
-        let before =
-            skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);
-        let _ = refused("RATELIMITED slow down");
-        let after =
-            skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);
         assert_eq!(
-            after, before,
-            "the counter names a fault in the backend, not backend traffic"
+            backend_code_word("RATELIMITED slow down"),
+            Some(BACKEND_RETRYABLE_CODE),
+            "from_backend ticks exactly when this is not the code word"
+        );
+        assert_eq!(
+            refused("RATELIMITED slow down").retryability(),
+            Retryability::Retryable
         );
     }
 
@@ -637,7 +645,6 @@ mod tests {
     // ── a full queue ────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "opens in `server: a full vsearch queue is backpressure, not an error`"]
     fn a_full_queue_is_momentary() {
         let e = AdmissionError::Busy;
         assert_eq!(

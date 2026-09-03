@@ -2044,10 +2044,16 @@ fn shard_error(e: &crate::shard::ShardError) -> Frame {
     warn!("shard error: {e}");
     match e {
         crate::shard::ShardError::Admission(a) => Frame::Error(a.wire_message()),
+        // A full VSEARCH pool is an admission refusal that predates the
+        // enum, so it is mapped to its classification here rather than
+        // classified here: the retryable bit is still decided in one place.
+        crate::shard::ShardError::Busy => {
+            Frame::Error(crate::admission::AdmissionError::Busy.wire_message())
+        }
         crate::shard::ShardError::InvalidRequest(msg) => Frame::Error(format!("ERR {msg}")),
-        crate::shard::ShardError::Unavailable
-        | crate::shard::ShardError::Busy
-        | crate::shard::ShardError::Storage(_) => Frame::Error(format!("ERR {e}")),
+        crate::shard::ShardError::Unavailable | crate::shard::ShardError::Storage(_) => {
+            Frame::Error(format!("ERR {e}"))
+        }
     }
 }
 
