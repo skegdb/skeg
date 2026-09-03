@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use skeg_core::Durability;
+use skeg_core::{BoundedGet, Durability};
 use skeg_resp3::{
     Command, ConnectionState, Frame, FrameDecoder, encode_frame, handle_echo, handle_ping,
     parse_command,
@@ -526,6 +526,10 @@ pub async fn handle_connection_resp3(
                                                 .wire_message(),
                                         )
                                     } else {
+                                        // The bound above already covers this
+                                        // command's reply; a KV read is not
+                                        // one of them (`reply_upper_bound`
+                                        // answers `None` for `GET`/`MGET`).
                                         dispatch_command(
                                             cmd,
                                             &mut state,
@@ -533,11 +537,18 @@ pub async fn handle_connection_resp3(
                                             &shards,
                                             tenant_backend.as_ref(),
                                             peer.map(|p| p.ip()),
+                                            None,
                                         )
                                         .await
                                     }
                                 }
                                 _ => {
+                                    // Where `GET`/`MGET` land. They cannot be
+                                    // sized from the request, so they carry
+                                    // the budget INTO the dispatch and reserve
+                                    // there, from the lengths the index holds,
+                                    // before the first value is read.
+                                    let held = decoder.capacity();
                                     dispatch_command(
                                         cmd,
                                         &mut state,
@@ -545,6 +556,7 @@ pub async fn handle_connection_resp3(
                                         &shards,
                                         tenant_backend.as_ref(),
                                         peer.map(|p| p.ip()),
+                                        Some(&mut ReadAdmission::new(&mut budget, held)),
                                     )
                                     .await
                                 }
@@ -852,9 +864,9 @@ fn vmset_reply_upper_bound(args: &[Bytes]) -> usize {
 /// bound itself: 1 MiB is `262_144` `f32`s, an order of magnitude past any
 /// embedding dimension in production use, and the same shape of ceiling
 /// `MAX_VGET_VECTOR_BYTES` names so nobody has to rediscover the number.
-const MAX_VGET_VECTOR_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_VGET_VECTOR_BYTES: usize = 1024 * 1024;
 
-fn vget_reply_upper_bound() -> usize {
+pub(crate) fn vget_reply_upper_bound() -> usize {
     MAX_VGET_VECTOR_BYTES.saturating_add(FRAME_NODE_OVERHEAD)
 }
 
@@ -1131,6 +1143,7 @@ async fn dispatch_command(
     shards: &ShardSet,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
     peer_ip: Option<IpAddr>,
+    read_admission: Option<&mut ReadAdmission<'_>>,
 ) -> Frame {
     // Per-command admission (multi-tenant QoS). Hello/SkegAuth establish or
     // change the tenant and are never gated. Single-tenant (no backend) skips
@@ -1213,7 +1226,14 @@ async fn dispatch_command(
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
         Command::Get { key } => {
-            kv_get(std::slice::from_ref(&key), shards, *tenant, tenant_backend).await
+            kv_get(
+                std::slice::from_ref(&key),
+                shards,
+                *tenant,
+                tenant_backend,
+                read_admission,
+            )
+            .await
         }
         Command::Set { key, value } => kv_set(&[key, value], shards, *tenant, tenant_backend).await,
         Command::Append { key, value } => {
@@ -1221,7 +1241,9 @@ async fn dispatch_command(
         }
         Command::Del { keys } => kv_del(&keys, shards, *tenant, tenant_backend).await,
         Command::Exists { keys } => kv_exists(&keys, shards, *tenant, tenant_backend).await,
-        Command::Mget { keys } => kv_mget(&keys, shards, *tenant, tenant_backend).await,
+        Command::Mget { keys } => {
+            kv_mget(&keys, shards, *tenant, tenant_backend, read_admission).await
+        }
         Command::Mset { pairs } => {
             let args: Vec<Bytes> = pairs.into_iter().flat_map(|(k, v)| [k, v]).collect();
             kv_mset(&args, shards, *tenant, tenant_backend).await
@@ -2546,23 +2568,172 @@ fn kv_select_db(db: i64) -> Frame {
     }
 }
 
+/// One connection's side of a KV read's admission: the budget the reply has
+/// to fit inside, and what the rest of the connection already holds.
+///
+/// `GET`/`MGET` are the one command shape whose reply size is knowable from
+/// the STORE but not from the request (`reply_upper_bound` returns `None` for
+/// them, and the only request-derived bound - `MAX_BULK_LEN` per key - refuses
+/// ordinary four-key requests under any realistic class). The size is
+/// knowable, though: it is in the index, one lookup per key and no read. So
+/// these two go the other way round from every other command - they ask the
+/// store how big the answer is, reserve THAT, and only then fetch it.
+pub(crate) struct ReadAdmission<'a> {
+    budget: &'a mut ConnectionBudget,
+    /// Buffer-capacity bytes this connection already holds, which the
+    /// reservation sits on top of. The same figure `flush_reply` is later
+    /// given as `other_capacity`, so the charge taken here is the one the
+    /// flush finds already paid.
+    held: usize,
+}
+
+impl<'a> ReadAdmission<'a> {
+    pub(crate) fn new(budget: &'a mut ConnectionBudget, held: usize) -> Self {
+        Self { budget, held }
+    }
+}
+
+/// Why a KV read did not happen. WIRE-NEUTRAL on purpose: both listeners run
+/// the same preflight and each renders the answer in its own protocol, so the
+/// classification cannot drift between them by being written down twice.
+pub(crate) enum ReadRefusal {
+    /// The server refused the reply before it was built.
+    Admission(crate::admission::AdmissionError),
+    /// The store could not answer.
+    Shard(crate::shard::ShardError),
+}
+
+/// The refusal for a read whose size arithmetic does not fit a `usize`.
+///
+/// Unreachable with `u32` record sizes short of 2^32 keys in one request, and
+/// typed anyway: an admission decision that can only be taken by overflowing
+/// is an admission decision nobody took.
+fn read_sum_overflow(keys: usize) -> ReadRefusal {
+    skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+    ReadRefusal::Admission(crate::admission::AdmissionError::RequestTooLarge {
+        what: "summed KV reply bytes",
+        limit: u64::MAX,
+        got: keys as u64,
+    })
+}
+
+/// Measure, reserve, fetch - in that order, which is the whole of B1.
+///
+/// Every value's length comes from the index (`value_sizes`: one hashmap
+/// lookup per key, no segment touched, nothing allocated for a value); the
+/// sum is taken with checked arithmetic and reserved against the connection
+/// budget; only then is a byte of any value read, and each read is bounded by
+/// the size that was reserved for it so a concurrent overwrite cannot make the
+/// measurement stale (`mget_bounded` -> `VLog::get_bounded`, which checks the
+/// same `IndexEntry` the `pread` allocates from).
+///
+/// `Err` is the refusal frame to send back, and when it is returned NOTHING
+/// was fetched.
+/// A read refusal as a RESP3 error frame. The native listener renders the
+/// same value as an `Err` frame with a code byte; neither invents its own
+/// classification.
+fn read_refusal_frame(refusal: &ReadRefusal) -> Frame {
+    match refusal {
+        ReadRefusal::Admission(a) => Frame::Error(a.wire_message()),
+        ReadRefusal::Shard(e) => shard_error(e),
+    }
+}
+
+pub(crate) async fn fetch_within_budget(
+    keys: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    admission: Option<&mut ReadAdmission<'_>>,
+) -> Result<Vec<Option<Bytes>>, ReadRefusal> {
+    let scoped: Vec<ScopedKey> = keys.iter().map(|k| scope_key(tenant, k)).collect();
+    let bytes: Vec<Bytes> = scoped.iter().map(|k| k.as_bytes().clone()).collect();
+    let view = shards.tenant(tenant_u128(tenant));
+
+    let sizes = match view.value_sizes(&bytes).await {
+        Ok(sizes) => sizes,
+        Err(e) => return Err(ReadRefusal::Shard(e)),
+    };
+
+    // The reply's frame shape, sized before it exists: one node per key plus
+    // the array that holds them, exactly what `frame_upper_bound` will later
+    // measure on the real `Frame`.
+    let mut want = FRAME_NODE_OVERHEAD;
+    for &size in &sizes {
+        let element = (size as usize)
+            .checked_add(FRAME_NODE_OVERHEAD)
+            .ok_or_else(|| read_sum_overflow(keys.len()))?;
+        want = want
+            .checked_add(element)
+            .ok_or_else(|| read_sum_overflow(keys.len()))?;
+    }
+
+    if let Some(admission) = admission {
+        let target = admission
+            .held
+            .checked_add(want)
+            .ok_or_else(|| read_sum_overflow(keys.len()))?;
+        if let Err(e) = admission.budget.grow_to(target) {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
+            return Err(ReadRefusal::Admission(
+                crate::admission::AdmissionError::from(e),
+            ));
+        }
+    }
+
+    let got = match view.mget_bounded(&bytes, &sizes).await {
+        Ok(got) => got,
+        Err(e) => return Err(ReadRefusal::Shard(e)),
+    };
+    let mut out = Vec::with_capacity(got.len());
+    for (i, slot) in got.into_iter().enumerate() {
+        match slot {
+            BoundedGet::Missing => out.push(None),
+            BoundedGet::Found(v) => out.push(Some(v)),
+            // The window the bound exists to close: between the measurement
+            // and the read, somebody overwrote this key with a larger value.
+            // The reservation was taken for the old size, so the new one is
+            // refused rather than allocated - and by name, with both numbers,
+            // because "try again" is the honest advice here.
+            BoundedGet::Oversize { record_bytes } => {
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+                return Err(ReadRefusal::Admission(
+                    crate::admission::AdmissionError::RequestTooLarge {
+                        what: "stored value bytes (the value grew after its \
+                               size was reserved)",
+                        limit: u64::from(sizes.get(i).copied().unwrap_or(0)),
+                        got: u64::from(record_bytes),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 async fn kv_get(
     args: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
     ctx: Option<&Arc<dyn TenantBackend>>,
+    admission: Option<&mut ReadAdmission<'_>>,
 ) -> Frame {
     if args.len() != 1 {
         return Frame::Error("ERR wrong number of arguments for 'GET'".into());
     }
+    // BEFORE the size probe, not after: the probe reaches the index with the
+    // scoped key, and an anonymous connection naming another tenant's scoped
+    // key would learn from a refusal-vs-null whether that key exists. The
+    // forgery check is what stops it, so it has to come first.
     if anon_key_collides_with_tenant(tenant, &args[0], ctx) {
         return anon_forgery_error();
     }
-    let k = scope_key(tenant, &args[0]);
-    match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
-        Ok(Some(v)) => Frame::Bulk(v),
-        Ok(None) => Frame::Null,
-        Err(e) => shard_error(&e),
+    match fetch_within_budget(args, shards, tenant, admission).await {
+        Ok(mut values) => match values.pop().flatten() {
+            Some(v) => Frame::Bulk(v),
+            None => Frame::Null,
+        },
+        Err(refusal) => read_refusal_frame(&refusal),
     }
 }
 
@@ -2659,16 +2830,24 @@ async fn kv_exists(
             return anon_forgery_error();
         }
     }
-    let mut count: i64 = 0;
-    for key in args {
-        let k = scope_key(tenant, key);
-        match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
-            Ok(Some(_)) => count += 1,
-            Ok(None) => {}
-            Err(e) => return shard_error(&e),
-        }
+    // Counted from the index, not from the values. `EXISTS k1 ... kn` used
+    // to fetch every value in full and then throw them away - the same
+    // unbudgeted materialisation B1 is about, for an answer that is a single
+    // integer. A record size is `padded_record_size`, which is never zero for
+    // a live key (it covers the record header before it covers a byte of
+    // value), so a zero here means absent and nothing else.
+    let scoped: Vec<Bytes> = args
+        .iter()
+        .map(|k| scope_key(tenant, k).as_bytes().clone())
+        .collect();
+    match shards
+        .tenant(tenant_u128(tenant))
+        .value_sizes(&scoped)
+        .await
+    {
+        Ok(sizes) => Frame::Integer(sizes.iter().filter(|s| **s > 0).count() as i64),
+        Err(e) => shard_error(&e),
     }
-    Frame::Integer(count)
 }
 
 async fn kv_mget(
@@ -2676,25 +2855,26 @@ async fn kv_mget(
     shards: &ShardSet,
     tenant: TenantId,
     ctx: Option<&Arc<dyn TenantBackend>>,
+    admission: Option<&mut ReadAdmission<'_>>,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'MGET'".into());
     }
+    // Every key, before any of them is looked up: see `kv_get`.
     for key in args {
         if anon_key_collides_with_tenant(tenant, key, ctx) {
             return anon_forgery_error();
         }
     }
-    let mut out = Vec::with_capacity(args.len());
-    for key in args {
-        let k = scope_key(tenant, key);
-        match shards.tenant(k.accounting_tenant()).get(k.as_bytes()).await {
-            Ok(Some(v)) => out.push(Frame::Bulk(v)),
-            Ok(None) => out.push(Frame::Null),
-            Err(e) => return shard_error(&e),
-        }
+    match fetch_within_budget(args, shards, tenant, admission).await {
+        Ok(values) => Frame::Array(
+            values
+                .into_iter()
+                .map(|v| v.map_or(Frame::Null, Frame::Bulk))
+                .collect(),
+        ),
+        Err(refusal) => read_refusal_frame(&refusal),
     }
-    Frame::Array(out)
 }
 
 async fn kv_mset(
@@ -3518,6 +3698,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            None,
         )
         .await;
         assert!(
@@ -3535,6 +3716,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
             None,
         )
         .await;
@@ -3570,6 +3752,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            None,
         )
         .await;
         assert!(
@@ -3585,6 +3768,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            None,
         )
         .await;
         assert!(
@@ -3599,6 +3783,7 @@ mod tests {
             &mut tenant,
             &shards,
             Some(&backend),
+            None,
             None,
         )
         .await;
@@ -3618,6 +3803,7 @@ mod tests {
             &mut anon,
             &shards,
             Some(&backend),
+            None,
             None,
         )
         .await;
@@ -3647,6 +3833,7 @@ mod tests {
                 &mut state,
                 &mut tenant,
                 &shards,
+                None,
                 None,
                 None,
             )
@@ -3738,7 +3925,14 @@ mod tests {
         let _ = kv_set(&args(&["k1", "v1"]), &shards, TenantId::ZERO, None).await;
         let _ = kv_set(&args(&["k3", "v3"]), &shards, TenantId::ZERO, None).await;
 
-        let resp = kv_mget(&args(&["k1", "k2", "k3"]), &shards, TenantId::ZERO, None).await;
+        let resp = kv_mget(
+            &args(&["k1", "k2", "k3"]),
+            &shards,
+            TenantId::ZERO,
+            None,
+            None,
+        )
+        .await;
         match resp {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 3);
@@ -3762,7 +3956,7 @@ mod tests {
         .await;
         assert!(matches!(resp, Frame::Simple(ref s) if s == "OK"));
         for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
-            let r = kv_get(&args(&[k]), &shards, TenantId::ZERO, None).await;
+            let r = kv_get(&args(&[k]), &shards, TenantId::ZERO, None, None).await;
             assert!(matches!(r, Frame::Bulk(ref b) if &b[..] == v.as_bytes()));
         }
     }
@@ -3945,7 +4139,7 @@ mod tests {
         let r = kv_append(&args(&["doc", "cde"]), &shards, TenantId::ZERO, None).await;
         assert!(matches!(r, Frame::Integer(5)), "new length after append");
 
-        let g = kv_get(&args(&["doc"]), &shards, TenantId::ZERO, None).await;
+        let g = kv_get(&args(&["doc"]), &shards, TenantId::ZERO, None, None).await;
         assert!(matches!(g, Frame::Bulk(ref b) if &b[..] == b"abcde"));
     }
 
@@ -3955,7 +4149,7 @@ mod tests {
         let resp = kv_incr_by(&args(&["counter"]), &shards, 1, TenantId::ZERO, None).await;
         assert!(matches!(resp, Frame::Integer(1)));
         // Stored as a UTF-8 integer, GET-readable.
-        let g = kv_get(&args(&["counter"]), &shards, TenantId::ZERO, None).await;
+        let g = kv_get(&args(&["counter"]), &shards, TenantId::ZERO, None, None).await;
         assert!(matches!(g, Frame::Bulk(ref b) if &b[..] == b"1"));
     }
 
@@ -4066,14 +4260,14 @@ mod tests {
         let _ = kv_set(&args(&["k", "alice-value"]), &shards, alice, None).await;
         let _ = kv_set(&args(&["k", "bob-value"]), &shards, bob, None).await;
 
-        let r_alice = kv_get(&args(&["k"]), &shards, alice, None).await;
+        let r_alice = kv_get(&args(&["k"]), &shards, alice, None, None).await;
         assert!(matches!(r_alice, Frame::Bulk(ref b) if &b[..] == b"alice-value"));
-        let r_bob = kv_get(&args(&["k"]), &shards, bob, None).await;
+        let r_bob = kv_get(&args(&["k"]), &shards, bob, None, None).await;
         assert!(matches!(r_bob, Frame::Bulk(ref b) if &b[..] == b"bob-value"));
 
         // And the anonymous (ZERO) view must not see either: ZERO writes
         // are unprefixed and the scoped writes carry a non-zero prefix.
-        let r_anon = kv_get(&args(&["k"]), &shards, TenantId::ZERO, None).await;
+        let r_anon = kv_get(&args(&["k"]), &shards, TenantId::ZERO, None, None).await;
         assert!(matches!(r_anon, Frame::Null));
     }
 
@@ -4088,9 +4282,9 @@ mod tests {
         // Alice deletes her own "k"; Bob's "k" must survive.
         let d = kv_del(&args(&["k"]), &shards, alice, None).await;
         assert!(matches!(d, Frame::Integer(1)));
-        let r_bob = kv_get(&args(&["k"]), &shards, bob, None).await;
+        let r_bob = kv_get(&args(&["k"]), &shards, bob, None, None).await;
         assert!(matches!(r_bob, Frame::Bulk(ref b) if &b[..] == b"bv"));
-        let r_alice = kv_get(&args(&["k"]), &shards, alice, None).await;
+        let r_alice = kv_get(&args(&["k"]), &shards, alice, None, None).await;
         assert!(matches!(r_alice, Frame::Null));
     }
 
@@ -4108,9 +4302,9 @@ mod tests {
         for _ in 0..5 {
             let _ = kv_incr_by(&args(&["hits"]), &shards, 1, bob, None).await;
         }
-        let r = kv_get(&args(&["hits"]), &shards, alice, None).await;
+        let r = kv_get(&args(&["hits"]), &shards, alice, None, None).await;
         assert!(matches!(r, Frame::Bulk(ref b) if &b[..] == b"3"));
-        let r = kv_get(&args(&["hits"]), &shards, bob, None).await;
+        let r = kv_get(&args(&["hits"]), &shards, bob, None, None).await;
         assert!(matches!(r, Frame::Bulk(ref b) if &b[..] == b"5"));
     }
 
