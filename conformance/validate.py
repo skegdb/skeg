@@ -240,7 +240,18 @@ def main() -> int:
 
     port = free_port()
     data_dir = Path(tempfile.mkdtemp(prefix="skeg-conformance-"))
-    env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn")}
+    # Pinned, not left to the machine. The default shard count is the host's
+    # performance-core count, and a multi-key MSET is refused with CROSSSLOT
+    # unless its keys route to one shard - so on a one-core runner the
+    # cross-slot cases would silently assert nothing and on a 12-core one the
+    # same-slot case would need different literals. Four shards, everywhere,
+    # and `the_conformance_case_keys_route_the_way_the_cases_assume` in
+    # skeg-server pins the key literals against that number.
+    env = {
+        **os.environ,
+        "RUST_LOG": os.environ.get("RUST_LOG", "warn"),
+        "SKEG_SHARDS": "4",
+    }
     proc = subprocess.Popen(
         [args.bin, "--mode", "rw", "--addr", f"127.0.0.1:{port}", "--data-dir", str(data_dir)],
         env=env,
