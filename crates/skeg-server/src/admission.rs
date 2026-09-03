@@ -272,6 +272,38 @@ impl AdmissionError {
     }
 }
 
+/// Debug-only guard against a refusal smuggled through prose.
+///
+/// `ShardResp::Err(String)` still exists beside `ShardResp::Refused`, so
+/// which one a new refusal uses is convention rather than type. The cheap
+/// half of that gap IS checkable: a message that opens with a code word is a
+/// refusal somebody classified by hand on the way out, and it will reach the
+/// client as `ERR <the code word> ...` on RESP3 and `Internal` on the native
+/// wire - the exact shape this module was written to delete.
+///
+/// Debug builds only, and it panics rather than warns: this is a mistake in
+/// the engine's own source, caught the first time a test runs the path.
+#[cfg(debug_assertions)]
+pub fn debug_assert_not_a_smuggled_refusal(text: &str) {
+    if let Some(word) = backend_code_word(text) {
+        assert!(
+            word != "BACKPRESSURE" && word != BACKEND_RETRYABLE_CODE,
+            "a refusal reached the wire as prose: {text:?}. A condition the \
+             server decides belongs in ShardResp::Refused with an \
+             AdmissionError, not in ShardResp::Err with its code word typed \
+             into the string - that is how the RESP3 and native wires came to \
+             disagree in the first place."
+        );
+    }
+}
+
+/// The no-op the release build compiles.
+#[cfg(not(debug_assertions))]
+#[inline]
+pub fn debug_assert_not_a_smuggled_refusal(text: &str) {
+    let _ = text;
+}
+
 /// The leading uppercase token of a backend's message, if it has one.
 ///
 /// ASCII uppercase and digits only, which is what every RESP error code is

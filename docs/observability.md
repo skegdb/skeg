@@ -225,6 +225,14 @@ spelling from it, so they cannot say different things.
 **RESP3:** the first word of the error line is the code. `BACKPRESSURE`
 means retry; anything else means do not.
 
+**The quota row is RESP3-only in practice.** The native listener has no
+tenant backend - `Server::run` drops it and every request on that wire is
+tenant `0` - so `handler.rs` passes `limit: None` and the vector quota is
+never active there. The row above says what the byte WOULD be, and a test
+arms the limit to prove it, but no production native deployment reaches it.
+The same applies to a tenant backend's refusal, which cannot arrive on that
+wire at all.
+
 **Native:** the code is the first byte of the `Err` payload.
 `0x04 Backpressure` was added in 0.7.4 and is the only retryable code.
 It is emitted without a version gate: the refusal that matters most is

@@ -1244,6 +1244,15 @@ enum ShardResp {
     /// Per-index stats for this shard: `(scoped_name, resident_bytes,
     /// last_access_ms, n_vectors, evictable)`.
     IndexStats(Vec<(String, usize, u64, usize, bool)>),
+    /// A failure, as prose.
+    ///
+    /// NOT the place for a refusal. A refusal written here reaches the client
+    /// as `ERR <text>` on RESP3 and `ErrCode::Internal` on the native wire,
+    /// whatever it was about, and walks past the classification in
+    /// [`crate::admission`] without anything saying so - which is exactly the
+    /// hole this branch was opened to close, in the one shape the type system
+    /// still allows. Anything the server DECIDES to decline goes in
+    /// [`ShardResp::Refused`]; this carries what went wrong while it tried.
     Err(String),
     /// A refusal decided before any of the work happened, carried TYPED so
     /// the handler that answers the client can classify it rather than parse

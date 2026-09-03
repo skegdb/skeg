@@ -2051,7 +2051,9 @@ fn shard_error(e: &crate::shard::ShardError) -> Frame {
             Frame::Error(crate::admission::AdmissionError::Busy.wire_message())
         }
         crate::shard::ShardError::InvalidRequest(msg) => Frame::Error(format!("ERR {msg}")),
-        crate::shard::ShardError::Unavailable | crate::shard::ShardError::Storage(_) => {
+        crate::shard::ShardError::Unavailable => Frame::Error(format!("ERR {e}")),
+        crate::shard::ShardError::Storage(msg) => {
+            crate::admission::debug_assert_not_a_smuggled_refusal(msg);
             Frame::Error(format!("ERR {e}"))
         }
     }

@@ -103,6 +103,28 @@ for a miss), `rows_contain`, `hits_top_id`, `hits_len`, `error_contains`,
 3. **Every case runs somewhere.** A case no runner executes is a comment. Mark
    it `unvalidated` with the reason, or delete it.
 
+## What `want.retryable` covers, and what it does not
+
+Both files carry a `retryable` matcher: on RESP3 it reads the first word of
+the error line, on the native wire the error code byte, and a code the
+validator does not know counts as NOT retryable. It is checked alongside the
+other matchers rather than instead of them.
+
+Every case carrying it is `retryable: false`, and that is a limit of what a
+validator can arrange, not of what the server does. A validator runs ONE
+server with default settings over ONE sequential connection; every retryable
+refusal needs either an ingress class small enough to fill or a memory
+governor with no headroom, and neither can be produced that way. So the
+`0x04` byte - the reason the retryable classification exists - **is not
+exercised by any case in these files.** It is exercised over real sockets, on
+budgets the test chooses, by `crates/skeg-server/tests/admission_parity.rs`
+in the engine repo, which drives the same conditions on both wires and
+asserts they agree.
+
+What the cases here pin is the other half, and it is the half that fails
+quietly: a classification that called everything retryable would leave all of
+them green until a client started looping.
+
 ## Current state
 
 | suite | result |
