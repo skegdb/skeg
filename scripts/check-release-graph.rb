@@ -9,7 +9,7 @@ root = File.expand_path('..', __dir__)
 rel = YAML.load_file(ARGV[0] || File.join(root, '.github/workflows/release.yml'))
 dp  = YAML.load_file(File.join(root, '.github/workflows/docker-publish.yml'))
 jobs = rel['jobs']
-BUILDS = %w[guard test build-binaries docker-build].freeze
+BUILDS = %w[guard version-gate test build-binaries docker-build].freeze
 PUBLISH_MARKERS = ['action-gh-release', 'cargo publish', 'git push', 'imagetools create'].freeze
 
 def publishes?(name, job)

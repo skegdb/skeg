@@ -10,7 +10,7 @@ on:
   # Homebrew bump looking for a Release that was never created.
   workflow_dispatch:
 
-# Build, then promote. guard -> test -> {build-binaries, docker-build}
+# Build, then promote. guard -> version-gate -> test -> {build-binaries, docker-build}
 # produce nothing public: tarballs are run artifacts, images are pushed by
 # digest only (untagged). Only once all of them succeeded does
 # `promote-release` create the GitHub Release with every tarball, then
@@ -59,8 +59,25 @@ jobs:
           fi
           echo "ok: ref reachable from release"
 
-  test:
+  version-gate:
+    # Every crate whose source changed since the previous tag must carry a
+    # version that is not on crates.io yet. Without this, `cargo publish`
+    # answers "already exists" for a changed-but-unbumped crate, the publish
+    # job treats that as success, and the tag goes green without shipping
+    # the code it just tested. Runs on manual dry runs too, so the answer is
+    # known long before a tag exists. Same script as the local check.
     needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: changed crates carry unpublished versions
+        run: python3 scripts/check-release-versions.py
+
+  test:
+    needs: [guard, version-gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -101,7 +118,13 @@ jobs:
         # Failure modes still covered:
         # - First tag (no previous): every crate is published.
         # - Re-run of a partially-failed publish: the "already exists on
-        #   crates.io index" branch still skips already-shipped crates.
+        #   crates.io index" branch skips crates this run already shipped.
+        #   That branch is safe only because `version-gate` proved, before
+        #   anything was published, that no changed crate was already on
+        #   the index - so "already exists" here can only mean "published
+        #   earlier in this run", never "forgot to bump". Re-run failed
+        #   jobs, not the whole workflow: a fresh run would fail the gate
+        #   on the crates the first run did ship.
         # NOT `--locked`: the committed Cargo.lock pins sibling crates to
         # their previous registry versions (pulled in transitively by
         # already-published deps), so a crate using a just-bumped sibling's
