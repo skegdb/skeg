@@ -18,8 +18,9 @@
 //! "temporary margin" the ADR names), the counter's rebuild at reopen, and
 //! that one tenant at its limit cannot touch another's budget.
 
+use skeg_server::admission::{AdmissionError, Retryability};
 use skeg_server::failpoint::{WriteFailpoint, arm_at, disarm_at, fired_at};
-use skeg_server::shard::ShardSet;
+use skeg_server::shard::{ShardError, ShardSet};
 
 const DIM: usize = 8;
 
@@ -552,4 +553,129 @@ async fn two_tenants_on_one_disk_a_at_its_limit_cannot_touch_b() {
         a_used,
         "B's write must not have moved A's counter"
     );
+}
+
+// ── A2: the refusal is typed, not smuggled in a Storage string ────────────
+
+/// audit/17 A2: a disk-quota refusal from `stage_payload_blob` used to come
+/// back as `ShardError::Storage("vset payload failed: tenant disk quota
+/// exceeded")` - the exact shape `admission.rs` was built to delete, and one
+/// the debug guard could not catch because the message opens in lowercase.
+/// It must classify like its sibling, the vector-count quota: typed,
+/// `AdmissionError::DiskQuota`, permanent.
+#[tokio::test]
+#[ignore = "opens in 'server: classify a disk-quota refusal as AdmissionError::DiskQuota'"]
+async fn a_disk_quota_refusal_on_vset_is_typed_admission_not_storage() {
+    const T: u128 = 0x11A;
+    let dir = tempfile::TempDir::new().unwrap();
+    let shards = open(dir.path());
+    let name = scoped_name(T, "dqa2v");
+    create_scoped(&shards, &name).await;
+
+    let err = shards
+        .vset_with_disk_limit(
+            &name,
+            1,
+            vec_for(1),
+            T,
+            None,
+            Some(1),
+            Some(blob(4096, b'x')),
+        )
+        .await
+        .expect_err("a payload far over a one-byte budget must be refused");
+
+    match err {
+        ShardError::Admission(AdmissionError::DiskQuota { tenant, limit, .. }) => {
+            assert_eq!(tenant, T);
+            assert_eq!(limit, 1);
+        }
+        other => panic!(
+            "a disk-quota refusal must classify as \
+             ShardError::Admission(AdmissionError::DiskQuota {{ .. }}), not {other:?}"
+        ),
+    }
+}
+
+/// The same refusal reached from a payload-less overwrite's carry-forward
+/// staging (the other call site inside the Vset worker) must classify
+/// identically.
+#[tokio::test]
+#[ignore = "opens in 'server: classify a disk-quota refusal as AdmissionError::DiskQuota'"]
+async fn a_disk_quota_refusal_on_an_overwrites_carried_blob_is_typed_admission() {
+    const T: u128 = 0x11B;
+    let dir = tempfile::TempDir::new().unwrap();
+    let shards = open(dir.path());
+    let name = scoped_name(T, "dqa2o");
+    create_scoped(&shards, &name).await;
+
+    shards
+        .vset_with_disk_limit(&name, 1, vec_for(1), T, None, None, Some(blob(512, b'a')))
+        .await
+        .expect("the first, unconstrained write");
+    let one_blob = shards.tenant_disk_bytes(T);
+
+    let err = shards
+        .vset_with_disk_limit(
+            &name,
+            1,
+            vec_at(1, 1),
+            T,
+            None,
+            Some(one_blob), // room for one blob, not the transient two an overwrite needs
+            None,           // payload-less: carries the existing blob forward
+        )
+        .await
+        .expect_err("an overwrite needing room for two blobs must be refused");
+
+    assert!(
+        matches!(err, ShardError::Admission(AdmissionError::DiskQuota { .. })),
+        "the carried-forward blob's refusal must classify the same way a \
+         supplied one's does, not {err:?}"
+    );
+}
+
+/// The KV `SET`/`APPEND` path shares `VLog::set_scoped` with the payload
+/// blob path, and audit/17 A2 asks for "one place": the same typed refusal,
+/// not a second classification duplicated at the KV call site.
+#[tokio::test]
+#[ignore = "opens in 'server: classify a disk-quota refusal as AdmissionError::DiskQuota'"]
+async fn a_disk_quota_refusal_on_a_kv_set_is_also_typed_admission() {
+    const T: u128 = 0x11C;
+    let dir = tempfile::TempDir::new().unwrap();
+    let shards = open(dir.path());
+    let key = {
+        let mut k = T.to_le_bytes().to_vec();
+        k.extend_from_slice(b"k");
+        k
+    };
+
+    let err = shards
+        .tenant(T)
+        .with_disk_limit(Some(1))
+        .set(&key, &vec![0u8; 4096], skeg_core::Durability::Kernel)
+        .await
+        .expect_err("a value far over a one-byte budget must be refused");
+
+    assert!(
+        matches!(err, ShardError::Admission(AdmissionError::DiskQuota { .. })),
+        "a KV SET's disk-quota refusal must be typed the same way the \
+         payload path's is, not {err:?}"
+    );
+}
+
+/// The classification the sibling `max_vectors` quota already has: permanent
+/// (a tenant at its own ceiling does not clear on its own), and on the
+/// native wire that means `InvalidRequest`, not `Internal` - a client should
+/// not be told this is the server's fault.
+#[tokio::test]
+async fn a_disk_quota_refusal_is_permanent_like_its_sibling_vector_quota() {
+    let e = AdmissionError::DiskQuota {
+        tenant: 1,
+        limit: 10,
+        needed: 20,
+    };
+    assert_eq!(e.retryability(), Retryability::Permanent);
+    assert_eq!(e.code(), skeg_proto::ErrCode::InvalidRequest);
+    assert_eq!(e.resp3_code(), "ERR");
 }
