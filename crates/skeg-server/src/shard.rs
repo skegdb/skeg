@@ -9970,6 +9970,478 @@ mod tests {
         assert_eq!(shards.tenant_vector_count(7), 2);
     }
 
+    // ── The vector quota has to survive a restart ────────────────────────
+    //
+    // `TenantVectorQuota` is process state: `ShardSet::open` builds it empty
+    // and nothing puts back what the shards already hold. So a tenant sitting
+    // at its limit gets its entire budget back by restarting the server - the
+    // limit is not a limit, it is a limit per uptime - and the same restart
+    // can also count a tenant's rows twice, because a routed index keeps a
+    // second physical copy of a logical row on the boundary shard.
+    //
+    // These pin what the count must be immediately after an open, before a
+    // single write is admitted. They are written against the SCOPED name the
+    // RESP3 layer builds (`scope_key`), because that is the only place a
+    // stored index records which tenant reaches it.
+
+    /// Dimension of the quota fixtures. Sixteen so a per-row fingerprint has
+    /// room to make every row its own nearest neighbour, which is what lets
+    /// the balanced k-means split the two clusters cleanly.
+    const QUOTA_DIM: usize = 16;
+
+    /// A row in one of two orthogonal clusters, unique within its cluster.
+    /// The dominant component carries the cluster (so a reshard splits them
+    /// across two shards); the rest is a discrete +/- 0.5 fingerprint.
+    fn quota_vec(id: u64, cluster: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; QUOTA_DIM];
+        v[cluster] = 1.0;
+        let mut s = (id << 1) | 1;
+        for slot in v.iter_mut().skip(2) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *slot = if s % 2 == 0 { 0.5 } else { -0.5 };
+        }
+        v
+    }
+
+    /// The cluster a row belongs to, so a fixture can spread ids over both.
+    fn quota_row(id: u64) -> Vec<f32> {
+        quota_vec(id, (id % 2) as usize)
+    }
+
+    #[tokio::test]
+    #[ignore = "opens in: quota: rebuild unrouted counts during recover_vindexes"]
+    async fn test_quota_survives_restart() {
+        const T: u128 = 7;
+        const LIMIT: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "q");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..LIMIT {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(LIMIT), None)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(shards.tenant_vector_count(T), LIMIT);
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            LIMIT,
+            "the count a restart rebuilt must be what the shards hold"
+        );
+        assert!(
+            shards
+                .vset(&name, 99, quota_row(99), T, Some(LIMIT), None)
+                .await
+                .is_err(),
+            "a tenant at its limit must not get its budget back by restarting"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens in: quota: rebuild unrouted counts during recover_vindexes"]
+    async fn test_quota_overwrite_same_id_counts_once() {
+        const T: u128 = 11;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "ov");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for _ in 0..4 {
+                shards
+                    .vset(&name, 1, quota_row(1), T, Some(2), None)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(shards.tenant_vector_count(T), 1, "an overwrite is free");
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            1,
+            "four writes to one id are one logical row, before and after a restart"
+        );
+    }
+
+    /// A tenant is charged for its OWN indexes only. The rebuild reads the
+    /// scoped registry key, which is what decides who can reach the index in
+    /// the first place; an index in the unscoped namespace must not land on
+    /// the tenant whose id another name happens to spell.
+    #[tokio::test]
+    #[ignore = "opens in: quota: rebuild unrouted counts during recover_vindexes"]
+    async fn test_quota_rebuild_charges_each_index_to_its_own_tenant() {
+        const A: u128 = 0x2a;
+        const B: u128 = 0x2b;
+        let dir = TempDir::new().unwrap();
+        let a = scope_key(A, "own");
+        let b = scope_key(B, "own");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&a, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            shards
+                .vindex_create_scoped(&b, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            shards
+                .vindex_create("plain", QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..5 {
+                shards
+                    .vset(&a, id, quota_row(id), A, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..2 {
+                shards
+                    .vset(&b, id, quota_row(id), B, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..9 {
+                shards
+                    .vset("plain", id, quota_row(id), 0, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(shards.tenant_vector_count(A), 5, "tenant A's own rows");
+        assert_eq!(shards.tenant_vector_count(B), 2, "tenant B's own rows");
+        assert_eq!(
+            shards.tenant_vector_count(0),
+            9,
+            "the unscoped namespace keeps its own rows and takes nobody else's"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens in: quota: rebuild routed counts via owner-map dedup at open"]
+    async fn test_quota_survives_restart_after_move() {
+        const T: u128 = 13;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "mv");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..N {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(N), None)
+                    .await
+                    .unwrap();
+            }
+            let moved = shards.reshard(&name, 0.25, 10, T).await.expect("reshard");
+            assert!(moved > 0, "fixture: the reshard has to move something");
+            assert_eq!(
+                shards.tenant_vector_count(T),
+                N,
+                "a move changes no cardinality"
+            );
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            N,
+            "a moved row is one row after a restart too"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens in: quota: rebuild routed counts via owner-map dedup at open"]
+    async fn test_quota_survives_restart_with_replica() {
+        const T: u128 = 17;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "rp");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..N {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(N), None)
+                    .await
+                    .unwrap();
+            }
+            shards.reshard(&name, 0.25, 10, T).await.expect("reshard");
+            let replicated = shards.overlap(&name, 4.0, T).await.expect("overlap");
+            assert!(replicated > 0, "fixture: the overlap has to replicate");
+            let physical: u64 = shards
+                .vindex_list()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.n_vectors)
+                .unwrap();
+            assert!(
+                physical > N,
+                "fixture: replicas mean more physical rows than logical ones \
+                 ({physical} vs {N})"
+            );
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            N,
+            "a replica is a second copy of one logical row, not a second row"
+        );
+    }
+
+    /// A crash between a move's write to the destination and the delete of
+    /// its source leaves two physical copies of one logical row. The reopen
+    /// has to reconcile them to ONE, the same way the owner map does.
+    #[tokio::test]
+    #[ignore = "opens in: quota: rebuild routed counts via owner-map dedup at open"]
+    async fn test_quota_crash_between_move_vset_and_vdel_reconciles_at_reopen() {
+        const T: u128 = 19;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "hm");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..N {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(N), None)
+                    .await
+                    .unwrap();
+            }
+            crate::failpoint::arm(crate::failpoint::WriteFailpoint::ReshardSourceDelete);
+            let outcome = shards.reshard(&name, 0.25, 10, T).await;
+            crate::failpoint::disarm(crate::failpoint::WriteFailpoint::ReshardSourceDelete);
+            assert!(
+                crate::failpoint::fired(crate::failpoint::WriteFailpoint::ReshardSourceDelete),
+                "the failpoint never fired, so this test proved nothing"
+            );
+            assert!(outcome.is_err(), "the source delete was refused");
+            let physical: u64 = shards
+                .vindex_list()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.n_vectors)
+                .unwrap();
+            assert!(
+                physical > N,
+                "fixture: the half-done move has to leave a duplicate \
+                 ({physical} vs {N})"
+            );
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            N,
+            "a duplicate left by a half-done move is one logical row"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens in: quota: verify against drop and orphan states"]
+    async fn test_quota_drop_index_credits_then_restart() {
+        const T: u128 = 23;
+        let dir = TempDir::new().unwrap();
+        let keep = scope_key(T, "keep");
+        let go = scope_key(T, "go");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            for n in [&keep, &go] {
+                shards
+                    .vindex_create_scoped(n, QUOTA_DIM as u32, 1, 1)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..3 {
+                shards
+                    .vset(&keep, id, quota_row(id), T, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..2 {
+                shards
+                    .vset(&go, id, quota_row(id), T, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(shards.tenant_vector_count(T), 5);
+            shards.vindex_drop(&go, T).await.unwrap();
+            assert_eq!(shards.tenant_vector_count(T), 3, "the drop credits");
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            3,
+            "a dropped index is not counted again at the next open"
+        );
+    }
+
+    /// A vindex directory the catalogue no longer names is an orphan: a drop
+    /// whose registry commit landed and whose directory removal did not.
+    /// Recovery does not serve it, so the rebuild must not count it either -
+    /// otherwise a tenant pays for rows nothing can read.
+    #[tokio::test]
+    #[ignore = "opens in: quota: verify against drop and orphan states"]
+    async fn test_quota_orphan_records_not_double_counted() {
+        const T: u128 = 29;
+        let dir = TempDir::new().unwrap();
+        let live = scope_key(T, "live");
+        let orphan = scope_key(T, "orph");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            for n in [&live, &orphan] {
+                shards
+                    .vindex_create_scoped(n, QUOTA_DIM as u32, 1, 1)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..4 {
+                shards
+                    .vset(&live, id, quota_row(id), T, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..6 {
+                shards
+                    .vset(&orphan, id, quota_row(id), T, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+            shards.vindex_consolidate(&orphan).await.unwrap();
+        }
+        // The state a drop leaves when the registry commit lands and the
+        // directory removal does not: entry gone, files still there.
+        for shard in 0..2 {
+            let sdir = dir.path().join(format!("shard-{shard}"));
+            persist_registry_removing(&sdir, &RwLock::new(VindexSet::new()), Some(&orphan))
+                .unwrap();
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            4,
+            "an orphan directory the catalogue does not name is not the tenant's"
+        );
+    }
+
+    /// A write that failed BETWEEN staging its blob and committing its vector
+    /// reserved a quota slot and gave it back. The rebuild must agree: the row
+    /// is not there, so the slot is free - both in this process and in the one
+    /// that opens the store next.
+    #[tokio::test]
+    #[ignore = "opens in: quota: retry safety across the rebuild boundary"]
+    async fn test_quota_retry_after_failed_insert_does_not_double_reserve() {
+        const T: u128 = 31;
+        const LIMIT: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "rt");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..2 {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(LIMIT), None)
+                    .await
+                    .unwrap();
+            }
+            // Fail before anything is staged.
+            crate::failpoint::arm_at(crate::failpoint::WriteFailpoint::PayloadPrepare, &name);
+            let refused = shards
+                .vset(
+                    &name,
+                    2,
+                    quota_row(2),
+                    T,
+                    Some(LIMIT),
+                    Some(Bytes::from_static(b"{\"a\":1}")),
+                )
+                .await;
+            crate::failpoint::disarm_at(crate::failpoint::WriteFailpoint::PayloadPrepare, &name);
+            assert!(refused.is_err(), "the staging was refused");
+            assert!(
+                crate::failpoint::fired_at(crate::failpoint::WriteFailpoint::PayloadPrepare, &name),
+                "the failpoint never fired, so this test proved nothing"
+            );
+            // And fail again in the window BETWEEN the staged blob and the
+            // commit that would have published the row.
+            crate::failpoint::arm_at(crate::failpoint::WriteFailpoint::VectorCommit, &name);
+            let refused = shards
+                .vset(
+                    &name,
+                    2,
+                    quota_row(2),
+                    T,
+                    Some(LIMIT),
+                    Some(Bytes::from_static(b"{\"a\":1}")),
+                )
+                .await;
+            crate::failpoint::disarm_at(crate::failpoint::WriteFailpoint::VectorCommit, &name);
+            assert!(refused.is_err(), "the commit was refused");
+            assert!(
+                crate::failpoint::fired_at(crate::failpoint::WriteFailpoint::VectorCommit, &name),
+                "the failpoint never fired, so this test proved nothing"
+            );
+            assert_eq!(
+                shards.tenant_vector_count(T),
+                2,
+                "a refused write leaves the count where it was"
+            );
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            2,
+            "the rebuild counts rows, not attempts"
+        );
+        shards
+            .vset(&name, 2, quota_row(2), T, Some(LIMIT), None)
+            .await
+            .expect("the slot the failed write gave back is still free after the restart");
+        assert_eq!(shards.tenant_vector_count(T), 3);
+        assert!(
+            shards
+                .vset(&name, 3, quota_row(3), T, Some(LIMIT), None)
+                .await
+                .is_err(),
+            "and the limit still binds"
+        );
+    }
+
     #[test]
     fn test_scope_key_roundtrip() {
         // Tenant 0 is the unscoped namespace (byte-identical to pre-tenancy).

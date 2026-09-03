@@ -83,6 +83,13 @@ impl TenantVectorQuota {
     pub fn count(&self, tenant: u128) -> u64 {
         self.counts.read().get(&tenant).copied().unwrap_or(0)
     }
+
+    /// Stub. The real setter lands in "quota: add rebuild, never-reject
+    /// startup setter"; it is here only so the tests that pin its contract
+    /// compile and fail for the reason they are about.
+    pub fn rebuild(&self, tenant: u128, count: u64) {
+        let _ = (tenant, count);
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +142,56 @@ mod tests {
         assert!(q.try_add(9, 2, 2).is_ok(), "tenant 9 has its own budget");
         assert_eq!(q.try_add(7, 1, 2), Err(QuotaExceeded));
         assert_eq!(q.count(9), 2);
+    }
+
+    /// The startup setter states what the store holds. It is not an
+    /// admission decision and has nothing to refuse: the rows are already on
+    /// disk, and a count over the tenant's limit is a fact about the store,
+    /// not a request to be denied. Refusing it would leave the counter at
+    /// zero, which is the bug it exists to close.
+    #[test]
+    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
+    fn test_rebuild_sets_a_count_nothing_reserved() {
+        let q = TenantVectorQuota::new();
+        q.rebuild(7, 42);
+        assert_eq!(q.count(7), 42);
+        assert_eq!(q.count(9), 0, "another tenant is untouched");
+    }
+
+    #[test]
+    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
+    fn test_rebuild_overwrites_a_stale_count() {
+        let q = TenantVectorQuota::new();
+        q.try_add(7, 5, 100).unwrap();
+        q.rebuild(7, 2);
+        assert_eq!(q.count(7), 2, "rebuild SETS, it does not add");
+        q.rebuild(7, 9);
+        assert_eq!(q.count(7), 9, "and it can go back up");
+    }
+
+    #[test]
+    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
+    fn test_rebuild_to_zero_removes_the_entry() {
+        let q = TenantVectorQuota::new();
+        q.try_add(7, 3, 100).unwrap();
+        q.rebuild(7, 0);
+        assert_eq!(q.count(7), 0);
+        // Same invariant `sub` keeps: the map tracks only tenants with usage.
+        q.rebuild(9, 0);
+        assert_eq!(q.count(9), 0);
+    }
+
+    /// A count above every limit the tenant could have still lands: the
+    /// setter reports, it does not admit. What follows is that the tenant's
+    /// next write is refused, which is the correct answer for a tenant over
+    /// its quota - and the opposite of what a zeroed counter would say.
+    #[test]
+    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
+    fn test_rebuild_never_rejects() {
+        let q = TenantVectorQuota::new();
+        q.rebuild(7, u64::MAX);
+        assert_eq!(q.count(7), u64::MAX);
+        assert_eq!(q.try_add(7, 1, 10), Err(QuotaExceeded));
     }
 
     #[test]
