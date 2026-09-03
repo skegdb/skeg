@@ -39,17 +39,26 @@ impl ErrCode {
     /// never sent.
     #[must_use]
     pub const fn from_u8(byte: u8) -> Option<Self> {
-        // Stub: opened by `proto: a retryable error code on the native wire`.
-        let _ = byte;
-        None
+        match byte {
+            0x01 => Some(Self::NotFound),
+            0x02 => Some(Self::InvalidRequest),
+            0x03 => Some(Self::Internal),
+            0x04 => Some(Self::Backpressure),
+            _ => None,
+        }
     }
 
     /// May the caller send the same request again and expect a different
     /// answer?
     #[must_use]
     pub const fn is_retryable(self) -> bool {
-        // Stub: opened by `proto: a retryable error code on the native wire`.
-        false
+        // Exhaustive, no `_` arm: a code added later does not compile until
+        // somebody decides whether retrying it is worth doing, which is the
+        // one question this byte exists to answer.
+        match self {
+            Self::Backpressure => true,
+            Self::NotFound | Self::InvalidRequest | Self::Internal => false,
+        }
     }
 }
 
@@ -71,9 +80,18 @@ pub struct ErrResponse {
 /// than the two-byte prefix, or a length the payload does not cover).
 #[must_use]
 pub fn decode_err_response(payload: &Bytes) -> Option<ErrResponse> {
-    // Stub: opened by `proto: a retryable error code on the native wire`.
-    let _ = payload;
-    None
+    let [raw, msg_len, ..] = *payload.as_ref() else {
+        return None;
+    };
+    let msg_len = msg_len as usize;
+    if payload.len() < 2 + msg_len {
+        return None;
+    }
+    Some(ErrResponse {
+        code: ErrCode::from_u8(raw),
+        raw,
+        message: String::from_utf8_lossy(&payload[2..2 + msg_len]).into_owned(),
+    })
 }
 
 /// Native protocol v2 feature set returned by `Op::NativeHello`.
@@ -611,7 +629,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn the_three_original_codes_keep_the_bytes_they_have_always_had() {
         // Pinned as BYTES, not as an ordering. A released client reads the
         // first byte of the payload and compares it to a literal; renumbering
@@ -624,7 +641,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn every_code_round_trips_through_its_byte() {
         for code in every_code() {
             assert_eq!(
@@ -636,7 +652,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn an_unknown_code_byte_is_none_and_never_a_panic() {
         let known: Vec<u8> = every_code().iter().map(|c| *c as u8).collect();
         for byte in 0u8..=255 {
@@ -654,7 +669,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn backpressure_is_the_only_retryable_code() {
         for code in every_code() {
             let want = code == ErrCode::Backpressure;
@@ -668,7 +682,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn an_err_frame_decodes_to_its_code_and_its_message() {
         let frame = parse_one(encode_err(7, ErrCode::Backpressure, "no room right now"));
         let decoded = decode_err_response(&frame.payload).expect("an Err body decodes");
@@ -678,7 +691,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn an_err_frame_with_an_unknown_code_keeps_its_byte_and_its_message() {
         let mut payload = BytesMut::new();
         payload.extend_from_slice(&[0x7F, 5]);
@@ -690,7 +702,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `proto: a retryable error code on the native wire`"]
     fn a_truncated_err_body_is_none_not_a_panic() {
         assert!(decode_err_response(&Bytes::new()).is_none());
         assert!(decode_err_response(&Bytes::from_static(&[0x01])).is_none());
