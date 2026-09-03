@@ -49,12 +49,46 @@ A deployment can cap two resources per tenant:
   `SKEG.VSET`, under the index write lock, so an insert is counted exactly once
   and overwriting an existing id stays free. An over-limit insert is rejected
   before anything is stored.
-- `max_disk_bytes`. The live on-disk KV bytes a tenant holds. Checked on `SET`.
-  The counter is shared across shards, so the limit is global per tenant, and
-  it is rebuilt from the index on restart.
+- `max_disk_bytes`. The live vLog bytes a tenant holds. Checked on `SET`,
+  `MSET`, `APPEND`, and on the payload blob of `SKEG.VSET` / `SKEG.VMSET` -
+  one counter, one key format, one check, because a blob key carries the same
+  16-byte tenant prefix a KV key does. The counter is shared across shards, so
+  the limit is global per tenant, and it is rebuilt from the index on restart.
+  The check and the counter update happen in one critical section, so
+  concurrent writers of one tenant cannot jointly land it past the limit.
 
 Either limit may be left unset (unlimited). With no limit configured the write
 path is byte-identical to the non-tenant build.
+
+### What `max_disk_bytes` does and does not count
+
+It counts what the vLog holds LIVE for the tenant, and it holds the limit
+against the engine's own maintenance as well as against client writes: a
+boundary replica (`SKEG.VINDEX.OVERLAP`) is a second permanent copy of a row's
+payload blob, so it is charged - and when it does not fit it is SKIPPED rather
+than written, leaving that part of the boundary under-replicated instead of
+taking the tenant over its limit. Each skip ticks
+`skeg_overlap_replicas_skipped_quota_total`; a later run replicates whatever
+fits by then. A reshard MOVE is not charged, because it deletes the source
+copy it wrote: it is over the limit by at most one blob record, for the width
+of one row.
+
+Outside the number, and bounded by something else:
+
+- **The vector index files.** Vectors, graph, WAL and payload index live in
+  the index directory, not the vLog, and `max_disk_bytes` does not see them. A
+  payload-less `VSET` grows a tenant's disk with only `max_vectors` bounding
+  it. Size the two limits together.
+- **Dead records awaiting compaction.** The counter tracks live bytes: an
+  overwritten or deleted record stops counting immediately, while its space in
+  the segment file returns at the next compaction. The filesystem footprint of
+  a churn-heavy tenant is therefore above its counted bytes until then.
+- **The transient staging margin.** Prepare-before-commit means one row is two
+  physical keys for the width of a write, so a tenant exactly at its limit can
+  see a payload-less overwrite refused (see
+  `docs/adr-payload-transaction.md`, "Disk quota").
+- **The native (non-RESP3) listener**, which has no pluggable tenant backend
+  to read a limit from and writes as tenant `0`.
 
 ## Setting quotas (admin commands)
 

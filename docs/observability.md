@@ -54,6 +54,17 @@ Cache and shard health gauges (`skeg_cache_bytes`, `skeg_cache_evictions_total`,
 grep '^# TYPE'` against a live binary to see the current set; the list
 is grep-stable across patch releases.
 
+`skeg_overlap_replicas_skipped_quota_total` belongs to the tenant quotas
+rather than to the cache: it counts boundary replicas `SKEG.VINDEX.OVERLAP`
+did NOT write because the second copy of the row's payload blob would have
+taken the tenant past `max_disk_bytes`. The run completes either way - a
+replica is an optimisation, so the row stays reachable through its primary -
+which is precisely why the number matters: a rising count means a tenant's
+indexes are under-replicated at the shard seams, where a probe-narrowed
+`VSEARCH` loses recall, and nothing else says so. Alert on it moving, not on
+its absolute value; the fix is headroom (raise `max_disk_bytes`, or reclaim),
+after which a later overlap replicates what now fits.
+
 ### The memory budget and the ingress class
 
 Two gauge families report what the process has promised and to whom.

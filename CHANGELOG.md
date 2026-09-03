@@ -382,6 +382,42 @@ All of this matters where the native listener is exposed over a store a
 multi-tenant RESP3 listener also serves; a single-tenant store has no such
 names.
 
+### The disk quota holds against the engine's own maintenance
+
+`max_disk_bytes` had come to cover every client write - KV `SET`, `MSET`,
+`APPEND` and the payload blob of `SKEG.VSET`/`SKEG.VMSET`, one counter and one
+check for all of them - but one INTERNAL write still bypassed it. The boundary
+replica `SKEG.VINDEX.OVERLAP` writes is a second permanent physical copy of a
+row's payload blob on a second shard, and it went out with no limit attached:
+the counter saw the copy, nothing refused it, and a tenant sitting exactly at
+its ceiling could be carried one blob past it for every row it replicated,
+through a command it issues itself. The quota was a limit on what the tenant
+wrote, not on what the tenant held.
+
+**A replica that does not fit is now skipped, not written - and the run still
+completes.** The tenant's limit rides into the replica's write like any client
+write, and the refusal (which happens before a byte is appended and before the
+vector commit, so nothing is left half-written) is treated as "not this row"
+rather than "not this overlap": a boundary replica is an optimisation - the row
+is reachable through its primary either way - and failing the run would strand
+a maintenance operation for a tenant whose only offence is being at its own
+limit. Every other refusal still fails the run. Each skip ticks
+`skeg_overlap_replicas_skipped_quota_total`, without which an under-replicated
+boundary is indistinguishable from a boundary with nothing to replicate; a
+later run replicates whatever fits by then.
+
+The other internal relocation, the reshard MOVE, keeps no disk limit and now
+has a test rather than a paragraph: it writes the destination copy and deletes
+the source, so a tenant's counted bytes are identical on both sides of it, and
+it is over the limit by at most one blob record for the width of one row.
+
+**What the number does and does not include** is now written down rather than
+implied: it counts the tenant's LIVE vLog bytes, so the vector index files
+(bounded by `max_vectors` instead), dead records still waiting for compaction,
+and the native listener's tenant `0` writes are outside it. See
+[`docs/multi-tenancy.md`](docs/multi-tenancy.md#per-tenant-quotas) and
+[`docs/adr-payload-transaction.md`](docs/adr-payload-transaction.md).
+
 ### A tenant's vector quota survives a restart
 
 `max_vectors` counted a tenant's rows in process memory only. Nothing put the
