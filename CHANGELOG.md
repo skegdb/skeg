@@ -114,11 +114,28 @@ restarts this closes - keeps its rows readable and is refused its next write,
 which is what a quota means. A read-only (`--mode serve`) open counts nothing:
 it admits no writes.
 
-Two things it does not fix, both pre-existing and both self-repairing at the
-next open. Dropping a resharded index credits back the physical copies rather
-than the logical rows, so a tenant is briefly under-counted; and dropping a
-committed index that will not open credits nothing at all, because only the
-open index knew what it held.
+**Dropping an index credits back what the tenant spent, not what the shards
+held.** A drop used to give back each shard's PHYSICAL rows, and a resharded
+index keeps a second physical copy of every boundary row - so dropping one
+returned more slots than the tenant had ever taken, the counter saturated at
+zero, and the tenant could then write a whole further `max_vectors` on top of
+what it already held until the next restart. Reachable with four ordinary
+commands: create, reshard, overlap, drop. The credit is now decided by the
+coordinator, from the owner map, which counts one entry per logical row
+however many copies of it exist; a hash-placed index still credits per shard,
+where the two numbers are the same. `ERASE TENANT` states zero once every
+shard has answered, for the same reason: a tenant with no indexes left holds
+nothing, and no sum of fragments is that fact.
+
+One case is left, and it errs the safe way: dropping a committed index that
+will not open credits nothing at all, because only the open index knew what it
+held, so the tenant stays charged until the next open counts again.
+
+**A vindex router sidecar that will not read now fails the open**, naming the
+file. It used to warn and be skipped, which left the index looking unrouted:
+point ops placed by hash over rows a reshard had moved, and the vector count
+doubled where an overlap had replicated. A sidecar that is ABSENT is
+unchanged and still normal - an index that was never resharded has none.
 
 ### A vector and its payload are one write
 
