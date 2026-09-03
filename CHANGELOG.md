@@ -83,6 +83,81 @@ All of this matters where the native listener is exposed over a store a
 multi-tenant RESP3 listener also serves; a single-tenant store has no such
 names.
 
+### A tenant's vector quota survives a restart
+
+`max_vectors` counted a tenant's rows in process memory only. Nothing put the
+count back at startup, so a tenant sitting at its limit got its whole budget
+back by restarting the server: the limit was a limit per uptime, and a store
+could grow past it as often as it was restarted.
+
+**Every open now counts what the shards hold, before the listener binds.** The
+count is taken inside the readiness barrier that already existed, out of the
+same pass over the live rows the payload-blob reclamation makes, so no vindex
+is walked twice. A restart no longer changes what a tenant may write.
+
+It counts LOGICAL rows, which is what the quota always meant. A semantically
+resharded index keeps a second physical copy of every boundary row, and a
+crash between a move's write to its destination and the delete of its source
+leaves another; those are one row each, deduplicated by id across shards the
+same way the owner map picks a primary. An index with no router is
+hash-placed - an id lives on exactly one shard - and its shards simply add up.
+
+An index's rows are counted against the tenant its scoped registry key names,
+which is the same key a write from that tenant resolves through. On a store
+written before `::` was refused in raw names, a squatted key is still
+attributed to the tenant it spells - see the upgrade note above; the count now
+follows that attribution as well as the erase did.
+
+The rebuild only STATES what is there: it never refuses. A tenant found over
+its limit - a limit lowered underneath it, or a store grown past it by the
+restarts this closes - keeps its rows readable and is refused its next write,
+which is what a quota means. A read-only (`--mode serve`) open counts nothing:
+it admits no writes.
+
+**Dropping an index credits back what the tenant spent, not what the shards
+held.** A drop used to give back each shard's PHYSICAL rows, and a resharded
+index keeps a second physical copy of every boundary row - so dropping one
+returned more slots than the tenant had ever taken, the counter saturated at
+zero, and the tenant could then write a whole further `max_vectors` on top of
+what it already held until the next restart. Reachable with four ordinary
+commands: create, reshard, overlap, drop. The credit is now decided by the
+coordinator, from the owner map, which counts one entry per logical row
+however many copies of it exist; a hash-placed index still credits per shard,
+where the two numbers are the same. `ERASE TENANT` states zero once every
+shard has answered, for the same reason: a tenant with no indexes left holds
+nothing, and no sum of fragments is that fact.
+
+One case is left, and it errs the safe way: dropping a committed index that
+will not open credits nothing at all, because only the open index knew what it
+held, so the tenant stays charged until the next open counts again.
+
+**A DROP of a routed index can now be slow.** The logical credit is read from
+the owner map, and if nothing has needed that map yet this uptime it is built
+first, with one `LiveIds` round trip to every shard - O(rows) work inside a
+command that used to be O(1) on the accounting side. Measured at **77.7 ms for
+a 5000-row index over 2 shards dropped immediately after an open**; a map that
+is already warm costs nothing. It is the first drop after a restart that pays,
+and only for an index that was resharded.
+
+**A vindex router sidecar that will not read now fails the open**, naming the
+file. It used to warn and be skipped, which left the index looking unrouted:
+point ops placed by hash over rows a reshard had moved, and the vector count
+doubled where an overlap had replicated. This applies to a read-only
+`--mode serve` open too, which now also refuses to start: a replica routing by
+hash over re-partitioned rows answers wrongly whether or not it can write.
+
+**Known gap: a sidecar that is MISSING is not detected, and costs the same.**
+An absent sidecar is legitimate - an index that was never resharded has none -
+and nothing on disk distinguishes that from the sidecar of a resharded index
+being deleted or not restored from a backup. In the second case the index
+opens as unrouted and the count doubles exactly as the corrupt case used to:
+**79 against 40 logical rows**, measured. If a vindex was ever resharded, its
+`router-<name>.bin` must be present; check for it after any restore or manual
+cleanup of the store root, and either put the file back or reshard the index
+again, which writes a new one. The fix that would close it is recording in the
+vindex registry that an index is routed, so a missing sidecar becomes a refusal
+like a corrupt one; the registry does not carry that today.
+
 ### A vector and its payload are one write
 
 `SKEG.VSET name id vector payload` published the vector first and its blob
