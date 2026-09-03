@@ -437,7 +437,6 @@ async fn native_accept_is_bounded_by_the_connection_semaphore() {
 /// reads out of `SKEG.STATS` on a server they started, not one a test computed
 /// for itself.
 #[test]
-#[ignore = "opens in commit 7 (SKEG.STATS reports the ingress budget)"]
 fn slowloris_one_thousand_idle_connections_hold_only_the_floor() {
     const IDLE: usize = 1000;
     // The test process needs a descriptor per connection of its own; the
@@ -475,6 +474,12 @@ fn slowloris_one_thousand_idle_connections_hold_only_the_floor() {
 
     let held = read_ingress_held(addr);
     let floor_total = FLOOR_BYTES * (IDLE as u64 + 1);
+    // Printed, because the number is the point: a gate that only says "under
+    // the ceiling" cannot tell an operator what a connection actually costs.
+    println!(
+        "slowloris: {IDLE} idle connections hold {held} bytes, {} per connection",
+        held / (IDLE as u64 + 1)
+    );
     assert!(
         held >= FLOOR_BYTES * IDLE as u64 / 2,
         "the idle connections were not charged at all ({held}), so the number \
