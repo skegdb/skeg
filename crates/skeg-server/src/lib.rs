@@ -323,17 +323,37 @@ impl Server {
         let Self {
             listener,
             shards,
-            ingress: _,
-            max_connections: _,
+            ingress,
+            max_connections,
             tenant_backend: _,
         } = self;
-        info!(addr = ?listener.local_addr()?, n_shards = shards.n_shards(), "server listening (binary protocol)");
+        let fds = raise_descriptor_limit();
+        info!(
+            addr = ?listener.local_addr()?,
+            n_shards = shards.n_shards(),
+            max_fds = fds,
+            "server listening (binary protocol)"
+        );
+        // Same bound as the RESP3 listener, and for the same reason: this loop
+        // spawned a task per connection with nothing counting them, so a peer
+        // that opened sockets and said nothing bought a task and a buffer each
+        // time. A permit is held for the connection's lifetime.
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let fp_key: Arc<str> = Arc::from(listener.local_addr()?.port().to_string());
         loop {
             let (stream, _) = listener.accept().await?;
+            let Some((budget, stream)) =
+                admit_or_refuse(&ingress, stream, RefusalWire::Native).await
+            else {
+                continue;
+            };
+            let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
             tune_socket(&stream);
             let shards = shards.clone();
+            let fp_key = Arc::clone(&fp_key);
             tokio::spawn(async move {
-                handle_connection(stream, shards).await;
+                let _permit = permit;
+                handle_connection(stream, shards, budget, fp_key).await;
             });
         }
     }
@@ -353,25 +373,7 @@ impl Server {
             max_connections,
             tenant_backend,
         } = self;
-        // Descriptor headroom, the way every production database handles it:
-        // the default soft limit is a shell convention (256 on macOS, 1024 on
-        // many Linux distros), not a capacity decision, and this engine holds
-        // one descriptor per vlog segment and per vindex segment file. Raise
-        // it toward the hard limit at boot; a refusal is logged, not hidden,
-        // so an operator can raise the hard limit themselves.
-        let want_fds = std::env::var("SKEG_MAX_FDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(65_536);
-        let fds = skeg_platform::raise_fd_limit(want_fds);
-        if fds < want_fds {
-            tracing::warn!(
-                soft = fds,
-                wanted = want_fds,
-                "file-descriptor limit below the target; raise the hard limit \
-                 (ulimit -n) if the store grows past a few hundred segments"
-            );
-        }
+        let fds = raise_descriptor_limit();
         info!(
             addr = ?listener.local_addr()?,
             n_shards = shards.n_shards(),
@@ -392,7 +394,7 @@ impl Server {
             // limit into an availability outage; and taking it before the
             // permit means a connection parked on the semaphore is one that
             // already has somewhere to put its bytes.
-            let Some(budget) = admit_or_refuse(&ingress, stream).await else {
+            let Some(budget) = admit_or_refuse(&ingress, stream, RefusalWire::Resp3).await else {
                 continue;
             };
             let (budget, stream) = budget;
@@ -411,6 +413,40 @@ impl Server {
     }
 }
 
+/// Which wire an accept-time refusal has to be spelled in.
+///
+/// The two protocols agree on nothing except that the peer must be told, so
+/// the refusal is composed here rather than in either handler.
+#[derive(Clone, Copy)]
+enum RefusalWire {
+    Resp3,
+    Native,
+}
+
+/// Descriptor headroom, the way every production database handles it: the
+/// default soft limit is a shell convention (256 on macOS, 1024 on many Linux
+/// distros), not a capacity decision, and this engine holds one descriptor per
+/// vlog segment and per vindex segment file - plus one per connection, which
+/// is what makes it a listener's business and not only the store's. Raise it
+/// toward the hard limit at boot; a refusal is logged, not hidden, so an
+/// operator can raise the hard limit themselves.
+fn raise_descriptor_limit() -> u64 {
+    let want_fds = std::env::var("SKEG_MAX_FDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65_536);
+    let fds = skeg_platform::raise_fd_limit(want_fds);
+    if fds < want_fds {
+        warn!(
+            soft = fds,
+            wanted = want_fds,
+            "file-descriptor limit below the target; raise the hard limit \
+             (ulimit -n) if the store grows past a few hundred segments"
+        );
+    }
+    fds
+}
+
 /// Take the connection's floor, or refuse the connection by name.
 ///
 /// Returns `None` when the peer was refused; the socket is answered and closed
@@ -424,6 +460,7 @@ impl Server {
 async fn admit_or_refuse(
     ingress: &Arc<IngressBudget>,
     stream: TcpStream,
+    wire: RefusalWire,
 ) -> Option<(ConnectionBudget, TcpStream)> {
     match ingress.try_accept() {
         Ok(budget) => Some((budget, stream)),
@@ -433,9 +470,20 @@ async fn admit_or_refuse(
             let message = e.wire_message();
             tokio::spawn(async move {
                 let mut stream = stream;
+                let bytes = match wire {
+                    RefusalWire::Resp3 => format!("-{message}\r\n").into_bytes(),
+                    // req_id 0: there is no request yet, and inventing one
+                    // would make a client match this to something it sent.
+                    // The message carries the BACKPRESSURE code as text; the
+                    // native error enum has no retryable variant to put it in,
+                    // which is P0.5's job and not this change's.
+                    RefusalWire::Native => {
+                        skeg_proto::encode_err(0, skeg_proto::ErrCode::Internal, &message).to_vec()
+                    }
+                };
                 let write = async {
                     use tokio::io::AsyncWriteExt;
-                    let _ = stream.write_all(format!("-{message}\r\n").as_bytes()).await;
+                    let _ = stream.write_all(&bytes).await;
                     let _ = stream.shutdown().await;
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(1), write).await;

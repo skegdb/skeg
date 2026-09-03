@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::memory::{Budget, MemoryGovernor, MemoryRejected, MemoryReservation};
 
@@ -568,6 +568,68 @@ impl Drop for ConnectionBudget {
     fn drop(&mut self) {
         self.budget.release(self.held);
     }
+}
+
+/// How often a stalled connection asks whether the room has come back.
+///
+/// Short against the stall it lives inside: the point of waiting is to let a
+/// burst on another connection finish, and those finish in milliseconds. A
+/// stalled connection is not reading, so the cost of asking often is a timer,
+/// not a syscall.
+const STALL_POLL: Duration = Duration::from_millis(10);
+
+/// Charge for the buffer the connection is about to need, waiting out the
+/// stall if the answer is a refusal that could change.
+///
+/// RESERVE BEFORE GROW. While this waits the connection does not read, which
+/// is TCP backpressure the peer feels without anything being sent - the
+/// cheapest form of "slow down" there is. Only when the room has not come back
+/// within the stall is the frame refused, and then with a retryable code,
+/// because what refused it was other traffic and not this client's request.
+///
+/// A refusal that waiting cannot change - a frame larger than the connection
+/// will ever be allowed - is returned at once: stalling on it would just make
+/// the client wait for the same answer.
+pub async fn grow_or_stall(
+    budget: &mut ConnectionBudget,
+    want: usize,
+    fp_key: &str,
+) -> Result<(), IngressRejected> {
+    fn attempt(
+        budget: &mut ConnectionBudget,
+        want: usize,
+        fp_key: &str,
+    ) -> Result<(), IngressRejected> {
+        if crate::fp_ingress!(
+            crate::failpoint::IngressFailpoint::GrowRefusedMidFrame,
+            fp_key
+        ) {
+            return Err(IngressRejected::ClassFull {
+                held: budget.budget().held_bytes(),
+                requested: charge_for(want),
+                cap: budget.budget().cap().bytes(),
+            });
+        }
+        budget.grow_to(want)
+    }
+
+    let mut last = match attempt(budget, want, fp_key) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !last.is_retryable() {
+        return Err(last);
+    }
+    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressStalls);
+    let deadline = Instant::now() + budget.budget().stall();
+    while Instant::now() < deadline {
+        tokio::time::sleep(STALL_POLL).await;
+        match attempt(budget, want, fp_key) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 #[cfg(test)]

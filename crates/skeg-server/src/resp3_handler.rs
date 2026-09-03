@@ -35,7 +35,7 @@ use skeg_resp3::{
 use skeg_vector::QuantKind;
 
 use crate::failpoint::IngressFailpoint;
-use crate::ingress::{ConnectionBudget, IngressRejected};
+use crate::ingress::ConnectionBudget;
 use crate::payload::parse_filter;
 use crate::shard::ShardSet;
 use crate::tenant::{Admission, AnonymousPolicy, CommandKind, TenantBackend, TenantId};
@@ -257,7 +257,7 @@ fn anon_forgery_error() -> Frame {
 /// bytes the decoder hasn't parsed yet), reserve the large chunk so a
 /// pipelined burst still buffers many frames per syscall instead of
 /// serializing one-frame-per-read.
-fn read_reserve(buffered: usize) -> usize {
+pub(crate) fn read_reserve(buffered: usize) -> usize {
     if buffered == 0 { 4096 } else { 256 * 1024 }
 }
 
@@ -266,7 +266,7 @@ fn read_reserve(buffered: usize) -> usize {
 /// bursted once - or sent a single byte and went quiet - would hold 256 KiB
 /// for its whole life, and `read_reserve`'s idle figure would only be true
 /// for sockets that never sent anything.
-fn trim_idle(buf: &mut BytesMut) {
+pub(crate) fn trim_idle(buf: &mut BytesMut) {
     if buf.is_empty() && buf.capacity() > 64 * 1024 {
         *buf = BytesMut::with_capacity(4096);
     }
@@ -281,65 +281,6 @@ const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 /// Server-assigned connection id, monotonic across the process lifetime.
 /// Exposed via HELLO response and (future) CLIENT ID.
 static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
-
-/// How often a stalled connection asks whether the room has come back.
-///
-/// Short against the stall it lives inside: the point of waiting is to let a
-/// burst on another connection finish, and those finish in milliseconds. A
-/// stalled connection is not reading, so the cost of asking often is a timer,
-/// not a syscall.
-const STALL_POLL: Duration = Duration::from_millis(10);
-
-/// Charge for the buffer the connection is about to need, waiting out the
-/// stall if the answer is a refusal that could change.
-///
-/// RESERVE BEFORE GROW. While this waits the connection does not read, which
-/// is TCP backpressure the peer feels without anything being sent - the
-/// cheapest form of "slow down" there is. Only when the room has not come back
-/// within the stall is the frame refused, and then with a retryable code,
-/// because what refused it was other traffic and not this client's request.
-///
-/// A refusal that waiting cannot change - a frame larger than the connection
-/// will ever be allowed - is returned at once: stalling on it would just make
-/// the client wait for the same answer.
-async fn grow_or_stall(
-    budget: &mut ConnectionBudget,
-    want: usize,
-    fp_key: &str,
-) -> Result<(), IngressRejected> {
-    fn attempt(
-        budget: &mut ConnectionBudget,
-        want: usize,
-        fp_key: &str,
-    ) -> Result<(), IngressRejected> {
-        if crate::fp_ingress!(IngressFailpoint::GrowRefusedMidFrame, fp_key) {
-            return Err(IngressRejected::ClassFull {
-                held: budget.budget().held_bytes(),
-                requested: crate::ingress::charge_for(want),
-                cap: budget.budget().cap().bytes(),
-            });
-        }
-        budget.grow_to(want)
-    }
-
-    let mut last = match attempt(budget, want, fp_key) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
-    if !last.is_retryable() {
-        return Err(last);
-    }
-    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressStalls);
-    let deadline = Instant::now() + budget.budget().stall();
-    while Instant::now() < deadline {
-        tokio::time::sleep(STALL_POLL).await;
-        match attempt(budget, want, fp_key) {
-            Ok(()) => return Ok(()),
-            Err(e) => last = e,
-        }
-    }
-    Err(last)
-}
 
 /// Per-connection driver. Loops until EOF / write error / fatal parse error.
 ///
@@ -458,7 +399,7 @@ pub async fn handle_connection_resp3(
                     .buf_mut()
                     .capacity()
                     .max(decoder.buffered().saturating_add(reserve));
-                if let Err(e) = grow_or_stall(&mut budget, want, &fp_key).await {
+                if let Err(e) = crate::ingress::grow_or_stall(&mut budget, want, &fp_key).await {
                     // Back to the floor before the refusal goes out: the bytes
                     // of this frame that did arrive are not worth keeping for a
                     // frame that will not be completed, and holding them would

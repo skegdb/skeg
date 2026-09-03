@@ -331,7 +331,6 @@ async fn a_refused_growth_stalls_then_refuses_the_frame_by_name() {
 /// before a byte of it arrived. It joins the same class, so a native peer and
 /// a RESP3 peer draw on one total.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 6 (native: the same budget and the same semaphore)"]
 async fn native_connections_are_bounded_by_the_same_budget() {
     let cap = 16 * CHUNK_BYTES;
     let ingress = budget(cap, Duration::from_millis(50));
@@ -384,7 +383,6 @@ async fn native_connections_are_bounded_by_the_same_budget() {
 /// it. It now holds a permit for the connection's lifetime, exactly as the
 /// RESP3 loop does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 6 (native: the same budget and the same semaphore)"]
 async fn native_accept_is_bounded_by_the_connection_semaphore() {
     let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = native_server(&ingress, 2).await;

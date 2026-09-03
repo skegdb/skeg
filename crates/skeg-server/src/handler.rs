@@ -14,6 +14,9 @@ use tracing::{debug, warn};
 
 use skeg_core::Durability;
 
+use std::sync::Arc;
+
+use crate::ingress::ConnectionBudget;
 use crate::shard::{ShardError, ShardSet};
 
 /// Durability applied to writes that do not request one explicitly.
@@ -22,12 +25,32 @@ use crate::shard::{ShardError, ShardSet};
 /// (see `design-write-perf.md`).
 const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 
-pub async fn handle_connection(mut stream: TcpStream, shards: ShardSet) {
+/// Per-connection driver for the binary protocol.
+///
+/// `budget` is this connection's share of the ingress class, taken at accept
+/// and held for the whole life of the connection - the same class the RESP3
+/// listener draws on, so a native peer and a Redis client compete for one
+/// total instead of the native one being invisible. `fp_key` is the listener's
+/// port, which is what an ingress failpoint is keyed on.
+pub async fn handle_connection(
+    mut stream: TcpStream,
+    shards: ShardSet,
+    mut budget: ConnectionBudget,
+    fp_key: Arc<str>,
+) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, "connection accepted");
 
-    let mut parser = FrameParser::new();
-    let mut buf = BytesMut::with_capacity(64 * 1024);
+    // The parser refuses a declared payload_len larger than this connection
+    // will ever be allowed to hold, ON THE HEADER. Without it the 24 bytes
+    // that declare a length are free and the buffering that follows is not.
+    let allowance =
+        u32::try_from(budget.allowance() / crate::ingress::PARSE_FACTOR).unwrap_or(u32::MAX);
+    let mut parser = FrameParser::with_limit(allowance);
+    // The floor, not an eager 64 KiB. A connection that says nothing must not
+    // pin real memory for existing; the buffer grows below, under the budget,
+    // once there is something to read.
+    let mut buf = BytesMut::with_capacity(4096);
 
     loop {
         match parser.feed(&mut buf) {
@@ -40,14 +63,49 @@ pub async fn handle_connection(mut stream: TcpStream, shards: ShardSet) {
                     break;
                 }
             }
-            Ok(None) => match stream.read_buf(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(?peer, "read error: {e}");
+            Ok(None) => {
+                // Same order as the RESP3 loop, and the same reasons: give back
+                // what a drained buffer released, work out the capacity
+                // `reserve` is about to leave behind, charge for THAT, and only
+                // then let the buffer get there.
+                crate::resp3_handler::trim_idle(&mut buf);
+                budget.shrink_to(buf.capacity());
+                let reserve = crate::resp3_handler::read_reserve(buf.len());
+                let want = buf.capacity().max(buf.len().saturating_add(reserve));
+                if let Err(e) = crate::ingress::grow_or_stall(&mut budget, want, &fp_key).await {
+                    drop(std::mem::take(&mut buf));
+                    budget.shrink_to(4096);
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
+                    warn!(?peer, "ingress refused: {e}");
+                    // req_id 0: the frame that would have carried one has not
+                    // been parsed, and inventing an id would make a client
+                    // match this to something it sent.
+                    let body = encode_err(0, ErrCode::Internal, &e.wire_message());
+                    let _ = stream.write_all(&body).await;
                     break;
                 }
-            },
+                buf.reserve(reserve);
+                match stream.read_buf(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Err(e) = budget.grow_to(buf.capacity()) {
+                            drop(std::mem::take(&mut buf));
+                            budget.shrink_to(4096);
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::IngressRefusedGrowth,
+                            );
+                            warn!(?peer, "ingress refused after read: {e}");
+                            let body = encode_err(0, ErrCode::Internal, &e.wire_message());
+                            let _ = stream.write_all(&body).await;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(?peer, "read error: {e}");
+                        break;
+                    }
+                }
+            }
             Err(e) => {
                 warn!(?peer, "protocol error: {e}");
                 break;
@@ -55,6 +113,13 @@ pub async fn handle_connection(mut stream: TcpStream, shards: ShardSet) {
         }
     }
 
+    if crate::fp_ingress!(
+        crate::failpoint::IngressFailpoint::ReleaseDeferredOnClose,
+        &fp_key
+    ) {
+        tokio::task::yield_now().await;
+    }
+    drop(budget);
     debug!(?peer, "connection closed");
 }
 
