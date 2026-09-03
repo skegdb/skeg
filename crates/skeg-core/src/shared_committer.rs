@@ -31,7 +31,8 @@ use skeg_platform::PlatformFile;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, sleep_until};
 
-use crate::group_commit::Durability;
+use crate::failpoint::{self, CommitFailpoint};
+use crate::group_commit::{Durability, count_failure};
 
 /// Inbox cap. Matches the design doc `SharedCommitter` budget; full
 /// inbox makes `send().await` block, propagating backpressure up to
@@ -276,7 +277,19 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
                 match msg {
                     None => {
                         // All senders dropped: flush + exit.
-                        flush_batch(&mut state, &mut batch).await;
+                        //
+                        // Nobody is left to answer, which is why this used to
+                        // be discarded - and why it has to be said out loud
+                        // instead: a shutdown that could not land its last
+                        // batch is otherwise indistinguishable from a clean
+                        // one. This is the last barrier EVERY shard on the
+                        // device gets, not one file's.
+                        if let Err(e) = flush_batch(&mut state, &mut batch).await {
+                            tracing::error!(
+                                error = %e,
+                                "shared committer: the last flush before shutdown did not land"
+                            );
+                        }
                         return;
                     }
                     Some(Msg::Attach { file_id, file, initial_offset, reply }) => {
@@ -306,10 +319,10 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
                         }
                     }
                     Some(Msg::Flush { reply }) => {
-                        flush_batch(&mut state, &mut batch).await;
+                        let result = flush_batch(&mut state, &mut batch).await;
                         batch_bytes = 0;
                         batch_deadline = None;
-                        let _ = reply.send(Ok(()));
+                        let _ = reply.send(result);
                     }
                 }
             }
@@ -321,16 +334,36 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
         }
 
         if should_flush {
-            flush_batch(&mut state, &mut batch).await;
+            // A size- or deadline-triggered flush has no caller waiting on a
+            // result: every waiter in the batch is answered individually
+            // inside `flush_batch`. The failure is still worth a line, because
+            // it is the first sign the device under this process is going.
+            if let Err(e) = flush_batch(&mut state, &mut batch).await {
+                tracing::error!(error = %e, "shared committer: batch flush did not land");
+            }
             batch_bytes = 0;
             batch_deadline = None;
         }
     }
 }
 
-async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<BatchEntry>) {
+/// Commit `batch` - one combined write per file, then one sync for the lot -
+/// and answer every waiter in it.
+///
+/// Returns what the batch as a whole achieved, which is a different question
+/// from what each waiter is owed: a batch where one file's write failed still
+/// owes the other files' waiters their offsets, and owes the caller who asked
+/// for a barrier an error, because the barrier did not cover everything it was
+/// asked to cover. `Ok(())` means every file in the batch wrote and the sync
+/// that covers them succeeded.
+///
+/// An empty batch is `Ok(())`: there was nothing to make durable.
+async fn flush_batch(
+    state: &mut HashMap<FileId, FileState>,
+    batch: &mut Vec<BatchEntry>,
+) -> io::Result<()> {
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     // Env-gated batch-size probe (device-global committer).
     if std::env::var("SKEG_COMMIT_DEBUG").is_ok() {
@@ -356,6 +389,10 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
     // the small batches typical at the M-series fsync floor.)
     let mut sync_target: Option<Arc<PlatformFile>> = None;
     let mut successful_acks: Vec<AckSlot> = Vec::new();
+    // One entry per file this batch could not commit. Bounded by the number
+    // of files in the batch, itself bounded by MAX_BATCH_ENTRIES.
+    let mut failures: Vec<io::Error> = Vec::new();
+    let file_count = by_file.len();
 
     for (file_id, items) in by_file {
         let Some(fs) = state.get_mut(&file_id) else {
@@ -366,6 +403,9 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
             for (_, reply) in items {
                 let _ = reply.send(Err(io::Error::other("file detached during batch")));
             }
+            // A flush that could not write one of its files did not cover it,
+            // however good the reason.
+            failures.push(io::Error::other("file detached during batch"));
             continue;
         };
 
@@ -382,7 +422,15 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
         }
         let end = pos;
         let file = fs.file.clone();
-        match file.write_at(start, combined).await {
+        let write_result = if failpoint::hit(
+            CommitFailpoint::SharedBatchWrite,
+            failpoint::file_key(&file),
+        ) {
+            Err(failpoint::injected("shared batch write"))
+        } else {
+            file.write_at(start, combined).await
+        };
+        match write_result {
             Ok(()) => {
                 fs.next_offset = end;
                 if sync_target.is_none() {
@@ -396,6 +444,7 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
                 for (_, _, reply) in acks {
                     let _ = reply.send(Err(io::Error::new(kind, msg.clone())));
                 }
+                failures.push(e);
             }
         }
     }
@@ -405,12 +454,20 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
     let sync_res = match (batch_durability, sync_target.as_ref()) {
         (Durability::Relaxed, _) | (_, None) => Ok(()),
         (Durability::Kernel, Some(f)) => {
-            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-            f.sync_data().await
+            if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(f)) {
+                Err(failpoint::injected("shared batch sync"))
+            } else {
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                f.sync_data().await
+            }
         }
         (Durability::Power, Some(f)) => {
-            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-            f.sync_durable().await
+            if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(f)) {
+                Err(failpoint::injected("shared batch sync"))
+            } else {
+                skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                f.sync_durable().await
+            }
         }
     };
     skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogGroupCommitBatches);
@@ -423,6 +480,50 @@ async fn flush_batch(state: &mut HashMap<FileId, FileState>, batch: &mut Vec<Bat
         };
         let _ = reply.send(ack);
     }
+    if let Err(e) = sync_res {
+        // The sync covers every file that wrote, so its failure is the whole
+        // batch's, not one file's: it goes in front of the per-file failures.
+        failures.insert(0, e);
+    }
+
+    match aggregate(failures, file_count) {
+        None => Ok(()),
+        Some(e) => Err(count_failure(e)),
+    }
+}
+
+/// Fold a batch's per-file failures into the single error its flusher gets.
+///
+/// The caller asked one question - did this barrier cover everything? - and is
+/// owed one answer, but an operator reading it needs to know that two files
+/// failed and not one. So: the count, and every message, in one error.
+///
+/// The `ErrorKind` survives when every failure shares one, which is the case
+/// that matters: a batch that failed entirely on `StorageFull` still reaches a
+/// caller looking for ENOSPC. Mixed kinds collapse to `Other`, because no
+/// single one of them would be the truth.
+fn aggregate(failures: Vec<io::Error>, file_count: usize) -> Option<io::Error> {
+    let first = failures.first()?;
+    if failures.len() == 1 {
+        return Some(io::Error::new(first.kind(), first.to_string()));
+    }
+    let kind = first.kind();
+    let uniform = failures.iter().all(|e| e.kind() == kind);
+    let joined = failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let msg = format!(
+        "{} of {} files in the batch did not commit: {joined}",
+        failures.len(),
+        file_count
+    );
+    Some(if uniform {
+        io::Error::new(kind, msg)
+    } else {
+        io::Error::other(msg)
+    })
 }
 
 #[cfg(test)]
@@ -500,7 +601,6 @@ mod tests {
     /// whichever one happened to be written first. Per-file aggregation is
     /// the whole difference between this committer and the per-file one.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn a_shared_flush_reports_the_file_that_could_not_be_written_and_acks_the_others() {
         let _counter = counter_guard().await;
         let before = flush_failures();
@@ -556,7 +656,6 @@ mod tests {
     /// test that pinned WHICH one would be pinning a `HashMap` iteration
     /// order.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn a_shared_flush_over_a_failed_sync_reports_it_to_every_waiter() {
         let _counter = counter_guard().await;
         let before = flush_failures();
@@ -598,7 +697,6 @@ mod tests {
     /// Two broken files, one error. It has to name both, or an operator
     /// reading it learns about one failing disk out of two.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn two_failed_files_aggregate_into_one_error_that_names_them_both() {
         let _counter = counter_guard().await;
         let dir = TempDir::new().unwrap();
@@ -646,7 +744,6 @@ mod tests {
     /// The flush a shared committer runs on the way down has no caller left to
     /// tell. It is still the last barrier every shard on the device gets.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn the_shared_committers_last_flush_on_the_way_down_is_counted_not_discarded() {
         let _counter = counter_guard().await;
         let before = flush_failures();
@@ -684,7 +781,6 @@ mod tests {
     /// The other half of the contract: a shared flush that DID land still says
     /// so, and does not tick the failure counter.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn a_shared_flush_that_landed_still_answers_ok() {
         let _counter = counter_guard().await;
         let before = flush_failures();
