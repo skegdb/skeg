@@ -39,6 +39,25 @@ use crate::segment::{MAX_SEGMENT_SIZE, list_segments, scan_file, scan_file_from,
 use crate::snapshot;
 use crate::{Error, Result};
 
+/// What a read that carries a size ceiling came back with.
+///
+/// A plain `Result<Option<Bytes>>` cannot say the third thing, and the third
+/// thing is the point: "the key is there, the record is this big, and nothing
+/// was read" is an ADMISSION answer, not an error and not an absence. The
+/// caller reserved memory for a size it measured; if the record has since
+/// grown past that size, it needs to be told so it can refuse the request by
+/// name rather than allocate past what it was granted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedGet {
+    /// No such key.
+    Missing,
+    /// The value, read within the bound.
+    Found(Bytes),
+    /// The record is `record_bytes` on disk, past the ceiling the caller
+    /// asked for. Nothing was read.
+    Oversize { record_bytes: u32 },
+}
+
 /// Per-shard hot-key cache byte budget. `F_NOCACHE` disables the OS page
 /// cache, so this RAM cache is what keeps repeated reads off the SSD. A byte
 /// budget (not an entry count) keeps RAM bounded regardless of value size;
@@ -559,6 +578,97 @@ impl VLog {
     /// the unscoped default; reach this via [`VLog::tenant`] for a scoped view.
     async fn get_scoped(&self, key: &[u8], tenant: u128) -> Result<Option<Bytes>> {
         self.get_scoped_full(key, tenant, true).await
+    }
+
+    /// The PADDED ON-DISK RECORD SIZE the index already holds for `key`,
+    /// without reading a byte of the record. `None` when the key is absent.
+    ///
+    /// This is the number a caller needs BEFORE it decides whether it can
+    /// afford the value: `get` allocates exactly `entry.size` for its
+    /// `pread`, so an upper bound on what the read costs is available from
+    /// the index alone, in one hashmap lookup and no IO. It over-states the
+    /// value's own length - the record carries a header and the key, and the
+    /// whole thing is padded to 128 bytes - which is the direction an
+    /// admission bound has to err in.
+    ///
+    /// A key held only in the hot-key cache is still in the index: the cache
+    /// is populated from a read that found an index entry, or written through
+    /// by a set that made one. There is no "cached but unindexed" state for
+    /// this to miss.
+    #[must_use]
+    pub fn record_size(&self, key: &[u8]) -> Option<u32> {
+        self.inner.index.borrow().get(key).map(|e| e.size)
+    }
+
+    /// GET a key, refusing to allocate for a record larger than
+    /// `max_record_bytes` instead of reading it.
+    ///
+    /// The guard a caller that reserved memory from [`record_size`] needs, and
+    /// the reason it is HERE rather than in the caller: between a caller's
+    /// size probe and its fetch, another writer on this shard can overwrite
+    /// the key with a larger value, and a bound checked in the caller would be
+    /// checking a number that is no longer the one the `pread` is about to
+    /// use. This checks THE SAME `IndexEntry` the read allocates from, in the
+    /// same synchronous borrow, before the allocation - so a value that grew
+    /// in that window is refused rather than materialised.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn get_bounded(&self, key: &[u8], max_record_bytes: u32) -> Result<BoundedGet> {
+        self.get_scoped_bounded(key, 0, max_record_bytes).await
+    }
+
+    async fn get_scoped_bounded(
+        &self,
+        key: &[u8],
+        tenant: u128,
+        max_record_bytes: u32,
+    ) -> Result<BoundedGet> {
+        // The cache holds the value itself, so what it would hand back is
+        // measurable directly. Checked against the same ceiling: a cache hit
+        // costs no read, but the `Bytes` it returns is what the reply then
+        // carries, and the budget was granted for a size.
+        let cached = self.inner.cache.borrow_mut().get(key);
+        if let Some(value) = cached {
+            return Ok(if value.len() as u64 > u64::from(max_record_bytes) {
+                BoundedGet::Oversize {
+                    record_bytes: u32::try_from(value.len()).unwrap_or(u32::MAX),
+                }
+            } else {
+                BoundedGet::Found(value)
+            });
+        }
+        let entry = { self.inner.index.borrow().get(key).copied() };
+        let Some(entry) = entry else {
+            return Ok(BoundedGet::Missing);
+        };
+        // BEFORE the read, and from the entry the read is about to use: this
+        // is the whole point of the function.
+        if entry.size > max_record_bytes {
+            return Ok(BoundedGet::Oversize {
+                record_bytes: entry.size,
+            });
+        }
+        let file = {
+            let segs = self.inner.read_segments.borrow();
+            segs.iter()
+                .find(|s| s.id == entry.segment_id)
+                .map(|s| s.file.clone())
+        };
+        let file = file.ok_or(Error::InvalidRecord {
+            msg: "index references missing segment",
+        })?;
+        let buf = file
+            .pread(u64::from(entry.offset), entry.size as usize)
+            .await?;
+        let rec = decode_record(&buf)?;
+        let value = Bytes::from(rec.value);
+        self.inner
+            .cache
+            .borrow_mut()
+            .insert_for(key, value.clone(), value.len(), tenant);
+        Ok(BoundedGet::Found(value))
     }
 
     /// GET a key without letting the read populate the hot-key cache.
@@ -1744,6 +1854,28 @@ impl TenantView<'_> {
     /// Returns an error on IO failure.
     pub async fn del(&self, key: &[u8], durability: Durability) -> Result<bool> {
         self.vlog.del(key, durability).await
+    }
+
+    /// The padded on-disk record size for `key`, from the index alone. See
+    /// [`VLog::record_size`]; the tenant plays no part in it, and it is here
+    /// so a caller working through a scoped view does not have to reach
+    /// around it.
+    #[must_use]
+    pub fn record_size(&self, key: &[u8]) -> Option<u32> {
+        self.vlog.record_size(key)
+    }
+
+    /// GET a key, refusing a record larger than `max_record_bytes` instead of
+    /// reading it, and charging any cache insert to this tenant. See
+    /// [`VLog::get_bounded`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on IO failure, CRC mismatch, or corrupt record.
+    pub async fn get_bounded(&self, key: &[u8], max_record_bytes: u32) -> Result<BoundedGet> {
+        self.vlog
+            .get_scoped_bounded(key, self.tenant, max_record_bytes)
+            .await
     }
 
     /// MGET keys, charging read-path cache inserts to this tenant.
@@ -3367,6 +3499,112 @@ mod tests {
         assert_eq!(
             v.get(b"k3").await.unwrap().as_deref(),
             Some(b"v".as_slice())
+        );
+    }
+
+    // ── the size the index already knows, and a read bounded by it ────────
+
+    /// The length a read costs is available BEFORE the read: from the index,
+    /// in a hashmap lookup, with no segment touched. That is what makes an
+    /// egress reservation possible at all - a caller that has to fetch the
+    /// value to learn how big it is has already paid for it.
+    #[tokio::test]
+    async fn the_record_size_comes_from_the_index_without_reading_anything() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.set(b"k", &vec![7u8; 4096], Durability::Kernel)
+            .await
+            .unwrap();
+
+        let before = v.disk_reads();
+        let size = v.record_size(b"k").expect("a live key has a size");
+        assert_eq!(
+            v.disk_reads(),
+            before,
+            "the size must come from the index, not from a read"
+        );
+        assert!(
+            size as usize >= 4096,
+            "the padded record must cover the value it holds: {size}"
+        );
+        assert_eq!(v.record_size(b"absent"), None);
+    }
+
+    /// The stale-length guard (audit 20 B1, SD3). A caller reserves for the
+    /// size it measured; if the record is larger than that when the read
+    /// happens, nothing is read and the caller is told the real size.
+    #[tokio::test]
+    async fn a_record_over_its_bound_is_refused_without_being_read() {
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"k", &vec![7u8; 64 * 1024], Durability::Kernel)
+                .await
+                .unwrap();
+        }
+        // Reopened, so the value is on disk and not in the write-through
+        // cache: this test is about the read that would allocate.
+        let v = VLog::open(dir.path()).await.unwrap();
+        let size = v.record_size(b"k").expect("a live key has a size");
+
+        let before = v.disk_reads();
+        match v.get_bounded(b"k", size - 1).await.unwrap() {
+            BoundedGet::Oversize { record_bytes } => assert_eq!(record_bytes, size),
+            other => panic!("a record past its bound must be refused: {other:?}"),
+        }
+        assert_eq!(
+            v.disk_reads(),
+            before,
+            "a refused read must not have read anything"
+        );
+
+        // And at its measured size it comes back whole.
+        match v.get_bounded(b"k", size).await.unwrap() {
+            BoundedGet::Found(value) => assert_eq!(value.len(), 64 * 1024),
+            other => panic!("a record within its bound must be read: {other:?}"),
+        }
+    }
+
+    /// The window the guard closes: the size is measured, ANOTHER writer
+    /// overwrites the key with a larger value, and only then does the read
+    /// run. The read must not allocate for the new, larger record.
+    #[tokio::test]
+    async fn a_value_that_grew_after_the_measurement_is_not_fetched() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        v.set(b"k", &vec![1u8; 1024], Durability::Kernel)
+            .await
+            .unwrap();
+        let measured = v.record_size(b"k").expect("a live key has a size");
+
+        // The concurrent write, in the window between the measurement and
+        // the read.
+        v.set(b"k", &vec![2u8; 512 * 1024], Durability::Kernel)
+            .await
+            .unwrap();
+
+        match v.get_bounded(b"k", measured).await.unwrap() {
+            BoundedGet::Oversize { record_bytes } => assert!(
+                record_bytes > measured,
+                "the refusal must report the size that outgrew the bound: \
+                 {record_bytes} vs {measured}"
+            ),
+            other => panic!(
+                "a value that grew past the reservation must be refused, not \
+                 materialised: {other:?}"
+            ),
+        }
+    }
+
+    /// An absent key costs nothing and says so, rather than being reported as
+    /// a zero-byte value a caller would then reserve for.
+    #[tokio::test]
+    async fn a_bounded_get_of_an_absent_key_is_missing_not_empty() {
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        assert_eq!(
+            v.get_bounded(b"nope", 4096).await.unwrap(),
+            BoundedGet::Missing
         );
     }
 }
