@@ -143,6 +143,23 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
 
         skeg_proto::Op::VindexList => match shards.vindex_list().await {
             Ok(rows) => {
+                // Hide every tenant-scoped name, the same rule RESP3 applies
+                // to an anonymous connection (`skeg_vindex_list`). This
+                // listener has no tenant - it is always tenant 0 - so the
+                // names it may see are exactly the unscoped ones. Without
+                // this it handed out the scoped name, dim, kind and vector
+                // count of every index of every tenant, and a scoped name is
+                // the tenant id in hex, so the listing enumerated the tenants
+                // as well.
+                //
+                // Filtered BEFORE the v1 tier check below: that check refuses
+                // the call because the ROWS CANNOT BE REPRESENTED to this
+                // client, so it must weigh the rows this client receives, not
+                // ones it is not allowed to know exist.
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| !row.name.contains(crate::shard::SCOPE_SEP))
+                    .collect();
                 if frame.header.version == VERSION_V1 && rows.iter().any(|row| row.kind > 2) {
                     return Some(encode_err(
                         req_id,
@@ -491,7 +508,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "red until native VINDEX.LIST hides tenant-scoped names"]
     async fn native_vindex_list_does_not_name_other_tenants_indexes() {
         // The last asymmetry between the two handlers over one store. RESP3
         // hides every `::` name from an anonymous connection; the native arm

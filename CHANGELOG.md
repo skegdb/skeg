@@ -55,9 +55,13 @@ native listener, which has no tenant of its own - so `VGET` read that tenant's
 vectors, `VSET` wrote into its index, and `VDEL` and `VINDEX.DROP` destroyed
 them, from a connection that authenticated as nobody. `VINDEX.CREATE`,
 `VINDEX.DROP`, `VSET`, `VGET`, `VDEL` and `VSEARCH` now share one name check,
-so an op added later cannot quietly skip it. This matters where the native
-listener is exposed over a store a multi-tenant RESP3 listener also serves; a
-single-tenant store has no such names.
+so an op added later cannot quietly skip it. Native `VINDEX.LIST` takes no
+name but had the matching hole: it listed every index of every tenant, and a
+scoped name is the tenant id in hex, so it enumerated the tenants too. It now
+hides scoped names, the same rule RESP3 applies to an anonymous connection.
+All of this matters where the native listener is exposed over a store a
+multi-tenant RESP3 listener also serves; a single-tenant store has no such
+names.
 
 ### A vector and its payload are one write
 
