@@ -629,7 +629,9 @@ impl VLog {
     /// Tenant `0` is the unscoped default; reach this via [`VLog::tenant`].
     ///
     /// An over-limit set is rejected with [`Error::DiskQuota`] BEFORE anything
-    /// is written, so storage never crosses the limit.
+    /// is written, so storage never crosses the limit - and the check and the
+    /// counter update happen in the SAME critical section, so a concurrent
+    /// writer of the same tenant can never read stale headroom between them.
     async fn set_scoped(
         &self,
         key: &[u8],
@@ -639,25 +641,69 @@ impl VLog {
         disk_limit: Option<u64>,
     ) -> Result<()> {
         // Prior on-disk charge for this key, and the prospective new one. Both
-        // known without writing: enforce the disk quota first.
+        // known without writing.
         let prev = { self.inner.index.borrow().get(key).copied() };
         let old_disk = prev.map_or(0, |p| u64::from(p.size));
         let dtenant = tenant_from_key(key);
         let new_disk = padded_record_size(key.len(), value.len()) as u64;
-        if let Some(limit) = disk_limit {
-            let projected = self
-                .tenant_disk_bytes(dtenant)
-                .saturating_sub(old_disk)
-                .saturating_add(new_disk);
-            if projected > limit {
+
+        // Reserve atomically: evaluate the projected total and, if it fits,
+        // APPLY it to the tenant counter right here - before `append_raw`'s
+        // `.await` below gives another writer of the same tenant a chance to
+        // run. Without this the check and the update were two separate
+        // critical sections either side of an await: two concurrent writers
+        // of different keys under one tenant could each read the same
+        // pre-write total, each pass their own check, and both proceed -
+        // reproduced at 5.3x a 1.5-unit budget with 8 concurrent writers
+        // (audit/17 A1). Applied unconditionally, not only when `disk_limit`
+        // is `Some`, so the counter is written in exactly one place: a call
+        // with no limit still reserves, it just never has anything to refuse.
+        {
+            let mut disk = self.inner.tenant_disk.lock();
+            let cur = disk.get(&dtenant).copied().unwrap_or(0);
+            let projected = cur.saturating_sub(old_disk).saturating_add(new_disk);
+            if let Some(limit) = disk_limit
+                && projected > limit
+            {
                 return Err(Error::DiskQuota);
+            }
+            if projected == 0 {
+                disk.remove(&dtenant);
+            } else {
+                disk.insert(dtenant, projected);
             }
         }
 
         let ts = self.next_ts();
-        let (seg_id, offset, padded) = self
+        let appended = self
             .append_raw(key, value, RecordKind::Scalar, ts, durability)
-            .await?;
+            .await;
+        let (seg_id, offset, padded) = match appended {
+            Ok(v) => v,
+            Err(e) => {
+                // The write never happened: refund exactly the delta just
+                // reserved (relative to whatever the counter holds NOW, not
+                // to `cur` above - other writers may have reserved their own
+                // deltas concurrently, and this must undo only this call's
+                // contribution, not theirs).
+                let mut disk = self.inner.tenant_disk.lock();
+                let now = disk.get(&dtenant).copied().unwrap_or(0);
+                let refunded = now.saturating_sub(new_disk).saturating_add(old_disk);
+                if refunded == 0 {
+                    disk.remove(&dtenant);
+                } else {
+                    disk.insert(dtenant, refunded);
+                }
+                return Err(e);
+            }
+        };
+        debug_assert_eq!(
+            u64::from(padded),
+            new_disk,
+            "the reservation above assumed the record pads to `new_disk`; \
+             the disk counter is wrong if the actual write padded to \
+             something else"
+        );
 
         if let Some(prev) = prev {
             self.dec_live(prev.segment_id, prev.size);
@@ -679,13 +725,6 @@ impl VLog {
             value.len(),
             tenant,
         );
-        // Disk accounting: replace this key's old charge with the new one. The
-        // tenant is key-derived so write-time and recovery agree for scoped keys.
-        {
-            let mut disk = self.inner.tenant_disk.lock();
-            let e = disk.entry(dtenant).or_insert(0);
-            *e = e.saturating_sub(old_disk) + u64::from(padded);
-        }
         Ok(())
     }
 
@@ -752,6 +791,32 @@ impl VLog {
     /// Returns an error on IO failure, or if the encoded batch exceeds one
     /// segment (`max_seg_size`) - split into smaller batches.
     pub async fn set_many(&self, pairs: &[(&[u8], &[u8])], durability: Durability) -> Result<()> {
+        self.set_many_with_disk_limit(pairs, durability, 0, None)
+            .await
+    }
+
+    /// [`set_many`](Self::set_many), enforcing `disk_limit` (if any) against
+    /// `tenant`'s disk quota - the SUM of the batch's net delta to that
+    /// tenant's charge, not a per-pair check. `tenant`/`disk_limit` decide
+    /// only whether the write is REFUSED; every pair's bytes are still
+    /// credited to its own key-derived tenant unconditionally, exactly as
+    /// [`set_scoped`](Self::set_scoped) does, so a caller with no limit to
+    /// enforce (`disk_limit: None`) is byte-for-byte [`set_many`](Self::set_many).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DiskQuota`] if the batch's sum would push `tenant`
+    /// over `disk_limit` - before a single byte is written, so a refused
+    /// batch writes NONE of its members, the same all-or-nothing contract
+    /// [`set_many`](Self::set_many) already has for a crash. Otherwise, the
+    /// same errors as [`set_many`](Self::set_many).
+    pub async fn set_many_with_disk_limit(
+        &self,
+        pairs: &[(&[u8], &[u8])],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -781,8 +846,58 @@ impl VLog {
             blob.extend_from_slice(&rec);
         }
 
+        // Reservation: the batch's net delta to EVERY tenant it touches,
+        // evaluated and applied in one atomic step under the SAME
+        // `tenant_disk` mutex `set_scoped` uses, before `maybe_rotate`'s
+        // `.await` below gives another writer a chance to run. A duplicate
+        // key inside one batch nets to its LAST occurrence only - the same
+        // fold the per-key accounting loop further down performs one key at
+        // a time, done here in one pass because every size is already known
+        // from `member_rel` and nothing has been written yet. `tenant`/
+        // `disk_limit` decide only whether the batch is REFUSED; the deltas
+        // for every tenant present are applied regardless, exactly like an
+        // unlimited `set_scoped` still accounts.
+        let mut last_new: AHashMap<&[u8], u64> = AHashMap::default();
+        for ((key, _value), (_rel, padded)) in pairs.iter().zip(&member_rel) {
+            last_new.insert(key, u64::from(*padded));
+        }
+        let deltas: AHashMap<u128, i128> = {
+            let index = self.inner.index.borrow();
+            let mut deltas: AHashMap<u128, i128> = AHashMap::default();
+            for (key, new_size) in &last_new {
+                let dtenant = tenant_from_key(key);
+                let old = index.get(key).map_or(0, |e| u64::from(e.size));
+                *deltas.entry(dtenant).or_insert(0) += i128::from(*new_size) - i128::from(old);
+            }
+            deltas
+        };
+        {
+            let mut disk = self.inner.tenant_disk.lock();
+            if let Some(limit) = disk_limit {
+                let cur = disk.get(&tenant).copied().unwrap_or(0);
+                let delta = deltas.get(&tenant).copied().unwrap_or(0);
+                let projected = (i128::from(cur) + delta).max(0) as u64;
+                if projected > limit {
+                    return Err(Error::DiskQuota);
+                }
+            }
+            for (t, delta) in &deltas {
+                let cur = disk.get(t).copied().unwrap_or(0);
+                let updated = (i128::from(cur) + delta).max(0) as u64;
+                if updated == 0 {
+                    disk.remove(t);
+                } else {
+                    disk.insert(*t, updated);
+                }
+            }
+        }
+
         let blob_len = blob.len() as u64;
         if blob_len > self.inner.max_seg_size {
+            // The write never happens: refund exactly the deltas just
+            // reserved, relative to whatever the counter holds NOW (other
+            // writers may have reserved concurrently in between).
+            self.refund_tenant_disk_deltas(&deltas);
             return Err(Error::InvalidRecord {
                 msg: "batch exceeds one segment",
             });
@@ -792,7 +907,10 @@ impl VLog {
         // cannot be split across segments or interleaved with another writer's
         // records, which is what makes the header/member run contiguous for
         // recovery.
-        self.maybe_rotate(blob_len).await?;
+        if let Err(e) = self.maybe_rotate(blob_len).await {
+            self.refund_tenant_disk_deltas(&deltas);
+            return Err(e);
+        }
         let (committer, seg_id) = {
             // Reserve synchronously - see the matching comment in
             // `append_raw` for why this must happen in the same
@@ -802,26 +920,29 @@ impl VLog {
             a.size += blob_len;
             (a.committer.clone(), a.id)
         };
-        let (start, padded_total) = committer.append(blob, durability).await?;
+        let (start, padded_total) = match committer.append(blob, durability).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.refund_tenant_disk_deltas(&deltas);
+                return Err(Error::Io(e));
+            }
+        };
         debug_assert_eq!(
             u64::from(padded_total),
             blob_len,
             "padded write size must match the blob_len maybe_rotate checked against"
         );
 
-        // Now durable: apply each member to the index + accounting. Same steps
-        // as `set_scoped`, minus the per-key durability wait (already paid once).
+        // Now durable: apply each member to the index + live-byte bookkeeping.
+        // Same steps as `set_scoped`, minus the per-key durability wait
+        // (already paid once) and minus the disk accounting, which the
+        // reservation above already settled.
         let mut index = self.inner.index.borrow_mut();
         let mut cache = self.inner.cache.borrow_mut();
-        let mut disk = self.inner.tenant_disk.lock();
         for ((key, _value), (rel, padded)) in pairs.iter().zip(&member_rel) {
             let offset = start + u64::from(*rel);
             if let Some(prev) = index.get(key).copied() {
                 self.dec_live(prev.segment_id, prev.size);
-                let dtenant = tenant_from_key(key);
-                if let Some(e) = disk.get_mut(&dtenant) {
-                    *e = e.saturating_sub(u64::from(prev.size));
-                }
             }
             self.inc_live(seg_id, *padded);
             index.set(
@@ -843,9 +964,27 @@ impl VLog {
             // Removing rather than skipping: a key already cached would
             // otherwise keep its old value and be served stale.
             cache.remove(key);
-            *disk.entry(tenant_from_key(key)).or_insert(0) += u64::from(*padded);
         }
         Ok(())
+    }
+
+    /// Undo exactly the deltas [`set_many_with_disk_limit`](Self::set_many_with_disk_limit)
+    /// reserved, relative to whatever `tenant_disk` holds NOW - not to the
+    /// value read before the reservation, so this undoes only this batch's
+    /// own contribution when another writer has reserved concurrently in
+    /// between (the same rule [`set_scoped`](Self::set_scoped)'s refund
+    /// follows).
+    fn refund_tenant_disk_deltas(&self, deltas: &AHashMap<u128, i128>) {
+        let mut disk = self.inner.tenant_disk.lock();
+        for (t, delta) in deltas {
+            let cur = disk.get(t).copied().unwrap_or(0);
+            let refunded = (i128::from(cur) - delta).max(0) as u64;
+            if refunded == 0 {
+                disk.remove(t);
+            } else {
+                disk.insert(*t, refunded);
+            }
+        }
     }
 
     /// DEL a key at the given durability. Returns `true` if the key existed.
@@ -1960,6 +2099,81 @@ mod tests {
         assert_eq!(v.tenant_disk_bytes(7), 0, "del releases disk bytes");
     }
 
+    /// One writer's `set_scoped`: check the limit, apply the delta, both
+    /// under the SAME reservation.
+    async fn write_one(v: &VLog, tenant: u128, limit: u64, id: u8, size: usize) -> Result<()> {
+        let key = scoped(tenant, &[id]);
+        v.tenant(tenant)
+            .with_disk_limit(Some(limit))
+            .set(&key, &vec![0u8; size], Durability::Kernel)
+            .await
+    }
+
+    /// The race audit/17 A1 found: the old `set_scoped` read
+    /// `tenant_disk_bytes`, evaluated the projected total, and only
+    /// afterwards - past an `.await` on the actual write - applied it to the
+    /// counter. Two concurrent writers of the SAME tenant (different keys, so
+    /// neither's `old_disk` masks the other) could each read the total BEFORE
+    /// either had written, each pass their own check, and both proceed: the
+    /// reproduction was 8 concurrent 4 KiB writes against a 1.5-unit budget,
+    /// 8/8 admitted, final total 5.3x the limit.
+    ///
+    /// The fix makes the check and the counter update one atomic step (no
+    /// `.await` between them, under the tenant_disk mutex), so this bound is
+    /// exact, not a margin: nothing concurrent can ever push the tenant's
+    /// live bytes past its limit, full stop - not "limit plus one in-flight
+    /// blob".
+    #[tokio::test]
+    async fn n_concurrent_writers_of_one_tenant_never_land_the_counter_past_the_limit() {
+        const T: u128 = 0x2A2A;
+        const N: u8 = 8;
+        const UNIT_PAYLOAD: usize = 4096;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        // Probe: what does one write of this size cost, exactly? Then undo
+        // it, so the concurrent run below starts from a clean, known
+        // baseline instead of guessing padding.
+        let probe_key = scoped(T, &[255]);
+        v.set(&probe_key, &vec![0u8; UNIT_PAYLOAD], Durability::Kernel)
+            .await
+            .unwrap();
+        let unit = v.tenant_disk_bytes(T);
+        assert!(v.del(&probe_key, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+
+        // Room for 1.5 units: at most one of the N concurrent writers can
+        // land, ever - matching the audit's reproduction shape.
+        let limit = unit + unit / 2;
+
+        let futs: Vec<_> = (0..N)
+            .map(|id| write_one(&v, T, limit, id, UNIT_PAYLOAD))
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(admitted + refused, N as usize);
+        assert!(
+            admitted <= 1,
+            "a 1.5-unit budget must admit at most ONE {unit}-byte writer, \
+             admitted {admitted} of {N}"
+        );
+
+        let total = v.tenant_disk_bytes(T);
+        assert!(
+            total <= limit,
+            "the tenant's live bytes ({total}) must never exceed its own \
+             limit ({limit}) no matter how many writers race for it"
+        );
+        assert_eq!(
+            total,
+            admitted as u64 * unit,
+            "the counter must equal exactly what was actually admitted - no \
+             drift from refused writers, no double counting from the race"
+        );
+    }
+
     #[tokio::test]
     async fn test_disk_recovered_on_reopen() {
         let dir = TempDir::new().unwrap();
@@ -2282,6 +2496,164 @@ mod tests {
         );
         assert_eq!(v.get(b"b").await.unwrap().as_deref(), Some(b"2".as_slice()));
         assert_eq!(v.get(b"c").await.unwrap().as_deref(), Some(b"3".as_slice()));
+    }
+
+    // ── MSET disk quota (audit/17 round 2: a deterministic full bypass) ──────
+
+    /// A batch whose SUM would cross the tenant's limit writes NONE of its
+    /// members - set_many's own all-or-nothing contract, extended to the
+    /// disk quota rather than stopped short of it.
+    #[tokio::test]
+    async fn set_many_all_or_nothing_when_the_batch_would_exceed_the_limit() {
+        const T: u128 = 0x2222;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        // Probe: what does ONE of these pairs cost? Then undo it.
+        let ka = scoped(T, b"a");
+        v.set(&ka, b"xxxx", Durability::Kernel).await.unwrap();
+        let unit = v.tenant_disk_bytes(T);
+        assert!(v.del(&ka, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+
+        // Room for 1.5 units; the batch below asks for 2.
+        let limit = unit + unit / 2;
+        let kb = scoped(T, b"b");
+        let err = v
+            .set_many_with_disk_limit(
+                &[(ka.as_slice(), b"xxxx"), (kb.as_slice(), b"xxxx")],
+                Durability::Kernel,
+                T,
+                Some(limit),
+            )
+            .await
+            .expect_err("a batch whose sum exceeds the limit must be refused");
+        assert!(matches!(err, Error::DiskQuota));
+
+        assert_eq!(
+            v.tenant_disk_bytes(T),
+            0,
+            "a refused batch must not move the counter"
+        );
+        assert_eq!(v.get(&ka).await.unwrap(), None, "neither key was written");
+        assert_eq!(v.get(&kb).await.unwrap(), None, "neither key was written");
+    }
+
+    /// A batch that fits is admitted whole, and the counter equals exactly
+    /// the sum of what it wrote.
+    #[tokio::test]
+    async fn set_many_admits_and_charges_a_batch_that_fits() {
+        const T: u128 = 0x2223;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+        let ka = scoped(T, b"a");
+        let kb = scoped(T, b"b");
+
+        v.set_many_with_disk_limit(
+            &[(ka.as_slice(), b"xxxx"), (kb.as_slice(), b"xxxx")],
+            Durability::Kernel,
+            T,
+            Some(1 << 20),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            v.get(&ka).await.unwrap().as_deref(),
+            Some(b"xxxx".as_slice())
+        );
+        assert_eq!(
+            v.get(&kb).await.unwrap().as_deref(),
+            Some(b"xxxx".as_slice())
+        );
+        let total = v.tenant_disk_bytes(T);
+        assert!(total > 0);
+
+        // Charged exactly: deleting both keys releases the whole total.
+        assert!(v.del(&ka, Durability::Kernel).await.unwrap());
+        assert!(v.del(&kb, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+        let _ = total;
+    }
+
+    /// The reservation the batch's sum takes is refunded exactly if the
+    /// physical write then fails - here, a batch built to exceed the (tiny)
+    /// segment size, which fails AFTER the reservation and BEFORE anything
+    /// is durable.
+    #[tokio::test]
+    async fn set_many_refunds_its_reservation_when_the_write_itself_fails() {
+        const T: u128 = 0x2224;
+        let dir = TempDir::new().unwrap();
+        // A segment far too small for the batch below: the reservation
+        // passes (the limit is generous), but `set_many` itself refuses the
+        // batch as "exceeds one segment" before writing anything.
+        let v = VLog::open_with_max_segment(dir.path(), 128).await.unwrap();
+        let ka = scoped(T, b"a");
+        let kb = scoped(T, b"b");
+        let big = vec![0u8; 200];
+
+        let before = v.tenant_disk_bytes(T);
+        let err = v
+            .set_many_with_disk_limit(
+                &[
+                    (ka.as_slice(), big.as_slice()),
+                    (kb.as_slice(), big.as_slice()),
+                ],
+                Durability::Kernel,
+                T,
+                Some(1 << 20),
+            )
+            .await
+            .expect_err("a batch bigger than one segment must be refused");
+        assert!(matches!(err, Error::InvalidRecord { .. }));
+        assert_eq!(
+            v.tenant_disk_bytes(T),
+            before,
+            "a batch whose reservation passed but whose write then failed \
+             must refund exactly what it reserved"
+        );
+    }
+
+    /// The reservation is atomic with `set_scoped`'s: both go through the
+    /// same tenant_disk critical section, so a plain `SET` racing an `MSET`
+    /// batch for the same tenant's headroom cannot see stale room either.
+    #[tokio::test]
+    async fn set_many_and_set_scoped_reserve_against_the_same_atomic_counter() {
+        const T: u128 = 0x2225;
+        const N: u8 = 8;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        let probe = scoped(T, &[254]);
+        v.set(&probe, b"xxxx", Durability::Kernel).await.unwrap();
+        let unit = v.tenant_disk_bytes(T);
+        assert!(v.del(&probe, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+
+        let limit = unit + unit / 2; // room for 1.5 units
+        let futs: Vec<_> = (0..N)
+            .map(|id| {
+                let key = scoped(T, &[id]);
+                let v = v.clone();
+                async move {
+                    v.set_many_with_disk_limit(
+                        &[(key.as_slice(), b"xxxx")],
+                        Durability::Kernel,
+                        T,
+                        Some(limit),
+                    )
+                    .await
+                }
+            })
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert!(
+            admitted <= 1,
+            "a 1.5-unit budget must admit at most one {unit}-byte batch, admitted {admitted}"
+        );
+        assert!(v.tenant_disk_bytes(T) <= limit);
+        assert_eq!(v.tenant_disk_bytes(T), admitted as u64 * unit);
     }
 
     #[tokio::test]

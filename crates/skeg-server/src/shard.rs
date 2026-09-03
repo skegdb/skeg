@@ -277,26 +277,88 @@ struct Admitted {
 /// Split out because both the supplied-payload and the carry-forward paths
 /// write to the same place under the same failpoint, and a second copy of that
 /// is a second place for the key to be built differently.
+///
+/// `disk_limit` is the tenant's `max_disk_bytes`, the same limit a KV `SET`
+/// enforces (`docs/adr-payload-transaction.md`, "Disk quota covers the
+/// blob"). A blob key carries the same 16-byte tenant prefix a KV key does,
+/// so it is charged against - and can be refused against - the identical
+/// counter, by the identical check inside `VLog::set_scoped`. `None` (no
+/// backend, or the caller is an internal relocation - see the call sites)
+/// skips enforcement, matching every other admission check on this path.
+/// Why staging a payload blob failed. The disk quota gets its own arm
+/// because it is not a storage fault - it is an admission refusal, classified
+/// the same way a KV `SET`'s is (see [`disk_quota_refused`]), and travelling
+/// it as a plain string is the exact shape `admission.rs` exists to delete
+/// (audit/17 A2).
+enum StagePayloadError {
+    /// `needed` is the blob's own length - not the padded on-disk record its
+    /// key and durability framing would add, which this call site does not
+    /// have in hand, but the number a caller can already reason about.
+    DiskQuota {
+        needed: u64,
+    },
+    Other(skeg_core::Error),
+}
+
+/// Write a payload blob to the key of the version it belongs to. `Ok(true)`
+/// once the blob is there.
+///
+/// Split out because both the supplied-payload and the carry-forward paths
+/// write to the same place under the same failpoint, and a second copy of that
+/// is a second place for the key to be built differently.
+///
+/// `disk_limit` is the tenant's `max_disk_bytes`, the same limit a KV `SET`
+/// enforces (`docs/adr-payload-transaction.md`, "Disk quota covers the
+/// blob"). A blob key carries the same 16-byte tenant prefix a KV key does,
+/// so it is charged against - and can be refused against - the identical
+/// counter, by the identical check inside `VLog::set_scoped`. `None` (no
+/// backend, or the caller is an internal relocation - see the call sites)
+/// skips enforcement, matching every other admission check on this path.
 async fn stage_payload_blob(
     vlog: &VLog,
     scope: BlobScope<'_>,
     id: u64,
     version: u64,
     blob: &[u8],
-) -> Result<bool, String> {
+    disk_limit: Option<u64>,
+) -> Result<bool, StagePayloadError> {
     crate::fp_at!(
         crate::failpoint::WriteFailpoint::PayloadPrepare,
         scope.name,
-        Err("vset payload failed: failpoint: payload staging refused".to_owned())
+        Err(StagePayloadError::Other(skeg_core::Error::Io(
+            std::io::Error::other("failpoint: payload staging refused")
+        )))
     );
     vlog.tenant(scope.tenant)
+        .with_disk_limit(disk_limit)
         .set(&scope.key(id, version), blob, PAYLOAD_DURABILITY)
         .await
         .map(|()| {
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::PayloadBlobsStaged);
             true
         })
-        .map_err(|e| format!("vset payload failed: {e}"))
+        .map_err(|e| match e {
+            skeg_core::Error::DiskQuota => StagePayloadError::DiskQuota {
+                needed: blob.len() as u64,
+            },
+            other => StagePayloadError::Other(other),
+        })
+}
+
+/// One place a `skeg_core::Error::DiskQuota` becomes the typed refusal both
+/// the KV `SET`/`APPEND` path and the payload blob path answer with
+/// (audit/17 A2: "one place", not a second classification duplicated at the
+/// KV call site). `limit` is `None` only when the caller had no limit to
+/// enforce, which cannot itself produce `DiskQuota` - the `unwrap_or(0)` is
+/// defensive, not reachable in practice.
+fn disk_quota_refused(tenant: u128, limit: Option<u64>, needed: u64) -> ShardResp {
+    ShardResp::Refused(ShardError::Admission(
+        crate::admission::AdmissionError::DiskQuota {
+            tenant,
+            limit: limit.unwrap_or(0),
+            needed,
+        },
+    ))
 }
 
 enum VectorBackend {
@@ -828,9 +890,14 @@ enum ShardReq {
     Get(Bytes, u128),
     /// `(key, value, durability, tenant, disk_limit)`.
     Set(Bytes, Bytes, Durability, u128, Option<u64>),
-    /// Atomic multi-key write for the keys of one MSET that route to this shard.
-    /// Keys are already tenant-scoped; the batch is all-or-nothing on this shard.
-    SetMany(Vec<(Bytes, Bytes)>, Durability),
+    /// Atomic multi-key write for the keys of one MSET that route to this
+    /// shard. Keys are already tenant-scoped; the batch is all-or-nothing on
+    /// this shard. `(pairs, durability, tenant, disk_limit)`: `tenant`/
+    /// `disk_limit` decide only whether the WHOLE batch is refused (its net
+    /// delta to `tenant`'s charge, not per pair) - every pair's bytes are
+    /// still credited to its own key-derived tenant unconditionally, same as
+    /// `Set`.
+    SetMany(Vec<(Bytes, Bytes)>, Durability, u128, Option<u64>),
     /// `(key, value, durability, tenant, disk_limit)`: append to a scoped key,
     /// reply with the new value length.
     Append(Bytes, Bytes, Durability, u128, Option<u64>),
@@ -927,6 +994,17 @@ enum ShardReq {
         tenant: u128,
         /// Tenant's max vectors, if any. `None` skips quota enforcement.
         limit: Option<u64>,
+        /// Tenant's `max_disk_bytes`, if any, applied to the payload blob
+        /// staged below - the same limit and the same physical counter a KV
+        /// `SET` is charged against (`docs/adr-payload-transaction.md`).
+        /// `None` for every internal relocation (reshard, boundary replica,
+        /// the far side of an overwrite): those move a row's bytes, they do
+        /// not grow the tenant's total, and refusing them would strand a
+        /// vector mid-move against a limit their own client write never
+        /// crossed. Set from the pluggable backend at the two entry points
+        /// that mint a NEW write - [`ShardSet::vset`] and the per-item calls
+        /// inside [`ShardSet::vmset`] - exactly where `limit` above is.
+        disk_limit: Option<u64>,
         /// What this write means for the tenant's logical cardinality. The
         /// quota counts distinct rows and a shard can only see its own, so
         /// the coordinator - which knows whether the row is arriving, being
@@ -4444,6 +4522,7 @@ async fn process(
             vector,
             tenant,
             limit,
+            disk_limit,
             effect,
             version,
             payload,
@@ -4605,31 +4684,47 @@ async fn process(
             // because the record that publishes the row is then the only step
             // that has to survive.
             let staged = match &payload {
-                Some(blob) => stage_payload_blob(vlog, scope, id, admitted.version, blob).await,
+                Some(blob) => {
+                    stage_payload_blob(vlog, scope, id, admitted.version, blob, disk_limit).await
+                }
                 // A payload-less overwrite keeps the payload the row already
                 // had, which means CARRYING it to the new version's key.
                 // Skipped for a row this shard did not already hold - every
                 // insert, and every arriving relocation - so those pay no
                 // lookup for a blob that cannot exist.
+                //
+                // Charged against the same limit as a supplied payload: the
+                // carried copy is a second physical key until W4 reclaims the
+                // one it supersedes (`docs/adr-payload-transaction.md`, "Disk
+                // quota"), so a tenant sitting exactly at its limit can see a
+                // payload-less overwrite refused for the width of that
+                // window. That is the documented margin, not a bypass -
+                // bypassing it here would let an overwrite grow a tenant's
+                // resident bytes with nothing counting them.
                 None => match admitted.previous.filter(|&v| v != admitted.version) {
                     Some(old) => match read_payload_blob(vlog, scope, id, old).await {
                         Ok(Some(blob)) => {
                             skeg_telemetry::tick_counter(
                                 skeg_telemetry::Counter::PayloadBlobsCarriedForward,
                             );
-                            stage_payload_blob(vlog, scope, id, admitted.version, &blob).await
+                            stage_payload_blob(vlog, scope, id, admitted.version, &blob, disk_limit)
+                                .await
                         }
                         Ok(None) => Ok(false),
-                        Err(e) => Err(format!("vset payload failed: {e}")),
+                        Err(e) => Err(StagePayloadError::Other(e)),
                     },
                     None => Ok(false),
                 },
             };
             let staged = match staged {
                 Ok(staged) => staged,
-                Err(e) => {
+                Err(StagePayloadError::DiskQuota { needed }) => {
                     refund(&admitted);
-                    return ShardResp::Err(e);
+                    return disk_quota_refused(tenant, disk_limit, needed);
+                }
+                Err(StagePayloadError::Other(e)) => {
+                    refund(&admitted);
+                    return ShardResp::Err(format!("vset payload failed: {e}"));
                 }
             };
             let payload_ref = if staged {
@@ -5191,6 +5286,7 @@ async fn process(
             Err(e) => ShardResp::Err(e.to_string()),
         },
         ShardReq::Set(key, val, dur, tenant, disk_limit) => {
+            let needed = val.len() as u64;
             match vlog
                 .tenant(tenant)
                 .with_disk_limit(disk_limit)
@@ -5198,20 +5294,35 @@ async fn process(
                 .await
             {
                 Ok(()) => ShardResp::Done,
+                Err(skeg_core::Error::DiskQuota) => disk_quota_refused(tenant, disk_limit, needed),
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
-        ShardReq::SetMany(pairs, dur) => {
+        ShardReq::SetMany(pairs, dur, tenant, disk_limit) => {
+            // The sum of the batch's own values: not the exact padded
+            // on-disk total (which `set_many_with_disk_limit` computes
+            // internally, net of what each key already held), but an honest
+            // answer to "how much did this write ask for".
+            let needed: u64 = pairs.iter().map(|(_, v)| v.len() as u64).sum();
             let refs: Vec<(&[u8], &[u8])> = pairs
                 .iter()
                 .map(|(k, v)| (k.as_ref(), v.as_ref()))
                 .collect();
-            match vlog.set_many(&refs, dur).await {
+            match vlog
+                .set_many_with_disk_limit(&refs, dur, tenant, disk_limit)
+                .await
+            {
                 Ok(()) => ShardResp::Done,
+                Err(skeg_core::Error::DiskQuota) => disk_quota_refused(tenant, disk_limit, needed),
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
         ShardReq::Append(key, val, dur, tenant, disk_limit) => {
+            // The size of the increment, not the resulting value: the exact
+            // combined length lives inside `append_scoped`, which this call
+            // site does not see, and the increment is still an honest answer
+            // to "how much more did this write ask for".
+            let needed = val.len() as u64;
             match vlog
                 .tenant(tenant)
                 .with_disk_limit(disk_limit)
@@ -5219,6 +5330,7 @@ async fn process(
                 .await
             {
                 Ok(len) => ShardResp::Len(len),
+                Err(skeg_core::Error::DiskQuota) => disk_quota_refused(tenant, disk_limit, needed),
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
@@ -5871,6 +5983,11 @@ impl ShardSet {
     /// to one shard) is fully atomic. Callers wanting a global transaction must
     /// keep the keys on one shard.
     ///
+    /// No tenant disk quota: equivalent to
+    /// [`mset_with_disk_limit`](Self::mset_with_disk_limit) with
+    /// `disk_limit: None`. See [`vset`](Self::vset) for why this stays the
+    /// name every existing caller keeps using untouched.
+    ///
     /// # Errors
     ///
     /// Returns an error if a shard is unavailable or a write fails.
@@ -5878,6 +5995,30 @@ impl ShardSet {
         &self,
         pairs: &[(&[u8], &[u8])],
         durability: Durability,
+    ) -> Result<(), ShardError> {
+        self.mset_with_disk_limit(pairs, durability, 0, None).await
+    }
+
+    /// [`mset`](Self::mset), charging the batch's net delta against the
+    /// tenant's `max_disk_bytes` - per SHARD, since MSET is only atomic
+    /// per-shard to begin with (see the doc above): a batch that spans
+    /// shards is checked and admitted one shard's portion at a time, in the
+    /// global counter [`VLog::set_many_with_disk_limit`] shares with every
+    /// other write, so an earlier shard's admitted portion is already
+    /// visible to a later one's check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shard is unavailable, a write fails, or a
+    /// shard's portion of the batch would push the tenant over
+    /// `disk_limit` - refusing that shard's WHOLE portion, not a prefix of
+    /// it (audit/17 round 2).
+    pub async fn mset_with_disk_limit(
+        &self,
+        pairs: &[(&[u8], &[u8])],
+        durability: Durability,
+        tenant: u128,
+        disk_limit: Option<u64>,
     ) -> Result<(), ShardError> {
         let mut by_shard: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); self.inner.n];
         for (key, value) in pairs {
@@ -5889,7 +6030,10 @@ impl ShardSet {
                 continue;
             }
             match self
-                .call(shard, ShardReq::SetMany(batch, durability))
+                .call(
+                    shard,
+                    ShardReq::SetMany(batch, durability, tenant, disk_limit),
+                )
                 .await?
             {
                 ShardResp::Done => {}
@@ -6995,6 +7139,13 @@ impl ShardSet {
 
     /// Insert a vector under `id` into `name`. Routes by `id`.
     ///
+    /// No tenant disk quota: equivalent to
+    /// [`vset_with_disk_limit`](Self::vset_with_disk_limit) with
+    /// `disk_limit: None`. Kept so every caller that has no `max_disk_bytes`
+    /// to enforce - every internal relocation, every test, the native
+    /// listener (which has no pluggable tenant backend to read one from) -
+    /// is untouched by the disk quota threaded through the RESP3 entry point.
+    ///
     /// # Errors
     ///
     /// Returns an error if the index is missing, the dim mismatches, or the
@@ -7006,6 +7157,30 @@ impl ShardSet {
         vector: Vec<f32>,
         tenant: u128,
         limit: Option<u64>,
+        payload: Option<Bytes>,
+    ) -> Result<(), ShardError> {
+        self.vset_with_disk_limit(name, id, vector, tenant, limit, None, payload)
+            .await
+    }
+
+    /// [`vset`](Self::vset), charging the staged payload blob against the
+    /// tenant's `max_disk_bytes` - the same limit and the same physical
+    /// counter (live KV bytes plus live blob bytes) a KV `SET` already
+    /// enforces. See `docs/adr-payload-transaction.md`, "Disk quota".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is missing, the dim mismatches, the
+    /// shard is unavailable, or the blob would push the tenant over
+    /// `disk_limit`.
+    pub async fn vset_with_disk_limit(
+        &self,
+        name: &str,
+        id: u64,
+        vector: Vec<f32>,
+        tenant: u128,
+        limit: Option<u64>,
+        disk_limit: Option<u64>,
         payload: Option<Bytes>,
     ) -> Result<(), ShardError> {
         // Semantic placement when a router exists: the vector picks its owner
@@ -7060,6 +7235,7 @@ impl ShardSet {
                 vector,
                 tenant,
                 limit,
+                disk_limit,
                 // An overwrite of a row the tenant already owns changes no
                 // cardinality, wherever the old copy happened to live.
                 effect: if old.is_some() {
@@ -7163,6 +7339,7 @@ impl ShardSet {
             vector,
             tenant,
             limit,
+            disk_limit,
             // Hash placement never moves a row, so the shard's own answer to
             // "did I hold this id already" is the whole truth here - which is
             // exactly what `Insert` defers to.
@@ -7203,12 +7380,35 @@ impl ShardSet {
     /// owner map. That row is durable, acknowledged by the engine, and
     /// unreachable: an acknowledged write lost because a SIBLING was
     /// malformed.
+    ///
+    /// No tenant disk quota: equivalent to
+    /// [`vmset_with_disk_limit`](Self::vmset_with_disk_limit) with
+    /// `disk_limit: None`. See [`vset`](Self::vset) for why this stays the
+    /// name every existing caller keeps using untouched.
     pub async fn vmset(
         &self,
         name: &str,
         items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
         tenant: u128,
         limit: Option<u64>,
+    ) -> Vec<Result<(), ShardError>> {
+        self.vmset_with_disk_limit(name, items, tenant, limit, None)
+            .await
+    }
+
+    /// [`vmset`](Self::vmset), charging every item's staged payload blob
+    /// against the tenant's `max_disk_bytes` - see
+    /// [`vset_with_disk_limit`](Self::vset_with_disk_limit). Each item is
+    /// admitted independently, so one item refused by the disk quota does not
+    /// abort its siblings, matching every other per-item admission check
+    /// here.
+    pub async fn vmset_with_disk_limit(
+        &self,
+        name: &str,
+        items: Vec<(u64, Vec<f32>, Option<Bytes>)>,
+        tenant: u128,
+        limit: Option<u64>,
+        disk_limit: Option<u64>,
     ) -> Vec<Result<(), ShardError>> {
         let n = items.len();
         // Still concurrent, which is the whole point of the command: the
@@ -7241,7 +7441,10 @@ impl ShardSet {
                 let _inflight = vmset_inflight::Guard::enter();
                 (
                     i,
-                    this.vset(&name, id, vector, tenant, limit, payload).await,
+                    this.vset_with_disk_limit(
+                        &name, id, vector, tenant, limit, disk_limit, payload,
+                    )
+                    .await,
                 )
             });
             true
@@ -7518,6 +7721,12 @@ impl ShardSet {
                             vector,
                             tenant,
                             limit: None,
+                            // A relocation, not a client write growing the
+                            // tenant's bytes: it moves the blob that already
+                            // exists, and its source copy is reclaimed right
+                            // below. Charging it here would let a tenant
+                            // sitting at its disk limit get stuck mid-reshard.
+                            disk_limit: None,
                             // A reshard move: the row arrives, it is not new.
                             effect: crate::quota::QuotaEffect::Move,
                             version: Some(version),
@@ -7657,6 +7866,12 @@ impl ShardSet {
                         vector,
                         tenant,
                         limit: None,
+                        // Same reasoning as the reshard destination above: a
+                        // system-driven copy the maintenance loop decided to
+                        // make, not a client write. Refusing it here would
+                        // leave a boundary under-replicated for a tenant that
+                        // did nothing but reach its own limit.
+                        disk_limit: None,
                         // A boundary replica: a second physical copy of one
                         // logical row.
                         effect: crate::quota::QuotaEffect::Replica,
@@ -8493,6 +8708,7 @@ mod tests {
             vector,
             tenant: 0,
             limit: None,
+            disk_limit: None,
             effect: crate::quota::QuotaEffect::Move,
             version: Some(version),
             payload: Some(Bytes::from_static(blob.as_bytes())),

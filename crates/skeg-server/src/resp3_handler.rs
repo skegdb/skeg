@@ -1216,11 +1216,22 @@ async fn skeg_vset(
         Ok(s) => s,
         Err(e) => return e,
     };
-    // Limit comes from the pluggable backend; `None` (no backend / unlimited)
-    // skips quota enforcement entirely.
+    // Limits come from the pluggable backend; `None` (no backend / unlimited)
+    // skips the corresponding enforcement entirely. `max_disk_bytes` covers
+    // the payload blob the same way it already covers a KV `SET`
+    // (`docs/adr-payload-transaction.md`, "Disk quota").
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
+    let disk_limit = tenant_backend.and_then(|b| b.limits(tenant).max_disk_bytes);
     match shards
-        .vset(&scoped, id, vector, tenant_u128(tenant), limit, payload)
+        .vset_with_disk_limit(
+            &scoped,
+            id,
+            vector,
+            tenant_u128(tenant),
+            limit,
+            disk_limit,
+            payload,
+        )
         .await
     {
         Ok(()) => Frame::ok(),
@@ -1334,8 +1345,9 @@ async fn skeg_vmset(
         Err(e) => return e,
     };
     let limit = tenant_backend.and_then(|b| b.limits(tenant).max_vectors);
+    let disk_limit = tenant_backend.and_then(|b| b.limits(tenant).max_disk_bytes);
     let results = shards
-        .vmset(&scoped, items, tenant_u128(tenant), limit)
+        .vmset_with_disk_limit(&scoped, items, tenant_u128(tenant), limit, disk_limit)
         .await;
     // An array of n, one per item, in request order: `+OK` or that item's
     // error. The count this used to return could not name the item that
@@ -2262,7 +2274,17 @@ async fn kv_mset(
         .zip(args.chunks(2))
         .map(|(k, c)| (k.as_bytes().as_ref(), c[1].as_ref()))
         .collect();
-    match shards.mset(&pairs, DEFAULT_DURABILITY).await {
+    // Every key of one MSET is scoped under the SAME connection tenant, so
+    // one lookup covers the whole batch - same disk quota, same source, as
+    // a single SET's.
+    let accounting_tenant = scoped
+        .first()
+        .map_or(tenant_u128(tenant), ScopedKey::accounting_tenant);
+    let disk_limit = ctx.and_then(|b| b.limits(tenant).max_disk_bytes);
+    match shards
+        .mset_with_disk_limit(&pairs, DEFAULT_DURABILITY, accounting_tenant, disk_limit)
+        .await
+    {
         Ok(()) => Frame::ok(),
         Err(e) => shard_error(&e),
     }
