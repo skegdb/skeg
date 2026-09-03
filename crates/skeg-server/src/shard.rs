@@ -4993,20 +4993,41 @@ async fn process(
                     // lock; the blob in the vLog is reclaimed by the await below.
                     let (result, held, generation) = {
                         let mut g = arc.write();
-                        // The version of the copy being removed, read BEFORE
-                        // the tombstone lands on top of it: after the delete
-                        // `version_of` answers about the tombstone, and the
-                        // blob is filed under the row.
-                        let held = g.backend.version_of(id).get();
                         let generation = g.generation;
-                        // Saturating, same reason as the write path.
-                        let version = version
-                            .map_or_else(|| VectorVersion::new(held).next(), VectorVersion::new);
-                        let r = g.backend.delete(id, version);
-                        if matches!(r, Ok(true)) {
-                            g.payload.remove(id);
+                        // `version: None` with `effect: Delete` means the
+                        // coordinator's owner map had nothing to say about
+                        // this id (unrouted, or not migrated here yet): this
+                        // shard - the one `point_shard` would send an
+                        // unrouted write to - is the only authority on
+                        // whether it holds the row at all, and this is that
+                        // check, under the same write lock the delete would
+                        // take. An id it never held gets a no-op: no
+                        // version allocated, no WAL record, no tombstone
+                        // (P0-B, audit 16). A relocation (`Move`/`Replica`)
+                        // always carries its own version and never reaches
+                        // this branch.
+                        if version.is_none()
+                            && matches!(effect, crate::quota::QuotaEffect::Delete)
+                            && !g.backend.contains(id)
+                        {
+                            (Ok(false), 0, generation)
+                        } else {
+                            // The version of the copy being removed, read
+                            // BEFORE the tombstone lands on top of it: after
+                            // the delete `version_of` answers about the
+                            // tombstone, and the blob is filed under the row.
+                            let held = g.backend.version_of(id).get();
+                            // Saturating, same reason as the write path.
+                            let version = version.map_or_else(
+                                || VectorVersion::new(held).next(),
+                                VectorVersion::new,
+                            );
+                            let r = g.backend.delete(id, version);
+                            if matches!(r, Ok(true)) {
+                                g.payload.remove(id);
+                            }
+                            (r, held, generation)
                         }
-                        (r, held, generation)
                     };
                     match result {
                         Ok(existed) => {
@@ -7927,17 +7948,28 @@ impl ShardSet {
         // interleaving to lose as the write does.
         let _guard = self.owner_stripe(name, id).lock().await;
         let shard = self.point_shard(name, id);
-        // A user delete allocates, exactly like a user write: the tombstone
-        // has to beat every copy of the row that exists, including one a
-        // concurrent relocation is still carrying.
+        // A user delete allocates a version ONLY when the owner map already
+        // authoritatively names this row: the same rule a routed write
+        // follows, and it is what lets the tombstone beat every copy that
+        // exists, including one a concurrent relocation is still carrying.
+        //
+        // An id absent from the map is NOT necessarily unknown - it is also
+        // the normal state of a row a routed index has not migrated here
+        // yet, which `point_shard` sends to the same hash-placed shard an
+        // unrouted write would use. So when the map has nothing, no version
+        // is pre-allocated here: the shard `point_shard` names is the only
+        // authority on whether it holds this id at all, and it decides that
+        // under its own write lock, exactly like an unrouted `vset`
+        // (`version: None`, `shard.rs:7172`). An id neither this shard nor
+        // any owner map has ever seen then costs nothing - no version, no
+        // WAL record, no tombstone (P0-B, audit 16).
         let known = self
             .inner
             .owners
             .read()
             .get(name)
-            .and_then(|m| m.get(&id).map(|&(_, _, v)| v))
-            .unwrap_or(0);
-        let version = self.next_version(name, known);
+            .and_then(|m| m.get(&id).map(|&(_, _, v)| v));
+        let version = known.map(|known| self.next_version(name, known));
         let req = ShardReq::Vdel {
             name: name.to_owned(),
             id,
@@ -7945,7 +7977,7 @@ impl ShardSet {
             // The row really is leaving the tenant: this is the one delete
             // that credits the quota.
             effect: crate::quota::QuotaEffect::Delete,
-            version: Some(version),
+            version,
         };
         let existed = match self.call(shard, req).await? {
             ShardResp::Existed(b) => b,
@@ -7954,7 +7986,9 @@ impl ShardSet {
             _ => return Err(ShardError::Unavailable),
         };
         // A replicated id dies everywhere: the replica must not survive as a
-        // ghost the search could resurrect.
+        // ghost the search could resurrect. A replica slot only exists in the
+        // owner map, so this is reachable only when `known` (and therefore
+        // `version`) was `Some`.
         let replica = self
             .inner
             .owners
@@ -7962,6 +7996,8 @@ impl ShardSet {
             .get(name)
             .and_then(|m| m.get(&id).and_then(|&(_, r, _)| r));
         if let Some(rep) = replica {
+            let version =
+                version.expect("a replica entry only exists on a row the owner map named");
             // A failed replica delete must not report success and drop the map
             // entry: that would leave a resurrectable ghost (review finding).
             match self
