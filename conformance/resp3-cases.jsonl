@@ -68,6 +68,7 @@
 {"id": "vindex.create.arity", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbad"], "want": {"error_contains": "want name dim [kind] backend"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
 {"id": "vindex.create.bad.dim", "cmd": ["SKEG.VINDEX.CREATE", "cfidxbad", "abc", "int8", "flat"], "want": {"error_contains": "dim"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
 {"id": "vindex.name.rejects.tenant.separator", "cmd": ["SKEG.VINDEX.CREATE", "a::b", "8", "int8", "flat"], "want": {"error_contains": "must not contain '::'"}}
+{"id": "vindex.name.rejects.a.crafted.tenant.scope", "cmd": ["SKEG.VINDEX.CREATE", "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a::x", "8", "int8", "flat"], "want": {"error_contains": "must not contain '::'"}, "note": "the shape that matters: a name spelling another tenant's 32-hex scope key. The tenant is derived from the key by ERASE TENANT and by the payload warm-up, so a client must not be able to write one."}
 {"id": "vindex.name.rejects.traversal", "cmd": ["SKEG.VINDEX.CREATE", "../escape", "8", "int8", "flat"], "want": {"error_contains": "[A-Za-z0-9._-] only"}}
 {"id": "vindex.name.rejects.empty", "cmd": ["SKEG.VINDEX.CREATE", "", "8", "int8", "flat"], "want": {"error_contains": "1-255 chars"}}
 {"id": "vset.basic", "cmd": ["SKEG.VSET", "cfidxi8", "1", "f32:[1,0,0,0,0,0,0,0]"], "want": {"simple": "OK"}}

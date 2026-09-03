@@ -29,6 +29,8 @@
 {"id": "vindex.create.v2.tq2", "op": "vindex_create", "version": 2, "args": {"name": "cfntq2", "dim": 8, "kind": 4, "backend": 1}, "want": {"op": "ok"}}
 {"id": "vindex.create.v2.tq4", "op": "vindex_create", "version": 2, "args": {"name": "cfntq4", "dim": 8, "kind": 5, "backend": 1}, "want": {"op": "ok"}}
 {"id": "vindex.create.v2.rejects.unknown.kind", "op": "vindex_create", "version": 2, "args": {"name": "cfnbad", "dim": 8, "kind": 6, "backend": 0}, "want": {"error_contains": "native v2 kind must be"}}
+{"id": "vindex.create.v1.rejects.tenant.scope", "op": "vindex_create", "version": 1, "args": {"name": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a::x", "dim": 8, "kind": 0, "backend": 0}, "want": {"error_contains": "must not contain '::'"}, "note": "the native protocol has no tenant of its own - it is always tenant 0 with the raw name - so this door is where a crafted scope prefix used to walk in."}
+{"id": "vindex.create.v2.rejects.tenant.scope", "op": "vindex_create", "version": 2, "args": {"name": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a::x", "dim": 8, "kind": 4, "backend": 1}, "want": {"error_contains": "must not contain '::'"}}
 {"id": "vindex.list.v1.refuses.turboquant", "op": "vindex_list", "version": 1, "args": {}, "want": {"error_contains": "native v1 cannot represent TurboQuant indexes"}}
 {"id": "vindex.list.v2.reports.rows", "op": "vindex_list", "version": 2, "args": {}, "want": {"rows_contain": ["cfntq4", "cfni8"]}}
 {"id": "vset.v1", "op": "vset", "version": 1, "args": {"name": "cfni8", "id": 1, "vector": [1, 0, 0, 0, 0, 0, 0, 0]}, "want": {"op": "ok"}}
