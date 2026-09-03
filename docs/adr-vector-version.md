@@ -135,7 +135,29 @@ back means restoring it from before the upgrade.
   a versioned client still resolves duplicates by shard number.
 - **The flat backend** records a tombstone for a versioned delete of an id it has
   never held, but not for a legacy one - version zero could not win that
-  comparison anyway.
+  comparison anyway. Same rule on the disk (vamana) backend: a WAL `Delete`
+  record and a `tombstones` entry.
+- **A USER delete never reaches that branch for an id nothing wrote.**
+  `ShardSet::vdel` only allocates a version - and only then sends the backend
+  a versioned delete at all - when the owner map already authoritatively
+  names the row (`QuotaEffect::Delete`, `version: Some`). An id absent from
+  the map is not necessarily unknown - it is also the normal state of a row a
+  routed index has not migrated here yet - so the coordinator defers to the
+  shard `point_shard` would place it on (`version: None`, the same pattern an
+  unrouted `vset` already uses) and that shard checks `backend.contains(id)`
+  under its own write lock before doing anything. An id truly never written
+  costs nothing there: no version, no WAL record, no tombstone. This is what
+  used to let `SKEG.VDEL idx <random id>` in a loop grow the flat
+  `absent_tombstones` map (16 B/call) or the disk WAL and `tombstones` map
+  without bound and without touching quota (P0-B, audit 16). The anti-
+  resurrection tombstone described above - for a relocation's far side, or a
+  boundary replica taken back - is unaffected: `reshard`, `overlap`'s undo,
+  and the routed-and-present path all carry a pre-allocated version
+  (`QuotaEffect::Move` / `Replica`, or `Delete` with the map's own version),
+  never the `None` this no-op path requires, so they never take it. Its
+  reclamation horizon is the one already described: released the moment the
+  row it stood for is written again, or dropped at the next fold that masks
+  it.
 - **Durability of the version is the durability of the write it belongs to.**
   The WAL is `Relaxed` (OS buffer, no fsync per record); a version is exactly as
   durable as the vector it describes, no more and no less.
