@@ -252,3 +252,14 @@ pub fn file_key(file: &PlatformFile) -> u64 {
     let _ = file;
     0
 }
+
+/// The `io::Error` a fired commit failpoint stands in for.
+///
+/// One shape for every point, and deliberately `ErrorKind::Other`: a caller
+/// that special-cases `StorageFull` to surface ENOSPC to its own user must not
+/// be reachable from an armed failpoint, or a test could pass down a branch no
+/// injected failure is allowed to take.
+#[must_use]
+pub(crate) fn injected(what: &'static str) -> std::io::Error {
+    std::io::Error::other(format!("commit failpoint: {what}"))
+}

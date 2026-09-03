@@ -15,6 +15,7 @@ use skeg_platform::PlatformFile;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
+use crate::failpoint::{self, CommitFailpoint};
 use crate::shared_committer::{SharedCommitter, SharedCommitterEntry};
 
 const MAX_BATCH_BYTES: usize = 256 * 1024; // 256 KB
@@ -200,7 +201,20 @@ async fn committer_task(
                 match msg {
                     None => {
                         // Channel closed: flush remaining entries and exit.
-                        flush_batch(&file, &mut batch, &mut w_offset).await;
+                        //
+                        // Nobody is left to answer, which is exactly why this
+                        // used to be discarded - and exactly why it has to be
+                        // said out loud instead: a shutdown that could not
+                        // land its last batch is otherwise indistinguishable
+                        // from a clean one. The waiters of that batch still
+                        // get their `Err` from inside `flush_batch`; this is
+                        // for the operator, who has no waiter.
+                        if let Err(e) = flush_batch(&file, &mut batch, &mut w_offset).await {
+                            tracing::error!(
+                                error = %e,
+                                "group committer: the last flush before shutdown did not land"
+                            );
+                        }
                         return;
                     }
                     Some(Msg::Write(req)) => {
@@ -209,9 +223,9 @@ async fn committer_task(
                         batch_bytes >= MAX_BATCH_BYTES || batch.len() >= MAX_BATCH_ENTRIES
                     }
                     Some(Msg::Flush(reply_tx)) => {
-                        flush_batch(&file, &mut batch, &mut w_offset).await;
+                        let result = flush_batch(&file, &mut batch, &mut w_offset).await;
                         batch_bytes = 0;
-                        let _ = reply_tx.send(Ok(()));
+                        let _ = reply_tx.send(result);
                         false
                     }
                 }
@@ -222,16 +236,37 @@ async fn committer_task(
         };
 
         if flush {
-            flush_batch(&file, &mut batch, &mut w_offset).await;
+            // A size- or timer-triggered flush has no caller waiting on a
+            // result: every waiter in the batch is answered individually
+            // inside `flush_batch`. The failure is still worth a line, because
+            // it is the first sign the disk under this store is going.
+            if let Err(e) = flush_batch(&file, &mut batch, &mut w_offset).await {
+                tracing::error!(error = %e, "group committer: batch flush did not land");
+            }
             batch_bytes = 0;
         }
     }
 }
 
-async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &mut u64) {
+/// Commit `batch` to `file` and answer every waiter in it.
+///
+/// Returns what the batch actually achieved, which is not the same question as
+/// what each waiter is owed: the waiters are answered here either way, and the
+/// result is for the caller who asked for a barrier. `Ok(())` means the bytes
+/// are on the disk at the durability the batch asked for; an `Err` means they
+/// are not, and no caller may treat the flush as one.
+///
+/// An empty batch is `Ok(())`: there was nothing to make durable. Everything
+/// that came before it was answered by its own flush.
+async fn flush_batch(
+    file: &PlatformFile,
+    batch: &mut Vec<WriteReq>,
+    w_offset: &mut u64,
+) -> io::Result<()> {
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
+    let fp_key = failpoint::file_key(file);
 
     // Assign sequential offsets and find the strongest durability any entry
     // in this batch asked for. Each entry's buffer is *moved* out into
@@ -262,7 +297,11 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
     // be mistaken for live data. We preserve the original `ErrorKind`
     // (in particular `StorageFull`) when propagating to the waiter so the
     // caller can detect ENOSPC and surface it to its own user.
-    let write_result = file.write_vectored_at(*w_offset, chunks).await;
+    let write_result = if failpoint::hit(CommitFailpoint::PerFileBatchWrite, fp_key) {
+        Err(failpoint::injected("per-file batch write"))
+    } else {
+        file.write_vectored_at(*w_offset, chunks).await
+    };
     match write_result {
         Ok(()) => {
             // Telemetry: tick one batch per call regardless of durability,
@@ -273,24 +312,28 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
                 skeg_telemetry::Counter::VlogPwritevBytesTotal,
                 total_bytes,
             );
-            let sync_result = match batch_durability {
-                Durability::Relaxed => Ok(()),
-                Durability::Kernel => {
-                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-                    file.sync_data().await
-                }
-                Durability::Power => {
-                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-                    // `is_size_fixed` is stable for the handle's whole
-                    // lifetime (set once by `preallocate`), so this
-                    // accurately reflects whether the flush that is about
-                    // to run will take the Linux fdatasync fast path.
-                    if file.is_size_fixed() {
-                        skeg_telemetry::tick_counter(
-                            skeg_telemetry::Counter::VlogFdatasyncFastPath,
-                        );
+            let sync_result = if failpoint::hit(CommitFailpoint::PerFileBatchSync, fp_key) {
+                Err(failpoint::injected("per-file batch sync"))
+            } else {
+                match batch_durability {
+                    Durability::Relaxed => Ok(()),
+                    Durability::Kernel => {
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                        file.sync_data().await
                     }
-                    file.sync_durable().await
+                    Durability::Power => {
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                        // `is_size_fixed` is stable for the handle's whole
+                        // lifetime (set once by `preallocate`), so this
+                        // accurately reflects whether the flush that is about
+                        // to run will take the Linux fdatasync fast path.
+                        if file.is_size_fixed() {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::VlogFdatasyncFastPath,
+                            );
+                        }
+                        file.sync_durable().await
+                    }
                 }
             };
             let sync_err = sync_result
@@ -318,6 +361,10 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
                 };
                 let _ = req.tx.send(result);
             }
+            match sync_err {
+                None => Ok(()),
+                Some((kind, msg)) => Err(count_failure(io::Error::new(kind, msg))),
+            }
         }
         Err(e) => {
             let kind = e.kind();
@@ -325,8 +372,20 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
             for req in batch.drain(..) {
                 let _ = req.tx.send(Err(io::Error::new(kind, msg.clone())));
             }
+            Err(count_failure(e))
         }
     }
+}
+
+/// Record that one batch did not become durable, and hand the error back.
+///
+/// Every failed flush passes through here, whoever asked for it - an explicit
+/// `flush()`, a full batch, the 200 µs timer, or the last one before shutdown -
+/// and in either committer. The counter is the only signal for the three of
+/// those that have no caller to answer.
+pub(crate) fn count_failure(e: io::Error) -> io::Error {
+    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogFlushFailures);
+    e
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -412,7 +471,6 @@ mod tests {
     /// is on stable storage. A failing disk must not be able to produce an
     /// `Ok(())` here.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn a_flush_over_a_batch_whose_write_failed_reports_the_failure() {
         force_per_file();
         let _counter = counter_guard().await;
@@ -462,7 +520,6 @@ mod tests {
     /// SD-1 again, for the half an environmental fault cannot express: the
     /// write succeeds and the sync does not.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn a_flush_over_a_batch_whose_sync_failed_reports_the_failure() {
         force_per_file();
         let _counter = counter_guard().await;
@@ -527,7 +584,6 @@ mod tests {
     /// SD-2: a shutdown that could not land its final batch must leave a
     /// trace. Silence is indistinguishable from success.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn the_last_flush_on_the_way_down_is_counted_not_discarded() {
         force_per_file();
         let _counter = counter_guard().await;
@@ -566,7 +622,6 @@ mod tests {
     /// and does not tick the failure counter. Without this a fix that always
     /// answers `Err` would pass every test above.
     #[tokio::test]
-    #[ignore = "opens in the commit that returns the real flush result"]
     async fn a_flush_that_landed_still_answers_ok() {
         force_per_file();
         let _counter = counter_guard().await;
