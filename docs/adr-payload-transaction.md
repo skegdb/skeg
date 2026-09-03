@@ -242,14 +242,46 @@ occurrence, the same way the per-key write loop already does) checked and
 reserved atomically, in the SAME critical section as `set_scoped` above,
 before a single byte of the batch is written - so a batch that would cross
 the limit writes NONE of its members, the same all-or-nothing contract
-`set_many` already has for a crash. One caveat inherited, not introduced:
-an `MSET` whose keys span shards was never atomic ACROSS shards (each
-shard's portion is its own commit, sequentially), so the disk quota follows
-the same shape - a batch split across two shards can have one shard's
-portion admitted and written before the other shard's is checked, and
-refused. A single-shard deployment, or a batch whose keys all hash to one
-shard, gets true all-or-nothing for the quota exactly as it already did for
-the write itself.
+`set_many` already has for a crash.
+
+That left one caveat, inherited rather than introduced, which audit/20 (B2)
+then called what it was: an `MSET` whose keys span shards was never atomic
+ACROSS shards - each shard's portion is its own commit, run in sequence - so
+a batch split across two shards could have the first shard's portion admitted
+and durable before the second shard's was checked and refused. The client saw
+`ERR`. A durable write acknowledged as a failure is not a caveat, it is the
+one answer a store must never give, and documenting it does not make a
+command whose public meaning is all-or-nothing behave that way.
+
+**The span is refused, before the first write.** `ShardSet::mset_with_disk_limit`
+routes the batch over the borrowed keys first and, if they do not all land on
+one shard, returns `AdmissionError::CrossSlot` - before a byte is copied and
+before a shard worker is spoken to, so there is nothing that could have been
+made durable. On RESP3 that is Redis's own line,
+`CROSSSLOT Keys in request don't hash to the same slot`; on the native wire
+`ErrCode::InvalidRequest`; permanent on both, because the same keys hash the
+same way on every attempt. It is the semantics Redis Cluster gives the same
+shape, and it needs no cross-shard prepare/commit: what a real two-phase
+commit would buy is a batch that spans shards succeeding, not one failing
+more honestly, and that is a larger change than a release tranche should
+carry (see "What this deliberately does not do").
+
+There are no hash tags. `{tag}` is an ordinary part of the key and does not
+steer routing, so a client cannot force two keys onto one shard the way a
+Redis Cluster client can. Making `shard_for` tag-aware is not the cheap
+extension it looks like: routing is `xxh3_64(key) % n_shards` over the WHOLE
+scoped key, the shard count is pinned in `LAYOUT`, and each shard is its own
+store - so changing what is hashed would move every existing key containing
+braces to a different shard, leaving data that is still on disk and no longer
+reachable, with no migration in this release to move it. It would also have
+to read the tag out of the SCOPED key, whose first sixteen bytes are a raw
+tenant id that can contain `{` and `}` by coincidence. If hash tags are
+wanted later they belong with a routing version in `LAYOUT` and a migration,
+not in a point release.
+
+A batch whose keys all route to one shard - which is every batch on a
+single-shard deployment - is unaffected: one atomic `set_many`, its disk
+quota reserved before the first byte, exactly as above.
 
 ## Compatibility
 
@@ -317,3 +349,14 @@ partway.
 - **Two-phase commit across shards for VMSET.** For a command whose reason to
   exist is throughput, and whose per-item checks (quota, admission, dimension)
   are already per item.
+- **Two-phase commit across shards for MSET.** It would let a spanning batch
+  succeed rather than be refused, which is a feature and not a fix: the
+  correctness hole was a spanning batch being half durable behind an error,
+  and refusing the span closes that with no coordinator, no prepared state to
+  recover, and nothing new on disk. A prepare/commit protocol here means a
+  participant log, a recovery path for a coordinator that died between the two
+  phases, and a second durability contract to test - a release of its own, not
+  a line in this one.
+- **Redis hash tags in `shard_for`.** Reasons under "MSET" above: it would
+  silently relocate existing keys, and it would have to read the tag out of a
+  key whose first sixteen bytes are a raw tenant id.

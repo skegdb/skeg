@@ -221,6 +221,7 @@ spelling from it, so they cannot say different things.
 | request over a fixed ceiling (`SKEG.VMSET` items or bytes, native frame payload) | no | `-ERR ...: at most N, got M ...` | `2` InvalidRequest |
 | headroom could not be read at all | no | `-ERR ...` | `3` Internal |
 | vector of the wrong dimension | no | `-ERR vindex '...' dim N but vector has M` | `2` InvalidRequest |
+| `MSET` whose keys do not all route to one shard | no | `-CROSSSLOT Keys in request don't hash to the same slot` | `2` InvalidRequest |
 
 **RESP3: two words mean retry, not one.** `BACKPRESSURE` for everything the
 server decides, and `RATELIMITED` for a tenant backend's rate limit, which is
@@ -230,6 +231,17 @@ backend can introduce a fourth word this server has never seen, which it
 classifies as permanent and counts in
 `skeg_backend_refusal_unclassified_total`. On the native wire there is no such
 ambiguity: one byte, `0x04`.
+
+**And one word means "never", not "not now".** `CROSSSLOT` is the last row of
+the table and the one exception to "permanent is spelled `ERR`": Redis spells
+a multi-key command whose keys do not share a slot that way, and a client that
+already routes on the word should not have to learn a second spelling for the
+same condition. It is permanent - the same keys hash the same way on every
+attempt - so a client's `is_retryable` table must place it on the give-up
+side, and its caller must split the batch rather than resend it.
+`skeg_crossslot_refused_total` counts these; a climb is a client that is
+sending multi-key `MSET`s to a multi-shard store and getting none of them
+written.
 
 An unclassified backend refusal is `3` Internal there, not `2`: what failed
 is the server's reading of the backend's answer, and the caller's request may
