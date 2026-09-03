@@ -9,6 +9,36 @@ repository.
 
 ## [Unreleased]
 
+### A tenant is not something a client can spell
+
+A vindex map key carries its tenant as a `<32 hex>::<name>` prefix, and five
+places read the owner back OUT of that key and act on it: `ERASE TENANT` to
+decide what to destroy, the payload warm-up at open to decide whose blobs to
+read, two blob sweeps to decide what to reclaim, and the tiering stats to
+decide which tenant to report. That is sound only while the prefix can only
+have been written by the server, and it could not be - the name charset
+allowed `:`, tenant `0` is stored unscoped, and the native binary protocol is
+always tenant `0` with the client's raw name. So a client could create an
+index literally named `<another tenant's 32 hex>::x`, and all five sites read
+it as that tenant's: `ERASE TENANT` for the named tenant deleted it - vectors,
+payload blobs and quota - while reporting zero indexes erased, and that tenant
+could no longer create its own index of that name.
+
+**A raw, client-supplied vindex name containing `::` is now refused at
+create**, on the RESP3 command, on the native protocol, and on the library's
+`ShardSet::vindex_create`. A caller that has already scoped a name against a
+tenant it authenticated uses `vindex_create_scoped` instead; in this
+repository that is the RESP3 layer, which refuses the separator in the raw
+name before prepending its own prefix. Nothing else changes: a name without
+`::` behaves exactly as before, and existing indexes keep their keys.
+
+At open, the registry additionally refuses any key that
+`scope_key(unscope_key(k))` does not reproduce, naming the key in the error. A
+key the server's own round trip does not reproduce cannot have been written by
+the server, so there is no owner to serve it under - and serving it under a
+guess is the misattribution the create door exists to prevent. The registry
+format is unchanged.
+
 ### A vector and its payload are one write
 
 `SKEG.VSET name id vector payload` published the vector first and its blob
