@@ -489,4 +489,36 @@ mod tests {
             "the tenant's row was overwritten or deleted from the native listener"
         );
     }
+
+    #[tokio::test]
+    #[ignore = "red until native VINDEX.LIST hides tenant-scoped names"]
+    async fn native_vindex_list_does_not_name_other_tenants_indexes() {
+        // The last asymmetry between the two handlers over one store. RESP3
+        // hides every `::` name from an anonymous connection; the native arm
+        // listed the lot - scoped name, dim, kind and vector count for every
+        // index of every tenant, to a connection that authenticated as nobody.
+        // The scoped name IS the tenant id in hex, so the listing enumerates
+        // the tenants as well as their indexes.
+        //
+        // Metadata only - the ops themselves refuse `::` - but two handlers on
+        // one store answering differently is a defect, not a decision.
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let theirs = format!("{}::idx", "2a".repeat(16));
+        shards.vindex_create_scoped(&theirs, 4, 0, 0).await.unwrap();
+        shards.vindex_create("mine", 4, 0, 0).await.unwrap();
+
+        let frame = native_roundtrip(&shards, skeg_proto::encode_vindex_list(1)).await;
+        assert_eq!(frame.header.op, skeg_proto::Op::Ok, "expected a listing");
+        let rows = skeg_proto::decode_vindex_list_response(&frame.payload);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("::")),
+            "the native listing names another tenant's index: {names:?}"
+        );
+        assert!(
+            names.contains(&"mine"),
+            "hiding scoped names must not hide this listener's own: {names:?}"
+        );
+    }
 }
