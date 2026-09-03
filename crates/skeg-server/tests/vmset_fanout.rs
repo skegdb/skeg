@@ -20,6 +20,13 @@ use skeg_server::shard::{ShardSet, VMSET_INFLIGHT, vmset_inflight};
 
 const DIM: u32 = 8;
 
+/// The peak counter is process-wide, so the two tests that provoke a fan-out
+/// take turns. Run together they measure their SUM - 126 against a bound of
+/// 64, which is a fact about the harness and not about the bound. A tokio
+/// mutex and not a std one: the workspace denies holding a blocking guard
+/// across an await, for a good reason that applies here too.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn items(n: usize) -> Vec<(u64, Vec<f32>, Option<bytes::Bytes>)> {
     (0..n as u64)
         .map(|id| (id, vec![0.5f32; DIM as usize], None))
@@ -29,8 +36,8 @@ fn items(n: usize) -> Vec<(u64, Vec<f32>, Option<bytes::Bytes>)> {
 /// The bound, watched rather than asserted from the constant: a test that
 /// checked `VMSET_INFLIGHT == 64` would pass against code that ignored it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in the next commit (shard: bound the VMSET fan-out)"]
 async fn a_maximum_vmset_never_runs_more_than_the_inflight_bound() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let shards = ShardSet::open(dir.path(), 2).expect("a store");
     shards
@@ -63,6 +70,7 @@ async fn a_maximum_vmset_never_runs_more_than_the_inflight_bound() {
 /// completion order, and one item's outcome must not decide another's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_larger_than_the_window_still_answers_in_request_order() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let shards = ShardSet::open(dir.path(), 2).expect("a store");
     shards

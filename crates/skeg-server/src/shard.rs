@@ -7090,8 +7090,25 @@ impl ShardSet {
         // in batches instead of one barrier per vector (100k: ~770s serial ->
         // ~34s). Only the ORDER is restored, by carrying the index with the
         // task rather than by waiting for each in turn.
+        //
+        // But bounded at [`VMSET_INFLIGHT`], which it was not: a maximum batch
+        // is 4096 items, so one connection opened 4096 tasks and the default
+        // connection limit made that four million. That memory is per REQUEST
+        // and the ingress budget does not charge it - the budget covers the
+        // socket buffers, not the tree a request expands into - so the only
+        // ceiling it had was MAX_VMSET_ITEMS.
+        //
+        // Still spawned tasks rather than a buffered stream. A panic inside a
+        // task is that task's; a panic inside a stream's future unwinds into
+        // this call and takes every sibling with it, which is exactly the
+        // property Task 2 added the per-item answers for.
         let mut set = tokio::task::JoinSet::new();
-        for (i, (id, vector, payload)) in items.into_iter().enumerate() {
+        let mut pending = items.into_iter().enumerate();
+        let mut out: Vec<Option<Result<(), ShardError>>> = (0..n).map(|_| None).collect();
+        let mut spawn_next = |set: &mut tokio::task::JoinSet<_>| {
+            let Some((i, (id, vector, payload))) = pending.next() else {
+                return false;
+            };
             let this = self.clone();
             let name = name.to_owned();
             set.spawn(async move {
@@ -7101,17 +7118,27 @@ impl ShardSet {
                     this.vset(&name, id, vector, tenant, limit, payload).await,
                 )
             });
+            true
+        };
+        for _ in 0..VMSET_INFLIGHT {
+            if !spawn_next(&mut set) {
+                break;
+            }
         }
-        let mut out: Vec<Option<Result<(), ShardError>>> = (0..n).map(|_| None).collect();
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((i, r)) => out[i] = Some(r),
                 // A task that panicked names no item, so nothing can be said
                 // about a specific one. The `None`s below become
                 // `Unavailable`, which is the honest answer for an item whose
-                // outcome nobody observed.
+                // outcome nobody observed - and its siblings, which are their
+                // own tasks, are untouched.
                 Err(e) => tracing::error!(index = name, error = %e, "a VMSET item task failed"),
             }
+            // One out, one in: the window stays full until the batch runs out,
+            // so the bound costs a scheduling round trip per item and not a
+            // barrier per window.
+            spawn_next(&mut set);
         }
         out.into_iter()
             .map(|r| r.unwrap_or(Err(ShardError::Unavailable)))

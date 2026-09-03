@@ -61,6 +61,27 @@ bytes, and a RESP3 aggregate reserves the smallest of the count claimed,
 the existing 1024-slot ceiling, and the number of frames the buffered
 input could possibly contain.
 
+**One request's fan-out is now bounded too.** `SKEG.VMSET` answers per
+item, and to do that the coordinator spawns one task per item - which was
+unbounded, so a maximum batch was 4096 concurrent item writes on one
+connection and four million at the default connection limit. That is
+per-request memory and the ingress budget does not charge it: the budget
+covers the socket buffers, not the tree a single request expands into
+while it is being served. The window is now 64 (`VMSET_INFLIGHT`), one
+task out and one in, so results stay in request order and a panicking
+item still cannot take its siblings with it - both of which a buffered
+stream would have cost.
+
+Measured 2026-09-03, macOS arm64, release, driving `ShardSet::vmset`
+directly so the figure is the fan-out alone: 24 callers with one
+4096-item batch each cost **+208.0 and +209.9 MiB** resident unbounded,
+against **+25.0 and +28.0 MiB** with the window - 8.7 MiB per caller down
+to about 1.1. Batch throughput over seven runs of each: median 153,091
+items/s unbounded against 147,689 bounded, best 168,215 against 182,715.
+The window costs about three and a half per cent of the median and the
+run-to-run spread is wider than that, so 64 stands; nothing larger was
+needed.
+
 **What clients see.** A refusal that will not change - a frame larger
 than one connection may ever hold - comes back as
 `ERR ingress budget: this connection may hold at most N bytes and the
