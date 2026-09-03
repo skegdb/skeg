@@ -10643,7 +10643,6 @@ mod tests {
     /// is not there, so the slot is free - both in this process and in the one
     /// that opens the store next.
     #[tokio::test]
-    #[ignore = "opens in: quota: retry safety across the rebuild boundary"]
     async fn test_quota_retry_after_failed_insert_does_not_double_reserve() {
         const T: u128 = 31;
         const LIMIT: u64 = 3;
@@ -10722,6 +10721,78 @@ mod tests {
                 .await
                 .is_err(),
             "and the limit still binds"
+        );
+    }
+
+    /// A rebuilt count has to be a LIVE counter, not a number the open left
+    /// behind. The whole point of the rebuild is that a client which retries
+    /// after a restart gets the same answer it got before it - and that the
+    /// answer still changes when the tenant's contents do.
+    #[tokio::test]
+    async fn test_quota_rebuilt_count_still_moves_with_writes_and_deletes() {
+        const T: u128 = 43;
+        const LIMIT: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "lv");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..LIMIT {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(LIMIT), None)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                shards
+                    .vset(&name, 9, quota_row(9), T, Some(LIMIT), None)
+                    .await
+                    .is_err(),
+                "at the limit before the restart"
+            );
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        // The retry a refused client makes: same request, same answer.
+        assert!(
+            shards
+                .vset(&name, 9, quota_row(9), T, Some(LIMIT), None)
+                .await
+                .is_err(),
+            "the retry after the restart gets the answer the first attempt got"
+        );
+        // An overwrite is still free, and on the hash-placed path that
+        // decision is the receiving shard's own.
+        shards
+            .vset(&name, 0, quota_row(100), T, Some(LIMIT), None)
+            .await
+            .expect("an overwrite at the limit is free");
+        assert_eq!(shards.tenant_vector_count(T), LIMIT);
+        // And the rebuilt number is a counter, not a floor: a delete frees
+        // exactly one slot and the next write takes exactly that one.
+        assert!(shards.vdel(&name, 1, T).await.unwrap());
+        assert_eq!(shards.tenant_vector_count(T), LIMIT - 1);
+        shards
+            .vset(&name, 9, quota_row(9), T, Some(LIMIT), None)
+            .await
+            .expect("the freed slot is usable");
+        assert!(
+            shards
+                .vset(&name, 10, quota_row(10), T, Some(LIMIT), None)
+                .await
+                .is_err(),
+            "and only that one"
+        );
+        drop(shards);
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            LIMIT,
+            "the second open counts what the first one's writes and delete left"
         );
     }
 
