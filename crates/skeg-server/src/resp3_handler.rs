@@ -125,7 +125,7 @@ fn auth_clear(ip: IpAddr) {
 /// can pin while a frame is mid-flight, so a desynced or dribbled
 /// never-completing frame cannot grow the buffer without bound (and N
 /// connections cannot each pin more than this).
-const MAX_CONN_BUFFER: usize = MAX_VMSET_BYTES + skeg_resp3::MAX_BULK_LEN + (1 << 20);
+pub(crate) const MAX_CONN_BUFFER: usize = MAX_VMSET_BYTES + skeg_resp3::MAX_BULK_LEN + (1 << 20);
 
 fn scope_vindex_or_reject(tenant: TenantId, raw_name: &str) -> Result<String, Frame> {
     if raw_name.contains("::") {

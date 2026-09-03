@@ -164,8 +164,7 @@ mod armed_state {
 pub use armed_state::{arm, armed, disarm, disarm_all, fired};
 
 #[cfg(any(test, feature = "failpoints"))]
-mod armed_at_state {
-    use super::WriteFailpoint;
+mod keyed_state {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -177,119 +176,267 @@ mod armed_at_state {
         fired: bool,
     }
 
-    /// Bits with at least one key armed anywhere in the process.
+    /// A process-wide, key-scoped arming table for one FAMILY of failpoints.
     ///
-    /// The guarded sites sit on the vector write path, and under
-    /// `cargo test --workspace` the feature is on for every consumer of this
-    /// crate - so the cost of a DISARMED point has to be nothing worth
-    /// measuring. One relaxed load, and the mutex below is touched only once
-    /// a test has armed that exact point.
-    static ANY: AtomicU64 = AtomicU64::new(0);
-    static STATE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
-
-    fn with<R>(f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
-        // A poisoned lock here means a test panicked mid-assertion; the state
-        // is a few booleans and recovering it is strictly better than turning
-        // every later test in the binary into a panic about the first one.
-        let mut g = STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut g)
+    /// One instance per enum, so a bit means the same thing everywhere it is
+    /// read: two enums sharing a table would have `1 << 0` name two different
+    /// sites, and arming one would fire the other.
+    pub struct KeyedRegistry {
+        /// Bits with at least one key armed anywhere in the process.
+        ///
+        /// The guarded sites sit on hot paths, and under `cargo test
+        /// --workspace` the feature is on for every consumer of this crate -
+        /// so the cost of a DISARMED point has to be nothing worth measuring.
+        /// One relaxed load, and the mutex below is touched only once a test
+        /// has armed that exact point.
+        any: AtomicU64,
+        state: Mutex<Vec<Entry>>,
     }
 
-    fn refresh_any(entries: &[Entry]) {
-        let mask = entries.iter().filter(|e| e.armed).fold(0, |m, e| m | e.bit);
-        ANY.store(mask, Ordering::Relaxed);
+    impl KeyedRegistry {
+        pub const fn new() -> Self {
+            Self {
+                any: AtomicU64::new(0),
+                state: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with<R>(&self, f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
+            // A poisoned lock here means a test panicked mid-assertion; the
+            // state is a few booleans and recovering it is strictly better
+            // than turning every later test in the binary into a panic about
+            // the first one.
+            let mut g = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&mut g)
+        }
+
+        fn refresh_any(&self, entries: &[Entry]) {
+            let mask = entries.iter().filter(|e| e.armed).fold(0, |m, e| m | e.bit);
+            self.any.store(mask, Ordering::Relaxed);
+        }
+
+        /// Make `bit` fail wherever it is reached FOR `key`, until disarmed.
+        /// Clears its fired flag, so [`KeyedRegistry::fired`] answers about
+        /// this arming.
+        ///
+        /// # Panics
+        ///
+        /// If `bit` is ALREADY armed for `key`. The mask is process-wide and
+        /// the key is a plain string, so isolation between two tests in one
+        /// binary rests entirely on their choosing different keys. Nothing
+        /// enforces that, and when it is broken the symptom is a test failing
+        /// because of what another test armed - the exact kind of failure that
+        /// gets rerun until it passes. A test that arms in a loop disarms each
+        /// time round, so this is never a legitimate state.
+        pub fn arm(&self, bit: u64, key: &str, what: &dyn std::fmt::Debug) {
+            self.with(|entries| {
+                match entries.iter_mut().find(|e| e.bit == bit && e.key == key) {
+                    Some(e) => {
+                        assert!(
+                            !e.armed,
+                            "{what:?} is already armed for '{key}': two tests in this \
+                             binary are sharing a failpoint key, so each can make \
+                             the other fail. Give them different keys."
+                        );
+                        e.armed = true;
+                        e.fired = false;
+                    }
+                    None => entries.push(Entry {
+                        bit,
+                        key: key.to_owned(),
+                        armed: true,
+                        fired: false,
+                    }),
+                }
+                self.refresh_any(entries);
+            });
+        }
+
+        /// Stop `bit` failing for `key`. The fired flag is left alone: a test
+        /// disarms before it asserts.
+        pub fn disarm(&self, bit: u64, key: &str) {
+            self.with(|entries| {
+                if let Some(e) = entries.iter_mut().find(|e| e.bit == bit && e.key == key) {
+                    e.armed = false;
+                }
+                self.refresh_any(entries);
+            });
+        }
+
+        /// Is `bit` armed for `key`? Records the hit.
+        pub fn armed(&self, bit: u64, key: &str) -> bool {
+            if self.any.load(Ordering::Relaxed) & bit == 0 {
+                return false;
+            }
+            self.with(|entries| {
+                match entries
+                    .iter_mut()
+                    .find(|e| e.bit == bit && e.key == key && e.armed)
+                {
+                    Some(e) => {
+                        e.fired = true;
+                        true
+                    }
+                    None => false,
+                }
+            })
+        }
+
+        /// Did `bit` fire for `key` since it was armed? Assert it: an armed
+        /// point that never fired means the test proved nothing.
+        pub fn fired(&self, bit: u64, key: &str) -> bool {
+            self.with(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.bit == bit && e.key == key && e.fired)
+            })
+        }
     }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+mod armed_at_state {
+    use super::WriteFailpoint;
+    use super::keyed_state::KeyedRegistry;
+
+    static WRITE: KeyedRegistry = KeyedRegistry::new();
 
     /// Make `fp` fail wherever it is reached FOR `key`, until it is disarmed.
     /// Clears its fired flag, so [`fired_at`] answers about this arming.
     ///
     /// # Panics
     ///
-    /// If `fp` is ALREADY armed for `key`. The mask is process-wide and the
-    /// key is a plain string, so isolation between two tests in one binary
-    /// rests entirely on their choosing different vindex names. Nothing
-    /// enforces that, and when it is broken the symptom is a test failing
-    /// because of what another test armed - the exact kind of failure that
-    /// gets rerun until it passes. A test that arms in a loop disarms each
-    /// time round, so this is never a legitimate state.
+    /// If `fp` is ALREADY armed for `key`; see [`KeyedRegistry::arm`].
     pub fn arm_at(fp: WriteFailpoint, key: &str) {
-        with(|entries| {
-            match entries
-                .iter_mut()
-                .find(|e| e.bit == fp.bit() && e.key == key)
-            {
-                Some(e) => {
-                    assert!(
-                        !e.armed,
-                        "{fp:?} is already armed for '{key}': two tests in this \
-                         binary are sharing a failpoint key, so each can make \
-                         the other fail. Give them different index names."
-                    );
-                    e.armed = true;
-                    e.fired = false;
-                }
-                None => entries.push(Entry {
-                    bit: fp.bit(),
-                    key: key.to_owned(),
-                    armed: true,
-                    fired: false,
-                }),
-            }
-            refresh_any(entries);
-        });
+        WRITE.arm(fp.bit(), key, &fp);
     }
 
     /// Stop `fp` failing for `key`. The fired flag is left alone: a test
     /// disarms before it asserts.
     pub fn disarm_at(fp: WriteFailpoint, key: &str) {
-        with(|entries| {
-            if let Some(e) = entries
-                .iter_mut()
-                .find(|e| e.bit == fp.bit() && e.key == key)
-            {
-                e.armed = false;
-            }
-            refresh_any(entries);
-        });
+        WRITE.disarm(fp.bit(), key);
     }
 
     /// Is `fp` armed for `key`? Called by [`crate::fp_at`], not usually by
     /// hand. Records the hit.
     #[must_use]
     pub fn armed_at(fp: WriteFailpoint, key: &str) -> bool {
-        if ANY.load(Ordering::Relaxed) & fp.bit() == 0 {
-            return false;
-        }
-        with(|entries| {
-            match entries
-                .iter_mut()
-                .find(|e| e.bit == fp.bit() && e.key == key && e.armed)
-            {
-                Some(e) => {
-                    e.fired = true;
-                    true
-                }
-                None => false,
-            }
-        })
+        WRITE.armed(fp.bit(), key)
     }
 
     /// Did `fp` fire for `key` since it was armed? Assert it: an armed point
     /// that never fired means the test proved nothing.
     #[must_use]
     pub fn fired_at(fp: WriteFailpoint, key: &str) -> bool {
-        with(|entries| {
-            entries
-                .iter()
-                .any(|e| e.bit == fp.bit() && e.key == key && e.fired)
-        })
+        WRITE.fired(fp.bit(), key)
     }
 }
 
 #[cfg(any(test, feature = "failpoints"))]
 pub use armed_at_state::{arm_at, armed_at, disarm_at, fired_at};
+
+/// A point on the INGRESS path - accept, buffer growth, connection close -
+/// that a test can make fail.
+///
+/// Its own enum, not more variants on [`WriteFailpoint`]. The two families
+/// have nothing to do with each other: one guards a durable write, the other
+/// guards an allocation, and a single enum would let an ingress test arm a
+/// bit a shard worker reads. Its own registry too, so the bits cannot collide.
+///
+/// KEYED, always. A connection runs on a task the accept loop spawned, so it
+/// is never on the thread that armed anything, and the per-thread mask cannot
+/// reach it. The key is the LISTENER PORT as a string: every test in this
+/// binary binds port 0 and gets its own, so isolation does not depend on
+/// anyone remembering to choose a unique name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressFailpoint {
+    /// The mid-frame `grow_to` in the RESP3 read loop: refuse the growth as if
+    /// the class cap were full, so the stall and the typed refusal can be
+    /// driven without really exhausting a budget.
+    GrowRefusedMidFrame,
+    /// The point where a closing connection is about to release its budget.
+    /// Marks that the close path was actually reached, so "the budget came
+    /// back" cannot pass on a connection that never got that far.
+    ReleaseDeferredOnClose,
+}
+
+impl IngressFailpoint {
+    /// This point's bit in its own registry. Exhaustive on purpose: a new
+    /// variant does not compile until it is given a bit.
+    #[cfg(any(test, feature = "failpoints"))]
+    const fn bit(self) -> u64 {
+        match self {
+            IngressFailpoint::GrowRefusedMidFrame => 1 << 0,
+            IngressFailpoint::ReleaseDeferredOnClose => 1 << 1,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+mod ingress_at_state {
+    use super::IngressFailpoint;
+    use super::keyed_state::KeyedRegistry;
+
+    static INGRESS: KeyedRegistry = KeyedRegistry::new();
+
+    /// Make `fp` fail for the listener on `key`, until it is disarmed.
+    ///
+    /// # Panics
+    ///
+    /// If `fp` is ALREADY armed for `key`; see [`KeyedRegistry::arm`].
+    pub fn arm_ingress_at(fp: IngressFailpoint, key: &str) {
+        INGRESS.arm(fp.bit(), key, &fp);
+    }
+
+    /// Stop `fp` failing for `key`. The fired flag is left for the assertion.
+    pub fn disarm_ingress_at(fp: IngressFailpoint, key: &str) {
+        INGRESS.disarm(fp.bit(), key);
+    }
+
+    /// Is `fp` armed for `key`? Records the hit.
+    #[must_use]
+    pub fn armed_ingress_at(fp: IngressFailpoint, key: &str) -> bool {
+        INGRESS.armed(fp.bit(), key)
+    }
+
+    /// Did `fp` fire for `key` since it was armed? Every ingress failpoint
+    /// test asserts this.
+    #[must_use]
+    pub fn fired_ingress_at(fp: IngressFailpoint, key: &str) -> bool {
+        INGRESS.fired(fp.bit(), key)
+    }
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+pub use ingress_at_state::{arm_ingress_at, armed_ingress_at, disarm_ingress_at, fired_ingress_at};
+
+/// Is `$fp` armed for `$key`, as a boolean?
+///
+/// The ingress family's form. Unlike [`fp_at!`] it does not `return`: an
+/// ingress site has to turn the hit into its own typed refusal, which is the
+/// value the caller then handles.
+#[macro_export]
+#[cfg(any(test, feature = "failpoints"))]
+macro_rules! fp_ingress {
+    ($fp:expr, $key:expr) => {
+        $crate::failpoint::armed_ingress_at($fp, $key)
+    };
+}
+
+/// The disabled expansion: still names the variant, so a renamed point fails
+/// to compile instead of quietly never firing.
+#[macro_export]
+#[cfg(not(any(test, feature = "failpoints")))]
+macro_rules! fp_ingress {
+    ($fp:expr, $key:expr) => {{
+        let _: $crate::failpoint::IngressFailpoint = $fp;
+        let _ = &$key;
+        false
+    }};
+}
 
 /// Fail at `$fp` with `$err` when the point is armed.
 ///
@@ -483,5 +630,30 @@ mod tests {
         let shared = "failpoint-unit-shared";
         arm_at(WriteFailpoint::VdelBlobDelete, shared);
         arm_at(WriteFailpoint::VdelBlobDelete, shared);
+    }
+
+    /// Two families, two registries. Bit 0 of the ingress enum and bit 0 of
+    /// the write enum are the same number, so a shared table would make
+    /// arming an ingress point fail a shard worker - under the same key, with
+    /// no test naming the site that broke.
+    #[test]
+    fn the_two_failpoint_families_do_not_share_a_table() {
+        use super::{
+            IngressFailpoint, arm_ingress_at, armed_at, armed_ingress_at, disarm_ingress_at,
+            fired_ingress_at,
+        };
+        let key = "failpoint-unit-families";
+        arm_ingress_at(IngressFailpoint::GrowRefusedMidFrame, key);
+        assert!(
+            !armed_at(WriteFailpoint::ReshardDestinationWrite, key),
+            "an ingress arming reached the write family"
+        );
+        assert!(armed_ingress_at(IngressFailpoint::GrowRefusedMidFrame, key));
+        assert!(
+            !armed_ingress_at(IngressFailpoint::ReleaseDeferredOnClose, key),
+            "one bit each"
+        );
+        disarm_ingress_at(IngressFailpoint::GrowRefusedMidFrame, key);
+        assert!(fired_ingress_at(IngressFailpoint::GrowRefusedMidFrame, key));
     }
 }

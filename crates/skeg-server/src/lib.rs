@@ -14,6 +14,7 @@ pub mod bind_policy;
 pub mod catalog_intent;
 pub mod failpoint;
 pub mod handler;
+pub mod ingress;
 pub mod layout_manifest;
 pub mod memory;
 pub mod payload;
@@ -35,6 +36,7 @@ use tracing::{info, warn};
 
 pub use bind_policy::{ALLOW_ENV, ALLOW_FLAG, check_unauthenticated_bind};
 use handler::handle_connection;
+pub use ingress::{ConnectionBudget, IngressBudget, IngressCap, IngressRejected};
 pub use quota::{TenantLimits, TenantQos, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
@@ -53,6 +55,14 @@ pub const DEFAULT_RW_TIER: QuantKind = QuantKind::TurboQuant { bits: 2 };
 pub struct Server {
     listener: TcpListener,
     shards: ShardSet,
+    /// The aggregate ingress budget. Built from the same `MemoryGovernor` the
+    /// shard set carries, so a byte a socket holds and a byte the delta holds
+    /// are counted in one place.
+    ingress: Arc<IngressBudget>,
+    /// Concurrent connections this listener will serve. Each one can buffer
+    /// up to the frame ceiling, so an unbounded accept loop is a memory-DoS
+    /// surface; both protocols hold a permit for the connection's lifetime.
+    max_connections: usize,
     /// Optional multi-tenant backend. `None` keeps single-tenant
     /// semantics; wiring an `Arc<dyn TenantBackend>` enables RESP3
     /// AUTH + per-tenant key scoping on this listener.
@@ -140,9 +150,15 @@ impl Server {
             data_dir, n_shards, false, tier, workers, mmap_tier, mmap_graph,
         )?;
         let listener = TcpListener::bind(addr).await?;
+        let ingress = Arc::new(ingress::IngressBudget::from_env(
+            Arc::clone(shards.memory()),
+            resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
         Ok(Self {
             listener,
             shards,
+            ingress,
+            max_connections: max_connections_from_env(),
             tenant_backend: None,
         })
     }
@@ -154,6 +170,37 @@ impl Server {
     #[must_use]
     pub fn with_tenant_backend(mut self, backend: Arc<dyn TenantBackend>) -> Self {
         self.tenant_backend = Some(backend);
+        self
+    }
+
+    /// Serve with the ingress budget supplied, instead of the one derived from
+    /// this process's memory governor.
+    ///
+    /// Exists so a test can bind a real listener against a budget it chose -
+    /// a cap of a few hundred kilobytes, refusals in milliseconds - rather
+    /// than by arranging for the machine to run out of memory. Same seam, and
+    /// the same reason, as `ShardSet::open_full_with_memory`.
+    #[must_use]
+    pub fn with_ingress_budget(mut self, budget: Arc<IngressBudget>) -> Self {
+        self.ingress = budget;
+        self
+    }
+
+    /// The ingress budget this server admits connections against.
+    #[must_use]
+    pub fn ingress(&self) -> &Arc<IngressBudget> {
+        &self.ingress
+    }
+
+    /// Serve at most `n` concurrent connections, instead of the figure
+    /// `SKEG_MAX_CONNECTIONS` supplies.
+    ///
+    /// A test seam, for the same reason as [`Server::with_ingress_budget`]:
+    /// the alternative is an environment variable, which is process-wide and
+    /// therefore shared by every test in the binary.
+    #[must_use]
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = n.max(1);
         self
     }
 
@@ -231,9 +278,15 @@ impl Server {
             ShardSet::open_mode_full_mmap(data_dir, n, true, tier, workers, mmap_tier, mmap_graph)?
         };
         let listener = TcpListener::bind(addr).await?;
+        let ingress = Arc::new(ingress::IngressBudget::from_env(
+            Arc::clone(shards.memory()),
+            resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
         Ok(Self {
             listener,
             shards,
+            ingress,
+            max_connections: max_connections_from_env(),
             tenant_backend: None,
         })
     }
@@ -270,6 +323,8 @@ impl Server {
         let Self {
             listener,
             shards,
+            ingress: _,
+            max_connections: _,
             tenant_backend: _,
         } = self;
         info!(addr = ?listener.local_addr()?, n_shards = shards.n_shards(), "server listening (binary protocol)");
@@ -294,6 +349,8 @@ impl Server {
         let Self {
             listener,
             shards,
+            ingress: _,
+            max_connections,
             tenant_backend,
         } = self;
         // Descriptor headroom, the way every production database handles it:
@@ -326,12 +383,7 @@ impl Server {
         // ceiling, so an unbounded accept loop is a memory-DoS surface
         // (review P0). SKEG_MAX_CONNECTIONS caps it; a permit is held for the
         // connection's lifetime.
-        let max_conns = std::env::var("SKEG_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(1024);
-        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_conns));
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
         loop {
             let (stream, _) = listener.accept().await?;
             // Acquire before spawning; if the pool is exhausted the accept
@@ -346,6 +398,22 @@ impl Server {
             });
         }
     }
+}
+
+/// Concurrent connections a listener serves unless told otherwise.
+///
+/// The default is a capacity decision, not a shell convention: each connection
+/// can hold its floor of the ingress budget for as long as it is open.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// `SKEG_MAX_CONNECTIONS`, or the default. An unparseable or zero value is
+/// "not set": a typo must not become a server that accepts nothing.
+fn max_connections_from_env() -> usize {
+    std::env::var("SKEG_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
 }
 
 /// Apply per-connection socket tuning: `TCP_NODELAY` for low-latency

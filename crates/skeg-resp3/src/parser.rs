@@ -33,6 +33,19 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// elements arrive (bounded anyway by the bytes actually sent).
 const PREALLOC_CAP: usize = 1024;
 
+/// How many slots to reserve for an aggregate of `frame_count` elements whose
+/// remaining input is `body_len` bytes.
+///
+/// The declared count is checked against `MAX_AGGREGATE_LEN`, but a header is
+/// eight bytes and the count it declares is a CLAIM. Reserving for the claim
+/// lets a few hundred bytes of nested headers hold megabytes, recreated on
+/// every read of a connection that never completes the frame. So the bytes
+/// that actually arrived get a vote.
+fn prealloc(frame_count: usize, body_len: usize) -> usize {
+    let _ = body_len;
+    frame_count.min(PREALLOC_CAP)
+}
+
 pub type ParseResult = Result<Option<(Frame, usize)>, ParseError>;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -209,7 +222,7 @@ fn parse_aggregate(body: &[u8], kind: AggKind, depth: usize) -> ParseResult {
     } else {
         count
     };
-    let mut items = Vec::with_capacity(frame_count.min(PREALLOC_CAP));
+    let mut items = Vec::with_capacity(prealloc(frame_count, body.len()));
     let mut consumed = len_end + 2;
     for _ in 0..frame_count {
         match parse_frame_depth(&body[consumed..], depth + 1)? {
@@ -225,7 +238,7 @@ fn parse_aggregate(body: &[u8], kind: AggKind, depth: usize) -> ParseResult {
         AggKind::Set => Frame::Set(items),
         AggKind::Push => Frame::Push(items),
         AggKind::Map => {
-            let mut pairs = Vec::with_capacity(count.min(PREALLOC_CAP));
+            let mut pairs = Vec::with_capacity(prealloc(count, consumed));
             let mut iter = items.into_iter();
             while let Some(k) = iter.next() {
                 // frame_count = 2 * count, so the value is always present.
@@ -358,6 +371,49 @@ fn parse_big_number(body: &[u8]) -> ParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An aggregate header is eight bytes and the count in it is a CLAIM. The
+    /// parser used to reserve for the claim: `*1048576\r\n` bought a million
+    /// slots, one per nesting level, live at once and rebuilt on every read of
+    /// a connection that never completes the frame - megabytes of heap from a
+    /// few hundred bytes of input, and the connection buffer's own ceiling
+    /// never sees them because they are not in the buffer.
+    ///
+    /// Reserve for the bytes that ARRIVED. Nothing declared can arrive in
+    /// fewer than three bytes per element, so the input still buffered is
+    /// itself the bound.
+    #[test]
+    #[ignore = "opens in commit 3 (resp3: preallocate for the bytes present)"]
+    fn a_resp3_aggregate_preallocates_only_for_bytes_that_arrived() {
+        // A million elements claimed, nothing behind the header.
+        assert_eq!(prealloc(MAX_AGGREGATE_LEN, 0), 0);
+        // Thirty bytes of input can hold at most ten frames, whatever the
+        // header says.
+        assert_eq!(prealloc(MAX_AGGREGATE_LEN, 30), 10);
+        // The `PREALLOC_CAP` ceiling still applies when plenty has arrived.
+        assert_eq!(prealloc(MAX_AGGREGATE_LEN, 1 << 20), PREALLOC_CAP);
+        // And an honest small aggregate is not made slower: it gets exactly
+        // what it asked for.
+        assert_eq!(prealloc(3, 1024), 3);
+
+        // The same rule seen through the parser: a real, complete aggregate
+        // comes back with a Vec sized for its elements, not for a claim.
+        let Some((Frame::Array(items), _)) = parse_frame(b"*3\r\n:1\r\n:2\r\n:3\r\n").unwrap()
+        else {
+            panic!("expected an array of three");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(
+            items.capacity() <= PREALLOC_CAP,
+            "capacity {} came from the header, not the bytes",
+            items.capacity()
+        );
+
+        // And the malicious header, end to end: a million claimed with eight
+        // bytes of body is incomplete, and must not have bought a million
+        // slots on the way to saying so.
+        assert!(parse_frame(b"*1048576\r\n:1\r\n").unwrap().is_none());
+    }
 
     fn done(input: &[u8]) -> (Frame, usize) {
         parse_frame(input)
