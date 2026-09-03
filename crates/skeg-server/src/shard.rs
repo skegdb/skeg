@@ -8041,6 +8041,11 @@ impl ShardSet {
             // Past everything on disk, so the next user write to this index
             // beats every copy the rebuild just saw.
             self.observe_version(&name, highest);
+            // Every shard has been scanned and nothing is published yet: the
+            // one instant at which a point op can still be reading the map
+            // this line is about to throw away. A test parks here and decides
+            // what runs during it.
+            crate::gate_at!(crate::failpoint::PlacementFailpoint::OwnerMapPublish, &name);
             self.inner.owners.write().insert(name, map);
         }
         Ok(())
