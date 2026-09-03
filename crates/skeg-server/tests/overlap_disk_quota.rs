@@ -32,6 +32,18 @@
 use skeg_server::shard::ShardSet;
 use skeg_telemetry::{Counter, counter_value};
 
+/// `skeg_overlap_replicas_skipped_quota_total` is process-wide, and a test
+/// binary runs its `#[tokio::test]` functions concurrently by default - so
+/// the tests below that assert a DELTA on it would otherwise measure each
+/// other's skips. Take turns instead, the same way `ingress_budget.rs` does
+/// with its own shared counter.
+///
+/// Held by every test that TICKS the counter as well as every test that
+/// reads it: a test that only skips replicas still moves the number another
+/// test is measuring, which is exactly how this file failed once under a
+/// full-package run before the two silent ones took their turn too.
+static SKIPPED_COUNTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const DIM: usize = 16;
 /// Big enough that one blob dominates the record and the arithmetic below is
 /// about payload bytes rather than key framing.
@@ -122,8 +134,8 @@ fn unit(total: u64) -> u64 {
 /// every replica is skipped, the counter says how many, and the tenant's
 /// physical bytes did not move.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn an_overlap_at_the_tenant_disk_limit_writes_no_replica_and_completes() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_01;
     let dir = tempfile::TempDir::new().unwrap();
     let (shards, name, at_limit) = seeded(dir.path(), T, "ov").await;
@@ -150,8 +162,8 @@ async fn an_overlap_at_the_tenant_disk_limit_writes_no_replica_and_completes() {
 /// The rows it skipped are exactly the rows it would have replicated with
 /// room: same fixture, same tau, one with headroom and one without.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn an_overlap_at_the_limit_skips_exactly_the_replicas_it_would_have_written() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_02;
     let roomy = tempfile::TempDir::new().unwrap();
     let (with_room, name, base) = seeded(roomy.path(), T, "ov").await;
@@ -184,8 +196,8 @@ async fn an_overlap_at_the_limit_skips_exactly_the_replicas_it_would_have_writte
 /// where an "abort the run on the first refusal" fix would look right and be
 /// wrong.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn an_overlap_with_room_for_one_replica_writes_one_and_skips_the_rest() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_04;
     let dir = tempfile::TempDir::new().unwrap();
     let (shards, name, base) = seeded(dir.path(), T, "ov").await;
@@ -210,8 +222,8 @@ async fn an_overlap_with_room_for_one_replica_writes_one_and_skips_the_rest() {
 /// The primary is untouched by a skip: every row still reads back, with its
 /// payload, and still answers a search.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn a_skipped_replica_leaves_the_primary_readable() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_05;
     let dir = tempfile::TempDir::new().unwrap();
     let (shards, name, at_limit) = seeded(dir.path(), T, "ov").await;
@@ -244,8 +256,8 @@ async fn a_skipped_replica_leaves_the_primary_readable() {
 /// is the ghost `an_overlap_that_fails_after_writing_a_replica_does_not_leave_a_ghost`
 /// is about; this is the same property for the refusal path.)
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn a_skipped_replica_leaves_no_copy_the_owner_map_does_not_name() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_06;
     let dir = tempfile::TempDir::new().unwrap();
     let (shards, name, at_limit) = seeded(dir.path(), T, "ov").await;
@@ -279,8 +291,8 @@ async fn a_skipped_replica_leaves_no_copy_the_owner_map_does_not_name() {
 /// were measured against - otherwise the limit binds differently before and
 /// after a restart.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn the_disk_counter_after_a_skipped_overlap_is_the_same_after_a_reopen() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_07;
     let dir = tempfile::TempDir::new().unwrap();
     let live = {
@@ -320,8 +332,8 @@ async fn the_disk_counter_after_a_skipped_overlap_is_the_same_after_a_reopen() {
 /// is charged for - the quota is the same physical counter, so "written as
 /// before" and "counted" are one assertion.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn an_overlap_below_the_tenant_disk_limit_writes_and_charges_its_replicas() {
+    let _turn = SKIPPED_COUNTER_TESTS.lock().await;
     const T: u128 = 0xB3_08;
     let dir = tempfile::TempDir::new().unwrap();
     let (shards, name, base) = seeded(dir.path(), T, "ov").await;
@@ -348,7 +360,6 @@ async fn an_overlap_below_the_tenant_disk_limit_writes_and_charges_its_replicas(
 /// And with no limit at all the path is what it always was: the same number
 /// of replicas, the same bytes.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn an_overlap_with_no_limit_replicates_exactly_as_before() {
     const T: u128 = 0xB3_09;
     let dir = tempfile::TempDir::new().unwrap();
@@ -366,7 +377,6 @@ async fn an_overlap_with_no_limit_replicates_exactly_as_before() {
 /// sides of it - which is why the move keeps no disk limit and the replica
 /// now takes one. Asserted here rather than argued in the ADR.
 #[tokio::test]
-#[ignore = "opens in the commit that skips an over-quota boundary replica"]
 async fn a_reshard_move_does_not_duplicate_a_blob() {
     const T: u128 = 0xB3_0A;
     let dir = tempfile::TempDir::new().unwrap();

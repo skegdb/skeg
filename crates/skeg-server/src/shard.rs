@@ -7917,6 +7917,28 @@ impl ShardSet {
                     let outcome = match self.call(usize::from(second), req).await {
                         Ok(ShardResp::Done) => Ok(()),
                         Ok(ShardResp::Err(e)) => Err(ShardError::Storage(e)),
+                        // The tenant has no room for a second copy of this
+                        // row's blob. Not an error: a replica is an
+                        // optimisation - the row is reachable through its
+                        // primary either way - so the answer is "not this
+                        // row", not "not this overlap". The refusal happens
+                        // inside `VLog::set_scoped` before a byte is
+                        // appended and before the vector commit, so there is
+                        // nothing here to undo and nothing to take back out:
+                        // no map entry, no second copy, no ghost.
+                        //
+                        // Deliberately NOT `continue`-on-any-refusal: a
+                        // memory refusal or a vector-quota refusal means the
+                        // shard could not do what it was asked, and reporting
+                        // that as a quiet skip would hide it.
+                        Ok(ShardResp::Refused(ShardError::Admission(
+                            crate::admission::AdmissionError::DiskQuota { .. },
+                        ))) => {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::OverlapReplicasSkippedQuota,
+                            );
+                            continue;
+                        }
                         Ok(ShardResp::Refused(e)) => Err(e),
                         Ok(_) => Err(ShardError::Unavailable),
                         Err(e) => Err(e),
