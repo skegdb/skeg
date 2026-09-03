@@ -4497,17 +4497,24 @@ async fn process(
                     let version =
                         version.unwrap_or_else(|| VectorVersion::new(previous).next().get());
                     let was_new = effect.charges(!existed_before);
-                    // Armed only by a test: the condition is real but needs a
-                    // tenant already at its ceiling, and the native listener
-                    // - always tenant `0` - has no limits to be at, so this
-                    // is how the same refusal is put on both wires.
-                    let quota_refused = crate::fp_admission!(
+                    // The failpoint supplies a LIMIT, not a refusal: with a
+                    // ceiling of zero the real `try_add` below does the
+                    // refusing, so what a test exercises is the production
+                    // path and not a branch beside it. It exists because the
+                    // native listener is always tenant `0`, which has no
+                    // limits to be at, and putting the same refusal on both
+                    // wires is the whole question.
+                    let limit = if crate::fp_admission!(
                         crate::failpoint::AdmissionFailpoint::QuotaRefusedAtVset,
                         &name
-                    );
+                    ) {
+                        Some(0)
+                    } else {
+                        limit
+                    };
                     if was_new
                         && let Some(max) = limit
-                        && (quota_refused || quota.try_add(tenant, 1, max).is_err())
+                        && quota.try_add(tenant, 1, max).is_err()
                     {
                         skeg_telemetry::tick_counter(skeg_telemetry::Counter::QuotaRefused);
                         return ShardResp::Refused(ShardError::Admission(
@@ -4522,6 +4529,13 @@ async fn process(
                     // the request.
                     let want = idx.backend.resident_bytes()
                         + (vector.len() * std::mem::size_of::<f32>()) as u64;
+                    // The failpoint stands in for the governor's answer, the
+                    // way the ingress one stands in for a full class: really
+                    // exhausting a process-wide headroom from inside a test
+                    // that runs beside others is not something a test may do.
+                    // What it does NOT stand in for is anything after this
+                    // point - the refund, the counter, the reply - which is
+                    // the part under test.
                     let forced = crate::fp_admission!(
                         crate::failpoint::AdmissionFailpoint::MemoryRefusedAtVset,
                         &name

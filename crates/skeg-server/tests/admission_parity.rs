@@ -340,6 +340,7 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                     b"SKEG.VINDEX.CREATE",
                     name.as_bytes(),
                     b"4",
+                    b"flat",
                 ]))
                 .await;
             let created = read_resp3_line(&mut conn).await.expect("create replies");
@@ -388,6 +389,7 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                     b"SKEG.VINDEX.CREATE",
                     name.as_bytes(),
                     b"4",
+                    b"flat",
                 ]))
                 .await;
             let created = read_resp3_line(&mut conn).await.expect("create replies");
@@ -529,7 +531,6 @@ fn oversized_header(payload_len: u32) -> Vec<u8> {
 // ----------------------------------------------------------------- the test
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in `native: refuse an oversized frame by name, not by silence`"]
 async fn every_admission_refusal_says_the_same_thing_on_both_wires() {
     for cond in Condition::ALL {
         let (want_retryability, want_code) = cond.expected();
@@ -597,7 +598,6 @@ async fn every_admission_refusal_says_the_same_thing_on_both_wires() {
 /// close the socket without a word, which a client reads as a network fault
 /// and answers with a reconnect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opens in `native: refuse an oversized frame by name, not by silence`"]
 async fn a_frame_over_the_connection_allowance_is_refused_by_name_not_by_silence() {
     let ingress = budget(256 * 1024, Duration::from_millis(50));
     let server = native_server(&ingress, 16).await;

@@ -179,7 +179,9 @@ impl fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ingress(e) => write!(f, "{e}"),
-            Self::MemoryAtWrite(e) => write!(f, "out of memory budget: {e}"),
+            // `MemoryRejected` already opens with "memory budget:", so this
+            // says where the refusal happened and lets the governor say why.
+            Self::MemoryAtWrite(e) => write!(f, "out of budget at the write: {e}"),
             Self::QuotaExceeded { tenant, limit } => write!(
                 f,
                 "tenant vector quota exceeded: tenant {tenant:#034x} may hold {limit} vectors"

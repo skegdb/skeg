@@ -129,6 +129,31 @@ pub async fn handle_connection(
             }
             Err(e) => {
                 warn!(?peer, "protocol error: {e}");
+                // A frame larger than this connection may ever hold is
+                // REFUSED, not ignored. The parser catches it on the 24 bytes
+                // that declared the length - which is the only place the
+                // refusal is free - and the connection then closed without a
+                // word, which a client reads as a network fault and answers
+                // with a reconnect and the same frame. Saying so by name
+                // costs one frame and turns an infinite loop into an error
+                // the caller can act on.
+                //
+                // Only this one. The other parse errors mean the peer is not
+                // speaking this protocol at all, and a reply to a stream that
+                // is already desynced is a guess about where it restarts.
+                //
+                // req_id 0: the header that would have carried one did not
+                // parse, and inventing an id would make a client match this
+                // to something it sent.
+                if let skeg_proto::ParseError::FrameTooLarge { len, max } = e {
+                    let refusal = crate::admission::AdmissionError::RequestTooLarge {
+                        what: "native frame payload bytes",
+                        limit: u64::from(max),
+                        got: u64::from(len),
+                    };
+                    let body = encode_err(0, refusal.code(), &refusal.to_string());
+                    let _ = stream.write_all(&body).await;
+                }
                 break;
             }
         }
