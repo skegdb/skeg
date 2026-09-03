@@ -47,6 +47,18 @@ that reported success left the centroids trained on the erased vectors both on
 disk and loaded. The prefix now comes from the same helper that writes the
 keys.
 
+**Every native-protocol op that takes an index name refuses `::` too.** The
+create door stops a client MAKING a key that reads as another tenant's; it
+does not stop one NAMING a key that already exists. A tenant's index, created
+over RESP3 from an id the server authenticated, was just a string to the
+native listener, which has no tenant of its own - so `VGET` read that tenant's
+vectors, `VSET` wrote into its index, and `VDEL` and `VINDEX.DROP` destroyed
+them, from a connection that authenticated as nobody. `VINDEX.CREATE`,
+`VINDEX.DROP`, `VSET`, `VGET`, `VDEL` and `VSEARCH` now share one name check,
+so an op added later cannot quietly skip it. This matters where the native
+listener is exposed over a store a multi-tenant RESP3 listener also serves; a
+single-tenant store has no such names.
+
 ### A vector and its payload are one write
 
 `SKEG.VSET name id vector payload` published the vector first and its blob

@@ -94,6 +94,34 @@ fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
     encode_err(req_id, ErrCode::Internal, &e.to_string())
 }
 
+/// The index name of a native request: UTF-8, and free of the tenant-scope
+/// separator.
+///
+/// EVERY arm that takes an index name goes through this, and that is the whole
+/// point of it existing. The native protocol has no tenant: it calls with
+/// tenant `0` and the client's raw name. Closing the create door stops a
+/// client MAKING a key that reads as another tenant's, but not one NAMING a
+/// key that already exists - a tenant's index, created over RESP3 from an id
+/// the server authenticated, is just a string here. Without this, VGET reads
+/// that tenant's vectors, VSET writes into its index, and VDEL and
+/// VINDEX.DROP destroy them, from a connection that authenticated as nobody.
+///
+/// Returns the encoded error frame to send back, so a new arm that forgets the
+/// check is a name it cannot use rather than a hole it cannot see.
+fn native_index_name(req_id: u64, raw: &Bytes) -> Result<&str, Bytes> {
+    let Ok(name) = std::str::from_utf8(raw) else {
+        return Err(encode_err(
+            req_id,
+            ErrCode::InvalidRequest,
+            "index name not utf-8",
+        ));
+    };
+    if let Err(e) = crate::shard::reject_scope_separator(name) {
+        return Err(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string()));
+    }
+    Ok(name)
+}
+
 /// Dispatch a parsed frame to the shard set and return an optional response.
 #[allow(clippy::too_many_lines)] // one arm per protocol op; splitting hurts readability
 async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
@@ -183,12 +211,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             if let Err(message) = native_vindex_kind_is_allowed(frame.header.version, kind) {
                 return Some(encode_err(req_id, ErrCode::InvalidRequest, message));
@@ -204,12 +229,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vindex_drop(name, 0).await {
                 Ok(()) => Some(encode_ok(req_id)),
@@ -222,12 +244,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vset(name, id, vector, 0, None, None).await {
                 Ok(()) => {
@@ -246,12 +265,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vget(name, id).await {
                 Ok(Some(v)) => Some(encode_ok_value(req_id, &f32_vec_to_bytes(&v))),
@@ -265,12 +281,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             match shards.vdel(name, id, 0).await {
                 Ok(existed) => Some(encode_ok_bool(req_id, existed)),
@@ -283,12 +296,9 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
                 Ok(v) => v,
                 Err(e) => return Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
             };
-            let Ok(name) = std::str::from_utf8(&name) else {
-                return Some(encode_err(
-                    req_id,
-                    ErrCode::InvalidRequest,
-                    "index name not utf-8",
-                ));
+            let name = match native_index_name(req_id, &name) {
+                Ok(n) => n,
+                Err(frame) => return Some(frame),
             };
             let span = tracing::info_span!(
                 "vsearch",
@@ -423,7 +433,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "red until every native arm refuses the scope separator"]
     async fn no_native_op_can_address_a_tenant_scoped_index() {
         // Closing the CREATE door stops a client MAKING a key that reads as
         // another tenant's. It does not stop one NAMING a key that already
