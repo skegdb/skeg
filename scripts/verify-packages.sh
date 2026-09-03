@@ -37,7 +37,12 @@ for crate in "${ORDER[@]}"; do
   rm -rf "$dir"; mkdir -p "$dir"
   tar -xzf "target/package/${crate}-${ver}.crate" -C "$dir" --strip-components=1
   mkdir -p "$dir/.cargo"
-  printf '[patch.crates-io]\n%b' "$patch_lines" > "$dir/.cargo/config.toml"
+  # The crate's own tests resolve the crate itself too: a dev-dependency on
+  # itself (the failpoints pattern) is rewritten by `cargo package` into a
+  # version requirement, which would otherwise pick the PUBLISHED previous
+  # version off the index instead of this package. Patch it to this dir
+  # first: after the real publish those are the same thing.
+  printf '[patch.crates-io]\n%b%s = { path = "%s" }\n' "$patch_lines" "$crate" "$dir" > "$dir/.cargo/config.toml"
   # Packaged crates carry no Cargo.lock we want to trust; resolve fresh, then
   # lock so the test run and a later inspection see the same graph.
   if (cd "$dir" && cargo generate-lockfile -q && cargo test --release -q 2>&1 | tail -n 3); then
@@ -47,7 +52,12 @@ for crate in "${ORDER[@]}"; do
   fi
   (cd "$dir" && cargo tree -e normal -d 2>/dev/null | grep -E '^skeg-' | sed 's/^/   duplicate: /' || true)
   patch_lines="${patch_lines}${crate} = { path = \"${dir}\" }\n"
-  patch_args+=(--config "patch.crates-io.${crate}.path=\"${dir}\"")
+  # The workspace already patches skeg-platform/simd/vector to its own tree
+  # for every `cargo package`; a second patch for the same crate collides.
+  case "$crate" in
+    skeg-platform|skeg-simd|skeg-vector) ;;
+    *) patch_args+=(--config "patch.crates-io.${crate}.path=\"${dir}\"") ;;
+  esac
 done
 if [ ${#failed[@]} -gt 0 ]; then echo "FAILED: ${failed[*]}"; exit 1; fi
 echo "ok: every package builds and tests against the registry plus its published-order siblings"
