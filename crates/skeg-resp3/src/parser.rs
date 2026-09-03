@@ -33,17 +33,28 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// elements arrive (bounded anyway by the bytes actually sent).
 const PREALLOC_CAP: usize = 1024;
 
+/// The smallest a RESP frame can be: a type marker and a CRLF, as in `_\r\n`.
+/// Nothing declared can arrive in fewer bytes than this each, so the input
+/// still buffered is itself a bound on how many elements are really there.
+const MIN_FRAME_BYTES: usize = 3;
+
 /// How many slots to reserve for an aggregate of `frame_count` elements whose
 /// remaining input is `body_len` bytes.
 ///
-/// The declared count is checked against `MAX_AGGREGATE_LEN`, but a header is
-/// eight bytes and the count it declares is a CLAIM. Reserving for the claim
-/// lets a few hundred bytes of nested headers hold megabytes, recreated on
-/// every read of a connection that never completes the frame. So the bytes
-/// that actually arrived get a vote.
+/// The declared count is checked against [`MAX_AGGREGATE_LEN`], but a header
+/// is eight bytes and the count it declares is a CLAIM. Reserving for the
+/// claim let `*1048576\r\n` buy a million slots, one per nesting level held
+/// live at once, rebuilt on every read of a connection that never completes
+/// the frame - megabytes of heap from a few hundred bytes of input, and
+/// invisible to the connection buffer's own ceiling because none of it is in
+/// the buffer.
+///
+/// So the bytes that actually arrived get a vote, and they are the binding
+/// one: a claim can be any size, `body_len` cannot.
 fn prealloc(frame_count: usize, body_len: usize) -> usize {
-    let _ = body_len;
-    frame_count.min(PREALLOC_CAP)
+    frame_count
+        .min(PREALLOC_CAP)
+        .min(body_len / MIN_FRAME_BYTES)
 }
 
 pub type ParseResult = Result<Option<(Frame, usize)>, ParseError>;
@@ -383,7 +394,6 @@ mod tests {
     /// fewer than three bytes per element, so the input still buffered is
     /// itself the bound.
     #[test]
-    #[ignore = "opens in commit 3 (resp3: preallocate for the bytes present)"]
     fn a_resp3_aggregate_preallocates_only_for_bytes_that_arrived() {
         // A million elements claimed, nothing behind the header.
         assert_eq!(prealloc(MAX_AGGREGATE_LEN, 0), 0);
