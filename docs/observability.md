@@ -215,15 +215,25 @@ spelling from it, so they cannot say different things.
 | memory governor out of headroom | yes | `-BACKPRESSURE out of budget at the write: ...` | `4` Backpressure |
 | VSEARCH pool saturated | yes | `-BACKPRESSURE vsearch queue is full` | `4` Backpressure |
 | tenant backend refused, `RATELIMITED ...` | yes | the backend's own line, verbatim | `4` Backpressure |
-| tenant backend refused, any other message | no | the backend's own line, verbatim | `2` InvalidRequest |
+| tenant backend refused, any other message | no | the backend's own line, verbatim | `3` Internal |
 | frame over the connection allowance | no | `-ERR ingress budget: this connection may hold at most N ...` | `2` InvalidRequest |
 | tenant vector quota exceeded | no | `-ERR tenant vector quota exceeded: ...` | `2` InvalidRequest |
 | request over a fixed ceiling (`SKEG.VMSET` items or bytes, native frame payload) | no | `-ERR ...: at most N, got M ...` | `2` InvalidRequest |
 | headroom could not be read at all | no | `-ERR ...` | `3` Internal |
 | vector of the wrong dimension | no | `-ERR vindex '...' dim N but vector has M` | `2` InvalidRequest |
 
-**RESP3:** the first word of the error line is the code. `BACKPRESSURE`
-means retry; anything else means do not.
+**RESP3: two words mean retry, not one.** `BACKPRESSURE` for everything the
+server decides, and `RATELIMITED` for a tenant backend's rate limit, which is
+passed through as the backend wrote it. A client's `is_retryable` must
+therefore be a TABLE of code words, not `starts_with("BACKPRESSURE")` - and a
+backend can introduce a fourth word this server has never seen, which it
+classifies as permanent and counts in
+`skeg_backend_refusal_unclassified_total`. On the native wire there is no such
+ambiguity: one byte, `0x04`.
+
+An unclassified backend refusal is `3` Internal there, not `2`: what failed
+is the server's reading of the backend's answer, and the caller's request may
+have been perfectly fine.
 
 **The quota row is RESP3-only in practice.** The native listener has no
 tenant backend - `Server::run` drops it and every request on that wire is

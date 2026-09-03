@@ -306,8 +306,12 @@ impl Condition {
             Condition::OverConnectionAllowance
             | Condition::QuotaRefusedAtVset
             | Condition::RequestTooLarge
-            | Condition::DimMismatch
-            | Condition::BackendUnclassified => (Retryability::Permanent, ErrCode::InvalidRequest),
+            | Condition::DimMismatch => (Retryability::Permanent, ErrCode::InvalidRequest),
+            // What failed is the server's reading of the backend's answer,
+            // not the caller's request. Declared here for the day a native
+            // listener carries a tenant; today the native row of this
+            // condition is absent by construction.
+            Condition::BackendUnclassified => (Retryability::Permanent, ErrCode::Internal),
         }
     }
 

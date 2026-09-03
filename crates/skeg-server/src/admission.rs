@@ -209,8 +209,17 @@ impl AdmissionError {
             // process. The client cannot fix it by sending anything else, so
             // calling its request invalid would send it looking in the wrong
             // place.
+            //
+            // A backend refusal that reaches here is one whose code word the
+            // engine could not place - a classified one is retryable and
+            // never asks for a permanent code - and that is the same kind of
+            // fault: what failed is the SERVER's reading of the backend's
+            // answer, not the caller's request. Saying `InvalidRequest` would
+            // send a client looking for a mistake in a message that may have
+            // been perfectly fine.
             Self::Ingress(IngressRejected::Governor(MemoryRejected::Unknown))
-            | Self::MemoryAtWrite(MemoryRejected::Unknown) => ErrCode::Internal,
+            | Self::MemoryAtWrite(MemoryRejected::Unknown)
+            | Self::Backend { .. } => ErrCode::Internal,
             // Everything else permanent is about the request: it is too big,
             // or the tenant it belongs to is full.
             Self::Ingress(
@@ -226,11 +235,7 @@ impl AdmissionError {
             )
             | Self::QuotaExceeded { .. }
             | Self::RequestTooLarge { .. }
-            | Self::Busy
-            // A refusal the engine could not classify is the request's, not
-            // the server's: something about this tenant or this command was
-            // declined, and the caller is the one who can act on it.
-            | Self::Backend { .. } => ErrCode::InvalidRequest,
+            | Self::Busy => ErrCode::InvalidRequest,
         }
     }
 }
@@ -278,8 +283,12 @@ impl AdmissionError {
 /// which one a new refusal uses is convention rather than type. The cheap
 /// half of that gap IS checkable: a message that opens with a code word is a
 /// refusal somebody classified by hand on the way out, and it will reach the
-/// client as `ERR <the code word> ...` on RESP3 and `Internal` on the native
-/// wire - the exact shape this module was written to delete.
+/// client as `ERR <the code word> ...` on RESP3 - the exact shape this module
+/// was written to delete.
+///
+/// Applied to BOTH variants that carry prose, `Storage` and `InvalidRequest`:
+/// a code word typed into either of them comes out behind an `ERR` that
+/// contradicts it.
 ///
 /// Debug builds only, and it panics rather than warns: this is a mistake in
 /// the engine's own source, caught the first time a test runs the path.
@@ -628,7 +637,12 @@ mod tests {
                 "{message:?}: guessing that an unclassified refusal clears on \
                  its own is how a client loops"
             );
-            assert_eq!(e.code(), ErrCode::InvalidRequest, "{message:?}");
+            assert_eq!(
+                e.code(),
+                ErrCode::Internal,
+                "{message:?}: what failed is the server's reading of the \
+                 backend's answer, not the caller's request"
+            );
             assert!(
                 after > before,
                 "{message:?}: a rate limit that reads as 'give up' to every \

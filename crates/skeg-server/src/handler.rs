@@ -223,7 +223,10 @@ fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
             let busy = crate::admission::AdmissionError::Busy;
             (busy.code(), busy.to_string())
         }
-        ShardError::InvalidRequest(msg) => (ErrCode::InvalidRequest, msg.clone()),
+        ShardError::InvalidRequest(msg) => {
+            crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            (ErrCode::InvalidRequest, msg.clone())
+        }
         ShardError::Unavailable => (ErrCode::Internal, e.to_string()),
         ShardError::Storage(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);

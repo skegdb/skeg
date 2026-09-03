@@ -2050,7 +2050,10 @@ fn shard_error(e: &crate::shard::ShardError) -> Frame {
         crate::shard::ShardError::Busy => {
             Frame::Error(crate::admission::AdmissionError::Busy.wire_message())
         }
-        crate::shard::ShardError::InvalidRequest(msg) => Frame::Error(format!("ERR {msg}")),
+        crate::shard::ShardError::InvalidRequest(msg) => {
+            crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            Frame::Error(format!("ERR {msg}"))
+        }
         crate::shard::ShardError::Unavailable => Frame::Error(format!("ERR {e}")),
         crate::shard::ShardError::Storage(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
@@ -2674,6 +2677,19 @@ mod tests {
             panic!("an error frame");
         };
         assert!(s.starts_with("BACKPRESSURE "), "the code was buried: {s}");
+    }
+
+    /// The guard covers BOTH prose-carrying variants, not only `Storage`.
+    ///
+    /// Debug builds only: that is where the assertion exists, and a release
+    /// test asserting a no-op would pass without proving anything.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a refusal reached the wire as prose")]
+    fn a_code_word_typed_into_an_invalid_request_is_caught() {
+        let _ = shard_error(&crate::shard::ShardError::InvalidRequest(
+            "BACKPRESSURE this is a refusal wearing the wrong variant".to_owned(),
+        ));
     }
 
     #[test]

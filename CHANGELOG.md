@@ -80,6 +80,17 @@ integer and need a constant plus a `retryable` accessor. Until then a
 retryable refusal is reported as an ordinary error, which is what
 happens today.
 
+**On RESP3, `is_retryable` must be a table, not a prefix.** There are now
+TWO retryable code words: `BACKPRESSURE` for every refusal the server
+decides, and `RATELIMITED` for a tenant backend's rate limit, which is
+passed through exactly as the backend wrote it so existing clients keep
+routing on it. A backend may also emit a third word this server has never
+seen; the server calls that permanent and counts it in
+`skeg_backend_refusal_unclassified_total`, and a client should do the same
+rather than guess. `starts_with("BACKPRESSURE")` is not the rule and never
+was on the backend path. The native wire has no such ambiguity - one byte,
+and `ErrCode::is_retryable` answers for it.
+
 ### The memory budget and the ingress class reach `/metrics`
 
 `SKEG.STATS` assembled them by hand in its own handler, so the two
