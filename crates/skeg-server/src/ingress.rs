@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::memory::{MemoryGovernor, MemoryRejected};
+use crate::memory::{Budget, MemoryGovernor, MemoryRejected, MemoryReservation};
 
 /// Bytes charged per byte of buffer capacity: one for the buffer, one for the
 /// copy the parser makes out of it. The parse copy is real and simultaneous -
@@ -57,27 +57,46 @@ use crate::memory::{MemoryGovernor, MemoryRejected};
 pub const PARSE_FACTOR: u64 = 2;
 
 /// The idle buffer a connection is given for existing: 4 KiB of capacity, so
-/// [`PARSE_FACTOR`] times that in charge.
+/// [`PARSE_FACTOR`] times that in charge. Small enough that a thousand idle
+/// connections cost megabytes rather than gigabytes, large enough for any
+/// session command to arrive in one read.
 pub const FLOOR_BYTES: u64 = 4096 * PARSE_FACTOR;
 
 /// The granularity growth is charged in: the 256 KiB chunk the RESP3 read loop
-/// reserves once a frame is mid-flight, times [`PARSE_FACTOR`].
+/// reserves once a frame is mid-flight, times [`PARSE_FACTOR`]. Charging in
+/// chunks rather than per byte keeps the reservation count per connection in
+/// the low hundreds at the ceiling instead of one per read.
 pub const CHUNK_BYTES: u64 = 256 * 1024 * PARSE_FACTOR;
 
 /// Share of the governor's usable headroom that ingress may hold, as a
-/// percentage.
+/// percentage. A quarter: the delta, the folds and the caches share the rest,
+/// and a class that could take all of it would just move the OOM.
 pub const DEFAULT_FRACTION: u64 = 25;
 
 /// The cap applied when no ceiling exists anywhere.
+///
+/// A static figure on purpose. `Budget::Unlimited` is the normal state off
+/// Linux, where there is no cgroup to read, and a budget that switched itself
+/// off there would mean the enforcement path never runs on a developer's
+/// machine and every test of it would have to fake a limit. One gigabyte is
+/// far above any legitimate ingress and far below what a thousand connections
+/// could pin unbudgeted, so the code path is the same one production takes.
 pub const UNLIMITED_DEFAULT_CAP: u64 = 1 << 30;
 
 /// How long a connection whose growth was refused waits before the frame is
-/// refused outright.
+/// refused outright. While it waits it does not read, which is free TCP
+/// backpressure; after it, the peer is told to retry.
 pub const DEFAULT_STALL: Duration = Duration::from_millis(500);
+
+/// The smallest class cap worth having: below this a single legitimate
+/// pipelined burst cannot be buffered, and every connection would stall on its
+/// first frame. A ceiling this tight is reported, not silently rounded up -
+/// see [`IngressBudget::cap`].
+const MIN_CAP: u64 = 4 * CHUNK_BYTES;
 
 /// What ingress may hold in total, and how that figure was arrived at.
 ///
-/// Three states, like the governor's own `Budget`, and for the same reason:
+/// Three states, like the governor's own [`Budget`], and for the same reason:
 /// "no ceiling" and "a ceiling nobody can read" are opposites, and one number
 /// cannot report both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +105,9 @@ pub enum IngressCap {
     Room(u64),
     /// No ceiling applies anywhere, so [`UNLIMITED_DEFAULT_CAP`] stands in.
     Default(u64),
-    /// A ceiling applies and its headroom could not be read.
+    /// A ceiling applies and its headroom could not be read. Every connection
+    /// still gets its floor - refusing to accept at all would take the server
+    /// down for an accounting fault - and nothing may grow past it.
     FloorOnly,
 }
 
@@ -129,6 +150,11 @@ pub enum IngressRejected {
 
 impl IngressRejected {
     /// Should the client try the same frame again?
+    ///
+    /// The whole difference between backpressure and an error. A class that is
+    /// momentarily full, or a governor whose headroom the delta has taken,
+    /// clears on its own; a frame larger than one connection may hold does
+    /// not, and telling a client to retry it is telling it to loop.
     #[must_use]
     pub fn is_retryable(self) -> bool {
         match self {
@@ -142,6 +168,10 @@ impl IngressRejected {
     }
 
     /// The error line a client sees, code first.
+    ///
+    /// The first word IS the code, so a retryable refusal must not be dressed
+    /// as `ERR`: that turns backpressure into a failure the caller gives up
+    /// on.
     #[must_use]
     pub fn wire_message(self) -> String {
         let code = if self.is_retryable() {
@@ -186,32 +216,82 @@ impl std::fmt::Display for IngressRejected {
 impl std::error::Error for IngressRejected {}
 
 /// The aggregate ingress budget: a class cap over the process-wide governor.
-///
-/// Scaffolding. The cap is not computed and nothing is charged yet - the
-/// enforcement lands with the tests below.
 #[derive(Debug)]
 pub struct IngressBudget {
     governor: Arc<MemoryGovernor>,
     cap: IngressCap,
     per_conn_max: u64,
     stall: Duration,
+    /// This class's share of the governor's `outstanding`. See the module
+    /// note: not a second budget, the same bytes seen by class.
     held: AtomicU64,
 }
 
 impl IngressBudget {
     /// Build the budget from the settings an operator supplied.
+    ///
+    /// The cap is decided ONCE, here. Headroom moves with every allocation the
+    /// process and its cgroup siblings make, and a class cap that moved with
+    /// it would let a connection be refused for a growth it was granted a
+    /// millisecond earlier, on a store doing nothing different. What stays
+    /// live is the governor underneath: a reservation still has to fit the
+    /// headroom of the moment.
     #[must_use]
     pub fn new(
         governor: Arc<MemoryGovernor>,
-        _fraction_percent: Option<u64>,
-        _explicit_bytes: Option<u64>,
+        fraction_percent: Option<u64>,
+        explicit_bytes: Option<u64>,
         stall: Option<Duration>,
-        _per_connection_ceiling: u64,
+        per_connection_ceiling: u64,
     ) -> Self {
+        let fraction = fraction_percent
+            .filter(|f| *f > 0 && *f <= 100)
+            .unwrap_or(DEFAULT_FRACTION);
+        let cap = match (explicit_bytes.filter(|b| *b > 0), governor.budget()) {
+            // An operator's figure replaces the fraction outright - the two
+            // are alternatives, not a pair to be intersected - but it is
+            // never a licence above the governor: the reservation behind it
+            // still has to fit the headroom of the moment.
+            (Some(b), Budget::Room(usable)) => IngressCap::Room(b.min(usable)),
+            (Some(b), Budget::Unlimited) => IngressCap::Default(b),
+            // A figure was given for exactly this case: an unreadable ceiling
+            // is a refusal only while nobody has said what to do about it.
+            (Some(b), Budget::Unreadable) => IngressCap::Room(b),
+            // The derived figure gets a floor, because a share so small that
+            // no legitimate pipelined burst fits would stall every connection
+            // on its first frame - and never above what the governor has.
+            (None, Budget::Room(usable)) => IngressCap::Room(
+                (usable.saturating_mul(fraction) / 100)
+                    .max(MIN_CAP)
+                    .min(usable),
+            ),
+            (None, Budget::Unlimited) => IngressCap::Default(UNLIMITED_DEFAULT_CAP),
+            (None, Budget::Unreadable) => IngressCap::FloorOnly,
+        };
+        if matches!(cap, IngressCap::FloorOnly) {
+            // Said out loud, once, at startup. A server quietly serving only
+            // small frames looks to a client like refusals it cannot explain,
+            // and the counter below turns "quietly" into a number.
+            tracing::warn!(
+                "ingress budget: a memory limit applies to this process and its \
+                 headroom cannot be read; connections will be given their {} \
+                 byte floor and no growth. Set SKEG_MEMORY_LIMIT_BYTES or \
+                 SKEG_INGRESS_BUDGET_BYTES to run with a budget.",
+                FLOOR_BYTES
+            );
+        }
+        // Fairness: a quarter each, so four greedy connections is the worst a
+        // single peer can arrange for the fifth. Never above the frame ceiling
+        // the protocol handler already enforces, and never below the floor - a
+        // cap so small that the quarter rounds under the floor would refuse
+        // every connection its first read.
+        let per_conn_max = (cap.bytes() / 4)
+            .min(per_connection_ceiling.saturating_mul(PARSE_FACTOR))
+            .max(FLOOR_BYTES);
         Self {
             governor,
-            cap: IngressCap::Default(0),
-            per_conn_max: 0,
+            cap,
+            per_conn_max,
             stall: stall.unwrap_or(DEFAULT_STALL),
             held: AtomicU64::new(0),
         }
@@ -252,7 +332,7 @@ impl IngressBudget {
         self.per_conn_max
     }
 
-    /// How long a connection whose growth was refused waits.
+    /// How long a refused connection waits before its frame is refused.
     #[must_use]
     pub fn stall(&self) -> Duration {
         self.stall
@@ -266,21 +346,124 @@ impl IngressBudget {
 
     /// Take the floor for a newly accepted connection, or say why not.
     ///
+    /// NON-BLOCKING, and called before the connection semaphore's permit: a
+    /// budget awaited at accept is a listener that stops accepting, which is
+    /// how a memory limit becomes an availability outage. Either the floor is
+    /// there and the connection is served, or the peer is told by name.
+    ///
     /// # Errors
     /// Propagates the class, allowance and governor refusals.
     pub fn try_accept(self: &Arc<Self>) -> Result<ConnectionBudget, IngressRejected> {
+        // The floor under an unreadable budget is granted WITHOUT a governor
+        // reservation, because the governor cannot answer at all in that
+        // state and refusing every connection would turn an accounting fault
+        // into an outage. What bounds it is the connection semaphore: at its
+        // default of 1024 the whole floor is 8 MiB, which is knowable without
+        // reading anything.
+        if matches!(self.cap, IngressCap::FloorOnly) {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressBudgetUnreadable);
+            self.held.fetch_add(FLOOR_BYTES, Ordering::AcqRel);
+            return Ok(ConnectionBudget {
+                budget: Arc::clone(self),
+                chunks: vec![Chunk {
+                    bytes: FLOOR_BYTES,
+                    reservation: None,
+                }],
+                held: FLOOR_BYTES,
+            });
+        }
+        let reservation = self.reserve(FLOOR_BYTES)?;
         Ok(ConnectionBudget {
             budget: Arc::clone(self),
-            held: 0,
+            chunks: vec![Chunk {
+                bytes: FLOOR_BYTES,
+                reservation: Some(reservation),
+            }],
+            held: FLOOR_BYTES,
         })
+    }
+
+    /// Charge `bytes` to the class AND to the governor, or refuse.
+    ///
+    /// The class share moves first and is rolled back if the governor refuses:
+    /// the other order would let a connection see a class total that no
+    /// reservation stands behind.
+    fn reserve(&self, bytes: u64) -> Result<MemoryReservation, IngressRejected> {
+        let cap = match self.cap {
+            IngressCap::FloorOnly => return Err(IngressRejected::Unreadable { requested: bytes }),
+            IngressCap::Room(c) | IngressCap::Default(c) => c,
+        };
+        let mut held = self.held.load(Ordering::Acquire);
+        loop {
+            let wanted = held.checked_add(bytes).ok_or(IngressRejected::ClassFull {
+                held,
+                requested: bytes,
+                cap,
+            })?;
+            if wanted > cap {
+                return Err(IngressRejected::ClassFull {
+                    held,
+                    requested: bytes,
+                    cap,
+                });
+            }
+            match self
+                .held
+                .compare_exchange_weak(held, wanted, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => held = actual,
+            }
+        }
+        match self.governor.try_reserve(bytes) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                self.held.fetch_sub(bytes, Ordering::AcqRel);
+                Err(IngressRejected::Governor(e))
+            }
+        }
+    }
+
+    /// Give `bytes` of the class share back. The governor reservation behind
+    /// them is released by dropping it, in the same step.
+    fn release(&self, bytes: u64) {
+        self.held.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
 
+/// One granted step of a connection's charge, and the governor reservation
+/// standing behind it.
+///
+/// `reservation` is `None` only for a floor granted under an unreadable
+/// budget, where the governor has no answer to give.
+#[derive(Debug)]
+struct Chunk {
+    bytes: u64,
+    reservation: Option<MemoryReservation>,
+}
+
 /// One connection's charge, released when the connection task ends.
+///
+/// The connection asks for a BUFFER CAPACITY and the budget converts it: the
+/// charge is capacity times [`PARSE_FACTOR`], rounded up to [`CHUNK_BYTES`].
+/// Capacity and not length, because `BytesMut::reserve` rounds up and the
+/// process pays for the allocation, not for the bytes that arrived in it.
 #[derive(Debug)]
 pub struct ConnectionBudget {
     budget: Arc<IngressBudget>,
+    chunks: Vec<Chunk>,
     held: u64,
+}
+
+/// The charge a buffer of `buffer_capacity` bytes carries.
+#[must_use]
+pub fn charge_for(buffer_capacity: usize) -> u64 {
+    let want = (buffer_capacity as u64).saturating_mul(PARSE_FACTOR);
+    if want <= FLOOR_BYTES {
+        FLOOR_BYTES
+    } else {
+        want.div_ceil(CHUNK_BYTES).saturating_mul(CHUNK_BYTES)
+    }
 }
 
 impl ConnectionBudget {
@@ -302,16 +485,80 @@ impl ConnectionBudget {
         &self.budget
     }
 
+    /// How many of this connection's charges are backed by a governor
+    /// reservation.
+    ///
+    /// All of them, except a floor granted under an unreadable budget - the
+    /// one case where the governor has no answer to give and the floor is
+    /// bounded by the connection semaphore instead. Reported so a test can
+    /// tell the two apart, because from the outside they hold the same bytes.
+    #[must_use]
+    pub fn reserved_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|c| c.reservation.is_some())
+            .count()
+    }
+
     /// Charge for a buffer about to hold `buffer_capacity` bytes.
+    ///
+    /// RESERVE BEFORE GROW: the caller must not let the buffer reach a size
+    /// this has not granted. A refusal is the signal to stop reading, which is
+    /// TCP backpressure the peer feels for free.
     ///
     /// # Errors
     /// Propagates the class, allowance and governor refusals.
-    pub fn grow_to(&mut self, _buffer_capacity: usize) -> Result<(), IngressRejected> {
+    pub fn grow_to(&mut self, buffer_capacity: usize) -> Result<(), IngressRejected> {
+        let want = charge_for(buffer_capacity);
+        if want <= self.held {
+            return Ok(());
+        }
+        // Asked before the allowance, because under an unreadable budget the
+        // allowance IS the floor, and answering "your frame is too big" would
+        // name the wrong cause and the wrong remedy.
+        if matches!(self.budget.cap, IngressCap::FloorOnly) {
+            return Err(IngressRejected::Unreadable { requested: want });
+        }
+        if want > self.budget.per_conn_max {
+            return Err(IngressRejected::OverConnectionAllowance {
+                requested: want,
+                allowance: self.budget.per_conn_max,
+            });
+        }
+        let delta = want - self.held;
+        let reservation = self.budget.reserve(delta)?;
+        self.chunks.push(Chunk {
+            bytes: delta,
+            reservation: Some(reservation),
+        });
+        self.held = want;
         Ok(())
     }
 
     /// Give back what a drained buffer no longer needs, down to the floor.
-    pub fn shrink_to(&mut self, _buffer_capacity: usize) {}
+    ///
+    /// Without this a connection that bursted once would hold its peak for the
+    /// rest of its life: `BytesMut` keeps its allocation across `split_to`,
+    /// and a charge that only ever grew would make the class cap a high-water
+    /// mark of every connection that ever existed.
+    pub fn shrink_to(&mut self, buffer_capacity: usize) {
+        let want = charge_for(buffer_capacity);
+        while self.chunks.len() > 1 {
+            let top = self.chunks[self.chunks.len() - 1].bytes;
+            if self.held - top < want {
+                break;
+            }
+            self.chunks.pop();
+            self.held -= top;
+            self.budget.release(top);
+        }
+    }
+}
+
+impl Drop for ConnectionBudget {
+    fn drop(&mut self) {
+        self.budget.release(self.held);
+    }
 }
 
 #[cfg(test)]
@@ -345,7 +592,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in commit 4 (server: IngressBudget)"]
     fn a_drained_buffer_gives_its_growth_back() {
         // `BytesMut` keeps its allocation, so a charge that only grew would
         // make every connection's peak permanent and the class cap a
@@ -353,6 +599,11 @@ mod tests {
         let budget = budget_with_cap(64 * CHUNK_BYTES);
         let mut conn = budget.try_accept().expect("the floor");
         assert_eq!(conn.held_bytes(), FLOOR_BYTES);
+        assert_eq!(
+            conn.reserved_chunks(),
+            1,
+            "the floor stands on a reservation"
+        );
         conn.grow_to(1024 * 1024).expect("growth");
         let grown = conn.held_bytes();
         assert!(grown > FLOOR_BYTES, "the growth was not charged: {grown}");
@@ -370,7 +621,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in commit 4 (server: IngressBudget)"]
     fn one_greedy_connection_cannot_starve_the_others() {
         // The per-connection allowance is the whole reason the class cap is
         // not just a bigger place to be starved in: without it the first
@@ -409,7 +659,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in commit 4 (server: IngressBudget)"]
     fn an_accepted_connection_always_gets_its_floor_or_is_refused_by_name() {
         // Accept is the one place the budget must never await: a listener that
         // parks on memory is an outage. Every connection either has its floor
@@ -441,7 +690,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in commit 4 (server: IngressBudget)"]
     fn the_ingress_and_delta_reservations_sum_under_one_budget() {
         // The point of the whole module: ingress is not a second budget beside
         // the governor's, it is a class inside it. A byte a socket holds and a
@@ -450,12 +698,15 @@ mod tests {
         //
         // `governor.try_reserve` is exactly what `Vindex::reserve_memory`
         // calls, so this is the delta's own path, not a stand-in for it.
-        let usable = 16 * CHUNK_BYTES;
+        // The class cap is deliberately generous against the headroom: what
+        // must refuse the second growth is the GOVERNOR, with room left in
+        // the class, or the test would be proving the class cap again.
+        let usable = 20 * CHUNK_BYTES;
         let gov = governor(Headroom::Known(usable));
         let budget = Arc::new(IngressBudget::new(
             Arc::clone(&gov),
             None,
-            Some(4 * CHUNK_BYTES),
+            Some(16 * CHUNK_BYTES),
             None,
             u64::from(u32::MAX),
         ));
@@ -487,11 +738,14 @@ mod tests {
             matches!(err, IngressRejected::Governor(_)),
             "the governor is what ran out, not the class: {err:?}"
         );
+        assert!(
+            budget.held_bytes() + 2 * CHUNK_BYTES <= budget.cap().bytes(),
+            "the class still had room, so the refusal came from the shared total"
+        );
         drop((delta, rest));
     }
 
     #[test]
-    #[ignore = "opens in commit 4 (server: IngressBudget)"]
     fn an_unreadable_budget_serves_small_frames_and_refuses_growth() {
         // A ceiling applies and its headroom cannot be read. Refusing every
         // connection would turn an accounting fault into an outage; admitting
@@ -509,6 +763,12 @@ mod tests {
 
         let mut conn = budget.try_accept().expect("a small frame is still served");
         assert_eq!(conn.held_bytes(), FLOOR_BYTES);
+        assert_eq!(
+            conn.reserved_chunks(),
+            0,
+            "the governor cannot answer at all here, so the floor is bounded \
+             by the connection semaphore and not by a reservation"
+        );
         let err = conn
             .grow_to(1024 * 1024)
             .expect_err("growth under an unreadable budget must be refused");
