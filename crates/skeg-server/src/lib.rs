@@ -156,6 +156,7 @@ impl Server {
             Arc::clone(shards.memory()),
             resp3_handler::MAX_CONN_BUFFER as u64,
         ));
+        ingress.register_metrics();
         Ok(Self {
             listener,
             shards,
@@ -184,6 +185,10 @@ impl Server {
     /// the same reason, as `ShardSet::open_full_with_memory`.
     #[must_use]
     pub fn with_ingress_budget(mut self, budget: Arc<IngressBudget>) -> Self {
+        // The gauges follow the budget the server actually admits against,
+        // not the one it was built with; otherwise a test that injects a
+        // budget scrapes numbers belonging to a budget nothing uses.
+        budget.register_metrics();
         self.ingress = budget;
         self
     }
@@ -284,6 +289,7 @@ impl Server {
             Arc::clone(shards.memory()),
             resp3_handler::MAX_CONN_BUFFER as u64,
         ));
+        ingress.register_metrics();
         Ok(Self {
             listener,
             shards,

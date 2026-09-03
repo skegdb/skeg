@@ -114,8 +114,15 @@ fn free_port() -> u16 {
     l.local_addr().expect("addr").port()
 }
 
+/// One test, one server, on purpose.
+///
+/// The gauge registry is process-wide and keyed, which is exactly right for a
+/// server - one process, one governor, one class - and exactly wrong for two
+/// tests each building a server of their own: the second registration
+/// replaces the first, and when the second server is dropped its source is
+/// pruned and the first test scrapes a dump with no budget in it at all. So
+/// the parity checks share one server and run in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in `server: the governor and the budget report their own gauges`"]
 async fn stats_reports_every_gauge_the_metrics_dump_reports() {
     let ingress = ingress_over(Headroom::Known(150 * 1024 * 1024));
     let dir = tempfile::tempdir().expect("tempdir");
@@ -159,23 +166,9 @@ async fn stats_reports_every_gauge_the_metrics_dump_reports() {
         );
         assert!(stats.contains_key(name), "{name} is not in SKEG.STATS");
     }
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in `server: the governor and the budget report their own gauges`"]
-async fn a_three_state_gauge_reports_all_three_states_with_exactly_one_at_one() {
-    let ingress = ingress_over(Headroom::Known(150 * 1024 * 1024));
-    let dir = tempfile::tempdir().expect("tempdir");
-    let server = Server::bind_with_shards("127.0.0.1:0", dir.path(), 1, 0)
-        .await
-        .expect("bind")
-        .with_ingress_budget(Arc::clone(&ingress));
-    let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run_resp3().await;
-    });
-
-    let stats = series(&skeg_stats_body(addr).await);
+    // The state sets, on the same scrape: all three series present, exactly
+    // one of them at 1.
     for (metric, states) in [
         (
             "skeg_memory_budget_state",

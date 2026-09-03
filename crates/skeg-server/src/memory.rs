@@ -434,9 +434,48 @@ impl MemoryGovernor {
 /// Nothing on the reserve path changes; this is a reader.
 impl skeg_telemetry::GaugeSource for MemoryGovernor {
     fn sample(&self, out: &mut Vec<skeg_telemetry::GaugeSample>) {
-        // Stub: opened by `server: the governor and the budget report their
-        // own gauges`.
-        let _ = out;
+        use skeg_telemetry::GaugeSample as S;
+        // A STATE SET: all three series, every time, exactly one at 1.
+        //
+        // This used to emit only the state that was true. Two things go wrong
+        // with that in production: an alert on "the budget went unreadable"
+        // can only be written with `absent()`, and after a transition the
+        // series that WAS true keeps its last value until it goes stale, so a
+        // dashboard shows two states at once.
+        let budget = self.budget();
+        for (labels, matches) in [
+            ("state=\"known\"", matches!(budget, Budget::Room(_))),
+            ("state=\"unlimited\"", matches!(budget, Budget::Unlimited)),
+            ("state=\"unknown\"", matches!(budget, Budget::Unreadable)),
+        ] {
+            out.push(S::labelled(
+                "skeg_memory_budget_state",
+                labels,
+                u64::from(matches),
+            ));
+        }
+        // ABSENT when nobody could read it. Publishing 0 for a headroom that
+        // could not be read says "no room left", which is a different fact
+        // and the one an operator would page on.
+        if let Budget::Room(usable) = budget {
+            out.push(S::new("skeg_memory_headroom_bytes", usable));
+        }
+        out.push(S::new("skeg_memory_reserved_bytes", self.reserved_bytes()));
+        out.push(S::new("skeg_memory_reserve_bytes", self.reserve_bytes()));
+    }
+}
+
+impl MemoryGovernor {
+    /// Publish this governor's gauges on both telemetry surfaces.
+    ///
+    /// Called once where the `Arc` is made. Keyed, so a process that opens
+    /// several shard sets - every integration test does - ends with one
+    /// governor reporting rather than one series per shard set ever opened.
+    pub fn register_metrics(self: &Arc<Self>) {
+        skeg_telemetry::register_gauge_source(
+            "skeg-server::memory",
+            Arc::downgrade(self) as std::sync::Weak<dyn skeg_telemetry::GaugeSource>,
+        );
     }
 }
 
@@ -762,7 +801,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
     fn the_budget_state_is_a_set_of_three_series_with_exactly_one_at_one() {
         for (headroom, live) in [
             (Headroom::Known(1000), "known"),
@@ -803,7 +841,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
     fn headroom_is_absent_when_nobody_could_read_it() {
         let known = gauges_of(&gov(Headroom::Known(1000), 0));
         assert_eq!(

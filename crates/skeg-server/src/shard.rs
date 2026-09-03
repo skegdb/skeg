@@ -5456,6 +5456,10 @@ impl ShardSet {
     ) -> std::io::Result<Self> {
         let memory =
             Arc::new(crate::memory::MemoryGovernor::from_env().map_err(std::io::Error::other)?);
+        // Both telemetry surfaces read the governor from here on. A test that
+        // supplies its own governor registers it itself, through the seam
+        // below.
+        memory.register_metrics();
         Self::open_full_with_memory(
             base_dir, n_shards, read_only, tier, workers, mmap_tier, mmap_graph, memory,
         )

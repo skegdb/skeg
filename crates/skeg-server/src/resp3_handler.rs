@@ -409,7 +409,6 @@ pub async fn handle_connection_resp3(
                                 &shards,
                                 tenant_backend.as_ref(),
                                 peer.map(|p| p.ip()),
-                                budget.budget(),
                             )
                             .await
                         }
@@ -721,7 +720,6 @@ async fn dispatch_command(
     shards: &ShardSet,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
     peer_ip: Option<IpAddr>,
-    ingress: &Arc<crate::ingress::IngressBudget>,
 ) -> Frame {
     // Per-command admission (multi-tenant QoS). Hello/SkegAuth establish or
     // change the tenant and are never gated. Single-tenant (no backend) skips
@@ -840,7 +838,7 @@ async fn dispatch_command(
             kv_incrby_apply(&key, signed, shards, *tenant, tenant_backend).await
         }
         Command::Select { db } => kv_select_db(db),
-        Command::SkegStats => skeg_stats(shards, ingress).await,
+        Command::SkegStats => skeg_stats(shards).await,
         Command::SkegShards => skeg_shards(shards).await,
         Command::SkegWhoami => skeg_whoami(*tenant, tenant_backend.is_some()),
         Command::SkegAuth { args } => skeg_auth(&args),
@@ -1951,7 +1949,14 @@ fn skeg_auth(_args: &[Bytes]) -> Frame {
     Frame::Error("ERR SKEG.AUTH is reserved; use HELLO 3 AUTH user pass for now (v0.2)".into())
 }
 
-async fn skeg_stats(shards: &ShardSet, ingress: &Arc<crate::ingress::IngressBudget>) -> Frame {
+/// `SKEG.STATS`: the cache summary line, this process's own cost, then the
+/// whole telemetry dump.
+///
+/// Takes no budget any more. The governor and the ingress class publish
+/// themselves to the telemetry registry the dump reads, so this reply and a
+/// `/metrics` scrape carry the same series by construction rather than
+/// because two blocks of formatting were kept in step by hand.
+async fn skeg_stats(shards: &ShardSet) -> Frame {
     match shards.stats().await {
         Ok(s) => {
             // Combine the legacy single-line cache summary with the
@@ -1969,57 +1974,14 @@ async fn skeg_stats(shards: &ShardSet, ingress: &Arc<crate::ingress::IngressBudg
             // Descriptors: one per vlog segment and per vindex segment file,
             // so an operator needs to see headroom BEFORE "too many open
             // files" turns into a failed open.
-            // The memory budget, reported rather than only enforced. A gate
-            // that watched a 256 MiB container survive could not tell whether
-            // the engine had SEEN the limit or got lucky, because nothing
-            // said. Three states, never one number pretending to cover them:
-            // a ceiling with room left, no ceiling at all, and a ceiling whose
-            // room could not be read - which is a refusal, not a licence.
-            let g = shards.memory();
-            let memory = match g.budget() {
-                crate::memory::Budget::Room(usable) => format!(
-                    "# TYPE skeg_memory_budget_state gauge\n\
-                     skeg_memory_budget_state{{state=\"known\"}} 1\n\
-                     # TYPE skeg_memory_headroom_bytes gauge\n\
-                     skeg_memory_headroom_bytes {usable}\n"
-                ),
-                crate::memory::Budget::Unlimited => "# TYPE skeg_memory_budget_state gauge\n\
-                     skeg_memory_budget_state{state=\"unlimited\"} 1\n"
-                    .to_owned(),
-                crate::memory::Budget::Unreadable => "# TYPE skeg_memory_budget_state gauge\n\
-                     skeg_memory_budget_state{state=\"unknown\"} 1\n"
-                    .to_owned(),
-            };
-            let memory = format!(
-                "{memory}# TYPE skeg_memory_reserved_bytes gauge\n\
-                 skeg_memory_reserved_bytes {}\n\
-                 # TYPE skeg_memory_reserve_bytes gauge\n\
-                 skeg_memory_reserve_bytes {}\n",
-                g.reserved_bytes(),
-                g.reserve_bytes(),
-            );
-            // The ingress class, in the same three states and for the same
-            // reason: a ceiling with room, no ceiling at all, and a ceiling
-            // whose room could not be read. Reported next to the governor
-            // rather than as a separate section, because the held figure is
-            // this class's share of the number directly above it - a reader
-            // who cannot see the two together cannot tell whether ingress or
-            // the delta is what is filling the budget.
-            let cap = ingress.cap();
-            let ingress_text = format!(
-                "# TYPE skeg_ingress_state gauge\n\
-                 skeg_ingress_state{{state=\"{}\"}} 1\n\
-                 # TYPE skeg_ingress_cap_bytes gauge\n\
-                 skeg_ingress_cap_bytes {}\n\
-                 # TYPE skeg_ingress_held_bytes gauge\n\
-                 skeg_ingress_held_bytes {}\n\
-                 # TYPE skeg_ingress_per_connection_max_bytes gauge\n\
-                 skeg_ingress_per_connection_max_bytes {}\n",
-                cap.state_name(),
-                cap.bytes(),
-                ingress.held_bytes(),
-                ingress.per_connection_max(),
-            );
+            // The memory budget and the ingress class used to be assembled
+            // by hand, right here, which is why `/metrics` - the surface an
+            // operator actually scrapes - could not see either of them: the
+            // two numbers that say whether the server is about to start
+            // refusing were visible only to whoever typed a Redis command.
+            // They report themselves now, through the same dump both
+            // surfaces read, so parity is a property of the code rather than
+            // of somebody remembering to copy a block.
             let (fd_soft, _fd_hard) = skeg_platform::fd_limit();
             let fd_open = skeg_platform::open_fd_count();
             let process = format!(
@@ -2036,7 +1998,7 @@ async fn skeg_stats(shards: &ShardSet, ingress: &Arc<crate::ingress::IngressBudg
                 )),
             );
             let body = format!(
-                "{cache_line}\n\n{process}{memory}{ingress_text}\n{}",
+                "{cache_line}\n\n{process}\n{}",
                 skeg_telemetry::stats::dump_text()
             );
             Frame::Bulk(Bytes::from(body))
@@ -2343,13 +2305,18 @@ mod tests {
             )
             .expect("a governor"),
         );
-        Arc::new(crate::ingress::IngressBudget::new(
+        let budget = Arc::new(crate::ingress::IngressBudget::new(
             governor,
             None,
             None,
             None,
             u64::from(u32::MAX),
-        ))
+        ));
+        // What `Server::with_ingress_budget` does for a real listener: a
+        // budget nothing registered is a budget `SKEG.STATS` cannot see, and
+        // that is the property under test.
+        budget.register_metrics();
+        budget
     }
 
     /// An ingress budget whose class is far too small for a maximum reply, so
@@ -2512,7 +2479,7 @@ mod tests {
         // without reporting one survived without knowing.
         let dir = tempfile::TempDir::new().unwrap();
         let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
-        let Frame::Bulk(body) = skeg_stats(&shards, &test_ingress()).await else {
+        let Frame::Bulk(body) = skeg_stats(&shards).await else {
             panic!("a bulk summary");
         };
         let text = String::from_utf8(body.to_vec()).unwrap();
@@ -2541,8 +2508,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
         let ingress = test_ingress();
+        // Held for the length of the assertions: the registry keeps the
+        // source by Weak, so a budget nobody holds is a budget that has
+        // correctly stopped reporting.
         let held = ingress.try_accept().expect("a floor");
-        let Frame::Bulk(body) = skeg_stats(&shards, &ingress).await else {
+        let Frame::Bulk(body) = skeg_stats(&shards).await else {
             panic!("a bulk summary");
         };
         let text = String::from_utf8(body.to_vec()).unwrap();
@@ -3000,7 +2970,6 @@ mod tests {
             &shards,
             Some(&backend),
             None,
-            &test_ingress(),
         )
         .await;
         assert!(
@@ -3019,7 +2988,6 @@ mod tests {
             &shards,
             Some(&backend),
             None,
-            &test_ingress(),
         )
         .await;
         assert!(
@@ -3054,7 +3022,6 @@ mod tests {
             &shards,
             Some(&backend),
             None,
-            &test_ingress(),
         )
         .await;
         assert!(
@@ -3070,7 +3037,6 @@ mod tests {
             &shards,
             Some(&backend),
             None,
-            &test_ingress(),
         )
         .await;
         assert!(
@@ -3086,7 +3052,6 @@ mod tests {
             &shards,
             Some(&backend),
             None,
-            &test_ingress(),
         )
         .await;
         assert!(
@@ -3106,7 +3071,6 @@ mod tests {
             &shards,
             Some(&backend),
             None,
-            &test_ingress(),
         )
         .await;
         assert!(
@@ -3137,7 +3101,6 @@ mod tests {
                 &shards,
                 None,
                 None,
-                &test_ingress(),
             )
             .await;
             assert!(!matches!(f, Frame::Error(_)), "create {name} failed: {f:?}");
@@ -3494,7 +3457,7 @@ mod tests {
     #[tokio::test]
     async fn skeg_stats_returns_a_bulk_summary() {
         let (_dir, shards) = fresh_shards().await;
-        let resp = skeg_stats(&shards, &test_ingress()).await;
+        let resp = skeg_stats(&shards).await;
         match resp {
             Frame::Bulk(b) => {
                 let s = std::str::from_utf8(&b).unwrap();

@@ -437,9 +437,39 @@ impl IngressBudget {
 /// cannot tell whether the sockets or the delta are filling the budget.
 impl skeg_telemetry::GaugeSource for IngressBudget {
     fn sample(&self, out: &mut Vec<skeg_telemetry::GaugeSample>) {
-        // Stub: opened by `server: the governor and the budget report their
-        // own gauges`.
-        let _ = out;
+        use skeg_telemetry::GaugeSample as S;
+        // The same state-set rule as the governor's, and for the same
+        // reasons: three series, exactly one at 1.
+        let cap = self.cap();
+        for (labels, matches) in [
+            ("state=\"known\"", matches!(cap, IngressCap::Room(_))),
+            ("state=\"default\"", matches!(cap, IngressCap::Default(_))),
+            ("state=\"unreadable\"", matches!(cap, IngressCap::FloorOnly)),
+        ] {
+            out.push(S::labelled(
+                "skeg_ingress_state",
+                labels,
+                u64::from(matches),
+            ));
+        }
+        out.push(S::new("skeg_ingress_cap_bytes", cap.bytes()));
+        out.push(S::new("skeg_ingress_held_bytes", self.held_bytes()));
+        out.push(S::new(
+            "skeg_ingress_per_connection_max_bytes",
+            self.per_connection_max(),
+        ));
+    }
+}
+
+impl IngressBudget {
+    /// Publish this class's gauges on both telemetry surfaces. Called once
+    /// where the `Arc` is made; keyed, so the last budget built wins rather
+    /// than every budget ever built reporting at once.
+    pub fn register_metrics(self: &Arc<Self>) {
+        skeg_telemetry::register_gauge_source(
+            "skeg-server::ingress",
+            Arc::downgrade(self) as std::sync::Weak<dyn skeg_telemetry::GaugeSource>,
+        );
     }
 }
 
@@ -958,7 +988,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
     fn the_ingress_state_is_a_set_of_three_series_with_exactly_one_at_one() {
         for (headroom, explicit, live) in [
             (Headroom::Known(64 * 1024 * 1024), None, "known"),
@@ -1004,7 +1033,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: the governor and the budget report their own gauges`"]
     fn the_class_reports_the_numbers_stats_used_to_assemble_by_hand() {
         let b = Arc::new(IngressBudget::new(
             governor(Headroom::Known(150 * 1024 * 1024)),
