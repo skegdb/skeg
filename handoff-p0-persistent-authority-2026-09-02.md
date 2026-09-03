@@ -12,3 +12,5 @@ Esecuzione: R1/R2/R3 in parallelo su tre worktree da `b72ca90` (`fix/r1-egress-r
 round; merge in sequenza R2, R3, R1 (conflitti in shard.rs risolti al merge, suite a ogni
 passo). R5 (matrice versioni + validation job crates.io) parte dalla ricognizione in corso.
 Prompt in scratchpad r1/r2/r3-prompt.md.
+Suite su `80a2600` (bump + ponte), 65 target: seriale 1205/0/12, parallela 1205/0/12
+(17:54-17:59 UTC). Harness package sulle versioni nuove in corso.
