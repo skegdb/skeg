@@ -14,6 +14,7 @@ pub mod bind_policy;
 pub mod catalog_intent;
 pub mod failpoint;
 pub mod handler;
+pub mod ingress;
 pub mod layout_manifest;
 pub mod memory;
 pub mod payload;
@@ -35,6 +36,7 @@ use tracing::{info, warn};
 
 pub use bind_policy::{ALLOW_ENV, ALLOW_FLAG, check_unauthenticated_bind};
 use handler::handle_connection;
+pub use ingress::{ConnectionBudget, IngressBudget, IngressCap, IngressRejected};
 pub use quota::{TenantLimits, TenantQos, TenantVectorQuota};
 use resp3_handler::handle_connection_resp3;
 use shard::ShardSet;
@@ -53,6 +55,14 @@ pub const DEFAULT_RW_TIER: QuantKind = QuantKind::TurboQuant { bits: 2 };
 pub struct Server {
     listener: TcpListener,
     shards: ShardSet,
+    /// The aggregate ingress budget. Built from the same `MemoryGovernor` the
+    /// shard set carries, so a byte a socket holds and a byte the delta holds
+    /// are counted in one place.
+    ingress: Arc<IngressBudget>,
+    /// Concurrent connections this listener will serve. Each one can buffer
+    /// up to the frame ceiling, so an unbounded accept loop is a memory-DoS
+    /// surface; both protocols hold a permit for the connection's lifetime.
+    max_connections: usize,
     /// Optional multi-tenant backend. `None` keeps single-tenant
     /// semantics; wiring an `Arc<dyn TenantBackend>` enables RESP3
     /// AUTH + per-tenant key scoping on this listener.
@@ -140,9 +150,15 @@ impl Server {
             data_dir, n_shards, false, tier, workers, mmap_tier, mmap_graph,
         )?;
         let listener = TcpListener::bind(addr).await?;
+        let ingress = Arc::new(ingress::IngressBudget::from_env(
+            Arc::clone(shards.memory()),
+            resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
         Ok(Self {
             listener,
             shards,
+            ingress,
+            max_connections: max_connections_from_env(),
             tenant_backend: None,
         })
     }
@@ -154,6 +170,37 @@ impl Server {
     #[must_use]
     pub fn with_tenant_backend(mut self, backend: Arc<dyn TenantBackend>) -> Self {
         self.tenant_backend = Some(backend);
+        self
+    }
+
+    /// Serve with the ingress budget supplied, instead of the one derived from
+    /// this process's memory governor.
+    ///
+    /// Exists so a test can bind a real listener against a budget it chose -
+    /// a cap of a few hundred kilobytes, refusals in milliseconds - rather
+    /// than by arranging for the machine to run out of memory. Same seam, and
+    /// the same reason, as `ShardSet::open_full_with_memory`.
+    #[must_use]
+    pub fn with_ingress_budget(mut self, budget: Arc<IngressBudget>) -> Self {
+        self.ingress = budget;
+        self
+    }
+
+    /// The ingress budget this server admits connections against.
+    #[must_use]
+    pub fn ingress(&self) -> &Arc<IngressBudget> {
+        &self.ingress
+    }
+
+    /// Serve at most `n` concurrent connections, instead of the figure
+    /// `SKEG_MAX_CONNECTIONS` supplies.
+    ///
+    /// A test seam, for the same reason as [`Server::with_ingress_budget`]:
+    /// the alternative is an environment variable, which is process-wide and
+    /// therefore shared by every test in the binary.
+    #[must_use]
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = n.max(1);
         self
     }
 
@@ -231,9 +278,15 @@ impl Server {
             ShardSet::open_mode_full_mmap(data_dir, n, true, tier, workers, mmap_tier, mmap_graph)?
         };
         let listener = TcpListener::bind(addr).await?;
+        let ingress = Arc::new(ingress::IngressBudget::from_env(
+            Arc::clone(shards.memory()),
+            resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
         Ok(Self {
             listener,
             shards,
+            ingress,
+            max_connections: max_connections_from_env(),
             tenant_backend: None,
         })
     }
@@ -270,15 +323,37 @@ impl Server {
         let Self {
             listener,
             shards,
+            ingress,
+            max_connections,
             tenant_backend: _,
         } = self;
-        info!(addr = ?listener.local_addr()?, n_shards = shards.n_shards(), "server listening (binary protocol)");
+        let fds = raise_descriptor_limit();
+        info!(
+            addr = ?listener.local_addr()?,
+            n_shards = shards.n_shards(),
+            max_fds = fds,
+            "server listening (binary protocol)"
+        );
+        // Same bound as the RESP3 listener, and for the same reason: this loop
+        // spawned a task per connection with nothing counting them, so a peer
+        // that opened sockets and said nothing bought a task and a buffer each
+        // time. A permit is held for the connection's lifetime.
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let fp_key: Arc<str> = Arc::from(listener.local_addr()?.port().to_string());
         loop {
             let (stream, _) = listener.accept().await?;
+            let Some((budget, stream)) =
+                admit_or_refuse(&ingress, stream, RefusalWire::Native).await
+            else {
+                continue;
+            };
+            let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
             tune_socket(&stream);
             let shards = shards.clone();
+            let fp_key = Arc::clone(&fp_key);
             tokio::spawn(async move {
-                handle_connection(stream, shards).await;
+                let _permit = permit;
+                handle_connection(stream, shards, budget, fp_key).await;
             });
         }
     }
@@ -294,27 +369,11 @@ impl Server {
         let Self {
             listener,
             shards,
+            ingress,
+            max_connections,
             tenant_backend,
         } = self;
-        // Descriptor headroom, the way every production database handles it:
-        // the default soft limit is a shell convention (256 on macOS, 1024 on
-        // many Linux distros), not a capacity decision, and this engine holds
-        // one descriptor per vlog segment and per vindex segment file. Raise
-        // it toward the hard limit at boot; a refusal is logged, not hidden,
-        // so an operator can raise the hard limit themselves.
-        let want_fds = std::env::var("SKEG_MAX_FDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(65_536);
-        let fds = skeg_platform::raise_fd_limit(want_fds);
-        if fds < want_fds {
-            tracing::warn!(
-                soft = fds,
-                wanted = want_fds,
-                "file-descriptor limit below the target; raise the hard limit \
-                 (ulimit -n) if the store grows past a few hundred segments"
-            );
-        }
+        let fds = raise_descriptor_limit();
         info!(
             addr = ?listener.local_addr()?,
             n_shards = shards.n_shards(),
@@ -326,26 +385,128 @@ impl Server {
         // ceiling, so an unbounded accept loop is a memory-DoS surface
         // (review P0). SKEG_MAX_CONNECTIONS caps it; a permit is held for the
         // connection's lifetime.
-        let max_conns = std::env::var("SKEG_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(1024);
-        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_conns));
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let fp_key: Arc<str> = Arc::from(listener.local_addr()?.port().to_string());
         loop {
             let (stream, _) = listener.accept().await?;
+            // The floor comes FIRST, and never awaits. A budget awaited at
+            // accept is a listener that stops accepting, which turns a memory
+            // limit into an availability outage; and taking it before the
+            // permit means a connection parked on the semaphore is one that
+            // already has somewhere to put its bytes.
+            let Some(budget) = admit_or_refuse(&ingress, stream, RefusalWire::Resp3).await else {
+                continue;
+            };
+            let (budget, stream) = budget;
             // Acquire before spawning; if the pool is exhausted the accept
             // loop parks here rather than piling up unbounded tasks.
             let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
             tune_socket(&stream);
             let shards = shards.clone();
             let backend = tenant_backend.clone();
+            let fp_key = Arc::clone(&fp_key);
             tokio::spawn(async move {
                 let _permit = permit;
-                handle_connection_resp3(stream, shards, backend).await;
+                handle_connection_resp3(stream, shards, backend, budget, fp_key).await;
             });
         }
     }
+}
+
+/// Which wire an accept-time refusal has to be spelled in.
+///
+/// The two protocols agree on nothing except that the peer must be told, so
+/// the refusal is composed here rather than in either handler.
+#[derive(Clone, Copy)]
+enum RefusalWire {
+    Resp3,
+    Native,
+}
+
+/// Descriptor headroom, the way every production database handles it: the
+/// default soft limit is a shell convention (256 on macOS, 1024 on many Linux
+/// distros), not a capacity decision, and this engine holds one descriptor per
+/// vlog segment and per vindex segment file - plus one per connection, which
+/// is what makes it a listener's business and not only the store's. Raise it
+/// toward the hard limit at boot; a refusal is logged, not hidden, so an
+/// operator can raise the hard limit themselves.
+fn raise_descriptor_limit() -> u64 {
+    let want_fds = std::env::var("SKEG_MAX_FDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65_536);
+    let fds = skeg_platform::raise_fd_limit(want_fds);
+    if fds < want_fds {
+        warn!(
+            soft = fds,
+            wanted = want_fds,
+            "file-descriptor limit below the target; raise the hard limit \
+             (ulimit -n) if the store grows past a few hundred segments"
+        );
+    }
+    fds
+}
+
+/// Take the connection's floor, or refuse the connection by name.
+///
+/// Returns `None` when the peer was refused; the socket is answered and closed
+/// on a task of its own so a peer that never reads the answer cannot wedge the
+/// accept loop. That task holds one socket and one short string for at most a
+/// second, which is less than the connection would have cost admitted.
+///
+/// Answered BY NAME rather than shut in the peer's face: a connection dropped
+/// without a word looks to a client like a network fault, and the retry it
+/// schedules is the one thing a server out of room cannot afford.
+async fn admit_or_refuse(
+    ingress: &Arc<IngressBudget>,
+    stream: TcpStream,
+    wire: RefusalWire,
+) -> Option<(ConnectionBudget, TcpStream)> {
+    match ingress.try_accept() {
+        Ok(budget) => Some((budget, stream)),
+        Err(e) => {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedAccept);
+            warn!("ingress refused a connection: {e}");
+            let message = e.wire_message();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let bytes = match wire {
+                    RefusalWire::Resp3 => format!("-{message}\r\n").into_bytes(),
+                    // req_id 0: there is no request yet, and inventing one
+                    // would make a client match this to something it sent.
+                    // The message carries the BACKPRESSURE code as text; the
+                    // native error enum has no retryable variant to put it in,
+                    // which is P0.5's job and not this change's.
+                    RefusalWire::Native => {
+                        skeg_proto::encode_err(0, skeg_proto::ErrCode::Internal, &message).to_vec()
+                    }
+                };
+                let write = async {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream.write_all(&bytes).await;
+                    let _ = stream.shutdown().await;
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(1), write).await;
+            });
+            None
+        }
+    }
+}
+
+/// Concurrent connections a listener serves unless told otherwise.
+///
+/// The default is a capacity decision, not a shell convention: each connection
+/// can hold its floor of the ingress budget for as long as it is open.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// `SKEG_MAX_CONNECTIONS`, or the default. An unparseable or zero value is
+/// "not set": a typo must not become a server that accepts nothing.
+fn max_connections_from_env() -> usize {
+    std::env::var("SKEG_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
 }
 
 /// Apply per-connection socket tuning: `TCP_NODELAY` for low-latency

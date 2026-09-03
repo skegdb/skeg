@@ -384,10 +384,43 @@ pub enum Counter {
     /// failing - both of which have their own counter above. A one-off after a
     /// crash is the mechanism working.
     PayloadBlobsReclaimedAtOpen = 47,
+    /// Connections refused at accept because the ingress class was full. This
+    /// is the budget doing its job in the only place it can be done cheaply;
+    /// a sustained climb means the cap is too small for the client count, not
+    /// that a client is misbehaving.
+    IngressRefusedAccept = 48,
+    /// Frames refused because the connection could not be granted the buffer
+    /// they needed. Separate from the accept counter on purpose: one is about
+    /// how many peers there are, the other about how big their frames are.
+    IngressRefusedGrowth = 49,
+    /// Reads paused because a growth was refused and the connection waited to
+    /// see whether the room came back. A stall that ends in room is invisible
+    /// to the client except as latency, so without this it is invisible full
+    /// stop.
+    IngressStalls = 50,
+    /// Connections accepted while the ingress budget could not be established
+    /// (a cgroup limit applies and its headroom is unreadable) and were
+    /// therefore given their floor and no growth. Non-zero means the server is
+    /// serving small frames only, which a client experiences as refusals it
+    /// cannot explain.
+    IngressBudgetUnreadable = 51,
+    /// Replies whose buffer the ingress class could not charge for.
+    ///
+    /// "Could not charge", not "was large". The reply is still written - it is
+    /// the answer to work that has already committed, and withdrawing it would
+    /// make a client retry something that has happened - so this is the one
+    /// place the budget is knowingly exceeded. Counted rather than enforced,
+    /// and the buffer is handed back immediately afterwards.
+    ///
+    /// Under a full class it therefore ticks for ANY reply, including a
+    /// seven-byte `+PONG`: what failed is the charge, not the reply. Read it
+    /// next to `IngressRefusedGrowth` as a signal that the class is full, and
+    /// not as a measure of how big replies are getting.
+    IngressReplyOverBudget = 52,
 }
 
 impl Counter {
-    pub const COUNT: usize = 48;
+    pub const COUNT: usize = 53;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -437,6 +470,11 @@ impl Counter {
         Counter::PayloadBlobsCarriedForward,
         Counter::PayloadPostCommitFailures,
         Counter::PayloadBlobsReclaimedAtOpen,
+        Counter::IngressRefusedAccept,
+        Counter::IngressRefusedGrowth,
+        Counter::IngressStalls,
+        Counter::IngressBudgetUnreadable,
+        Counter::IngressReplyOverBudget,
     ];
 
     #[inline]
@@ -490,6 +528,11 @@ impl Counter {
             Counter::PayloadPostCommitFailures => "skeg_payload_post_commit_failures_total",
             Counter::PayloadBlobsReclaimedAtOpen => "skeg_payload_blobs_reclaimed_at_open_total",
             Counter::VacuumSkipped => "skeg_vacuum_skipped_total",
+            Counter::IngressRefusedAccept => "skeg_ingress_refused_accept_total",
+            Counter::IngressRefusedGrowth => "skeg_ingress_refused_growth_total",
+            Counter::IngressStalls => "skeg_ingress_stalls_total",
+            Counter::IngressBudgetUnreadable => "skeg_ingress_budget_unreadable_total",
+            Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
         }
     }
 }

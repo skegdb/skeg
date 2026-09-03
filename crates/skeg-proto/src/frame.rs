@@ -53,16 +53,52 @@ enum ParseState {
 /// (24 bytes) is parsed, then accumulates `payload_len` more bytes.
 pub struct FrameParser {
     state: ParseState,
+    /// The largest payload this parser will accept, checked at the HEADER.
+    ///
+    /// Defaults to [`MAX_FRAME_SIZE`]. A server that gives its connections a
+    /// smaller allowance passes it here so the refusal happens on the 24 bytes
+    /// that declared the length, not after the bytes have been buffered.
+    limit: u32,
 }
 
 impl FrameParser {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_limit(MAX_FRAME_SIZE)
+    }
+
+    /// A parser that refuses any frame declaring more than `limit` payload
+    /// bytes.
+    ///
+    /// `limit` is clamped to [`MAX_FRAME_SIZE`]: a caller cannot raise the
+    /// protocol ceiling, only lower it for itself.
+    #[must_use]
+    pub fn with_limit(limit: u32) -> Self {
         Self {
             state: ParseState::Header {
                 buf: [0u8; HEADER_LEN],
                 filled: 0,
             },
+            limit: limit.min(MAX_FRAME_SIZE),
+        }
+    }
+
+    /// The largest payload this parser accepts.
+    #[must_use]
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Bytes the parser has actually ALLOCATED for the frame in flight.
+    ///
+    /// Reported, not just held: the whole hazard of a length-prefixed protocol
+    /// is a declared length that allocates before anything arrives, and a
+    /// number nobody can read is a promise nobody can check.
+    #[must_use]
+    pub fn buffered_capacity(&self) -> usize {
+        match &self.state {
+            ParseState::Header { .. } => 0,
+            ParseState::Payload { buf, .. } => buf.capacity(),
         }
     }
 
@@ -90,11 +126,18 @@ impl FrameParser {
                         return Ok(None);
                     }
 
-                    let header = parse_header(buf)?;
-                    let cap = header.payload_len as usize;
+                    let header = parse_header(buf, self.limit)?;
+                    // EMPTY, not `with_capacity(payload_len)`. The length in a
+                    // header is a claim a peer made, and believing it turns 24
+                    // bytes into 16 MiB of resident heap that no protocol
+                    // error and no timeout ever gets back. The buffer grows
+                    // from `extend_from_slice` below as bytes actually arrive;
+                    // the cost is the amortised doubling any Vec pays, which a
+                    // 16 MiB frame pays once and a flood of headers never pays
+                    // at all.
                     self.state = ParseState::Payload {
                         header,
-                        buf: BytesMut::with_capacity(cap),
+                        buf: BytesMut::new(),
                     };
                     // fall through to try payload on the same call
                 }
@@ -130,7 +173,7 @@ impl Default for FrameParser {
     }
 }
 
-fn parse_header(buf: &[u8; HEADER_LEN]) -> Result<FrameHeader, ParseError> {
+fn parse_header(buf: &[u8; HEADER_LEN], limit: u32) -> Result<FrameHeader, ParseError> {
     let magic = u16::from_le_bytes([buf[0], buf[1]]);
     if magic != MAGIC {
         return Err(ParseError::InvalidMagic {
@@ -154,11 +197,16 @@ fn parse_header(buf: &[u8; HEADER_LEN]) -> Result<FrameHeader, ParseError> {
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
     ]);
 
+    // Checked HERE, on the 24 bytes that declared it, which is the only place
+    // the refusal is free: past this point the payload is being buffered, and
+    // a limit applied at the end costs exactly what admitting it would have.
+    // `limit` is the connection's allowance and is never above MAX_FRAME_SIZE
+    // (FrameParser::with_limit clamps it), so this is one comparison, not two.
     let payload_len = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-    if payload_len > MAX_FRAME_SIZE {
+    if payload_len > limit {
         return Err(ParseError::FrameTooLarge {
             len: payload_len,
-            max: MAX_FRAME_SIZE,
+            max: limit,
         });
     }
 
@@ -347,6 +395,63 @@ mod tests {
         let mut buf = BytesMut::from(encoded.as_ref());
         let frame = FrameParser::new().feed(&mut buf).unwrap().unwrap();
         assert_eq!(frame.header.req_id, u64::MAX);
+    }
+
+    /// The hazard of every length-prefixed protocol: 24 bytes of header
+    /// declare 16 MiB, and the parser believes them before a single payload
+    /// byte has arrived. Sixteen connections doing that pin 256 MiB from 384
+    /// bytes of input.
+    ///
+    /// The parser must allocate for what ARRIVED, and grow as more does.
+    #[test]
+    fn a_declared_native_payload_length_allocates_nothing_before_bytes_arrive() {
+        let declared = MAX_FRAME_SIZE; // 16 MiB, the largest a frame may claim
+        let raw = make_raw_header(MAGIC, VERSION, Op::Ok as u8, declared);
+        let mut parser = FrameParser::new();
+        let mut buf = BytesMut::from(&raw[..]);
+        assert!(parser.feed(&mut buf).unwrap().is_none(), "header only");
+        assert_eq!(
+            parser.buffered_capacity(),
+            0,
+            "the declared length was believed before any payload arrived"
+        );
+
+        // A kilobyte arrives. The parser may hold that, and not a megabyte.
+        let mut some = BytesMut::from(&vec![7u8; 1024][..]);
+        assert!(parser.feed(&mut some).unwrap().is_none(), "still partial");
+        let held = parser.buffered_capacity();
+        assert!(held >= 1024, "the bytes that arrived must be kept: {held}");
+        assert!(
+            held < declared as usize / 16,
+            "still allocating for what was declared, not for what arrived: {held}"
+        );
+    }
+
+    /// A connection given a smaller allowance than the protocol ceiling
+    /// refuses on the HEADER, which is the only place the refusal is free.
+    #[test]
+    fn a_payload_length_over_the_parser_limit_is_refused_at_the_header() {
+        let raw = make_raw_header(MAGIC, VERSION, Op::Ok as u8, 5000);
+        let mut buf = BytesMut::from(&raw[..]);
+        let err = FrameParser::with_limit(4096).feed(&mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::FrameTooLarge {
+                    len: 5000,
+                    max: 4096
+                }
+            ),
+            "wrong refusal: {err:?}"
+        );
+        // And the protocol ceiling is still a ceiling: a limit above it does
+        // not raise it.
+        let raw = make_raw_header(MAGIC, VERSION, Op::Ok as u8, MAX_FRAME_SIZE + 1);
+        let mut buf = BytesMut::from(&raw[..]);
+        let err = FrameParser::with_limit(u32::MAX)
+            .feed(&mut buf)
+            .unwrap_err();
+        assert!(matches!(err, ParseError::FrameTooLarge { .. }), "{err:?}");
     }
 
     #[test]

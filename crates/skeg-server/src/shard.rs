@@ -7090,27 +7090,55 @@ impl ShardSet {
         // in batches instead of one barrier per vector (100k: ~770s serial ->
         // ~34s). Only the ORDER is restored, by carrying the index with the
         // task rather than by waiting for each in turn.
+        //
+        // But bounded at [`VMSET_INFLIGHT`], which it was not: a maximum batch
+        // is 4096 items, so one connection opened 4096 tasks and the default
+        // connection limit made that four million. That memory is per REQUEST
+        // and the ingress budget does not charge it - the budget covers the
+        // socket buffers, not the tree a request expands into - so the only
+        // ceiling it had was MAX_VMSET_ITEMS.
+        //
+        // Still spawned tasks rather than a buffered stream. A panic inside a
+        // task is that task's; a panic inside a stream's future unwinds into
+        // this call and takes every sibling with it, which is exactly the
+        // property Task 2 added the per-item answers for.
         let mut set = tokio::task::JoinSet::new();
-        for (i, (id, vector, payload)) in items.into_iter().enumerate() {
+        let mut pending = items.into_iter().enumerate();
+        let mut out: Vec<Option<Result<(), ShardError>>> = (0..n).map(|_| None).collect();
+        let mut spawn_next = |set: &mut tokio::task::JoinSet<_>| {
+            let Some((i, (id, vector, payload))) = pending.next() else {
+                return false;
+            };
             let this = self.clone();
             let name = name.to_owned();
             set.spawn(async move {
+                let _inflight = vmset_inflight::Guard::enter();
                 (
                     i,
                     this.vset(&name, id, vector, tenant, limit, payload).await,
                 )
             });
+            true
+        };
+        for _ in 0..VMSET_INFLIGHT {
+            if !spawn_next(&mut set) {
+                break;
+            }
         }
-        let mut out: Vec<Option<Result<(), ShardError>>> = (0..n).map(|_| None).collect();
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((i, r)) => out[i] = Some(r),
                 // A task that panicked names no item, so nothing can be said
                 // about a specific one. The `None`s below become
                 // `Unavailable`, which is the honest answer for an item whose
-                // outcome nobody observed.
+                // outcome nobody observed - and its siblings, which are their
+                // own tasks, are untouched.
                 Err(e) => tracing::error!(index = name, error = %e, "a VMSET item task failed"),
             }
+            // One out, one in: the window stays full until the batch runs out,
+            // so the bound costs a scheduling round trip per item and not a
+            // barrier per window.
+            spawn_next(&mut set);
         }
         out.into_iter()
             .map(|r| r.unwrap_or(Err(ShardError::Unavailable)))
@@ -14650,5 +14678,82 @@ mod tests {
             ratio >= 1.2,
             "per-vindex locks did not parallelise (baseline {baseline:?}, concurrent {concurrent:?}, ratio {ratio:.2}x; expected >= 1.2x)"
         );
+    }
+}
+
+/// The most `SKEG.VMSET` item writes that run at once inside one call.
+///
+/// The fan-out is a per-REQUEST cost, and it is the one the ingress budget
+/// does not charge: the budget covers the socket buffers a connection holds,
+/// not the tree a single request expands into while it is being served. One
+/// maximum VMSET is 4096 items, so an unbounded fan-out was 4096 concurrent
+/// tasks per connection - about 98,000 across 24 connections, and 4.2 million
+/// at the default connection limit. Measured at 24 connections it cost
+/// +284.9 MiB of resident memory, roughly 12 MiB per connection, none of it
+/// visible to any budget.
+///
+/// Bounding it does not undo the reason the fan-out exists. The point of VMSET
+/// is that per-vector blob writes accumulate in the group committer and flush
+/// in batches instead of one barrier per vector; sixty-four writers is still a
+/// batch, and the throughput measurement in the CHANGELOG says by how much.
+pub const VMSET_INFLIGHT: usize = 64;
+
+/// Item writes running inside [`ShardSet::vmset`], and the most that ever ran
+/// at once.
+///
+/// Instrumentation, not accounting. The fan-out is memory no budget charges,
+/// so the only way a test can say "at most N at a time" is to watch it happen;
+/// a test that checked the constant instead would pass against code that
+/// ignored it. Present only where failpoints are, and the guard is a
+/// zero-sized nothing otherwise.
+#[cfg(any(test, feature = "failpoints"))]
+pub mod vmset_inflight {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static RUNNING: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held for the life of one item write.
+    pub(crate) struct Guard;
+
+    impl Guard {
+        pub(crate) fn enter() -> Self {
+            let now = RUNNING.fetch_add(1, Ordering::AcqRel) + 1;
+            PEAK.fetch_max(now, Ordering::AcqRel);
+            Self
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RUNNING.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The most item writes that ran at once since [`reset`].
+    ///
+    /// Process-wide, so a test that reads it has to be the only VMSET in its
+    /// process - which an integration test target is, each one being its own
+    /// binary.
+    #[must_use]
+    pub fn peak() -> usize {
+        PEAK.load(Ordering::Acquire)
+    }
+
+    /// Start a new measurement.
+    pub fn reset() {
+        PEAK.store(0, Ordering::Release);
+    }
+}
+
+/// The same guard where the instrumentation is compiled out: nothing at all.
+#[cfg(not(any(test, feature = "failpoints")))]
+pub mod vmset_inflight {
+    pub(crate) struct Guard;
+
+    impl Guard {
+        pub(crate) fn enter() -> Self {
+            Self
+        }
     }
 }

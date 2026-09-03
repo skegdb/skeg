@@ -34,6 +34,8 @@ use skeg_resp3::{
 };
 use skeg_vector::QuantKind;
 
+use crate::failpoint::IngressFailpoint;
+use crate::ingress::ConnectionBudget;
 use crate::payload::parse_filter;
 use crate::shard::ShardSet;
 use crate::tenant::{Admission, AnonymousPolicy, CommandKind, TenantBackend, TenantId};
@@ -125,7 +127,7 @@ fn auth_clear(ip: IpAddr) {
 /// can pin while a frame is mid-flight, so a desynced or dribbled
 /// never-completing frame cannot grow the buffer without bound (and N
 /// connections cannot each pin more than this).
-const MAX_CONN_BUFFER: usize = MAX_VMSET_BYTES + skeg_resp3::MAX_BULK_LEN + (1 << 20);
+pub(crate) const MAX_CONN_BUFFER: usize = MAX_VMSET_BYTES + skeg_resp3::MAX_BULK_LEN + (1 << 20);
 
 fn scope_vindex_or_reject(tenant: TenantId, raw_name: &str) -> Result<String, Frame> {
     if raw_name.contains("::") {
@@ -255,7 +257,7 @@ fn anon_forgery_error() -> Frame {
 /// bytes the decoder hasn't parsed yet), reserve the large chunk so a
 /// pipelined burst still buffers many frames per syscall instead of
 /// serializing one-frame-per-read.
-fn read_reserve(buffered: usize) -> usize {
+pub(crate) fn read_reserve(buffered: usize) -> usize {
     if buffered == 0 { 4096 } else { 256 * 1024 }
 }
 
@@ -264,7 +266,7 @@ fn read_reserve(buffered: usize) -> usize {
 /// bursted once - or sent a single byte and went quiet - would hold 256 KiB
 /// for its whole life, and `read_reserve`'s idle figure would only be true
 /// for sockets that never sent anything.
-fn trim_idle(buf: &mut BytesMut) {
+pub(crate) fn trim_idle(buf: &mut BytesMut) {
     if buf.is_empty() && buf.capacity() > 64 * 1024 {
         *buf = BytesMut::with_capacity(4096);
     }
@@ -280,11 +282,63 @@ const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 /// Exposed via HELLO response and (future) CLIENT ID.
 static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
 
+/// Encode one reply into `out`, write it, and account for what it cost.
+///
+/// The reply buffer is a per-connection buffer exactly like the decoder's, and
+/// it was in no budget at all. `BytesMut` never returns capacity on its own,
+/// so a single `SKEG.VMSET` of 4096 failing items - one reply line each, each
+/// capped at 256 bytes - left about 1.03 MiB allocated for the rest of the
+/// connection's life, and 1024 connections is a gigabyte the governor cannot
+/// see. Ingress was charged; egress was not, and both are buffers the same
+/// socket holds.
+///
+/// The charge is taken after the encode and the reply is written even when it
+/// is refused. A reply is the answer to work that has already committed:
+/// withdrawing it would be an error raised past the commit point, and the
+/// client would retry a batch that has been applied. So an overshoot here is
+/// COUNTED, not returned - the one place the budget is knowingly exceeded -
+/// and the buffer is handed back in the same breath.
+///
+/// `other_capacity` is what the rest of this connection holds, normally the
+/// decoder's: the charge is the connection's whole footprint, ingress and
+/// egress in one figure, because they are one socket's memory.
+async fn flush_reply(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    out: &mut BytesMut,
+    frame: &Frame,
+    version: skeg_resp3::ProtoVersion,
+    budget: &mut ConnectionBudget,
+    other_capacity: usize,
+) -> bool {
+    out.clear();
+    encode_frame(frame, version, out);
+    if budget
+        .grow_to(other_capacity.saturating_add(out.capacity()))
+        .is_err()
+    {
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressReplyOverBudget);
+    }
+    let ok = stream.write_all(out).await.is_ok();
+    // Given back immediately, not at the next read: `trim_idle` only fires on
+    // an EMPTY buffer, and `out` is only empty between replies - which is
+    // exactly now.
+    out.clear();
+    trim_idle(out);
+    budget.shrink_to(other_capacity.saturating_add(out.capacity()));
+    ok
+}
+
 /// Per-connection driver. Loops until EOF / write error / fatal parse error.
+///
+/// `budget` is this connection's share of the ingress class, taken at accept
+/// and held for the whole life of the connection. `fp_key` is the listener's
+/// port, which is what an ingress failpoint is keyed on.
 pub async fn handle_connection_resp3(
     mut stream: TcpStream,
     shards: ShardSet,
     tenant_backend: Option<Arc<dyn TenantBackend>>,
+    mut budget: ConnectionBudget,
+    fp_key: Arc<str>,
 ) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, "RESP3 connection accepted");
@@ -313,9 +367,16 @@ pub async fn handle_connection_resp3(
                 let resp = h
                     .await
                     .unwrap_or_else(|_| Frame::Error("ERR internal task failure".into()));
-                out.clear();
-                encode_frame(&resp, state.version, &mut out);
-                ok = stream.write_all(&out).await.is_ok();
+                let held = decoder.capacity();
+                ok = flush_reply(
+                    &mut stream,
+                    &mut out,
+                    &resp,
+                    state.version,
+                    &mut budget,
+                    held,
+                )
+                .await;
             }
             ok
         }};
@@ -348,14 +409,23 @@ pub async fn handle_connection_resp3(
                                 &shards,
                                 tenant_backend.as_ref(),
                                 peer.map(|p| p.ip()),
+                                budget.budget(),
                             )
                             .await
                         }
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     };
-                    out.clear();
-                    encode_frame(&response, state.version, &mut out);
-                    if stream.write_all(&out).await.is_err() {
+                    let held = decoder.capacity();
+                    if !flush_reply(
+                        &mut stream,
+                        &mut out,
+                        &response,
+                        state.version,
+                        &mut budget,
+                        held,
+                    )
+                    .await
+                    {
                         break 'conn;
                     }
                 }
@@ -379,11 +449,67 @@ pub async fn handle_connection_resp3(
                 // to the large chunk after its first partial read fills the
                 // small reservation and leaves bytes buffered.
                 trim_idle(decoder.buf_mut());
+                // Give back what the trim released BEFORE asking for more:
+                // a connection that bursted once must not still be charged for
+                // its peak while it asks for the next chunk.
+                budget.shrink_to(decoder.buf_mut().capacity());
                 let reserve = read_reserve(decoder.buffered());
+                // What `BytesMut::reserve` will leave the capacity at. It never
+                // shrinks and it grows to at least len + additional, so this is
+                // the charge to hold BEFORE the buffer is allowed to get there.
+                let want = decoder
+                    .buf_mut()
+                    .capacity()
+                    .max(decoder.buffered().saturating_add(reserve));
+                if let Err(e) = crate::ingress::grow_or_stall(&mut budget, want, &fp_key).await {
+                    // Back to the floor before the refusal goes out: the bytes
+                    // of this frame that did arrive are not worth keeping for a
+                    // frame that will not be completed, and holding them would
+                    // make the refusal cost what admitting it would have.
+                    *decoder.buf_mut() = BytesMut::with_capacity(4096);
+                    budget.shrink_to(4096);
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
+                    warn!(?peer, "ingress refused: {e}");
+                    let err = Frame::Error(e.wire_message());
+                    let _ = flush_reply(
+                        &mut stream,
+                        &mut out,
+                        &err,
+                        state.version,
+                        &mut budget,
+                        4096,
+                    )
+                    .await;
+                    break 'conn;
+                }
                 decoder.buf_mut().reserve(reserve);
                 match stream.read_buf(decoder.buf_mut()).await {
                     Ok(0) => break,
                     Ok(_) => {
+                        // Re-checked AFTER the read. `read_buf` fills the whole
+                        // spare capacity, and `BytesMut::chunk_mut` will add a
+                        // little more when the buffer is exactly full, so the
+                        // capacity charged for a moment ago is not necessarily
+                        // the capacity that came back.
+                        if let Err(e) = budget.grow_to(decoder.buf_mut().capacity()) {
+                            *decoder.buf_mut() = BytesMut::with_capacity(4096);
+                            budget.shrink_to(4096);
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::IngressRefusedGrowth,
+                            );
+                            warn!(?peer, "ingress refused after read: {e}");
+                            let err = Frame::Error(e.wire_message());
+                            let _ = flush_reply(
+                                &mut stream,
+                                &mut out,
+                                &err,
+                                state.version,
+                                &mut budget,
+                                4096,
+                            )
+                            .await;
+                            break 'conn;
+                        }
                         // Bound per-connection buffering. A frame that never
                         // completes (protocol desync, or a bulk whose declared
                         // length is dribbled forever) would otherwise let one
@@ -410,9 +536,16 @@ pub async fn handle_connection_resp3(
                 }
                 warn!(?peer, "RESP3 parse error: {e}");
                 let err = Frame::Error(format!("ERR protocol: {e}"));
-                out.clear();
-                encode_frame(&err, state.version, &mut out);
-                let _ = stream.write_all(&out).await;
+                let held = decoder.capacity();
+                let _ = flush_reply(
+                    &mut stream,
+                    &mut out,
+                    &err,
+                    state.version,
+                    &mut budget,
+                    held,
+                )
+                .await;
                 break;
             }
         }
@@ -424,6 +557,13 @@ pub async fn handle_connection_resp3(
         }
     }
 
+    // The budget goes back HERE, and the failpoint marks that this line was
+    // reached. Without it a test asserting "the class came back to zero" would
+    // pass just as well on a connection that was never served at all.
+    if crate::fp_ingress!(IngressFailpoint::ReleaseDeferredOnClose, &fp_key) {
+        tokio::task::yield_now().await;
+    }
+    drop(budget);
     debug!(?peer, "RESP3 connection closed");
 }
 
@@ -581,6 +721,7 @@ async fn dispatch_command(
     shards: &ShardSet,
     tenant_backend: Option<&Arc<dyn TenantBackend>>,
     peer_ip: Option<IpAddr>,
+    ingress: &Arc<crate::ingress::IngressBudget>,
 ) -> Frame {
     // Per-command admission (multi-tenant QoS). Hello/SkegAuth establish or
     // change the tenant and are never gated. Single-tenant (no backend) skips
@@ -699,7 +840,7 @@ async fn dispatch_command(
             kv_incrby_apply(&key, signed, shards, *tenant, tenant_backend).await
         }
         Command::Select { db } => kv_select_db(db),
-        Command::SkegStats => skeg_stats(shards).await,
+        Command::SkegStats => skeg_stats(shards, ingress).await,
         Command::SkegShards => skeg_shards(shards).await,
         Command::SkegWhoami => skeg_whoami(*tenant, tenant_backend.is_some()),
         Command::SkegAuth { args } => skeg_auth(&args),
@@ -1802,7 +1943,7 @@ fn skeg_auth(_args: &[Bytes]) -> Frame {
     Frame::Error("ERR SKEG.AUTH is reserved; use HELLO 3 AUTH user pass for now (v0.2)".into())
 }
 
-async fn skeg_stats(shards: &ShardSet) -> Frame {
+async fn skeg_stats(shards: &ShardSet, ingress: &Arc<crate::ingress::IngressBudget>) -> Frame {
     match shards.stats().await {
         Ok(s) => {
             // Combine the legacy single-line cache summary with the
@@ -1849,6 +1990,28 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
                 g.reserved_bytes(),
                 g.reserve_bytes(),
             );
+            // The ingress class, in the same three states and for the same
+            // reason: a ceiling with room, no ceiling at all, and a ceiling
+            // whose room could not be read. Reported next to the governor
+            // rather than as a separate section, because the held figure is
+            // this class's share of the number directly above it - a reader
+            // who cannot see the two together cannot tell whether ingress or
+            // the delta is what is filling the budget.
+            let cap = ingress.cap();
+            let ingress_text = format!(
+                "# TYPE skeg_ingress_state gauge\n\
+                 skeg_ingress_state{{state=\"{}\"}} 1\n\
+                 # TYPE skeg_ingress_cap_bytes gauge\n\
+                 skeg_ingress_cap_bytes {}\n\
+                 # TYPE skeg_ingress_held_bytes gauge\n\
+                 skeg_ingress_held_bytes {}\n\
+                 # TYPE skeg_ingress_per_connection_max_bytes gauge\n\
+                 skeg_ingress_per_connection_max_bytes {}\n",
+                cap.state_name(),
+                cap.bytes(),
+                ingress.held_bytes(),
+                ingress.per_connection_max(),
+            );
             let (fd_soft, _fd_hard) = skeg_platform::fd_limit();
             let fd_open = skeg_platform::open_fd_count();
             let process = format!(
@@ -1865,7 +2028,7 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
                 )),
             );
             let body = format!(
-                "{cache_line}\n\n{process}{memory}\n{}",
+                "{cache_line}\n\n{process}{memory}{ingress_text}\n{}",
                 skeg_telemetry::stats::dump_text()
             );
             Frame::Bulk(Bytes::from(body))
@@ -2146,6 +2309,60 @@ mod tests {
     /// An idle or between-frames socket (`buffered == 0`) must not pin more
     /// than a few KiB of decoder capacity - the connection semaphore's
     /// default limit means hundreds of these can be idle at once.
+    /// An ingress budget over a headroom the test dictates, for the call
+    /// sites that need one and are not testing it.
+    fn test_ingress() -> Arc<crate::ingress::IngressBudget> {
+        #[derive(Debug)]
+        struct Fixed(crate::memory::Headroom);
+        impl crate::memory::MemorySource for Fixed {
+            fn headroom(&self) -> crate::memory::Headroom {
+                self.0
+            }
+        }
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(
+                Arc::new(Fixed(crate::memory::Headroom::Known(64 << 20))),
+                None,
+                Some(0),
+            )
+            .expect("a governor"),
+        );
+        Arc::new(crate::ingress::IngressBudget::new(
+            governor,
+            None,
+            None,
+            None,
+            u64::from(u32::MAX),
+        ))
+    }
+
+    /// An ingress budget whose class is far too small for a maximum reply, so
+    /// the overshoot path can be driven without a megabyte-sized fixture.
+    fn tiny_ingress() -> Arc<crate::ingress::IngressBudget> {
+        #[derive(Debug)]
+        struct Fixed(crate::memory::Headroom);
+        impl crate::memory::MemorySource for Fixed {
+            fn headroom(&self) -> crate::memory::Headroom {
+                self.0
+            }
+        }
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(
+                Arc::new(Fixed(crate::memory::Headroom::Known(1 << 20))),
+                None,
+                Some(0),
+            )
+            .expect("a governor"),
+        );
+        Arc::new(crate::ingress::IngressBudget::new(
+            governor,
+            None,
+            Some(crate::ingress::CHUNK_BYTES),
+            None,
+            u64::from(u32::MAX),
+        ))
+    }
+
     #[test]
     fn read_reserve_idle_is_small() {
         assert!(super::read_reserve(0) <= 4096);
@@ -2279,7 +2496,7 @@ mod tests {
         // without reporting one survived without knowing.
         let dir = tempfile::TempDir::new().unwrap();
         let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
-        let Frame::Bulk(body) = skeg_stats(&shards).await else {
+        let Frame::Bulk(body) = skeg_stats(&shards, &test_ingress()).await else {
             panic!("a bulk summary");
         };
         let text = String::from_utf8(body.to_vec()).unwrap();
@@ -2296,6 +2513,137 @@ mod tests {
                 || text.contains("state=\"unlimited\"")
                 || text.contains("state=\"unknown\""),
             "the budget state is not one of the three: {text}"
+        );
+    }
+
+    /// A slowloris gate reads ONE number out of a running server to decide
+    /// whether a thousand idle connections cost megabytes or gigabytes. If
+    /// STATS does not carry it, the gate has to infer the answer from the
+    /// process RSS, which is every allocation in the engine at once.
+    #[tokio::test]
+    async fn stats_reports_the_ingress_budget() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = crate::shard::ShardSet::open(dir.path(), 1).unwrap();
+        let ingress = test_ingress();
+        let held = ingress.try_accept().expect("a floor");
+        let Frame::Bulk(body) = skeg_stats(&shards, &ingress).await else {
+            panic!("a bulk summary");
+        };
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for line in [
+            "skeg_ingress_state",
+            "skeg_ingress_cap_bytes",
+            "skeg_ingress_held_bytes",
+            "skeg_ingress_per_connection_max_bytes",
+        ] {
+            assert!(text.contains(line), "STATS says nothing about {line}");
+        }
+        // Three states, named, exactly as the governor's own gauge does it.
+        assert!(
+            text.contains("skeg_ingress_state{state=\"known\"}")
+                || text.contains("skeg_ingress_state{state=\"default\"}")
+                || text.contains("skeg_ingress_state{state=\"unreadable\"}"),
+            "the ingress state is not one of the three: {text}"
+        );
+        // And the held figure is the live one, not a constant.
+        assert!(
+            text.contains(&format!(
+                "skeg_ingress_held_bytes {}",
+                crate::ingress::FLOOR_BYTES
+            )),
+            "the held figure did not follow the accepted connection: {text}"
+        );
+        drop(held);
+    }
+
+    /// The reply buffer is the other half of "one budget", and it was in no
+    /// budget at all. A VMSET of 4096 failing items is about 1.03 MiB of
+    /// reply, `BytesMut` never gives capacity back, and 1024 connections that
+    /// each sent one such batch pin a gigabyte the governor cannot see.
+    #[tokio::test]
+    async fn a_reply_buffer_is_charged_and_given_back_after_the_flush() {
+        let budget = test_ingress();
+        let mut conn = budget.try_accept().expect("the floor");
+        let mut out = BytesMut::with_capacity(4096);
+        let mut sink: Vec<u8> = Vec::new();
+
+        // The worst reply this server can build: one line per item, each the
+        // longest error the item cap allows.
+        let reply = Frame::Array(
+            (0..MAX_VMSET_ITEMS)
+                .map(|_| Frame::Error("E".repeat(MAX_VMSET_ERROR_LEN)))
+                .collect(),
+        );
+        assert!(
+            flush_reply(
+                &mut sink,
+                &mut out,
+                &reply,
+                skeg_resp3::ProtoVersion::Resp3,
+                &mut conn,
+                4096,
+            )
+            .await
+        );
+        assert!(
+            sink.len() > 1_000_000,
+            "the reply was not the large one: {}",
+            sink.len()
+        );
+        assert!(
+            out.capacity() <= 4096,
+            "the reply buffer was not given back: {} bytes still allocated",
+            out.capacity()
+        );
+        assert_eq!(
+            conn.held_bytes(),
+            crate::ingress::FLOOR_BYTES,
+            "the charge did not come back with the buffer"
+        );
+    }
+
+    /// A reply is the answer to work that has already committed. When the
+    /// class cannot cover its buffer the answer still goes out - withdrawing
+    /// it would make a client retry a VMSET that has been applied - so the
+    /// overshoot is COUNTED rather than turned into an error.
+    #[tokio::test]
+    async fn a_reply_too_large_for_the_class_is_still_delivered_and_counted() {
+        let budget = tiny_ingress();
+        let mut conn = budget.try_accept().expect("the floor");
+        let mut out = BytesMut::with_capacity(4096);
+        let mut sink: Vec<u8> = Vec::new();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
+
+        let reply = Frame::Array(
+            (0..MAX_VMSET_ITEMS)
+                .map(|_| Frame::Error("E".repeat(MAX_VMSET_ERROR_LEN)))
+                .collect(),
+        );
+        assert!(
+            flush_reply(
+                &mut sink,
+                &mut out,
+                &reply,
+                skeg_resp3::ProtoVersion::Resp3,
+                &mut conn,
+                4096,
+            )
+            .await,
+            "the reply must be written even when the class cannot cover it"
+        );
+        assert!(
+            sink.len() > 1_000_000,
+            "the reply was truncated: {}",
+            sink.len()
+        );
+        assert!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget) > before,
+            "the budget was exceeded in silence"
+        );
+        assert!(
+            out.capacity() <= 4096,
+            "the buffer was not given back: {}",
+            out.capacity()
         );
     }
 
@@ -2607,6 +2955,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            &test_ingress(),
         )
         .await;
         assert!(
@@ -2625,6 +2974,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            &test_ingress(),
         )
         .await;
         assert!(
@@ -2659,6 +3009,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            &test_ingress(),
         )
         .await;
         assert!(
@@ -2674,6 +3025,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            &test_ingress(),
         )
         .await;
         assert!(
@@ -2689,6 +3041,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            &test_ingress(),
         )
         .await;
         assert!(
@@ -2708,6 +3061,7 @@ mod tests {
             &shards,
             Some(&backend),
             None,
+            &test_ingress(),
         )
         .await;
         assert!(
@@ -2738,6 +3092,7 @@ mod tests {
                 &shards,
                 None,
                 None,
+                &test_ingress(),
             )
             .await;
             assert!(!matches!(f, Frame::Error(_)), "create {name} failed: {f:?}");
@@ -3094,7 +3449,7 @@ mod tests {
     #[tokio::test]
     async fn skeg_stats_returns_a_bulk_summary() {
         let (_dir, shards) = fresh_shards().await;
-        let resp = skeg_stats(&shards).await;
+        let resp = skeg_stats(&shards, &test_ingress()).await;
         match resp {
             Frame::Bulk(b) => {
                 let s = std::str::from_utf8(&b).unwrap();

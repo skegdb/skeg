@@ -76,6 +76,9 @@ tracing-otlp = [
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+# The slowloris gate opens a thousand sockets of its own, so the TEST process
+# needs the descriptor headroom too - the default soft limit is 256 on macOS.
+skeg-platform = { path = "../skeg-platform", version = "0.1.6" }
 # The crate itself, with failpoints on. An integration test is its own crate
 # and links the library through this entry, so `cargo test -p skeg-server`
 # builds the tested library WITH the failpoints while `cargo build` does not.
