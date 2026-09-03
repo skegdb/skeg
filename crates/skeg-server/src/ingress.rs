@@ -816,6 +816,93 @@ mod tests {
         drop((delta, rest));
     }
 
+    /// A megabyte, so the arithmetic below reads as the numbers an operator
+    /// would compute by hand.
+    const MIB: u64 = 1 << 20;
+
+    /// The worked example, pinned. Everything documented about what a
+    /// container-sized budget offers is derived here, and derived numbers that
+    /// only live in prose stop being true the first time a constant moves.
+    #[test]
+    fn the_arithmetic_of_a_256_mib_container_is_what_the_docs_say() {
+        // A 256 MiB cgroup with about 100 MiB resident leaves ~150 MiB.
+        let gov = Arc::new(
+            MemoryGovernor::new(Arc::new(Fixed(Headroom::Known(150 * MIB))), None, None)
+                .expect("a governor"),
+        );
+        // The governor holds a tenth back, floored at 64 MiB - the floor wins
+        // at this size.
+        assert_eq!(gov.reserve_bytes(), 64 * MIB);
+        assert_eq!(gov.budget(), Budget::Room(86 * MIB), "150 less the reserve");
+
+        let budget = Arc::new(IngressBudget::new(
+            Arc::clone(&gov),
+            None,
+            None,
+            None,
+            crate::resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
+        // A quarter of the usable headroom for the whole ingress class...
+        assert_eq!(budget.cap(), IngressCap::Room(22_544_384), "21.5 MiB");
+        // ...and a quarter of that for any one connection, in CHARGE, which is
+        // twice the buffer it may hold.
+        assert_eq!(budget.per_connection_max(), 5_636_096, "5.375 MiB charged");
+        assert_eq!(
+            budget.per_connection_max() / PARSE_FACTOR,
+            2_818_048,
+            "2.6875 MiB of buffer"
+        );
+
+        // So a VMSET at the protocol's frame ceiling does not fit, and this is
+        // the consequence worth declaring: in a 256 MiB container that request
+        // is refused BY NAME, where before it was admitted and the process was
+        // killed for it. The refusal is not retryable, because the same frame
+        // will not fit next time either.
+        let mut conn = budget.try_accept().expect("the floor");
+        let err = conn
+            .grow_to(crate::resp3_handler::MAX_CONN_BUFFER)
+            .expect_err("a 129 MiB frame cannot fit a 21.5 MiB class");
+        assert!(
+            matches!(err, IngressRejected::OverConnectionAllowance { .. }),
+            "wrong refusal: {err:?}"
+        );
+        assert!(!err.is_retryable(), "retrying will not make it fit");
+        assert!(
+            err.wire_message().starts_with("ERR "),
+            "a permanent refusal must not wear a retryable code: {}",
+            err.wire_message()
+        );
+    }
+
+    /// Off Linux there is no cgroup to read, so the default cap is what every
+    /// developer machine and most of the test suite actually runs. It must not
+    /// narrow the frame ceiling the protocol already enforces - a budget that
+    /// refuses a legitimate VMSET on a machine with no memory limit at all is
+    /// not a budget, it is a regression.
+    #[test]
+    fn the_default_cap_still_admits_one_maximum_frame_per_connection() {
+        let budget = Arc::new(IngressBudget::new(
+            governor(Headroom::Unlimited),
+            None,
+            None,
+            None,
+            crate::resp3_handler::MAX_CONN_BUFFER as u64,
+        ));
+        assert_eq!(budget.cap().state_name(), "default");
+        assert!(
+            budget.cap().bytes() >= UNLIMITED_DEFAULT_CAP,
+            "the documented 1 GiB is the floor of this figure, not a ceiling"
+        );
+        assert_eq!(
+            budget.per_connection_max() / PARSE_FACTOR,
+            crate::resp3_handler::MAX_CONN_BUFFER as u64,
+            "the per-connection buffer allowance is exactly the frame ceiling"
+        );
+        let mut conn = budget.try_accept().expect("the floor");
+        conn.grow_to(crate::resp3_handler::MAX_CONN_BUFFER)
+            .expect("a maximum frame must still fit under the default cap");
+    }
+
     #[test]
     fn an_unreadable_budget_serves_small_frames_and_refuses_growth() {
         // A ceiling applies and its headroom cannot be read. Refusing every

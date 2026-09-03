@@ -9,6 +9,88 @@ repository.
 
 ## [Unreleased]
 
+### What the network may hold is now part of the memory budget
+
+Every limit on incoming bytes was per connection, and the connection
+semaphore multiplied it. RESP3 checked its 129 MiB frame ceiling against
+the buffer's LENGTH while `BytesMut::reserve` doubles its capacity, so
+one legitimate `SKEG.VMSET` reached 256 MiB of buffer and the parser
+copied on top of that; a thousand connections was 256 GiB before the
+memory governor was consulted about anything, because nothing consults it
+until a command exists and no command exists until the frame is whole.
+The binary protocol had no connection limit at all, an eager 64 KiB
+buffer per socket, and a frame header that allocated its declared
+`payload_len` before a byte of it arrived - 24 bytes bought 16 MiB.
+
+**Ingress is now a class inside the same budget the delta uses.** A
+connection reserves through the same `MemoryGovernor`, so a byte a socket
+holds and a byte a delta holds compete for one headroom figure and show
+up in one total. Inside that budget the network gets a class cap - 25% of
+usable headroom by default - and inside the class each connection gets a
+quarter as its allowance. A connection is charged for the CAPACITY of its
+read buffer, times two for the parse copy that is live at the same time,
+in 512 KiB steps, granted before the buffer grows and given back when it
+drains.
+
+Both listeners take the same route: a floor reserved at accept, before
+the connection permit and never awaited (a budget awaited at accept is a
+listener that stops accepting); a refusal answered by name rather than a
+socket shut in the peer's face. The binary protocol joins the connection
+semaphore, raises the descriptor limit at boot, starts its buffer at the
+floor, and builds its frame parser with the connection's allowance so a
+declared length too large to hold is refused on the header.
+
+Both parsers now allocate for what arrived rather than for what was
+claimed: the native payload buffer starts empty and grows from real
+bytes, and a RESP3 aggregate reserves the smallest of the count claimed,
+the existing 1024-slot ceiling, and the number of frames the buffered
+input could possibly contain.
+
+**What clients see.** A refusal that will not change - a frame larger
+than one connection may ever hold - comes back as
+`ERR ingress budget: this connection may hold at most N bytes and the
+frame needs M`, and means the batch must be split. A refusal that is
+momentary - the class is full, or the governor has no headroom - comes
+back as `BACKPRESSURE ingress budget: ...` after the connection has
+stopped reading for `SKEG_INGRESS_STALL_MS` (500 ms) waiting for room,
+and should be retried. On the binary protocol the same text arrives in an
+`Internal` error frame with request id 0: the native error enum has no
+retryable code yet, which is separate work.
+
+**Declare this before upgrading.** In a 256 MiB container the arithmetic
+is: 150 MiB of headroom, less a 64 MiB reserve, is 86 MiB usable; a
+quarter of that is a 21.5 MiB ingress class; a quarter of the class is
+one connection's 5.375 MiB charge, which is 2.7 MiB of buffer. A
+`SKEG.VMSET` at the 129 MiB frame ceiling no longer fits, and is refused
+by name where an earlier build accepted it and was OOM-killed part-way
+through. Raise `SKEG_INGRESS_BUDGET_BYTES`, or give the container more
+memory, if you send frames that size. Off Linux, where there is no cgroup
+to read, the class cap is a static 1 GiB or four maximum frames if that
+is larger - it is the larger, so nothing narrows on a machine with no
+limit at all.
+
+`SKEG.STATS` reports `skeg_ingress_state` (known / default /
+unreadable), `_cap_bytes`, `_held_bytes` and
+`_per_connection_max_bytes`. Four counters - refusals at accept,
+refusals of growth, stalls, and accepts made while the budget could not
+be read - go to the telemetry registry, so those also reach `/metrics`;
+the gauges do not, for the same reason the existing memory gauges do not,
+which is that both are assembled inside the `SKEG.STATS` handler. See
+[docs/observability.md](docs/observability.md) for the sizing table.
+
+Measured 2026-09-03, macOS arm64, release build:
+
+- A thousand idle RESP3 connections against the real binary hold
+  8,200,192 bytes - 8,192 per connection, exactly the floor. Sixteen
+  connections each dribbling a 64 MiB bulk peak inside the class cap
+  instead of at sixteen times one connection's ceiling.
+- Pipelined RESP3 throughput, one connection, 20,000 `SKEG.VSET` at
+  dim 128, eight runs of each build back to back: best 135,246 ops/s
+  before against 136,335 after, medians 132k against 128k. The spread
+  within one build (99k to 135k on the unchanged one) is several times
+  the difference between the two, so this measures "no regression the
+  probe can see", not a speedup or a slowdown.
+
 ### A tenant is not something a client can spell
 
 A vindex map key carries its tenant as a `<32 hex>::<name>` prefix, and five

@@ -54,6 +54,91 @@ Cache and shard health gauges (`skeg_cache_bytes`, `skeg_cache_evictions_total`,
 grep '^# TYPE'` against a live binary to see the current set; the list
 is grep-stable across patch releases.
 
+### The memory budget and the ingress class
+
+Two gauge families report what the process has promised and to whom.
+
+**Where to read them.** The gauges below are composed by the `SKEG.STATS`
+command and appear in its reply only; `/metrics` carries the counters but
+not these gauges, because the exporter serves the telemetry registry and
+these are assembled at the point the command runs. Scrape them with a
+`SKEG.STATS` probe until that is unified.
+
+`skeg_memory_budget_state{state="known"|"unlimited"|"unknown"}` is the
+governor: whether a ceiling applies, whether none does, and whether one
+applies whose headroom could not be read. The third is a refusal, not a
+licence - it is the state in which writes are declined - so `unknown` is
+the one to alert on. `skeg_memory_headroom_bytes` is what is left when
+the state is `known`, `skeg_memory_reserved_bytes` what is promised and
+not yet allocated, and `skeg_memory_reserve_bytes` the margin
+deliberately held back.
+
+`skeg_ingress_state{state="known"|"default"|"unreadable"}` is the share
+of that budget the network may hold, with `skeg_ingress_cap_bytes`,
+`skeg_ingress_held_bytes` and
+`skeg_ingress_per_connection_max_bytes`. `held` is a SUBSET of
+`skeg_memory_reserved_bytes`: the two are one total seen whole and seen
+by class, which is how you tell a store that is full of buffered requests
+from one that is full of data.
+
+Four counters go with them, and these DO reach `/metrics`:
+`skeg_ingress_refused_accept_total` (peers
+turned away because the class was full - too many clients),
+`skeg_ingress_refused_growth_total` (frames refused because the buffer
+they needed was not available - frames too large, or too much other
+traffic), `skeg_ingress_stalls_total` (reads paused waiting for room; a
+stall that ends in room shows up to a client only as latency), and
+`skeg_ingress_budget_unreadable_total` (connections served while the
+budget could not be established).
+
+#### The three charges, and why they do not overlap
+
+1. **Ingress**: the CAPACITY of a connection's read buffer, times two for
+   the copy the parser makes out of it while the buffer still holds it.
+   Charged for as long as the buffer is that big, given back when it
+   drains or the connection closes.
+2. **Delta**: the rows a committed write puts in the in-memory delta,
+   charged per megabyte as it grows. A row reaches it only after it has
+   stopped being wire bytes; the buffer it arrived in is drained before
+   the command runs.
+3. **`MAX_VMSET_BYTES`** (64 MiB): a constant early reject on one
+   command's vector bytes, with no reservation at all. It is a ceiling on
+   what a single frame may ask for, applied upstream of both budgets, and
+   reserving for it would charge the same bytes twice.
+
+#### Sizing
+
+| setting | default | what it does |
+| --- | --- | --- |
+| `SKEG_MEMORY_LIMIT_BYTES` | cgroup headroom | ceiling on headroom; only ever makes the budget smaller |
+| `SKEG_MEMORY_RESERVE_BYTES` | max(64 MiB, limit/10) | margin held back from the budget |
+| `SKEG_INGRESS_FRACTION` | 25 | percent of usable headroom the network may hold |
+| `SKEG_INGRESS_BUDGET_BYTES` | derived | an explicit class cap, replacing the fraction |
+| `SKEG_INGRESS_STALL_MS` | 500 | how long a connection waits for room before its frame is refused |
+| `SKEG_MAX_CONNECTIONS` | 1024 | concurrent connections per listener, both protocols |
+| `SKEG_MAX_FDS` | 65536 | descriptor limit raised at boot |
+
+Worked example, a 256 MiB container with about 100 MiB resident:
+headroom 150 MiB, less a 64 MiB reserve, leaves 86 MiB usable. A quarter
+of that is the ingress class, 21.5 MiB; a quarter of the class is one
+connection's allowance, 5.375 MiB charged, which is 2.7 MiB of actual
+buffer. An idle connection holds 8 KiB, so a thousand of them hold
+8 MiB - measured at exactly that against the real binary.
+
+**Declare this to your clients.** In a container that size, a `SKEG.VMSET`
+at the protocol's 129 MiB frame ceiling no longer fits one connection's
+allowance and is refused by name, where an earlier build accepted it and
+was killed by the kernel part-way through. A refusal that says
+`ERR ingress budget: this connection may hold at most N bytes and the
+frame needs M` is not retryable and means the batch must be split. A
+refusal that says `BACKPRESSURE ingress budget: ...` is momentary and
+should be retried.
+
+Off Linux there is no cgroup to read, so the class cap is a static
+default: 1 GiB, or four maximum frames if that is larger. It is the
+larger, by three per cent, so a machine with no memory limit at all still
+admits a frame at the protocol ceiling.
+
 ## Prometheus scrape config
 
 Drop into your `prometheus.yml`:
