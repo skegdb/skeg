@@ -282,26 +282,82 @@ const DEFAULT_DURABILITY: Durability = Durability::Kernel;
 /// Exposed via HELLO response and (future) CLIENT ID.
 static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
 
+/// How much slack `frame_upper_bound` adds around one frame node's own
+/// bytes: the type byte, the RESP length prefix, and the trailing CRLF (both
+/// ends, for an aggregate). No legitimate skeg reply approaches this many
+/// digits of length - it is chosen generous rather than exact, because it
+/// bounds a RESERVATION, not the wire; `encode_frame` remains the only
+/// source of truth for what is actually written.
+const FRAME_NODE_OVERHEAD: usize = 32;
+
+/// A tight upper bound on what `encode_frame` will write for `frame`,
+/// computed by walking the `Frame` tree that dispatch already built -
+/// without encoding it. `Frame` already owns every byte it will emit (a
+/// `Bulk`'s `Bytes`, an `Array`'s child frames), so this costs a sum over
+/// data that is already resident, not a second fetch.
+///
+/// This is what makes reservation-before-encode possible for a READ without
+/// guessing: by the time a dispatcher's `Frame` exists, the store has
+/// already answered, so the size is no longer speculative - it can be
+/// measured instead of estimated. `reply_upper_bound` handles the opposite
+/// case (a MUTATION, whose bound must be knowable before the store is
+/// touched at all).
+fn frame_upper_bound(frame: &Frame) -> usize {
+    let payload = match frame {
+        Frame::Simple(s) => s.len(),
+        Frame::Error(s) => s.len(),
+        Frame::Integer(_) => 20,
+        Frame::Bulk(b) => b.len(),
+        Frame::Null => 0,
+        Frame::Array(items) | Frame::Set(items) | Frame::Push(items) => {
+            items.iter().map(frame_upper_bound).sum()
+        }
+        Frame::BlobError { code, message } => code.len() + message.len() + 1,
+        Frame::Boolean(_) => 1,
+        Frame::Double(_) => 32,
+        Frame::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| frame_upper_bound(k) + frame_upper_bound(v))
+            .sum(),
+        Frame::Verbatim { data, .. } => data.len() + 4,
+        Frame::BigNumber(s) => s.len(),
+    };
+    payload.saturating_add(FRAME_NODE_OVERHEAD)
+}
+
 /// Encode one reply into `out`, write it, and account for what it cost.
 ///
-/// The reply buffer is a per-connection buffer exactly like the decoder's, and
-/// it was in no budget at all. `BytesMut` never returns capacity on its own,
-/// so a single `SKEG.VMSET` of 4096 failing items - one reply line each, each
-/// capped at 256 bytes - left about 1.03 MiB allocated for the rest of the
-/// connection's life, and 1024 connections is a gigabyte the governor cannot
-/// see. Ingress was charged; egress was not, and both are buffers the same
-/// socket holds.
+/// The reply buffer is a per-connection buffer exactly like the decoder's,
+/// and it used to be in no budget at all - see `frame_upper_bound`, which
+/// this reserves BEFORE `encode_frame` runs rather than after, so the
+/// governor sees the peak coming instead of reading it off a `BytesMut` that
+/// already grew to hold it. `other_capacity` is what the rest of this
+/// connection holds (the decoder's buffer, plus any reply still queued
+/// ahead of this one in the pipeline): the charge is the connection's whole
+/// footprint, ingress and egress in one figure, because they are one
+/// socket's memory.
 ///
-/// The charge is taken after the encode and the reply is written even when it
-/// is refused. A reply is the answer to work that has already committed:
-/// withdrawing it would be an error raised past the commit point, and the
-/// client would retry a batch that has been applied. So an overshoot here is
-/// COUNTED, not returned - the one place the budget is knowingly exceeded -
-/// and the buffer is handed back in the same breath.
+/// A reservation taken here can still be refused - the bound is an
+/// ESTIMATE, taken without knowing whether other connections have since
+/// filled the class - and when that happens the reply is written anyway and
+/// the overshoot is COUNTED, not returned: by the time a `Frame` exists the
+/// work behind it has already committed (a mutation's caller reserved its
+/// own bound in `handle_connection_resp3` before that commit ran; a read
+/// commits nothing), and withdrawing the answer now would be an error
+/// raised past the point where undoing it is possible.
 ///
-/// `other_capacity` is what the rest of this connection holds, normally the
-/// decoder's: the charge is the connection's whole footprint, ingress and
-/// egress in one figure, because they are one socket's memory.
+/// `frame_upper_bound` bounds the CONTENT `encode_frame` writes, not the
+/// CAPACITY `out` ends up with - `BytesMut`'s growth doubles past what it
+/// needs, so `out.capacity()` routinely overshoots the content it holds.
+/// This does not reserve for that slack: the budget already charges
+/// capacity, not length, at every OTHER call site for exactly the reason the
+/// module doc gives (the allocation is what the process pays for), and here
+/// too the true peak is `out.capacity()` - but re-reserving for it after the
+/// fact would mean charging the SAME growth twice, once as an estimate and
+/// once as the real thing, which only shrinks how much of the connection's
+/// allowance is left for what happens next. `trim_idle` frees the real
+/// allocation immediately after the write regardless of what the budget
+/// charged for it, so the memory itself is never the thing left unaccounted.
 async fn flush_reply(
     stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     out: &mut BytesMut,
@@ -310,14 +366,14 @@ async fn flush_reply(
     budget: &mut ConnectionBudget,
     other_capacity: usize,
 ) -> bool {
-    out.clear();
-    encode_frame(frame, version, out);
     if budget
-        .grow_to(other_capacity.saturating_add(out.capacity()))
+        .grow_to(other_capacity.saturating_add(frame_upper_bound(frame)))
         .is_err()
     {
         skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressReplyOverBudget);
     }
+    out.clear();
+    encode_frame(frame, version, out);
     let ok = stream.write_all(out).await.is_ok();
     // Given back immediately, not at the next read: `trim_idle` only fires on
     // an EMPTY buffer, and `out` is only empty between replies - which is
@@ -357,17 +413,30 @@ pub async fn handle_connection_resp3(
     // responses are flushed in order before the barrier runs serially, so the
     // request/response ordering the client sees is unchanged.
     const PIPELINE_WINDOW: usize = 128;
-    let mut inflight: VecDeque<tokio::task::JoinHandle<Frame>> = VecDeque::new();
-    // Await the oldest in-flight command and write its response in order.
-    // Returns false on write failure (caller must stop).
+    // Each in-flight command carries the bytes reserved against `budget` for
+    // ITS reply (0 for one with no computable pre-dispatch bound - a read,
+    // whose reservation instead happens in `flush_reply`). `reply_reserved`
+    // is the running sum of those, because `ConnectionBudget::grow_to` is a
+    // "hold at least this much" call, not an additive one: without tracking
+    // the sum here, reserving before each of several pipelined `SKEG.VMSET`s
+    // would only ever charge for the LARGEST of them, and the other 127
+    // slots in the window would be free to fan out unreserved fan-out
+    // replies - the exact multiplication P0-A is about, just moved one level
+    // down, from connections to one connection's pipeline.
+    let mut inflight: VecDeque<(tokio::task::JoinHandle<Frame>, u64)> = VecDeque::new();
+    let mut reply_reserved: u64 = 0;
+    // Await the oldest in-flight command, release its share of
+    // `reply_reserved`, and write its response in order. Returns false on
+    // write failure (caller must stop).
     macro_rules! emit_front {
         () => {{
             let mut ok = true;
-            if let Some(h) = inflight.pop_front() {
+            if let Some((h, reserved)) = inflight.pop_front() {
+                reply_reserved = reply_reserved.saturating_sub(reserved);
                 let resp = h
                     .await
                     .unwrap_or_else(|_| Frame::Error("ERR internal task failure".into()));
-                let held = decoder.capacity();
+                let held = decoder.capacity().saturating_add(reply_reserved as usize);
                 ok = flush_reply(
                     &mut stream,
                     &mut out,
@@ -386,8 +455,40 @@ pub async fn handle_connection_resp3(
         match decoder.decode() {
             Ok(Some(frame)) => match parse_command(frame) {
                 Ok(cmd) if is_pipelineable(&cmd) => {
-                    let (sh, be, t) = (shards.clone(), tenant_backend.clone(), tenant);
-                    inflight.push_back(tokio::spawn(exec_pipelined(cmd, t, sh, be)));
+                    // RESERVE BEFORE COMMIT: a bound computable from the
+                    // request is reserved (summed with everything already
+                    // queued ahead of it) before the command - which may be
+                    // a mutation - is allowed to run at all. A refusal here
+                    // never undoes work, because no work has happened yet.
+                    let this_bound = reply_upper_bound(&cmd).unwrap_or(0) as u64;
+                    let refused = if this_bound > 0 {
+                        let want = decoder
+                            .capacity()
+                            .saturating_add((reply_reserved + this_bound) as usize);
+                        match budget.grow_to(want) {
+                            Ok(()) => {
+                                reply_reserved += this_bound;
+                                None
+                            }
+                            Err(e) => Some(e),
+                        }
+                    } else {
+                        None
+                    };
+                    let handle = match refused {
+                        None => {
+                            let (sh, be, t) = (shards.clone(), tenant_backend.clone(), tenant);
+                            (tokio::spawn(exec_pipelined(cmd, t, sh, be)), this_bound)
+                        }
+                        Some(e) => {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::IngressRefusedGrowth,
+                            );
+                            let msg = crate::admission::AdmissionError::from(e).wire_message();
+                            (tokio::spawn(async move { Frame::Error(msg) }), 0)
+                        }
+                    };
+                    inflight.push_back(handle);
                     if inflight.len() >= PIPELINE_WINDOW && !emit_front!() {
                         break 'conn;
                     }
@@ -402,15 +503,45 @@ pub async fn handle_connection_resp3(
                     }
                     let response = match other {
                         Ok(cmd) => {
-                            dispatch_command(
-                                cmd,
-                                &mut state,
-                                &mut tenant,
-                                &shards,
-                                tenant_backend.as_ref(),
-                                peer.map(|p| p.ip()),
-                            )
-                            .await
+                            // Same reserve-before-commit as the pipelined
+                            // arm above; `reply_reserved` is 0 here (the
+                            // drain just above emptied it), so the bound
+                            // reserved is this command's alone.
+                            match reply_upper_bound(&cmd) {
+                                Some(bound) if bound > 0 => {
+                                    let want = decoder.capacity().saturating_add(bound);
+                                    if let Err(e) = budget.grow_to(want) {
+                                        skeg_telemetry::tick_counter(
+                                            skeg_telemetry::Counter::IngressRefusedGrowth,
+                                        );
+                                        Frame::Error(
+                                            crate::admission::AdmissionError::from(e)
+                                                .wire_message(),
+                                        )
+                                    } else {
+                                        dispatch_command(
+                                            cmd,
+                                            &mut state,
+                                            &mut tenant,
+                                            &shards,
+                                            tenant_backend.as_ref(),
+                                            peer.map(|p| p.ip()),
+                                        )
+                                        .await
+                                    }
+                                }
+                                _ => {
+                                    dispatch_command(
+                                        cmd,
+                                        &mut state,
+                                        &mut tenant,
+                                        &shards,
+                                        tenant_backend.as_ref(),
+                                        peer.map(|p| p.ip()),
+                                    )
+                                    .await
+                                }
+                            }
                         }
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     };
@@ -672,6 +803,113 @@ fn is_pipelineable(cmd: &Command) -> bool {
             | Command::Ping(_)
             | Command::Echo(_)
     )
+}
+
+/// A reply this small covers `+OK`, an integer, a short array of integers,
+/// or a bounded error line - which is every mutation on this wire except
+/// `SKEG.VMSET` (see [`vmset_reply_upper_bound`]). Backed by
+/// `every_bounded_mutations_reply_fits_the_small_bound`, which dispatches a
+/// sample of each at worst-case argument sizes (the longest legal vindex
+/// name, a full tenant id) and measures the encoded reply.
+const SMALL_REPLY_BOUND: usize = 4096;
+
+/// The upper bound of a `SKEG.VMSET` reply, computed from the request alone
+/// (before a single item has run) by the same arithmetic `skeg_vmset` uses
+/// to count items, capped at [`MAX_VMSET_ITEMS`] the same way the admission
+/// check there is. One reply line per item, each at most
+/// [`MAX_VMSET_ERROR_LEN`] (`skeg_vmset` caps every item's error to that via
+/// `cap_item_error`), plus per-node framing.
+///
+/// An arity this function does not recognise (not `1 + 3n` args) still gets
+/// a finite answer rather than a panic: `skeg_vmset` itself refuses that
+/// request with a short error frame, which fits comfortably under any bound
+/// this returns.
+fn vmset_reply_upper_bound(args: &[Bytes]) -> usize {
+    let n_items = (args.len().saturating_sub(1) / 3).min(MAX_VMSET_ITEMS);
+    n_items
+        .saturating_mul(MAX_VMSET_ERROR_LEN.saturating_add(FRAME_NODE_OVERHEAD))
+        .saturating_add(FRAME_NODE_OVERHEAD)
+}
+
+/// The upper bound of `cmd`'s reply, computable from the REQUEST alone -
+/// before the command has run. This is what makes reservation-before-commit
+/// possible: a mutation's answer must be known to fit the budget before the
+/// mutation is allowed to happen, because refusing after it already
+/// committed would tell a client to retry work that is done.
+///
+/// `None` means the reply's size depends on data the STORE holds, not on
+/// anything the request declares - which is true of every command here that
+/// does not mutate. Nothing commits on the way to answering one of those, so
+/// there is no "before commit" to keep: their bound is instead measured from
+/// the `Frame` dispatch actually built, by `frame_upper_bound`, right before
+/// `encode_frame` runs in [`flush_reply`].
+///
+/// Exhaustive over [`Command`], no `_` arm: a new variant has to say which
+/// side of that line it is on rather than defaulting onto either one.
+fn reply_upper_bound(cmd: &Command) -> Option<usize> {
+    match cmd {
+        // ---- mutations: reserved before dispatch runs, because dispatch is
+        // where these commit. Everything here answers `+OK`, an integer, a
+        // short array of integers, or a bounded error line, regardless of
+        // the request's own size - except `SKEG.VMSET`, whose bound is a
+        // request-derived formula, not a constant. ----
+        Command::Set { .. }
+        | Command::Append { .. }
+        | Command::Del { .. }
+        | Command::Mset { .. }
+        | Command::Incr { .. }
+        | Command::Decr { .. }
+        | Command::IncrBy { .. }
+        | Command::DecrBy { .. }
+        | Command::SkegVindexCreate { .. }
+        | Command::SkegVindexDrop { .. }
+        | Command::SkegVindexConsolidate { .. }
+        | Command::SkegVset { .. }
+        | Command::SkegVdel { .. }
+        | Command::SkegVindexReshard { .. }
+        | Command::SkegVindexOverlap { .. }
+        | Command::SkegSubjectErase { .. }
+        | Command::SkegTenantErase { .. }
+        | Command::SkegTenantDelete { .. }
+        | Command::SkegReclaim
+        | Command::SkegQuotaSet { .. }
+        | Command::SkegQosSet { .. } => Some(SMALL_REPLY_BOUND),
+        Command::SkegVmset { args } => Some(vmset_reply_upper_bound(args)),
+
+        // ---- everything else commits nothing on the way to answering, so
+        // there is no commit for a pre-dispatch refusal to protect: `Exists`
+        // and the reads are sized by the store, `Hello`/`Select`/`SkegAuth`/
+        // `SkegWhoami`/the quota-and-QoS getters/`Unknown`/`Ping`/`Echo` are
+        // small but do not need a SEPARATE reservation on top of what they
+        // already hold - adding one here pushed an idle connection sitting
+        // exactly at its floor a few bytes over it, which a genuinely
+        // saturated class then refused, and starving an existing connection
+        // on a class that is full is the one thing admission must not do.
+        // Their bound is instead measured, exactly, from the `Frame`
+        // dispatch built - see `frame_upper_bound` in `flush_reply`. ----
+        Command::Hello(_)
+        | Command::Select { .. }
+        | Command::SkegWhoami
+        | Command::SkegAuth { .. }
+        | Command::SkegQuotaGet { .. }
+        | Command::SkegQosGet { .. }
+        | Command::Unknown { .. }
+        | Command::Ping(_)
+        | Command::Echo(_)
+        | Command::Get { .. }
+        | Command::Mget { .. }
+        | Command::Exists { .. }
+        | Command::SkegStats
+        | Command::SkegShards
+        | Command::SkegVindexList
+        | Command::SkegCheck { .. }
+        | Command::SkegVowner { .. }
+        | Command::SkegHealth { .. }
+        | Command::SkegVindexShards { .. }
+        | Command::SkegVsearch { .. }
+        | Command::SkegVget { .. }
+        | Command::SkegVgraph { .. } => None,
+    }
 }
 
 /// Run one pipelineable command with owned inputs so it can be driven
@@ -2579,12 +2817,19 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
 
         // The worst reply this server can build: one line per item, each the
-        // longest error the item cap allows.
+        // longest error the item cap allows. `frame_upper_bound` sizes this
+        // reservation from the `Frame` BEFORE `encode_frame` runs (R1), so it
+        // is taken from the frame's own content - not from `out`'s allocated
+        // capacity, which `BytesMut`'s growth doubles past what it needs and
+        // so routinely overshoots. That reservation comfortably fits this
+        // connection's allowance (`test_ingress`'s per-connection ceiling is
+        // several times the ~1.1 MiB this reply needs), so it succeeds.
         let reply = Frame::Array(
             (0..MAX_VMSET_ITEMS)
                 .map(|_| Frame::Error("E".repeat(MAX_VMSET_ERROR_LEN)))
                 .collect(),
         );
+        let peak_bound = super::frame_upper_bound(&reply);
         assert!(
             flush_reply(
                 &mut sink,
@@ -2601,15 +2846,51 @@ mod tests {
             "the reply was not the large one: {}",
             sink.len()
         );
+        // The MEMORY is given back unconditionally: `out` is trimmed right
+        // after the write regardless of what the budget could release.
         assert!(
             out.capacity() <= 4096,
             "the reply buffer was not given back: {} bytes still allocated",
             out.capacity()
         );
+        // The BUDGET'S bookkeeping is chunk-granular (`shrink_to` only pops a
+        // whole `CHUNK_BYTES`-rounded reservation, never a fraction of one),
+        // so a connection that genuinely needed one large chunk does not
+        // shrink back to the literal floor the moment its buffer empties -
+        // that granularity is `ConnectionBudget`'s, not R1's to change here.
+        // What R1 owns is that the charge is bounded to what was reserved
+        // for THIS reply and does not silently grow further.
+        assert!(
+            conn.held_bytes() >= crate::ingress::FLOOR_BYTES,
+            "held less than the floor a connection always keeps: {}",
+            conn.held_bytes()
+        );
+        let expected_peak_charge = crate::ingress::charge_for(4096usize.saturating_add(peak_bound));
         assert_eq!(
             conn.held_bytes(),
-            crate::ingress::FLOOR_BYTES,
-            "the charge did not come back with the buffer"
+            expected_peak_charge,
+            "held does not match what this reply's own bound ({peak_bound}) should have \
+             charged, chunk-rounded"
+        );
+        // And it does not creep further on a second, tiny reply: the charge
+        // taken for the big one is the peak, not a floor a later flush
+        // silently raises again.
+        let held_after_first = conn.held_bytes();
+        assert!(
+            flush_reply(
+                &mut sink,
+                &mut out,
+                &Frame::ok(),
+                skeg_resp3::ProtoVersion::Resp3,
+                &mut conn,
+                4096,
+            )
+            .await
+        );
+        assert!(
+            conn.held_bytes() <= held_after_first,
+            "a tiny reply must not grow the charge past the big reply's peak: {} > {held_after_first}",
+            conn.held_bytes()
         );
     }
 

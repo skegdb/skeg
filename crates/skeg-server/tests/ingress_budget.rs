@@ -637,7 +637,6 @@ fn vmset_of_failing_items(items: usize) -> Vec<u8> {
 /// comfortably and request-plus-worst-case-reply does not, which is exactly
 /// what makes this a test of the reply side and not the request side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in the next commit: server: reserve the reply upper bound before dispatch/encode (R1)"]
 async fn a_max_vmset_reply_too_large_for_the_allowance_is_refused_before_it_runs() {
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 64).await;

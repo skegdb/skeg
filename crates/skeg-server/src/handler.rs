@@ -55,9 +55,32 @@ pub async fn handle_connection(
     loop {
         match parser.feed(&mut buf) {
             Ok(Some(frame)) => {
-                if let Some(response) = dispatch(&frame, &shards)
-                    .await
-                    .map(|response| response_for_version(response, frame.header.version))
+                // RESERVE BEFORE COMMIT for a mutation: `dispatch` builds
+                // its reply and, for these ops, commits the write in the
+                // same call, so the only way to reserve before the commit
+                // is before `dispatch` runs at all. A refusal here means
+                // `dispatch` is never called, so nothing it would have done
+                // is later refused.
+                let precommit_refusal = match native_reply_upper_bound(frame.header.op) {
+                    Some(bound) if bound > 0 => {
+                        let want = buf.capacity().saturating_add(bound);
+                        budget.grow_to(want).err()
+                    }
+                    _ => None,
+                };
+                let dispatched = if let Some(e) = precommit_refusal {
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
+                    let admission = crate::admission::AdmissionError::from(e);
+                    Some(encode_err(
+                        frame.header.req_id,
+                        admission.code(),
+                        &admission.to_string(),
+                    ))
+                } else {
+                    dispatch(&frame, &shards).await
+                };
+                if let Some(response) =
+                    dispatched.map(|response| response_for_version(response, frame.header.version))
                 {
                     // The reply side of the same connection, charged the same
                     // way. It is not retained here - the encoders build a fresh
@@ -262,6 +285,44 @@ fn native_index_name(req_id: u64, raw: &Bytes) -> Result<&str, Bytes> {
         return Err(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string()));
     }
     Ok(name)
+}
+
+/// Whether `op`'s reply is knowable, and bounded, from the request alone -
+/// before `dispatch` runs and, for a mutation, before it commits.
+///
+/// The six ops that mutate (`Set`, `Del`, `Vset`, `Vdel`, `VindexCreate`,
+/// `VindexDrop`) answer with a small, fixed-shape frame - `OK` or a bounded
+/// error line - regardless of the request's own size, so a constant bound
+/// covers every one of them; reserving it BEFORE `dispatch` is called is
+/// what makes the reservation precede the commit `dispatch` performs inline
+/// with building that reply.
+///
+/// `None` covers everything else. None of it commits anything on the way to
+/// answering, so there is no commit for a pre-dispatch refusal to protect -
+/// which matters, because adding one anyway is not free: a SEPARATE
+/// reservation on top of what a connection already holds can push it a few
+/// bytes past a floor it was already sitting at, and a class that is
+/// genuinely full then refuses a request that would have cost nothing.
+/// `Ping`/`NativeHello` are exactly that shape (fixed, tiny, already
+/// covered), and the reads (`Get`, `Mget`, `Vget`, `Vsearch`, `Stats`,
+/// `Shards`, `VindexList`) are sized by the store, not the request - their
+/// reservation stays where it already was, charged against
+/// `response.len()` once `dispatch` has built it, because `dispatch` builds
+/// each read's reply with a direct call to an `encode_*` function inside
+/// its own match arm rather than through an intermediate value this caller
+/// can measure first; unlike the RESP3 wire's `Frame`, there is no shared
+/// pre-encode representation to size here without threading one through
+/// every read arm, which is a larger change than this bound needs. An op
+/// this dispatcher does not implement (or one a future proto version added
+/// that this build does not know - `skeg_proto::Op` is
+/// `#[non_exhaustive]`) falls through to the same short "not implemented"
+/// frame and needs nothing new either.
+fn native_reply_upper_bound(op: skeg_proto::Op) -> Option<usize> {
+    use skeg_proto::Op;
+    match op {
+        Op::Set | Op::Del | Op::Vset | Op::Vdel | Op::VindexCreate | Op::VindexDrop => Some(512),
+        _ => None,
+    }
 }
 
 /// Dispatch a parsed frame to the shard set and return an optional response.
