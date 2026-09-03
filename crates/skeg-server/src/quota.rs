@@ -84,11 +84,37 @@ impl TenantVectorQuota {
         self.counts.read().get(&tenant).copied().unwrap_or(0)
     }
 
-    /// Stub. The real setter lands in "quota: add rebuild, never-reject
-    /// startup setter"; it is here only so the tests that pin its contract
-    /// compile and fail for the reason they are about.
+    /// STATE that `tenant` holds `count` vectors. Startup only.
+    ///
+    /// This is the one writer that is not an admission decision, and the
+    /// difference is the whole point of it existing separately from
+    /// [`try_add`](Self::try_add):
+    ///
+    /// - it SETS rather than adds, because the caller has just counted what
+    ///   the store holds and the number it arrived with is the answer, not a
+    ///   delta on top of whatever a previous open left behind;
+    /// - it NEVER REJECTS, because the rows are already on disk. A count over
+    ///   the tenant's limit is a fact about the store - reached by lowering a
+    ///   limit under a tenant, or by an earlier build that did not count at
+    ///   all - and refusing to record it would leave the counter at zero,
+    ///   which is exactly the state this exists to end. The limit is applied
+    ///   afterwards, by the next `try_add`, which then refuses: an over-quota
+    ///   tenant may not grow, and its existing rows stay readable.
+    ///
+    /// Zero removes the entry, keeping the same invariant [`sub`](Self::sub)
+    /// keeps: the map tracks only tenants with usage.
+    ///
+    /// It must run before any write is admitted. A `rebuild` racing a
+    /// `try_add` would overwrite a reservation the write is relying on; the
+    /// readiness barrier in `ShardSet::open` is what makes that impossible,
+    /// not anything here.
     pub fn rebuild(&self, tenant: u128, count: u64) {
-        let _ = (tenant, count);
+        let mut g = self.counts.write();
+        if count == 0 {
+            g.remove(&tenant);
+        } else {
+            g.insert(tenant, count);
+        }
     }
 }
 
@@ -150,7 +176,6 @@ mod tests {
     /// not a request to be denied. Refusing it would leave the counter at
     /// zero, which is the bug it exists to close.
     #[test]
-    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
     fn test_rebuild_sets_a_count_nothing_reserved() {
         let q = TenantVectorQuota::new();
         q.rebuild(7, 42);
@@ -159,7 +184,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
     fn test_rebuild_overwrites_a_stale_count() {
         let q = TenantVectorQuota::new();
         q.try_add(7, 5, 100).unwrap();
@@ -170,7 +194,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
     fn test_rebuild_to_zero_removes_the_entry() {
         let q = TenantVectorQuota::new();
         q.try_add(7, 3, 100).unwrap();
@@ -186,7 +209,6 @@ mod tests {
     /// next write is refused, which is the correct answer for a tenant over
     /// its quota - and the opposite of what a zeroed counter would say.
     #[test]
-    #[ignore = "opens in: quota: add rebuild, never-reject startup setter"]
     fn test_rebuild_never_rejects() {
         let q = TenantVectorQuota::new();
         q.rebuild(7, u64::MAX);
