@@ -11028,6 +11028,88 @@ mod tests {
         );
     }
 
+    /// A corrupt semantic-router sidecar used to be a `warn!` and a skip, so
+    /// the index came back UNROUTED: point ops fell through to hash placement
+    /// on a store whose rows had been physically re-partitioned, and the quota
+    /// rebuild counted each shard's rows instead of deduplicating them - 119
+    /// against 60 logical rows on this fixture, after which the tenant is
+    /// refused at half its limit.
+    ///
+    /// Nothing about that state is serviceable, and the only signal was one
+    /// warning line. Same stance as the registry that will not round-trip: an
+    /// open that cannot know how the store is routed refuses, and names the
+    /// file. A sidecar that is ABSENT is a different thing entirely - an index
+    /// that was never resharded has none - and still opens.
+    #[tokio::test]
+    #[ignore = "opens in: shard: an unreadable router sidecar fails the open"]
+    async fn test_a_corrupt_router_sidecar_fails_the_open() {
+        const T: u128 = 61;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "cr");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..N {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(500), None)
+                    .await
+                    .unwrap();
+            }
+            shards.reshard(&name, 0.25, 10, T).await.expect("reshard");
+            let replicated = shards.overlap(&name, 4.0, T).await.expect("overlap");
+            assert!(replicated > 0, "fixture: the overlap has to replicate");
+        }
+        // A clean reopen agrees with the writes.
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            assert_eq!(shards.tenant_vector_count(T), N);
+        }
+
+        let sidecar = crate::router::router_path(dir.path(), &name);
+        assert!(sidecar.exists(), "fixture: the reshard wrote a sidecar");
+        std::fs::write(&sidecar, b"not a router").unwrap();
+        let err = ShardSet::open(dir.path(), 2)
+            .err()
+            .expect("an open that cannot know how the store is routed must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("router-") && msg.contains(&name),
+            "the error must name the file: {msg}"
+        );
+    }
+
+    /// The control for the refusal above: an index with NO sidecar is the
+    /// normal state of one that was never resharded, and it opens.
+    #[tokio::test]
+    async fn test_a_vindex_without_a_router_sidecar_opens() {
+        const T: u128 = 67;
+        let dir = TempDir::new().unwrap();
+        let name = scope_key(T, "ns");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            shards
+                .vindex_create_scoped(&name, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+            for id in 0..5 {
+                shards
+                    .vset(&name, id, quota_row(id), T, Some(50), None)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(
+            !crate::router::router_path(dir.path(), &name).exists(),
+            "fixture: nothing resharded it, so there is no sidecar"
+        );
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(shards.tenant_vector_count(T), 5);
+    }
+
     #[test]
     fn test_scope_key_roundtrip() {
         // Tenant 0 is the unscoped namespace (byte-identical to pre-tenancy).
