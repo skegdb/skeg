@@ -53,9 +53,13 @@ for crate in "${ORDER[@]}"; do
   (cd "$dir" && cargo tree -e normal -d 2>/dev/null | grep -E '^skeg-' | sed 's/^/   duplicate: /' || true)
   patch_lines="${patch_lines}${crate} = { path = \"${dir}\" }\n"
   # The workspace already patches skeg-platform/simd/vector to its own tree
-  # for every `cargo package`; a second patch for the same crate collides.
+  # (for skeg-rigging-skeg's registry dependency); a second patch for the
+  # same crate at a DIFFERENT path collides, and the manifest patch alone
+  # does not cover a member's rewritten path dependency. Same path, no
+  # collision: for those three the package step resolves the workspace
+  # tree, which is what the extracted package was made from.
   case "$crate" in
-    skeg-platform|skeg-simd|skeg-vector) ;;
+    skeg-platform|skeg-simd|skeg-vector) patch_args+=(--config "patch.crates-io.${crate}.path=\"$PWD/crates/${crate}\"") ;;
     *) patch_args+=(--config "patch.crates-io.${crate}.path=\"${dir}\"") ;;
   esac
 done
