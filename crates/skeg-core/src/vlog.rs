@@ -629,7 +629,9 @@ impl VLog {
     /// Tenant `0` is the unscoped default; reach this via [`VLog::tenant`].
     ///
     /// An over-limit set is rejected with [`Error::DiskQuota`] BEFORE anything
-    /// is written, so storage never crosses the limit.
+    /// is written, so storage never crosses the limit - and the check and the
+    /// counter update happen in the SAME critical section, so a concurrent
+    /// writer of the same tenant can never read stale headroom between them.
     async fn set_scoped(
         &self,
         key: &[u8],
@@ -639,25 +641,69 @@ impl VLog {
         disk_limit: Option<u64>,
     ) -> Result<()> {
         // Prior on-disk charge for this key, and the prospective new one. Both
-        // known without writing: enforce the disk quota first.
+        // known without writing.
         let prev = { self.inner.index.borrow().get(key).copied() };
         let old_disk = prev.map_or(0, |p| u64::from(p.size));
         let dtenant = tenant_from_key(key);
         let new_disk = padded_record_size(key.len(), value.len()) as u64;
-        if let Some(limit) = disk_limit {
-            let projected = self
-                .tenant_disk_bytes(dtenant)
-                .saturating_sub(old_disk)
-                .saturating_add(new_disk);
-            if projected > limit {
+
+        // Reserve atomically: evaluate the projected total and, if it fits,
+        // APPLY it to the tenant counter right here - before `append_raw`'s
+        // `.await` below gives another writer of the same tenant a chance to
+        // run. Without this the check and the update were two separate
+        // critical sections either side of an await: two concurrent writers
+        // of different keys under one tenant could each read the same
+        // pre-write total, each pass their own check, and both proceed -
+        // reproduced at 5.3x a 1.5-unit budget with 8 concurrent writers
+        // (audit/17 A1). Applied unconditionally, not only when `disk_limit`
+        // is `Some`, so the counter is written in exactly one place: a call
+        // with no limit still reserves, it just never has anything to refuse.
+        {
+            let mut disk = self.inner.tenant_disk.lock();
+            let cur = disk.get(&dtenant).copied().unwrap_or(0);
+            let projected = cur.saturating_sub(old_disk).saturating_add(new_disk);
+            if let Some(limit) = disk_limit
+                && projected > limit
+            {
                 return Err(Error::DiskQuota);
+            }
+            if projected == 0 {
+                disk.remove(&dtenant);
+            } else {
+                disk.insert(dtenant, projected);
             }
         }
 
         let ts = self.next_ts();
-        let (seg_id, offset, padded) = self
+        let appended = self
             .append_raw(key, value, RecordKind::Scalar, ts, durability)
-            .await?;
+            .await;
+        let (seg_id, offset, padded) = match appended {
+            Ok(v) => v,
+            Err(e) => {
+                // The write never happened: refund exactly the delta just
+                // reserved (relative to whatever the counter holds NOW, not
+                // to `cur` above - other writers may have reserved their own
+                // deltas concurrently, and this must undo only this call's
+                // contribution, not theirs).
+                let mut disk = self.inner.tenant_disk.lock();
+                let now = disk.get(&dtenant).copied().unwrap_or(0);
+                let refunded = now.saturating_sub(new_disk).saturating_add(old_disk);
+                if refunded == 0 {
+                    disk.remove(&dtenant);
+                } else {
+                    disk.insert(dtenant, refunded);
+                }
+                return Err(e);
+            }
+        };
+        debug_assert_eq!(
+            u64::from(padded),
+            new_disk,
+            "the reservation above assumed the record pads to `new_disk`; \
+             the disk counter is wrong if the actual write padded to \
+             something else"
+        );
 
         if let Some(prev) = prev {
             self.dec_live(prev.segment_id, prev.size);
@@ -679,13 +725,6 @@ impl VLog {
             value.len(),
             tenant,
         );
-        // Disk accounting: replace this key's old charge with the new one. The
-        // tenant is key-derived so write-time and recovery agree for scoped keys.
-        {
-            let mut disk = self.inner.tenant_disk.lock();
-            let e = disk.entry(dtenant).or_insert(0);
-            *e = e.saturating_sub(old_disk) + u64::from(padded);
-        }
         Ok(())
     }
 
@@ -1985,7 +2024,6 @@ mod tests {
     /// live bytes past its limit, full stop - not "limit plus one in-flight
     /// blob".
     #[tokio::test]
-    #[ignore = "opens in 'core: reserve the tenant disk charge atomically with the limit check'"]
     async fn n_concurrent_writers_of_one_tenant_never_land_the_counter_past_the_limit() {
         const T: u128 = 0x2A2A;
         const N: u8 = 8;
