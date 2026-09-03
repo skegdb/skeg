@@ -45,7 +45,11 @@ for crate in "${ORDER[@]}"; do
   printf '[patch.crates-io]\n%b%s = { path = "%s" }\n' "$patch_lines" "$crate" "$dir" > "$dir/.cargo/config.toml"
   # Packaged crates carry no Cargo.lock we want to trust; resolve fresh, then
   # lock so the test run and a later inspection see the same graph.
-  if (cd "$dir" && cargo generate-lockfile -q && cargo test --release -q 2>&1 | tail -n 3); then
+  # A crate whose tests reach failpoints does so in the workspace through a
+  # path-only dev-dependency on itself, which the package drops; the feature
+  # is the published way to get the same code.
+  feats=(); grep -q '^failpoints *=' "$dir/Cargo.toml" && feats=(--features failpoints)
+  if (cd "$dir" && cargo generate-lockfile -q && cargo test --release -q ${feats[@]+"${feats[@]}"} 2>&1 | tail -n 3); then
     echo "   ok"
   else
     echo "   FAIL: $crate"; failed+=("$crate")
