@@ -1960,6 +1960,82 @@ mod tests {
         assert_eq!(v.tenant_disk_bytes(7), 0, "del releases disk bytes");
     }
 
+    /// One writer's `set_scoped`: check the limit, apply the delta, both
+    /// under the SAME reservation.
+    async fn write_one(v: &VLog, tenant: u128, limit: u64, id: u8, size: usize) -> Result<()> {
+        let key = scoped(tenant, &[id]);
+        v.tenant(tenant)
+            .with_disk_limit(Some(limit))
+            .set(&key, &vec![0u8; size], Durability::Kernel)
+            .await
+    }
+
+    /// The race audit/17 A1 found: the old `set_scoped` read
+    /// `tenant_disk_bytes`, evaluated the projected total, and only
+    /// afterwards - past an `.await` on the actual write - applied it to the
+    /// counter. Two concurrent writers of the SAME tenant (different keys, so
+    /// neither's `old_disk` masks the other) could each read the total BEFORE
+    /// either had written, each pass their own check, and both proceed: the
+    /// reproduction was 8 concurrent 4 KiB writes against a 1.5-unit budget,
+    /// 8/8 admitted, final total 5.3x the limit.
+    ///
+    /// The fix makes the check and the counter update one atomic step (no
+    /// `.await` between them, under the tenant_disk mutex), so this bound is
+    /// exact, not a margin: nothing concurrent can ever push the tenant's
+    /// live bytes past its limit, full stop - not "limit plus one in-flight
+    /// blob".
+    #[tokio::test]
+    #[ignore = "opens in 'core: reserve the tenant disk charge atomically with the limit check'"]
+    async fn n_concurrent_writers_of_one_tenant_never_land_the_counter_past_the_limit() {
+        const T: u128 = 0x2A2A;
+        const N: u8 = 8;
+        const UNIT_PAYLOAD: usize = 4096;
+        let dir = TempDir::new().unwrap();
+        let v = VLog::open(dir.path()).await.unwrap();
+
+        // Probe: what does one write of this size cost, exactly? Then undo
+        // it, so the concurrent run below starts from a clean, known
+        // baseline instead of guessing padding.
+        let probe_key = scoped(T, &[255]);
+        v.set(&probe_key, &vec![0u8; UNIT_PAYLOAD], Durability::Kernel)
+            .await
+            .unwrap();
+        let unit = v.tenant_disk_bytes(T);
+        assert!(v.del(&probe_key, Durability::Kernel).await.unwrap());
+        assert_eq!(v.tenant_disk_bytes(T), 0);
+
+        // Room for 1.5 units: at most one of the N concurrent writers can
+        // land, ever - matching the audit's reproduction shape.
+        let limit = unit + unit / 2;
+
+        let futs: Vec<_> = (0..N)
+            .map(|id| write_one(&v, T, limit, id, UNIT_PAYLOAD))
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(admitted + refused, N as usize);
+        assert!(
+            admitted <= 1,
+            "a 1.5-unit budget must admit at most ONE {unit}-byte writer, \
+             admitted {admitted} of {N}"
+        );
+
+        let total = v.tenant_disk_bytes(T);
+        assert!(
+            total <= limit,
+            "the tenant's live bytes ({total}) must never exceed its own \
+             limit ({limit}) no matter how many writers race for it"
+        );
+        assert_eq!(
+            total,
+            admitted as u64 * unit,
+            "the counter must equal exactly what was actually admitted - no \
+             drift from refused writers, no double counting from the race"
+        );
+    }
+
     #[tokio::test]
     async fn test_disk_recovered_on_reopen() {
         let dir = TempDir::new().unwrap();
