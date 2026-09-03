@@ -32,12 +32,32 @@ repository that is the RESP3 layer, which refuses the separator in the raw
 name before prepending its own prefix. Nothing else changes: a name without
 `::` behaves exactly as before, and existing indexes keep their keys.
 
+**Upgrading a store an earlier build wrote.** The door only stops NEW squats.
+A key an earlier build let tenant 0 create in the exact form
+`<32 lowercase hex>::<name>` round-trips, so it survives the registry check
+below and goes on being attributed to the tenant its name spells: `ERASE
+TENANT` for that tenant still destroys it (and now counts it). Nothing can
+distinguish it from a legitimate index of that tenant, so nothing tries: grep
+each shard's `vindexes.registry` for `::` and confirm every scoped key belongs
+to the tenant it names.
+
 At open, the registry additionally refuses any key that
 `scope_key(unscope_key(k))` does not reproduce, naming the key in the error. A
 key the server's own round trip does not reproduce cannot have been written by
 the server, so there is no owner to serve it under - and serving it under a
 guess is the misattribution the create door exists to prevent. The registry
 format is unchanged.
+
+An earlier build could write such a key - `<32 UPPERCASE hex>::x` is the
+reachable form - and the whole shard then refuses to open, naming the key.
+There is no flag to skip it and no tool to rewrite it, so the repair is by
+hand: with the server stopped, replace those bytes in the shard's
+`vindexes.registry` with a same-length name (lowercasing the hex restores the
+attribution the key was meant to have; replacing `::` makes it tenant 0's) and
+rename `vindex-<old key>/` to match. Same length keeps it a byte substitution -
+the entry carries a `u16` name length. Do not delete the registry: the next
+write rebuilds it from what it read, and an empty one drops every index on the
+shard.
 
 **`ERASE TENANT` now removes the tenant's semantic routers.** It swept the
 router map with a prefix built by hand from the tenant `u128`, whose `Display`
