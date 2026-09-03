@@ -1115,7 +1115,9 @@ async fn exec_pipelined(
         Command::SkegVget { args } => skeg_vget(&args, &shards, tenant).await,
         Command::SkegVgraph { args } => skeg_vgraph(&args, &shards, tenant).await,
         Command::SkegVindexReshard { args } => skeg_vindex_reshard(&args, &shards, tenant).await,
-        Command::SkegVindexOverlap { args } => skeg_vindex_overlap(&args, &shards, tenant).await,
+        Command::SkegVindexOverlap { args } => {
+            skeg_vindex_overlap(&args, &shards, tenant, be).await
+        }
         Command::Ping(msg) => handle_ping(msg),
         Command::Echo(msg) => handle_echo(msg),
         // Unreachable: the connection loop only routes `is_pipelineable` commands
@@ -1281,7 +1283,9 @@ async fn dispatch_command(
         Command::SkegVget { args } => skeg_vget(&args, shards, *tenant).await,
         Command::SkegVgraph { args } => skeg_vgraph(&args, shards, *tenant).await,
         Command::SkegVindexReshard { args } => skeg_vindex_reshard(&args, shards, *tenant).await,
-        Command::SkegVindexOverlap { args } => skeg_vindex_overlap(&args, shards, *tenant).await,
+        Command::SkegVindexOverlap { args } => {
+            skeg_vindex_overlap(&args, shards, *tenant, tenant_backend).await
+        }
         Command::SkegSubjectErase { args } => skeg_subject_erase(&args, shards, *tenant).await,
         Command::SkegTenantErase { args } => {
             skeg_tenant_erase(&args, shards, *tenant, tenant_backend).await
@@ -1996,7 +2000,19 @@ async fn skeg_vindex_reshard(args: &[Bytes], shards: &ShardSet, tenant: TenantId
 }
 
 /// `SKEG.VINDEX.OVERLAP name [tau]`: targeted boundary replication.
-async fn skeg_vindex_overlap(args: &[Bytes], shards: &ShardSet, tenant: TenantId) -> Frame {
+///
+/// A replica is a second physical copy of the row's payload blob and nothing
+/// deletes the first, so the tenant's `max_disk_bytes` rides in with it - the
+/// only internal write that both duplicates bytes and keeps them. Replicas
+/// that do not fit are skipped, not refused - see
+/// `ShardSet::overlap_with_disk_limit` and `docs/adr-payload-transaction.md`,
+/// "Disk quota".
+async fn skeg_vindex_overlap(
+    args: &[Bytes],
+    shards: &ShardSet,
+    tenant: TenantId,
+    tenant_backend: Option<&Arc<dyn TenantBackend>>,
+) -> Frame {
     let raw_name = match parse_utf8_arg(&args[0], "name") {
         Ok(s) => s,
         Err(e) => return e,
@@ -2015,7 +2031,11 @@ async fn skeg_vindex_overlap(args: &[Bytes], shards: &ShardSet, tenant: TenantId
         Ok(s) => s,
         Err(e) => return e,
     };
-    match shards.overlap(&scoped, tau, tenant_u128(tenant)).await {
+    let disk_limit = tenant_backend.and_then(|b| b.limits(tenant).max_disk_bytes);
+    match shards
+        .overlap_with_disk_limit(&scoped, tau, tenant_u128(tenant), disk_limit)
+        .await
+    {
         Ok(n) => Frame::Integer(n as i64),
         Err(e) => shard_error(&e),
     }
