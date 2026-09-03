@@ -1292,7 +1292,6 @@ fn vgraph_cmd(name: &str, count: usize) -> Vec<u8> {
 /// refused before they run (the class cannot hold all of `BURST`) - the
 /// same "some, not all, not none" shape the VSEARCH pipeline test proves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in the next commit: server: reserve SKEG.VGRAPH replies before the shard call (A2)"]
 async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
     const DIM: usize = 8;
     const COUNT: usize = 2048;

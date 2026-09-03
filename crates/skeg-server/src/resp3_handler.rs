@@ -893,6 +893,55 @@ fn vsearch_reply_upper_bound(args: &[Bytes]) -> usize {
         .saturating_add(FRAME_NODE_OVERHEAD)
 }
 
+/// The largest out-degree a Vamana graph node in this engine can carry.
+///
+/// Mirrors `skeg_vector::vamana::MAX_R` (currently 64), which is private to
+/// that crate and not re-exported - reaching it would mean widening
+/// `skeg-vector`'s public API for one constant, a change to a crate other
+/// branches are mid-flight on (see the R1/A1 handoffs) and bigger than the
+/// bound it would tighten. Documented here instead, the same
+/// documented-constant fallback `MAX_VGET_VECTOR_BYTES` already uses: if
+/// `MAX_R` ever changes, this drifts silently rather than failing to
+/// compile, which is the trade a private upstream constant forces.
+const VGRAPH_MAX_OUT_DEGREE: usize = 64;
+
+/// One `SKEG.VGRAPH` node line (`n <id> <degree>\n`) or edge line
+/// (`e <a> <b>\n`), generous: a `u64` printed in decimal is at most 20
+/// digits, and neither line carries more than two of them.
+const VGRAPH_LINE_BYTES: usize = 48;
+
+/// The upper bound of a `SKEG.VGRAPH` reply, computed from the request
+/// alone: `skeg_vgraph` clamps `count` to `[1, 2048]` before it ever reaches
+/// `shards.graph_sample`, and samples at most `count` nodes, each
+/// contributing at most one node line and [`VGRAPH_MAX_OUT_DEGREE`] edge
+/// lines (a Vamana node's out-degree is capped at build time, never
+/// exceeded at read time). `SkegVgraph` is pipelineable
+/// (`is_pipelineable`), so - same as `SkegVsearch` - this is what keeps a
+/// burst of them from sitting in `inflight` fully built and uncharged: a
+/// typical degree (~64) at `count=2048` is on the order of several MiB per
+/// reply, and `PIPELINE_WINDOW` (128) of those uncharged is the same
+/// hundreds-of-MiB shape P0-A names for `SKEG.VMSET`.
+///
+/// An unparseable `count` (or none at all - `skeg_vgraph` defaults it to
+/// 120) still gets a finite, conservative answer: the clamp's own
+/// ceiling, 2048.
+fn vgraph_reply_upper_bound(args: &[Bytes]) -> usize {
+    let count = args
+        .get(1)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2048)
+        .clamp(1, 2048);
+    count
+        .saturating_mul(VGRAPH_LINE_BYTES)
+        .saturating_add(
+            count
+                .saturating_mul(VGRAPH_MAX_OUT_DEGREE)
+                .saturating_mul(VGRAPH_LINE_BYTES),
+        )
+        .saturating_add(FRAME_NODE_OVERHEAD)
+}
+
 /// The upper bound of `cmd`'s reply, computable from the REQUEST alone -
 /// before the command has run, before `shards.*` is ever called. Reserving
 /// this BEFORE dispatch is what P0-A actually asks for: the allocation must
@@ -954,14 +1003,20 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         // each) into a `Frame` BEFORE `frame_upper_bound` ever runs on it, so
         // measuring the frame after the fact catches the SECOND allocation
         // (`encode_frame`'s buffer) and misses the first (the fetch itself).
-        // Because `SkegVget`/`SkegVsearch` are pipelineable (`is_pipelineable`),
-        // a `Some` bound here also sums into `reply_reserved` for the
-        // pipeline window - closing audit 19 A1's reproduced hazard: up to
-        // `PIPELINE_WINDOW` completed, payload-bearing reads sitting in
-        // `inflight` uncharged (measured at 20,809,984 bytes under a 4 MiB
-        // class, 100 pipelined `SKEG.VSEARCH k=50 WITHPAYLOAD`). ----
+        // Because `SkegVget`/`SkegVsearch`/`SkegVgraph` are pipelineable
+        // (`is_pipelineable`), a `Some` bound here also sums into
+        // `reply_reserved` for the pipeline window - closing audit 19 A1's
+        // reproduced hazard: up to `PIPELINE_WINDOW` completed,
+        // payload-bearing reads sitting in `inflight` uncharged (measured at
+        // 20,809,984 bytes under a 4 MiB class, 100 pipelined
+        // `SKEG.VSEARCH k=50 WITHPAYLOAD`), and its A2 twin for `SKEG.VGRAPH`
+        // (count clamped to 2048, a typical Vamana out-degree of ~64 makes
+        // one reply on the order of several MiB - the same hundreds-of-MiB
+        // shape under `PIPELINE_WINDOW`, left open by round 1 with no
+        // structural reason `VGET`/`VSEARCH` did not share). ----
         Command::SkegVget { .. } => Some(vget_reply_upper_bound()),
         Command::SkegVsearch { args } => Some(vsearch_reply_upper_bound(args)),
+        Command::SkegVgraph { args } => Some(vgraph_reply_upper_bound(args)),
 
         // ---- everything else commits nothing on the way to answering, is
         // NOT pipelineable (`Get`/`Mget`/`Exists` are deliberately excluded -
@@ -994,15 +1049,16 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         // thing admission must not do.
         //
         // `SkegStats`/`SkegShards`/`SkegVindexList`/`SkegCheck`/`SkegVowner`/
-        // `SkegHealth`/`SkegVindexShards`/`SkegVgraph` are sized by how much
-        // the STORE holds (index count, shard count, graph sample edges),
-        // not by anything in the request - found-not-fixed by this pass,
-        // lower severity than `VGET`/`VSEARCH` because none of them scale
-        // with an attacker-chosen per-request multiplier the way `k` or a
-        // payload blob does, though `SkegVgraph`'s pipelineability means the
-        // same accumulation shape is theoretically open there too. Their
-        // bound is instead measured, exactly, from the `Frame` dispatch
-        // built - see `frame_upper_bound` in `flush_reply`. ----
+        // `SkegHealth`/`SkegVindexShards` are sized by how much the STORE
+        // holds (index count, shard count), not by anything in the request -
+        // found-not-fixed by this pass, lower severity than `VGET`/
+        // `VSEARCH`/`VGRAPH` because none of them scale with an
+        // attacker-chosen per-request multiplier the way `k`/`count` or a
+        // payload blob does, AND none of them is pipelineable
+        // (`is_pipelineable`) - so, like `Get`/`Mget`, no accumulation
+        // multiplies a single reply's cost. Their bound is instead measured,
+        // exactly, from the `Frame` dispatch built - see `frame_upper_bound`
+        // in `flush_reply`. ----
         Command::Get { .. }
         | Command::Mget { .. }
         | Command::Hello(_)
@@ -1021,8 +1077,7 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         | Command::SkegCheck { .. }
         | Command::SkegVowner { .. }
         | Command::SkegHealth { .. }
-        | Command::SkegVindexShards { .. }
-        | Command::SkegVgraph { .. } => None,
+        | Command::SkegVindexShards { .. } => None,
     }
 }
 
