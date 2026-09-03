@@ -12,10 +12,16 @@
 //! So those objects register themselves, and the dumper asks them. Three
 //! rules make that safe:
 //!
-//! - **Keyed and idempotent.** A source is registered under a `&'static str`
-//!   key; registering again under the same key REPLACES it. A server built
-//!   twice in one process (every integration test does this) leaves one
-//!   source, not a growing list of them.
+//! - **Keyed, and one series per key.** A source is registered under a
+//!   `&'static str` key and the NEWEST LIVE source for that key is the one
+//!   the dump reads. Two series with one name and one label set are not a
+//!   Prometheus scrape, so a key cannot report twice; and a process that
+//!   builds several servers - every integration test binary does - must not
+//!   end with one series per server ever built.
+//!
+//!   Newest LIVE, not simply newest: an older source that is still alive
+//!   takes over when a newer one is dropped, instead of the series vanishing
+//!   because the last thing registered happened to go away first.
 //! - **Held by [`Weak`].** The registry is a static and lives forever; the
 //!   governor of a server that has been dropped must not. A dead source is
 //!   skipped and pruned rather than reported as zero, because zero is a
@@ -76,29 +82,82 @@ pub trait GaugeSource: Send + Sync {
     fn sample(&self, out: &mut Vec<GaugeSample>);
 }
 
-/// Register `source` under `key`, replacing whatever `key` held before.
+/// Register `source` under `key`. The newest LIVE source for a key is the one
+/// the dump reads.
 ///
-/// Idempotent by key: calling it twice for the same key leaves one entry.
+/// # Panics
+///
+/// If the registry mutex was poisoned by a panicking sampler.
 pub fn register_gauge_source(key: &'static str, source: Weak<dyn GaugeSource>) {
-    // Stub: opened by `telemetry: gauges pulled from the objects that own them`.
-    let _ = (key, source);
+    let mut sources = SOURCES.lock().expect("the gauge source registry");
+    // Dead entries go on every registration, not only on the dump: a process
+    // that builds a thousand servers must not carry a thousand dead weaks
+    // around waiting for somebody to scrape. Live ones under the same key
+    // STAY, and the newest of them is what gets read - see the module note.
+    sources.retain(|(_, w)| w.strong_count() > 0);
+    sources.push((key, source));
 }
 
 /// Every reading every live source reports, in registration order.
 ///
-/// Sources whose object has been dropped are skipped and removed.
+/// Sources whose object has been dropped are pruned rather than reported as
+/// zero: zero is a value, and "gone" is not.
+///
+/// # Panics
+///
+/// If the registry mutex was poisoned by a panicking sampler.
 #[must_use]
 pub fn sample_all() -> Vec<GaugeSample> {
-    // Stub: opened by `telemetry: gauges pulled from the objects that own them`.
-    Vec::new()
+    // The live sources are taken under the lock and sampled OUTSIDE it. A
+    // sampler is somebody else's code reached through a trait object; running
+    // it while holding a process-wide mutex makes every future registration
+    // wait on whatever it decides to do.
+    let live: Vec<std::sync::Arc<dyn GaugeSource>> = {
+        let mut sources = SOURCES.lock().expect("the gauge source registry");
+        sources.retain(|(_, w)| w.strong_count() > 0);
+        // One per key, the last registered, in the order the keys were first
+        // seen: the dump stays grep-stable across releases and a key never
+        // emits its series twice.
+        distinct_keys(&sources)
+            .into_iter()
+            .filter_map(|key| {
+                sources
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| *k == key)
+                    .and_then(|(_, w)| w.upgrade())
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for source in live {
+        source.sample(&mut out);
+    }
+    out
 }
 
 /// Registered source keys, live ones only. For tests and for `SKEG.STATS`
 /// diagnostics.
+///
+/// # Panics
+///
+/// If the registry mutex was poisoned by a panicking sampler.
 #[must_use]
 pub fn live_source_keys() -> Vec<&'static str> {
-    // Stub: opened by `telemetry: gauges pulled from the objects that own them`.
-    Vec::new()
+    let mut sources = SOURCES.lock().expect("the gauge source registry");
+    sources.retain(|(_, w)| w.strong_count() > 0);
+    distinct_keys(&sources)
+}
+
+/// The registered keys, each once, in the order they were first seen.
+fn distinct_keys(sources: &[(&'static str, Weak<dyn GaugeSource>)]) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = Vec::new();
+    for (k, _) in sources {
+        if !keys.contains(k) {
+            keys.push(k);
+        }
+    }
+    keys
 }
 
 /// Append the pulled gauges to a Prometheus text dump.
@@ -124,7 +183,6 @@ pub fn dump_text(out: &mut String) {
 /// The registry itself. A `Mutex<Vec<..>>` and not a map: the list is O(10)
 /// entries and iteration order is the registration order, which keeps the
 /// dump stable for `grep`.
-#[allow(dead_code)]
 static SOURCES: Mutex<Vec<(&'static str, Weak<dyn GaugeSource>)>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
@@ -147,7 +205,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `telemetry: gauges pulled from the objects that own them`"]
     fn a_registered_source_is_asked_at_dump_time() {
         let src = Arc::new(Fixed(vec![GaugeSample::new("t_asked", 42)]));
         register_gauge_source("t_asked", Arc::downgrade(&src) as Weak<dyn GaugeSource>);
@@ -159,8 +216,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `telemetry: gauges pulled from the objects that own them`"]
-    fn registering_the_same_key_twice_leaves_one_source() {
+    fn registering_the_same_key_twice_reports_only_the_newest() {
         let first = Arc::new(Fixed(vec![GaugeSample::new("t_idem", 1)]));
         let second = Arc::new(Fixed(vec![GaugeSample::new("t_idem", 2)]));
         register_gauge_source("t_idem", Arc::downgrade(&first) as Weak<dyn GaugeSource>);
@@ -168,20 +224,51 @@ mod tests {
         assert_eq!(
             samples_of("t_idem"),
             vec![GaugeSample::new("t_idem", 2)],
-            "every integration test builds a server; a registry that appended \
-             would report one series per server ever built"
+            "two series with one name and one label set are not a scrape; and \
+             every integration test builds a server, so a registry that \
+             reported all of them would report one per server ever built"
         );
         assert_eq!(
             live_source_keys()
                 .iter()
                 .filter(|k| **k == "t_idem")
                 .count(),
-            1
+            1,
+            "one key, one series"
         );
     }
 
     #[test]
-    #[ignore = "opens in `telemetry: gauges pulled from the objects that own them`"]
+    fn an_older_live_source_takes_over_when_the_newest_is_dropped() {
+        // Not a curiosity: a test binary builds several servers, and if the
+        // series vanished whenever whichever registered LAST happened to be
+        // dropped first, every assertion about the dump would be a race
+        // against the test finishing next to it.
+        let first = Arc::new(Fixed(vec![GaugeSample::new("t_fallback", 1)]));
+        let second = Arc::new(Fixed(vec![GaugeSample::new("t_fallback", 2)]));
+        register_gauge_source(
+            "t_fallback",
+            Arc::downgrade(&first) as Weak<dyn GaugeSource>,
+        );
+        register_gauge_source(
+            "t_fallback",
+            Arc::downgrade(&second) as Weak<dyn GaugeSource>,
+        );
+        assert_eq!(
+            samples_of("t_fallback"),
+            vec![GaugeSample::new("t_fallback", 2)]
+        );
+        drop(second);
+        assert_eq!(
+            samples_of("t_fallback"),
+            vec![GaugeSample::new("t_fallback", 1)],
+            "the older source is still alive and still reporting"
+        );
+        drop(first);
+        assert!(samples_of("t_fallback").is_empty());
+    }
+
+    #[test]
     fn a_dropped_source_disappears_instead_of_reporting_zero() {
         let src = Arc::new(Fixed(vec![GaugeSample::new("t_dropped", 7)]));
         register_gauge_source("t_dropped", Arc::downgrade(&src) as Weak<dyn GaugeSource>);
@@ -198,7 +285,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `telemetry: gauges pulled from the objects that own them`"]
     fn a_three_state_gauge_reports_all_its_states_with_exactly_one_at_one() {
         let src = Arc::new(Fixed(vec![
             GaugeSample::labelled("t_state", "state=\"known\"", 1),
@@ -216,7 +302,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `telemetry: gauges pulled from the objects that own them`"]
     fn the_dump_declares_each_metric_name_once() {
         let src = Arc::new(Fixed(vec![
             GaugeSample::labelled("t_dump", "state=\"a\"", 1),
