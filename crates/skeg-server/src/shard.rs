@@ -10509,20 +10509,149 @@ mod tests {
         );
     }
 
-    /// A DROP credits what each shard PHYSICALLY held, and a routed index
+    /// A DROP credited what each shard PHYSICALLY held, and a routed index
     /// keeps a second physical copy of every boundary row - so dropping one
-    /// takes back more slots than the tenant ever spent and the counter ends
-    /// up BELOW the tenant's remaining contents. Measured on this fixture:
-    /// 70 counted before the drop (10 + 60 logical), 59 replicas, 0 counted
-    /// after, against 10 rows still on disk.
+    /// gave back more slots than the tenant ever spent, `sub` saturated at
+    /// zero, and the tenant could then write a WHOLE `max_vectors` on top of
+    /// what it already held, until the next restart.
     ///
-    /// Pre-existing and NOT fixed here: crediting a logical count would have
-    /// to happen at the coordinator, which is not where a drop decides
-    /// anything today, and `EraseTenant` reaches the same code from inside a
-    /// shard. What this commit gives it is the repair - the next open counts
-    /// the rows again - so the test asserts that and leaves the transient
-    /// undercount described rather than pinned, which would only have to be
-    /// unpinned when the drop is fixed.
+    /// Measured on this fixture before the fix: 70 logical rows counted, 59
+    /// replicas, 0 counted after the drop against 10 rows still on disk, then
+    /// 100 more writes accepted for 110 held under a limit of 100. The whole
+    /// sequence is client-reachable: create, reshard, overlap, drop.
+    ///
+    /// Asserted BEFORE any reopen: the reopen repairs it, and a repair that
+    /// arrives at the next restart is not a limit.
+    #[tokio::test]
+    #[ignore = "opens in: quota: credit the logical cardinality when a routed index is dropped"]
+    async fn test_quota_drop_of_a_replicated_index_credits_only_what_it_charged() {
+        const T: u128 = 47;
+        const LIMIT: u64 = 100;
+        const KEPT: u64 = 10;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let keep = scope_key(T, "keep");
+        let rep = scope_key(T, "rep");
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        for n in [&keep, &rep] {
+            shards
+                .vindex_create_scoped(n, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+        }
+        for id in 0..KEPT {
+            shards
+                .vset(&keep, id, quota_row(id), T, Some(LIMIT), None)
+                .await
+                .unwrap();
+        }
+        for id in 0..N {
+            shards
+                .vset(&rep, id, quota_row(id), T, Some(LIMIT), None)
+                .await
+                .unwrap();
+        }
+        shards.reshard(&rep, 0.25, 10, T).await.expect("reshard");
+        let replicated = shards.overlap(&rep, 4.0, T).await.expect("overlap");
+        assert!(replicated > 0, "fixture: the overlap has to replicate");
+        assert_eq!(shards.tenant_vector_count(T), KEPT + N);
+
+        shards.vindex_drop(&rep, T).await.unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            KEPT,
+            "the drop must give back the rows the tenant had, not the copies \
+             the index kept of them"
+        );
+
+        // And the limit still binds, without a restart being what makes it.
+        for id in KEPT..LIMIT {
+            shards
+                .vset(&keep, id, quota_row(id), T, Some(LIMIT), None)
+                .await
+                .unwrap_or_else(|e| panic!("row {id} of {LIMIT} refused: {e}"));
+        }
+        assert!(
+            shards
+                .vset(&keep, LIMIT, quota_row(LIMIT), T, Some(LIMIT), None)
+                .await
+                .is_err(),
+            "a tenant must not be able to write past its limit by dropping a \
+             replicated index"
+        );
+        assert_eq!(shards.tenant_vector_count(T), LIMIT);
+    }
+
+    /// Erasing a tenant removes every index it has, so the one number that is
+    /// certainly right afterwards is zero. The physical fragments a routed
+    /// index leaves behind cannot add up to it, and this is the GDPR path -
+    /// the count must not be a leftover of how the rows happened to be laid
+    /// out.
+    ///
+    /// A CONTROL, green before the fix as well as after, and green for the
+    /// wrong reason today: the same over-credit the test above is about
+    /// saturates at zero, which happens to be the right answer here. What it
+    /// guards is the fix - stop the shards crediting a routed index and the
+    /// erase leaves the tenant counted at 65 unless the coordinator zeroes
+    /// it, which is the opposite error and just as wrong.
+    #[tokio::test]
+    async fn test_quota_erase_tenant_zeroes_only_that_tenant() {
+        const A: u128 = 0x53;
+        const B: u128 = 0x59;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let a_rep = scope_key(A, "rep");
+        let a_plain = scope_key(A, "plain");
+        let b_own = scope_key(B, "own");
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        for n in [&a_rep, &a_plain, &b_own] {
+            shards
+                .vindex_create_scoped(n, QUOTA_DIM as u32, 1, 1)
+                .await
+                .unwrap();
+        }
+        for id in 0..N {
+            shards
+                .vset(&a_rep, id, quota_row(id), A, Some(500), None)
+                .await
+                .unwrap();
+        }
+        for id in 0..5 {
+            shards
+                .vset(&a_plain, id, quota_row(id), A, Some(500), None)
+                .await
+                .unwrap();
+        }
+        for id in 0..7 {
+            shards
+                .vset(&b_own, id, quota_row(id), B, Some(500), None)
+                .await
+                .unwrap();
+        }
+        shards.reshard(&a_rep, 0.25, 10, A).await.expect("reshard");
+        let replicated = shards.overlap(&a_rep, 4.0, A).await.expect("overlap");
+        assert!(replicated > 0, "fixture: the overlap has to replicate");
+        assert_eq!(shards.tenant_vector_count(A), N + 5);
+
+        shards.erase_tenant(A, Durability::Kernel).await.unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(A),
+            0,
+            "an erased tenant holds nothing"
+        );
+        assert_eq!(
+            shards.tenant_vector_count(B),
+            7,
+            "and nobody else was touched"
+        );
+    }
+
+    /// The reopen guard for the drop above: whatever the drop credited, the
+    /// next open counts what is on disk. Kept alongside
+    /// `test_quota_drop_of_a_replicated_index_credits_only_what_it_charged`,
+    /// which pins the credit itself - one of them would go green if the
+    /// rebuild were removed and the other if the credit were, so both are
+    /// needed to say the pair is right.
     #[tokio::test]
     async fn test_quota_drop_of_a_replicated_index_is_repaired_by_the_next_open() {
         const T: u128 = 37;
