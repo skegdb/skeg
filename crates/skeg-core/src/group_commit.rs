@@ -358,6 +358,241 @@ mod tests {
         Arc::new(PlatformFile::create(dir.path().join("gc.bin").as_path()).unwrap())
     }
 
+    /// Run `committer_task` over a channel every message of which is queued
+    /// BEFORE the task exists.
+    ///
+    /// Not decoration: it is what makes these tests deterministic. The 200 µs
+    /// timer is a fresh `sleep` constructed inside the `select!` on every
+    /// iteration, so it cannot already be elapsed when it is first polled -
+    /// which means a message that is already in the queue always wins. Queue
+    /// the whole conversation first and the task's route through it is fixed:
+    /// write, then flush, with no batch the timer could have taken first.
+    fn queued_committer(
+        file: Arc<PlatformFile>,
+        initial_offset: u64,
+    ) -> (mpsc::UnboundedSender<Msg>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(committer_task(file, rx, initial_offset));
+        (tx, handle)
+    }
+
+    fn write_msg(
+        data: Vec<u8>,
+        durability: Durability,
+    ) -> (Msg, oneshot::Receiver<io::Result<(u64, u32)>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Msg::Write(WriteReq {
+                data,
+                durability,
+                tx,
+            }),
+            rx,
+        )
+    }
+
+    fn flush_msg() -> (Msg, oneshot::Receiver<io::Result<()>>) {
+        let (tx, rx) = oneshot::channel();
+        (Msg::Flush(tx), rx)
+    }
+
+    /// The process-wide flush-failure counter, held across a whole test so the
+    /// delta it measures is its own.
+    async fn counter_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::failpoint::FLUSH_FAILURE_COUNTER_LOCK.lock().await
+    }
+
+    fn flush_failures() -> u64 {
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::VlogFlushFailures)
+    }
+
+    /// A write that never reached the disk must not come back as a barrier.
+    ///
+    /// SD-1: an acknowledged `flush()` means every record submitted before it
+    /// is on stable storage. A failing disk must not be able to produce an
+    /// `Ok(())` here.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn a_flush_over_a_batch_whose_write_failed_reports_the_failure() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![7u8; 64], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        let write_result = write_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key),
+            "the write failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            write_result.is_err(),
+            "the waiter was told its record landed: {write_result:?}"
+        );
+        assert!(
+            flush_result.is_err(),
+            "flush answered Ok over a batch whose write failed: {flush_result:?}"
+        );
+        assert_eq!(
+            file.sync_count(),
+            0,
+            "a batch that never wrote must not have been synced"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a flush that could not land must be counted exactly once"
+        );
+    }
+
+    /// The bytes are on the disk; the proof that they survive is not. That is
+    /// still a failed barrier, and the offset must not move.
+    ///
+    /// SD-1 again, for the half an environmental fault cannot express: the
+    /// write succeeds and the sync does not.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn a_flush_over_a_batch_whose_sync_failed_reports_the_failure() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![0xEEu8; 64], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        let write_result = write_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key),
+            "the sync failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            write_result.is_err(),
+            "an unsynced record was acked as durable: {write_result:?}"
+        );
+        assert!(
+            flush_result.is_err(),
+            "flush answered Ok over a batch that was never synced: {flush_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a flush that could not land must be counted exactly once"
+        );
+        // The write DID happen - this is the sync-only failure - and the
+        // offset must not have advanced over bytes nothing proved durable.
+        assert!(
+            file.pread(0, 64).await.unwrap().iter().all(|&b| b == 0xEE),
+            "fixture: the write itself was supposed to succeed"
+        );
+        let (write2, write2_rx) = write_msg(vec![1u8; 32], Durability::Kernel);
+        let (flush2, flush2_rx) = flush_msg();
+        tx.send(write2).unwrap();
+        tx.send(flush2).unwrap();
+        assert!(
+            flush2_rx.await.unwrap().is_ok(),
+            "the disk is healthy again"
+        );
+        assert_eq!(
+            write2_rx.await.unwrap().unwrap().0,
+            0,
+            "the offset advanced over bytes no sync ever proved durable"
+        );
+    }
+
+    /// The flush a committer runs on the way down has no caller left to tell,
+    /// which is exactly why it used to be discarded. It is still the last
+    /// barrier the store gets.
+    ///
+    /// SD-2: a shutdown that could not land its final batch must leave a
+    /// trace. Silence is indistinguishable from success.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn the_last_flush_on_the_way_down_is_counted_not_discarded() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        let (tx, task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![3u8; 48], Durability::Kernel);
+        tx.send(write).unwrap();
+        // Closing the channel IS the shutdown: the task flushes what is left
+        // and returns.
+        drop(tx);
+        task.await.unwrap();
+        let write_result = write_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key),
+            "the write failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            write_result.is_err(),
+            "the last waiter was told its record landed: {write_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "the shutdown flush failed and nothing counted it"
+        );
+    }
+
+    /// The other half of the contract: a flush that DID land still says so,
+    /// and does not tick the failure counter. Without this a fix that always
+    /// answers `Err` would pass every test above.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn a_flush_that_landed_still_answers_ok() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![9u8; 128], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        assert!(
+            flush_rx.await.unwrap().is_ok(),
+            "a healthy batch must still answer Ok"
+        );
+        assert_eq!(write_rx.await.unwrap().unwrap(), (0, 128));
+        assert!(file.sync_count() >= 1, "Kernel must issue a flush");
+        assert_eq!(
+            flush_failures(),
+            before,
+            "a flush that landed must not tick the failure counter"
+        );
+    }
+
     #[tokio::test]
     async fn test_group_commit_single_write() {
         force_per_file();

@@ -3,6 +3,7 @@
 //! `skeg-core` - vLog, index, compaction, cache, group commit.
 
 pub mod cache;
+pub mod failpoint;
 pub mod group_commit;
 pub mod index;
 pub mod record;

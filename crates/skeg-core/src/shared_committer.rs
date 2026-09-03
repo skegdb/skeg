@@ -436,6 +436,280 @@ mod tests {
         Arc::new(PlatformFile::create(&path.join("test.bin")).unwrap())
     }
 
+    /// Drive `committer_loop` directly over a channel every message of which
+    /// is queued BEFORE the loop runs.
+    ///
+    /// Deterministic on purpose. The loop's `select!` is `biased`, so a
+    /// message already in the inbox always beats the batch deadline; queue the
+    /// whole conversation first and the route through it is fixed - attach,
+    /// append, flush - with no batch the timer could have taken first. Going
+    /// through `SharedCommitter::new()` instead would put the loop on its own
+    /// thread and the sends would race it.
+    fn queued_loop() -> (mpsc::Sender<Msg>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(64);
+        (tx, tokio::spawn(committer_loop(rx)))
+    }
+
+    fn attach_msg(file_id: FileId, file: Arc<PlatformFile>) -> Msg {
+        let (reply, _rx) = oneshot::channel();
+        Msg::Attach {
+            file_id,
+            file,
+            initial_offset: 0,
+            reply,
+        }
+    }
+
+    fn append_msg(
+        file_id: FileId,
+        data: Vec<u8>,
+        durability: Durability,
+    ) -> (Msg, oneshot::Receiver<io::Result<(u64, u32)>>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            Msg::Append {
+                file_id,
+                data,
+                durability,
+                reply,
+            },
+            rx,
+        )
+    }
+
+    fn flush_msg() -> (Msg, oneshot::Receiver<io::Result<()>>) {
+        let (reply, rx) = oneshot::channel();
+        (Msg::Flush { reply }, rx)
+    }
+
+    /// The process-wide flush-failure counter, held across a whole test so the
+    /// delta it measures is its own.
+    async fn counter_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::failpoint::FLUSH_FAILURE_COUNTER_LOCK.lock().await
+    }
+
+    fn flush_failures() -> u64 {
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::VlogFlushFailures)
+    }
+
+    /// One batch, two files, one broken. The waiters of the file that
+    /// committed are owed their offsets; the flusher is owed the truth about
+    /// the one that did not.
+    ///
+    /// SD-3: a shared flush answers for EVERY file in the batch, not for
+    /// whichever one happened to be written first. Per-file aggregation is
+    /// the whole difference between this committer and the per-file one.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn a_shared_flush_reports_the_file_that_could_not_be_written_and_acks_the_others() {
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let broken = Arc::new(PlatformFile::create(&dir.path().join("broken.bin")).unwrap());
+        let healthy = Arc::new(PlatformFile::create(&dir.path().join("healthy.bin")).unwrap());
+        let key = crate::failpoint::file_key(&broken);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, key);
+
+        let (tx, _task) = queued_loop();
+        let (broken_append, broken_rx) = append_msg(1, vec![1u8; 64], Durability::Kernel);
+        let (healthy_append, healthy_rx) = append_msg(2, vec![2u8; 32], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(attach_msg(1, broken.clone())).await.unwrap();
+        tx.send(attach_msg(2, healthy.clone())).await.unwrap();
+        tx.send(broken_append).await.unwrap();
+        tx.send(healthy_append).await.unwrap();
+        tx.send(flush).await.unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        let broken_result = broken_rx.await.unwrap();
+        let healthy_result = healthy_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, key),
+            "the write failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            broken_result.is_err(),
+            "the broken file's waiter was told its record landed: {broken_result:?}"
+        );
+        assert_eq!(
+            healthy_result.unwrap(),
+            (0, 32),
+            "one broken file must not take the rest of the batch with it"
+        );
+        assert!(
+            flush_result.is_err(),
+            "flush answered Ok while one of its files never wrote: {flush_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a flush that could not land must be counted exactly once"
+        );
+    }
+
+    /// Every file in the batch wrote; the one barrier that covers them did
+    /// not. Nobody may be told they are durable, the flusher included.
+    ///
+    /// One file only: the sync target is picked from the batch's files, and a
+    /// test that pinned WHICH one would be pinning a `HashMap` iteration
+    /// order.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn a_shared_flush_over_a_failed_sync_reports_it_to_every_waiter() {
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = Arc::new(PlatformFile::create(&dir.path().join("only.bin")).unwrap());
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::SharedBatchSync, key);
+
+        let (tx, _task) = queued_loop();
+        let (append, append_rx) = append_msg(1, vec![5u8; 64], Durability::Power);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(attach_msg(1, file.clone())).await.unwrap();
+        tx.send(append).await.unwrap();
+        tx.send(flush).await.unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        let append_result = append_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::SharedBatchSync, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::SharedBatchSync, key),
+            "the sync failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            append_result.is_err(),
+            "an unsynced record was acked as durable: {append_result:?}"
+        );
+        assert!(
+            flush_result.is_err(),
+            "flush answered Ok over a batch that was never synced: {flush_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a flush that could not land must be counted exactly once"
+        );
+    }
+
+    /// Two broken files, one error. It has to name both, or an operator
+    /// reading it learns about one failing disk out of two.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn two_failed_files_aggregate_into_one_error_that_names_them_both() {
+        let _counter = counter_guard().await;
+        let dir = TempDir::new().unwrap();
+        let a = Arc::new(PlatformFile::create(&dir.path().join("a.bin")).unwrap());
+        let b = Arc::new(PlatformFile::create(&dir.path().join("b.bin")).unwrap());
+        let (ka, kb) = (
+            crate::failpoint::file_key(&a),
+            crate::failpoint::file_key(&b),
+        );
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, ka);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, kb);
+
+        let (tx, _task) = queued_loop();
+        let (append_a, a_rx) = append_msg(1, vec![1u8; 16], Durability::Kernel);
+        let (append_b, b_rx) = append_msg(2, vec![2u8; 16], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(attach_msg(1, a.clone())).await.unwrap();
+        tx.send(attach_msg(2, b.clone())).await.unwrap();
+        tx.send(append_a).await.unwrap();
+        tx.send(append_b).await.unwrap();
+        tx.send(flush).await.unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        assert!(a_rx.await.unwrap().is_err());
+        assert!(b_rx.await.unwrap().is_err());
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, ka);
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, kb);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, ka)
+                && crate::failpoint::fired_at(
+                    crate::failpoint::CommitFailpoint::SharedBatchWrite,
+                    kb
+                ),
+            "both write failpoints must have fired: the test proved nothing"
+        );
+        let err = flush_result.expect_err("flush answered Ok with both its files broken");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 of 2"),
+            "the aggregate error must say how many files failed, got: {msg}"
+        );
+    }
+
+    /// The flush a shared committer runs on the way down has no caller left to
+    /// tell. It is still the last barrier every shard on the device gets.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn the_shared_committers_last_flush_on_the_way_down_is_counted_not_discarded() {
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = Arc::new(PlatformFile::create(&dir.path().join("down.bin")).unwrap());
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, key);
+
+        let (tx, task) = queued_loop();
+        let (append, append_rx) = append_msg(1, vec![6u8; 24], Durability::Kernel);
+        tx.send(attach_msg(1, file.clone())).await.unwrap();
+        tx.send(append).await.unwrap();
+        // Closing the inbox IS the shutdown: the loop flushes what is left
+        // and returns.
+        drop(tx);
+        task.await.unwrap();
+        let append_result = append_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::SharedBatchWrite, key),
+            "the write failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            append_result.is_err(),
+            "the last waiter was told its record landed: {append_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "the shutdown flush failed and nothing counted it"
+        );
+    }
+
+    /// The other half of the contract: a shared flush that DID land still says
+    /// so, and does not tick the failure counter.
+    #[tokio::test]
+    #[ignore = "opens in the commit that returns the real flush result"]
+    async fn a_shared_flush_that_landed_still_answers_ok() {
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = Arc::new(PlatformFile::create(&dir.path().join("fine.bin")).unwrap());
+
+        let (tx, _task) = queued_loop();
+        let (append, append_rx) = append_msg(1, vec![8u8; 40], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(attach_msg(1, file.clone())).await.unwrap();
+        tx.send(append).await.unwrap();
+        tx.send(flush).await.unwrap();
+
+        assert!(
+            flush_rx.await.unwrap().is_ok(),
+            "a healthy batch must still answer Ok"
+        );
+        assert_eq!(append_rx.await.unwrap().unwrap(), (0, 40));
+        assert_eq!(
+            flush_failures(),
+            before,
+            "a flush that landed must not tick the failure counter"
+        );
+    }
+
     #[tokio::test]
     async fn test_attach_append_flush_single_file() {
         let dir = TempDir::new().unwrap();

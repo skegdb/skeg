@@ -438,10 +438,21 @@ pub enum Counter {
     /// this counter, because the alternative is a rate limit that silently
     /// reads as "give up" to every client of that deployment.
     BackendRefusalUnclassified = 54,
+    /// Batch commits whose write or sync failed.
+    ///
+    /// A durability signal, not a throughput one: every tick is a batch whose
+    /// records were NOT made durable, and whose waiters were told so. It also
+    /// counts the flush a committer runs on the way down, which has no caller
+    /// left to tell - so on a shutdown that could not land its last batch this
+    /// is the only number that moves.
+    ///
+    /// Non-zero means the disk under this store is failing or full. There is
+    /// no healthy value above zero.
+    VlogFlushFailures = 55,
 }
 
 impl Counter {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 56;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -498,6 +509,7 @@ impl Counter {
         Counter::IngressReplyOverBudget,
         Counter::QuotaRefused,
         Counter::BackendRefusalUnclassified,
+        Counter::VlogFlushFailures,
     ];
 
     #[inline]
@@ -515,6 +527,7 @@ impl Counter {
             Counter::VlogPwritevBytesTotal => "skeg_vlog_pwritev_bytes_total",
             Counter::VlogWritebackHints => "skeg_vlog_writeback_hints_total",
             Counter::VlogRecoveryRecords => "skeg_vlog_recovery_records_total",
+            Counter::VlogFlushFailures => "skeg_vlog_flush_failures_total",
             Counter::PayloadIndexRebuilds => "skeg_payload_index_rebuilds_total",
             Counter::PayloadIndexFromDisk => "skeg_payload_index_from_disk_total",
             Counter::PayloadIndexRefreshed => "skeg_payload_index_refreshed_total",
