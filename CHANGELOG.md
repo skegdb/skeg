@@ -49,6 +49,21 @@ word - which a client reads as a network fault and answers by
 reconnecting and sending the same frame. That is a loop. It now gets one
 `Err` frame naming the limit and the length.
 
+**How far the classification reaches.** It covers every refusal the SERVER
+decides. For one a tenant backend decides it covers the leading code word
+and nothing more: `AdmitRejected` is `struct { message: String }`, written
+by a backend outside this tree, and its contract promises only that the
+string is a complete RESP3 error line beginning with an uppercase code. The
+engine reads that word, passes the line through **untouched** - a client
+that routes on `RATELIMITED` keeps routing on it - and derives the native
+byte from it, so a rate limit is `0x04` there. A message with no code word,
+or one this build does not know, is treated as permanent (the safe answer:
+guessing that an unclassified refusal clears is how a client loops) and
+counted by `skeg_backend_refusal_unclassified_total`, with a warning naming
+the message. Giving `AdmitRejected` a typed `Retryability` is the straight
+fix and belongs to a revision that may break the trait; it is deliberately
+not this one.
+
 **SDK note.** Clients that want the distinction need one change each:
 `skeg-client-rs` currently maps any unknown code byte to
 `ErrCode::Internal`, and `skeg-py` and `skeg-gleam` carry the raw

@@ -20,6 +20,26 @@
 //! the two wires cannot drift: making them disagree means editing one
 //! function whose own test loops over every variant.
 //!
+//! # What it covers, and how far
+//!
+//! Every refusal THE SERVER DECIDES: the ingress class, the memory governor,
+//! the tenant vector quota, a fixed request ceiling, a bounded queue. For
+//! those, the reason is a typed value and the classification reads the value.
+//!
+//! For a refusal a TENANT BACKEND decides, it covers the leading code word
+//! and nothing more. [`crate::tenant::AdmitRejected`] is
+//! `struct { message: String }`, written by a backend that lives outside this
+//! tree, and its contract promises only that the string is a complete RESP3
+//! error line whose first word is an uppercase code. So the engine reads that
+//! one word, passes the line through untouched, and counts every refusal
+//! whose word it cannot place. It does NOT understand why the backend
+//! refused, and it does not pretend to.
+//!
+//! The straight fix is a typed `Retryability` on `AdmitRejected`. That
+//! changes a public trait contract and every backend that implements it, so
+//! it belongs to the revision that gets to break one - not to this change,
+//! whose whole point is that nothing outside the engine has to move.
+//!
 //! # What this is not
 //!
 //! Not an application error type, and not a step towards one. It carries the
@@ -124,9 +144,19 @@ impl AdmissionError {
             Self::RequestTooLarge { .. } => Permanent,
             // Stub: opened by `server: a full vsearch queue is backpressure`.
             Self::Busy => Permanent,
-            // Stub: opened by `server: a backend refusal is classified by the
-            // code word its own contract promises`.
-            Self::Backend { .. } => Permanent,
+            // The one place in the engine that reads a code word out of a
+            // string, and only because the string IS the interface: see the
+            // variant's own note. One word, the one the trait's doc names;
+            // anything else - prose, or a word this build has never heard of
+            // - is permanent, which is the safe answer, and counted, which is
+            // how somebody finds out.
+            Self::Backend { message } => {
+                if backend_code_word(message) == Some(BACKEND_RETRYABLE_CODE) {
+                    Retryable
+                } else {
+                    Permanent
+                }
+            }
         }
     }
 
@@ -221,10 +251,7 @@ impl AdmissionError {
     /// that ticked on each would report traffic instead of refusals.
     #[must_use]
     pub fn from_backend(rejected: crate::tenant::AdmitRejected) -> Self {
-        // Stub: opened by `server: a backend refusal is classified by the code
-        // word its own contract promises`.
-        let classify = false;
-        if classify && backend_code_word(&rejected.message) != Some(BACKEND_RETRYABLE_CODE) {
+        if backend_code_word(&rejected.message) != Some(BACKEND_RETRYABLE_CODE) {
             // Said out loud as well as counted: a deployment whose rate limit
             // reads as "give up" to every client is a fault in the backend,
             // and the operator who can fix it is not reading this counter.
@@ -534,7 +561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: a backend refusal is classified by the code word its own contract promises`"]
     fn a_backend_rate_limit_is_retryable_and_keeps_its_own_word() {
         let e = refused("RATELIMITED tenant request rate exceeded");
         assert_eq!(e.retryability(), Retryability::Retryable);
@@ -552,7 +578,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: a backend refusal is classified by the code word its own contract promises`"]
     fn a_backend_refusal_the_engine_cannot_classify_is_permanent_and_counted() {
         for message in [
             "TENANTBLOCKED this tenant is suspended",
@@ -582,7 +607,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: a backend refusal is classified by the code word its own contract promises`"]
     fn a_classified_backend_refusal_is_not_counted_as_unclassified() {
         let before =
             skeg_telemetry::counter_value(skeg_telemetry::Counter::BackendRefusalUnclassified);

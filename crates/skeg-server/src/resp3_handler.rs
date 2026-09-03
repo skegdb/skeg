@@ -692,7 +692,11 @@ async fn exec_pipelined(
             cost: command_cost(&cmd),
         }) {
             Ok(guard) => Some(guard),
-            Err(rejected) => return Frame::Error(rejected.message),
+            Err(rejected) => {
+                return Frame::Error(
+                    crate::admission::AdmissionError::from_backend(rejected).wire_message(),
+                );
+            }
         },
     };
     let be = backend.as_ref();
@@ -735,7 +739,17 @@ async fn dispatch_command(
             };
             match ctx.admit(admission) {
                 Ok(guard) => Some(guard),
-                Err(rejected) => return Frame::Error(rejected.message),
+                // Through the classification, not around it. The line the
+                // client sees is unchanged - a backend writes its own,
+                // complete - but it is now a refusal the engine has an
+                // opinion about, which is what gives the native wire a byte
+                // to send and the operator a counter when the backend's
+                // message carries no code word at all.
+                Err(rejected) => {
+                    return Frame::Error(
+                        crate::admission::AdmissionError::from_backend(rejected).wire_message(),
+                    );
+                }
             }
         }
     };
