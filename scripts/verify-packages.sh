@@ -62,10 +62,13 @@ for crate in "${ORDER[@]}"; do
   # does not cover a member's rewritten path dependency. Same path, no
   # collision: for those three the package step resolves the workspace
   # tree, which is what the extracted package was made from.
-  case "$crate" in
-    skeg-platform|skeg-simd|skeg-vector) patch_args+=(--config "patch.crates-io.${crate}.path=\"$PWD/crates/${crate}\"") ;;
-    *) patch_args+=(--config "patch.crates-io.${crate}.path=\"${dir}\"") ;;
-  esac
+  # For the PACKAGE step every sibling is patched at its workspace path: a
+  # workspace-patched crate pulls its own path dependencies from the tree,
+  # and the same crate reached through an extracted copy would collide in
+  # the lockfile. The workspace tree and the extracted package are the same
+  # sources at the same versions; only the TEST step (above) resolves the
+  # extracted copies, which is where "as packaged" is proved.
+  patch_args+=(--config "patch.crates-io.${crate}.path=\"$PWD/crates/${crate}\"")
 done
 if [ ${#failed[@]} -gt 0 ]; then echo "FAILED: ${failed[*]}"; exit 1; fi
 echo "ok: every package builds and tests against the registry plus its published-order siblings"
