@@ -2,15 +2,34 @@ name: Release
 on:
   push:
     tags: ['v*']
-  # Manual runs are dry runs, always: they exercise guard, test, both
-  # binary and image builds, and stop there. Publishing only happens from a
-  # `v*` tag, because every promotion step (GitHub Release, image tags,
-  # crates.io, Homebrew) is keyed on that tag name; a publishing dispatch
-  # had no tag and would have shipped crates and images, then failed the
-  # Homebrew bump looking for a Release that was never created.
+  # Manual runs are dry runs, always: they exercise guard, version-gate,
+  # test, both binary and image builds, and stop there. Publishing only
+  # happens from a `v*` tag, because every promotion step (GitHub Release,
+  # image tags, crates.io, Homebrew) is keyed on that tag name; a
+  # publishing dispatch had no tag and would have shipped crates and
+  # images, then failed the Homebrew bump looking for a Release that was
+  # never created.
+  #
+  # `validate_promote` extends a manual run through the promotion
+  # MECHANICS without publishing anything that stays: the image digests are
+  # pushed (untagged, as on a real tag) and bound under one throwaway tag
+  # `validate-<sha>`, the GitHub Release is created as a DRAFT under a
+  # throwaway tag of the same name, and both are deleted by the last job.
+  # crates.io and Homebrew are never touched by a manual run. This is the
+  # only way to prove the digest handoff between the two docker-publish
+  # calls before the first real tag.
   workflow_dispatch:
+    inputs:
+      validate_promote:
+        description: "Also run the promotion chain against throwaway targets (draft release, scratch image tag), then delete them."
+        required: false
+        type: boolean
+        default: false
 
 # Build, then promote. guard -> version-gate -> test -> {build-binaries, docker-build}
+# (a manual run with `validate_promote` continues through promote-release and
+# docker-promote against throwaway targets that `validate-cleanup` deletes;
+# publish-crates and bump-homebrew never run on a manual run)
 # produce nothing public: tarballs are run artifacts, images are pushed by
 # digest only (untagged). Only once all of them succeeded does
 # `promote-release` create the GitHub Release with every tarball, then
@@ -138,7 +157,10 @@ jobs:
           set -eo pipefail
           # Find the previous release tag (excluding HEAD). On the very
           # first release, `prev_tag` is empty and every crate publishes.
-          prev_tag=$(git tag --sort=-creatordate | grep -E '^v[0-9]' | grep -v "^${GITHUB_REF_NAME}\$" | head -n 1 || true)
+          # Only tags REACHABLE from this commit count: a tag created later
+          # on another branch (a hotfix on `release` this line never merged)
+          # is newer by date and would make the diff lie about what changed.
+          prev_tag=$(git tag --merged HEAD --sort=-creatordate | grep -E '^v[0-9]' | grep -v "^${GITHUB_REF_NAME}\$" | head -n 1 || true)
           if [ -n "$prev_tag" ]; then
             echo "diffing against previous tag: $prev_tag"
           else
@@ -249,14 +271,19 @@ jobs:
     with:
       stage: build
       gated: true
-      dry_run: ${{ github.event_name != 'push' }}
+      # A validate-promote run pushes the digests for real (untagged), or
+      # there would be nothing for the promote stage to bind.
+      dry_run: ${{ github.event_name != 'push' && inputs.validate_promote != true }}
 
   # ---- promotion: nothing above this line is public ----
 
   promote-release:
     # First public step. Runs only once every build succeeded; on a tag push
-    # it creates the GitHub Release with every tarball at once.
-    if: github.event_name == 'push'
+    # it creates the GitHub Release with every tarball at once. On a
+    # validate-promote run it creates a DRAFT release under a throwaway tag
+    # (drafts are invisible to everyone but maintainers) that
+    # `validate-cleanup` deletes together with the tag.
+    if: github.event_name == 'push' || inputs.validate_promote == true
     needs: [guard, test, build-binaries, docker-build]
     runs-on: ubuntu-latest
     steps:
@@ -267,19 +294,56 @@ jobs:
           path: dist
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || format('validate-{0}', github.sha) }}
+          draft: ${{ github.event_name != 'push' }}
           files: |
             dist/skeg-*.tar.gz
             dist/skeg-*.tar.gz.sha256
 
   docker-promote:
     # Binds the digests `docker-build` pushed under `:<version>` / `:latest`
-    # (or the dispatch tag). Same call, `stage: promote`: no rebuild.
-    if: github.event_name == 'push'
+    # - or, on a validate-promote run, under the one throwaway tag
+    # `validate-<sha>`. Same call, `stage: promote`: no rebuild.
+    if: github.event_name == 'push' || inputs.validate_promote == true
     needs: [promote-release]
     uses: ./.github/workflows/docker-publish.yml
     with:
       stage: promote
       gated: true
+      scratch_tag: ${{ github.event_name != 'push' && format('validate-{0}', github.sha) || '' }}
+
+  validate-cleanup:
+    # Takes back what a validate-promote run put up: the draft release and
+    # its throwaway tag, and the scratch image tag on ghcr.io. The
+    # per-architecture digests stay untagged, exactly as after a tag run
+    # that failed before promotion (documented in the CHANGELOG under the
+    # release gate). Runs even when a promote job failed, so a broken
+    # validate run leaves nothing behind either.
+    if: always() && github.event_name != 'push' && inputs.validate_promote == true
+    needs: [promote-release, docker-promote]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: delete the draft release and its tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          tag="validate-${GITHUB_SHA}"
+          gh release delete "$tag" --yes --cleanup-tag || echo "no draft release '$tag' to delete"
+      - name: delete the scratch image tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          tag="validate-${GITHUB_SHA}"
+          ids=$(gh api --paginate "/orgs/skegdb/packages/container/skeg/versions" \
+                --jq ".[] | select(.metadata.container.tags | index(\"$tag\")) | .id")
+          if [ -z "$ids" ]; then echo "no image tagged '$tag'"; exit 0; fi
+          for id in $ids; do
+            gh api -X DELETE "/orgs/skegdb/packages/container/skeg/versions/$id"
+            echo "deleted package version $id ($tag)"
+          done
 
   # Custom one-shot brew bump. mislav's action stops working on the
   # second invocation because the version field is already at the

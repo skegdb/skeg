@@ -24,7 +24,9 @@ def prev_tag(explicit):
     if explicit:
         return explicit
     head = sh("git", "describe", "--tags", "--exact-match", "HEAD").stdout.strip()
-    tags = [t for t in sh("git", "tag", "--sort=-creatordate").stdout.split() if t.startswith("v") and t != head]
+    # Reachable tags only: a newer tag on a branch this commit never merged
+    # would make the diff lie about what changed (same rule as release.yml).
+    tags = [t for t in sh("git", "tag", "--merged", "HEAD", "--sort=-creatordate").stdout.split() if t.startswith("v") and t != head]
     return tags[0] if tags else ""
 
 def local_version(crate):
