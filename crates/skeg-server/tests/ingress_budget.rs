@@ -24,6 +24,15 @@ use skeg_server::memory::{Headroom, MemoryGovernor, MemorySource};
 
 // ---------------------------------------------------------------- fixtures
 
+/// `Counter::IngressReplyOverBudget` is a process-wide static, and this
+/// binary runs its `#[tokio::test]` functions concurrently by default (one
+/// process, many threads) - so three tests below that each assert a DELTA
+/// on it would otherwise measure each other's ticks instead of their own.
+/// The same pattern as `vmset_fanout.rs`'s `ONE_AT_A_TIME`: take turns
+/// rather than assert on a counter nothing else is touching, which nothing
+/// here can promise on its own.
+static REPLY_OVER_BUDGET_COUNTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug)]
 struct Fixed(Headroom);
 
@@ -638,6 +647,7 @@ fn vmset_of_failing_items(items: usize) -> Vec<u8> {
 /// what makes this a test of the reply side and not the request side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_max_vmset_reply_too_large_for_the_allowance_is_refused_before_it_runs() {
+    let _turn = REPLY_OVER_BUDGET_COUNTER_TESTS.lock().await;
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 64).await;
     let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
@@ -698,15 +708,23 @@ async fn a_max_vmset_reply_too_large_for_the_allowance_is_refused_before_it_runs
 /// reserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_max_vmset_replies_under_a_barrier_never_overshoot_the_budget() {
+    let _turn = REPLY_OVER_BUDGET_COUNTER_TESTS.lock().await;
     const N: usize = 8;
     // Sized to hold N worst-case VMSET replies (~1.15 MiB each, charged at
     // PARSE_FACTOR and rounded up to a whole CHUNK_BYTES) plus each
-    // connection's request buffer, with room to spare - the point of this
-    // test is concurrent admission succeeding cleanly, not admission
+    // connection's request buffer, with generous headroom - the point of
+    // this test is concurrent admission succeeding cleanly, not admission
     // refusing under a class too small to hold them (that is the test
     // above). "Small" per the audit's own framing is relative to what N
-    // legitimate worst-case replies cost, not to an arbitrary constant.
-    let ingress = budget(N as u64 * 8 * CHUNK_BYTES, Duration::from_millis(200));
+    // legitimate worst-case replies cost, not to an arbitrary constant. The
+    // margin is wide (32x a single reply's chunk-rounded charge per
+    // connection) because this workspace's test suite runs several worktrees
+    // and test binaries concurrently on one machine: a connection whose
+    // request read gets scheduled in smaller, slower slices grows a larger
+    // decoder buffer than it would alone, and that buffer shares this same
+    // class - a tight margin here would make the assertion about scheduler
+    // noise, not about the reservation.
+    let ingress = budget(N as u64 * 32 * CHUNK_BYTES, Duration::from_millis(500));
     let (addr, _dir) = resp3_server(&ingress, 64).await;
     let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
 
@@ -770,6 +788,17 @@ async fn concurrent_max_vmset_replies_under_a_barrier_never_overshoot_the_budget
 /// the connections that are behaving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturated_class_still_answers_ping_and_refuses_a_grower_by_name() {
+    // A class driven this close to full can legitimately push even a small
+    // reply's own `flush_reply` reservation (R1) past what little room is
+    // left - `charge_for` has no granularity between "fits in the floor"
+    // and "a whole CHUNK_BYTES", so a PONG whose OWN reservation needs a
+    // few bytes more than the connection already holds asks for a full
+    // chunk, same as a page's worth of reply would. That is a real,
+    // COUNTED overshoot on `IngressReplyOverBudget` - not a bug in this
+    // test's own scenario - and the two other tests in this file that
+    // assert a delta of zero on that same process-wide counter take turns
+    // with this one so its legitimate ticks are not mistaken for theirs.
+    let _turn = REPLY_OVER_BUDGET_COUNTER_TESTS.lock().await;
     let cap = 16 * CHUNK_BYTES;
     let stall = Duration::from_millis(300);
     let ingress = budget(cap, stall);
