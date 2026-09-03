@@ -961,6 +961,18 @@ fn vindex_create_flat(name: &str, dim: usize) -> Vec<u8> {
     ])
 }
 
+/// `SKEG.VINDEX.CREATE name dim 1` (disk, f32) as raw RESP3 bytes.
+/// `SKEG.VGRAPH` samples a Vamana graph, which only a disk-backed index
+/// builds - "flat backend has no graph".
+fn vindex_create_disk(name: &str, dim: usize) -> Vec<u8> {
+    resp_array(&[
+        b"SKEG.VINDEX.CREATE",
+        name.as_bytes(),
+        dim.to_string().as_bytes(),
+        b"1",
+    ])
+}
+
 /// `SKEG.VSET name id vector PAYLOAD blob` as raw RESP3 bytes.
 fn vset_with_payload(name: &str, id: u64, dim: usize, payload_len: usize) -> Vec<u8> {
     let mut vector = Vec::with_capacity(dim * 4);
@@ -1215,6 +1227,15 @@ fn find_reply_end(buf: &[u8]) -> Option<usize> {
     }
     match buf.first()? {
         b'-' | b':' => line_end(buf, 0),
+        b'$' => {
+            let header_end = line_end(buf, 0)?;
+            let len: usize = std::str::from_utf8(&buf[1..header_end - 2])
+                .ok()?
+                .parse()
+                .ok()?;
+            let end = header_end + len + 2;
+            (buf.len() >= end).then_some(end)
+        }
         b'*' => {
             let header_end = line_end(buf, 0)?;
             let n: usize = std::str::from_utf8(&buf[1..header_end - 2])
@@ -1244,4 +1265,115 @@ fn find_reply_end(buf: &[u8]) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+// ------------------------------------------------- the reply side, reads (A2)
+
+/// `SKEG.VGRAPH name count` as raw RESP3 bytes.
+fn vgraph_cmd(name: &str, count: usize) -> Vec<u8> {
+    resp_array(&[
+        b"SKEG.VGRAPH",
+        name.as_bytes(),
+        count.to_string().as_bytes(),
+    ])
+}
+
+/// audit/19 A2: `SkegVgraph` is pipelineable (`is_pipelineable`) but round 1
+/// left its bound `None`, the same shape A1 closed for `SkegVget`/
+/// `SkegVsearch` with no structural reason `VGRAPH` should differ.
+/// `count` clamps server-side to `[1, 2048]`; a typical Vamana out-degree
+/// (~64) at `count=2048` puts one reply on the order of several MiB, and
+/// `PIPELINE_WINDOW` (128) of those completed and uncharged on one
+/// connection is the hundreds-of-MiB shape P0-A names for `SKEG.VMSET`.
+///
+/// `BURST` pipelined `SKEG.VGRAPH count=2048` reads on one connection, sent
+/// without reading their replies, under a class sized for a handful: some
+/// must be admitted (the class is not THAT small) and some must be
+/// refused before they run (the class cannot hold all of `BURST`) - the
+/// same "some, not all, not none" shape the VSEARCH pipeline test proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens in the next commit: server: reserve SKEG.VGRAPH replies before the shard call (A2)"]
+async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
+    const DIM: usize = 8;
+    const COUNT: usize = 2048;
+    const BURST: usize = 8;
+
+    // One count=2048 VGRAPH reservation (VGRAPH_MAX_OUT_DEGREE=64 edges per
+    // node, VGRAPH_LINE_BYTES=48, chunk-rounded) is on the order of 12-13
+    // MiB charged. Sized for roughly half of BURST to fit.
+    let ingress = budget(560 * CHUNK_BYTES, Duration::from_millis(50));
+    let (addr, _dir) = resp3_server(&ingress, 8).await;
+
+    let mut setup = TcpStream::connect(addr).await.expect("connect");
+    setup
+        .write_all(&vindex_create_disk("graph-idx", DIM))
+        .await
+        .expect("create");
+    let _ = read_one_reply(&mut setup, Duration::from_secs(5)).await;
+    setup
+        .write_all(&vset_with_payload("graph-idx", 0, DIM, 0))
+        .await
+        .expect("vset");
+    let text = read_one_reply(&mut setup, Duration::from_secs(5)).await;
+    assert!(text.starts_with('+'), "setup vset must succeed: {text:?}");
+    drop(setup);
+
+    let mut conn = TcpStream::connect(addr).await.expect("connect");
+    let request = vgraph_cmd("graph-idx", COUNT);
+    for _ in 0..BURST {
+        conn.write_all(&request).await.expect("vgraph");
+    }
+
+    let mut ok = 0usize;
+    let mut refused = 0usize;
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let n = match tokio::time::timeout(Duration::from_secs(5), conn.read(&mut scratch)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&scratch[..n]);
+        while !buf.is_empty() {
+            let Some(end) = find_reply_end(&buf) else {
+                break;
+            };
+            match buf[0] {
+                b'$' => ok += 1,
+                b'-' => refused += 1,
+                other => panic!("unexpected reply lead byte {other:?}: {buf:?}"),
+            }
+            buf.drain(..end);
+        }
+    }
+
+    assert!(
+        ok + refused > 0,
+        "no replies arrived at all: nothing was proved"
+    );
+    assert!(
+        ok > 0,
+        "a class sized for a handful of these must admit at least one: \
+         {ok} completed, {refused} refused"
+    );
+    assert!(
+        refused > 0,
+        "a class sized for only a handful of a {BURST}-request pipelined \
+         burst of count={COUNT} VGRAPH reads must refuse some of them - \
+         {ok} completed and 0 were refused, which is the unreserved-pipeline \
+         shape audit 19 A2 named"
+    );
+
+    until(
+        "the connection to settle back near its floor",
+        Duration::from_secs(10),
+        || ingress.held_bytes() <= ingress.per_connection_max(),
+    )
+    .await;
 }
