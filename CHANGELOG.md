@@ -83,6 +83,43 @@ All of this matters where the native listener is exposed over a store a
 multi-tenant RESP3 listener also serves; a single-tenant store has no such
 names.
 
+### A tenant's vector quota survives a restart
+
+`max_vectors` counted a tenant's rows in process memory only. Nothing put the
+count back at startup, so a tenant sitting at its limit got its whole budget
+back by restarting the server: the limit was a limit per uptime, and a store
+could grow past it as often as it was restarted.
+
+**Every open now counts what the shards hold, before the listener binds.** The
+count is taken inside the readiness barrier that already existed, out of the
+same pass over the live rows the payload-blob reclamation makes, so no vindex
+is walked twice. A restart no longer changes what a tenant may write.
+
+It counts LOGICAL rows, which is what the quota always meant. A semantically
+resharded index keeps a second physical copy of every boundary row, and a
+crash between a move's write to its destination and the delete of its source
+leaves another; those are one row each, deduplicated by id across shards the
+same way the owner map picks a primary. An index with no router is
+hash-placed - an id lives on exactly one shard - and its shards simply add up.
+
+An index's rows are counted against the tenant its scoped registry key names,
+which is the same key a write from that tenant resolves through. On a store
+written before `::` was refused in raw names, a squatted key is still
+attributed to the tenant it spells - see the upgrade note above; the count now
+follows that attribution as well as the erase did.
+
+The rebuild only STATES what is there: it never refuses. A tenant found over
+its limit - a limit lowered underneath it, or a store grown past it by the
+restarts this closes - keeps its rows readable and is refused its next write,
+which is what a quota means. A read-only (`--mode serve`) open counts nothing:
+it admits no writes.
+
+Two things it does not fix, both pre-existing and both self-repairing at the
+next open. Dropping a resharded index credits back the physical copies rather
+than the logical rows, so a tenant is briefly under-counted; and dropping a
+committed index that will not open credits nothing at all, because only the
+open index knew what it held.
+
 ### A vector and its payload are one write
 
 `SKEG.VSET name id vector payload` published the vector first and its blob
