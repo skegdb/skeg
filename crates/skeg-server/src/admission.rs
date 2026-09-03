@@ -80,6 +80,18 @@ pub enum AdmissionError {
     MemoryAtWrite(MemoryRejected),
     /// The tenant already holds every vector its limit allows.
     QuotaExceeded { tenant: u128, limit: u64 },
+    /// The tenant is already at its `max_disk_bytes` and this write's bytes
+    /// do not fit. The same shape as [`Self::QuotaExceeded`] one dimension
+    /// over - vectors instead of bytes - and classified identically: a
+    /// tenant at its own ceiling does not clear on its own. `needed` is the
+    /// size of the write that was refused (the payload or value's own
+    /// length, not the padded on-disk record its key and framing would add),
+    /// which a caller has in hand without asking the store again.
+    DiskQuota {
+        tenant: u128,
+        limit: u64,
+        needed: u64,
+    },
     /// One request declared more than a fixed ceiling permits. `what` names
     /// the thing that was too large, in the units `limit` and `got` are in.
     RequestTooLarge {
@@ -141,6 +153,9 @@ impl AdmissionError {
             // A tenant at its ceiling stays there until somebody deletes a
             // vector or raises the limit, neither of which is a retry.
             Self::QuotaExceeded { .. } => Permanent,
+            // Same reasoning, the byte-quota sibling: nothing clears it but a
+            // delete or a raised limit, neither of which is a retry.
+            Self::DiskQuota { .. } => Permanent,
             Self::RequestTooLarge { .. } => Permanent,
             // What fills a bounded queue is other traffic, and other traffic
             // ends. Telling a client `ERR` here is telling it to give up on
@@ -234,6 +249,7 @@ impl AdmissionError {
                 MemoryRejected::NoHeadroom { .. } | MemoryRejected::ArithmeticOverflow { .. },
             )
             | Self::QuotaExceeded { .. }
+            | Self::DiskQuota { .. }
             | Self::RequestTooLarge { .. }
             | Self::Busy => ErrCode::InvalidRequest,
         }
@@ -356,6 +372,15 @@ impl fmt::Display for AdmissionError {
                 f,
                 "tenant vector quota exceeded: tenant {tenant:#034x} may hold {limit} vectors"
             ),
+            Self::DiskQuota {
+                tenant,
+                limit,
+                needed,
+            } => write!(
+                f,
+                "tenant disk quota exceeded: tenant {tenant:#034x} may hold {limit} bytes, \
+                 this write needs {needed} more"
+            ),
             Self::RequestTooLarge { what, limit, got } => write!(
                 f,
                 "{what}: at most {limit}, got {got}; send it in smaller pieces"
@@ -446,6 +471,14 @@ mod tests {
                 Retryability::Permanent,
             ),
             (
+                AdmissionError::DiskQuota {
+                    tenant: 7,
+                    limit: 1000,
+                    needed: 4096,
+                },
+                Retryability::Permanent,
+            ),
+            (
                 AdmissionError::RequestTooLarge {
                     what: "SKEG.VMSET items",
                     limit: 4096,
@@ -481,6 +514,7 @@ mod tests {
             AdmissionError::Ingress(_) => "ingress",
             AdmissionError::MemoryAtWrite(_) => "memory_at_write",
             AdmissionError::QuotaExceeded { .. } => "quota_exceeded",
+            AdmissionError::DiskQuota { .. } => "disk_quota",
             AdmissionError::RequestTooLarge { .. } => "request_too_large",
             AdmissionError::Busy => "busy",
             AdmissionError::Backend { .. } => "backend",
@@ -500,6 +534,7 @@ mod tests {
             vec![
                 "backend",
                 "busy",
+                "disk_quota",
                 "ingress",
                 "memory_at_write",
                 "quota_exceeded",
@@ -715,5 +750,33 @@ mod tests {
             limit: 10,
         };
         assert_eq!(e.wire_message(), format!("ERR {e}"));
+    }
+
+    /// audit/17 A2: this refusal used to leave `stage_payload_blob` as
+    /// `ShardError::Storage("vset payload failed: tenant disk quota
+    /// exceeded")` - a lowercase message the smuggled-refusal guard could not
+    /// catch, and on the native wire an `ErrCode::Internal` indistinguishable
+    /// from a real I/O fault. Pinned like the vector-quota sibling: `ERR` on
+    /// RESP3, `InvalidRequest` on native, never `Internal`.
+    #[test]
+    fn a_disk_quota_refusal_classifies_like_its_vector_quota_sibling() {
+        let disk = AdmissionError::DiskQuota {
+            tenant: 0x2a,
+            limit: 1000,
+            needed: 4096,
+        };
+        let vectors = AdmissionError::QuotaExceeded {
+            tenant: 0x2a,
+            limit: 1000,
+        };
+        assert_eq!(disk.retryability(), vectors.retryability());
+        assert_eq!(disk.code(), vectors.code());
+        assert_eq!(disk.resp3_code(), vectors.resp3_code());
+        assert_eq!(disk.code(), ErrCode::InvalidRequest);
+        assert_eq!(disk.wire_message(), format!("ERR {disk}"));
+        assert!(
+            disk.to_string().contains("4096") && disk.to_string().contains("1000"),
+            "the message must name both the limit and what the write needed: {disk}"
+        );
     }
 }
