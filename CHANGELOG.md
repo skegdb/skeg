@@ -22,15 +22,30 @@ The binary protocol had no connection limit at all, an eager 64 KiB
 buffer per socket, and a frame header that allocated its declared
 `payload_len` before a byte of it arrived - 24 bytes bought 16 MiB.
 
-**Ingress is now a class inside the same budget the delta uses.** A
-connection reserves through the same `MemoryGovernor`, so a byte a socket
-holds and a byte a delta holds compete for one headroom figure and show
-up in one total. Inside that budget the network gets a class cap - 25% of
-usable headroom by default - and inside the class each connection gets a
-quarter as its allowance. A connection is charged for the CAPACITY of its
-read buffer, times two for the parse copy that is live at the same time,
-in 512 KiB steps, granted before the buffer grows and given back when it
-drains.
+The reply buffer was the other half of it, and it was worse: `out` is
+per connection, cleared but never trimmed, and `BytesMut` does not give
+capacity back. One `SKEG.VMSET` of 4096 failing items - one reply line
+each, each capped at 256 bytes - left that buffer at 2 MiB for the rest
+of the connection's life.
+
+**Ingress AND egress are now a class inside the same budget the delta
+uses.** A connection reserves through the same `MemoryGovernor`, so a
+byte a socket holds and a byte a delta holds compete for one headroom
+figure and show up in one total. Inside that budget the network gets a
+class cap - 25% of usable headroom by default - and inside the class each
+connection gets a quarter as its allowance. A connection is charged for
+the CAPACITY of its read buffer plus its reply buffer, times two for the
+parse copy that is live at the same time, in 512 KiB steps, granted
+before the buffer grows and given back when it drains. The reply buffer
+is handed back the moment the reply is on the wire.
+
+Requests are refused when the budget cannot cover them; replies are not.
+A reply answers work that has already committed, so withdrawing it would
+make a client retry a batch that has been applied. When a reply's buffer
+takes the connection past its allowance the answer still goes out and the
+overshoot is counted on `skeg_ingress_reply_over_budget_total` - the one
+place the budget is knowingly exceeded, and it is visible rather than
+silent.
 
 Both listeners take the same route: a floor reserved at accept, before
 the connection permit and never awaited (a budget awaited at accept is a
@@ -71,9 +86,10 @@ limit at all.
 
 `SKEG.STATS` reports `skeg_ingress_state` (known / default /
 unreadable), `_cap_bytes`, `_held_bytes` and
-`_per_connection_max_bytes`. Four counters - refusals at accept,
-refusals of growth, stalls, and accepts made while the budget could not
-be read - go to the telemetry registry, so those also reach `/metrics`;
+`_per_connection_max_bytes`. Five counters - refusals at accept,
+refusals of growth, stalls, accepts made while the budget could not be
+read, and replies that took a connection past its allowance - go to the
+telemetry registry, so those also reach `/metrics`;
 the gauges do not, for the same reason the existing memory gauges do not,
 which is that both are assembled inside the `SKEG.STATS` handler. See
 [docs/observability.md](docs/observability.md) for the sizing table.

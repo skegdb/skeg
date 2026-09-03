@@ -292,7 +292,16 @@ static CONN_COUNTER: AtomicI64 = AtomicI64::new(1);
 /// see. Ingress was charged; egress was not, and both are buffers the same
 /// socket holds.
 ///
-/// Scaffolding: this writes the reply and nothing else yet.
+/// The charge is taken after the encode and the reply is written even when it
+/// is refused. A reply is the answer to work that has already committed:
+/// withdrawing it would be an error raised past the commit point, and the
+/// client would retry a batch that has been applied. So an overshoot here is
+/// COUNTED, not returned - the one place the budget is knowingly exceeded -
+/// and the buffer is handed back in the same breath.
+///
+/// `other_capacity` is what the rest of this connection holds, normally the
+/// decoder's: the charge is the connection's whole footprint, ingress and
+/// egress in one figure, because they are one socket's memory.
 async fn flush_reply(
     stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     out: &mut BytesMut,
@@ -301,10 +310,22 @@ async fn flush_reply(
     budget: &mut ConnectionBudget,
     other_capacity: usize,
 ) -> bool {
-    let _ = (&budget, other_capacity);
     out.clear();
     encode_frame(frame, version, out);
-    stream.write_all(out).await.is_ok()
+    if budget
+        .grow_to(other_capacity.saturating_add(out.capacity()))
+        .is_err()
+    {
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressReplyOverBudget);
+    }
+    let ok = stream.write_all(out).await.is_ok();
+    // Given back immediately, not at the next read: `trim_idle` only fires on
+    // an EMPTY buffer, and `out` is only empty between replies - which is
+    // exactly now.
+    out.clear();
+    trim_idle(out);
+    budget.shrink_to(other_capacity.saturating_add(out.capacity()));
+    ok
 }
 
 /// Per-connection driver. Loops until EOF / write error / fatal parse error.
@@ -2540,7 +2561,6 @@ mod tests {
     /// reply, `BytesMut` never gives capacity back, and 1024 connections that
     /// each sent one such batch pin a gigabyte the governor cannot see.
     #[tokio::test]
-    #[ignore = "opens in commit 10 (the reply buffer joins the budget)"]
     async fn a_reply_buffer_is_charged_and_given_back_after_the_flush() {
         let budget = test_ingress();
         let mut conn = budget.try_accept().expect("the floor");
@@ -2587,7 +2607,6 @@ mod tests {
     /// it would make a client retry a VMSET that has been applied - so the
     /// overshoot is COUNTED rather than turned into an error.
     #[tokio::test]
-    #[ignore = "opens in commit 10 (the reply buffer joins the budget)"]
     async fn a_reply_too_large_for_the_class_is_still_delivered_and_counted() {
         let budget = tiny_ingress();
         let mut conn = budget.try_accept().expect("the floor");

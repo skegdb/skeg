@@ -627,7 +627,6 @@ fn vmset_of_failing_items(items: usize) -> Vec<u8> {
 /// that it went over. The reply itself arrives in full either way, because it
 /// answers work that has already committed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens in commit 10 (the reply buffer joins the budget)"]
 async fn n_connections_that_sent_one_huge_reply_hold_only_the_floor_afterwards() {
     const N: usize = 4;
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));

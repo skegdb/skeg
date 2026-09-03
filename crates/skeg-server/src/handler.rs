@@ -58,9 +58,26 @@ pub async fn handle_connection(
                 if let Some(response) = dispatch(&frame, &shards)
                     .await
                     .map(|response| response_for_version(response, frame.header.version))
-                    && stream.write_all(&response).await.is_err()
                 {
-                    break;
+                    // The reply side of the same connection, charged the same
+                    // way. It is not retained here - the encoders build a fresh
+                    // buffer per response and it is dropped after the write, so
+                    // there is nothing to trim - but while it exists it is this
+                    // socket's memory, and a `VSEARCH` with payloads or a wide
+                    // `MGET` is not small. Counted rather than refused: the
+                    // work behind the answer has already committed.
+                    let held = buf.capacity();
+                    if budget.grow_to(held.saturating_add(response.len())).is_err() {
+                        skeg_telemetry::tick_counter(
+                            skeg_telemetry::Counter::IngressReplyOverBudget,
+                        );
+                    }
+                    let sent = stream.write_all(&response).await;
+                    drop(response);
+                    budget.shrink_to(held);
+                    if sent.is_err() {
+                        break;
+                    }
                 }
             }
             Ok(None) => {
