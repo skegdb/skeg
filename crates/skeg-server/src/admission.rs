@@ -102,6 +102,22 @@ pub enum AdmissionError {
     /// A bounded queue inside the engine had no room. Momentary by
     /// construction: what fills it is other traffic, and other traffic ends.
     Busy,
+    /// A multi-key command whose keys do not all route to one shard, refused
+    /// whole before any of it ran.
+    ///
+    /// Keys route by `xxh3_64(key) % n_shards` and each shard commits its own
+    /// portion, so a batch that spans shards is several independent commits.
+    /// `MSET` is exposed under a name whose public meaning is all-or-nothing,
+    /// and honouring that without two-phase commit means refusing the span
+    /// rather than half-applying it. Redis Cluster refuses the same shape for
+    /// the same reason, and this carries its word so a client that already
+    /// routes on `CROSSSLOT` needs no change.
+    ///
+    /// Fieldless on purpose: the wire line is Redis's, byte for byte, and a
+    /// count or a shard number in it would be both a deviation from that line
+    /// and a free reading of `xxh3_64(scoped_key) % n_shards` for whoever
+    /// asked.
+    CrossSlot,
     /// A tenant backend refused the command.
     ///
     /// The message is OPAQUE. It is written by a backend that lives outside
@@ -161,6 +177,10 @@ impl AdmissionError {
             // ends. Telling a client `ERR` here is telling it to give up on
             // the one condition where waiting a moment is exactly right.
             Self::Busy => Retryable,
+            // The same keys hash the same way on every attempt, and the shard
+            // count does not move while the store is open. Nothing about a
+            // retry can change the answer.
+            Self::CrossSlot => Permanent,
             // The one place in the engine that reads a code word out of a
             // string, and only because the string IS the interface: see the
             // variant's own note. One word, the one the trait's doc names;
@@ -179,11 +199,23 @@ impl AdmissionError {
 
     /// The first word of the RESP3 error line, which IS the code a client
     /// routes on.
+    ///
+    /// Derived from [`retryability`](Self::retryability) with ONE exception,
+    /// listed by name here rather than left to a reader to notice:
+    /// [`Self::CrossSlot`] is permanent and spells itself `CROSSSLOT`,
+    /// because Redis spells it that way and a client that already routes on
+    /// that word would have to learn a second spelling for the same
+    /// condition. The invariant that matters is unchanged and still
+    /// mechanical: retryable IS `BACKPRESSURE` and nothing else is, so no
+    /// permanent refusal can ever ask a client to loop.
     #[must_use]
     pub fn resp3_code(&self) -> &'static str {
-        match self.retryability() {
-            Retryability::Retryable => "BACKPRESSURE",
-            Retryability::Permanent => "ERR",
+        match self {
+            Self::CrossSlot => "CROSSSLOT",
+            other => match other.retryability() {
+                Retryability::Retryable => "BACKPRESSURE",
+                Retryability::Permanent => "ERR",
+            },
         }
     }
 
@@ -251,7 +283,10 @@ impl AdmissionError {
             | Self::QuotaExceeded { .. }
             | Self::DiskQuota { .. }
             | Self::RequestTooLarge { .. }
-            | Self::Busy => ErrCode::InvalidRequest,
+            | Self::Busy
+            // The key SET is what is wrong with it: send the same keys in one
+            // batch per shard and every one of them is accepted.
+            | Self::CrossSlot => ErrCode::InvalidRequest,
         }
     }
 }
@@ -312,7 +347,7 @@ impl AdmissionError {
 pub fn debug_assert_not_a_smuggled_refusal(text: &str) {
     if let Some(word) = backend_code_word(text) {
         assert!(
-            word != "BACKPRESSURE" && word != BACKEND_RETRYABLE_CODE,
+            word != "BACKPRESSURE" && word != "CROSSSLOT" && word != BACKEND_RETRYABLE_CODE,
             "a refusal reached the wire as prose: {text:?}. A condition the \
              server decides belongs in ShardResp::Refused with an \
              AdmissionError, not in ShardResp::Err with its code word typed \
@@ -388,6 +423,10 @@ impl fmt::Display for AdmissionError {
             // The text the shard error carried before it was classified, so
             // only the code word in front of it changes.
             Self::Busy => write!(f, "vsearch queue is full"),
+            // Redis's own wording, so that `wire_message` renders the line a
+            // Redis client already knows character for character. Changing a
+            // word here changes the wire.
+            Self::CrossSlot => write!(f, "Keys in request don't hash to the same slot"),
             // Verbatim. The backend wrote a complete error line, code word
             // included, and rewriting it would strip the only thing a RESP3
             // client of that deployment already routes on.
@@ -487,6 +526,7 @@ mod tests {
                 Retryability::Permanent,
             ),
             (AdmissionError::Busy, Retryability::Retryable),
+            (AdmissionError::CrossSlot, Retryability::Permanent),
             (
                 AdmissionError::Backend {
                     message: "RATELIMITED tenant request rate exceeded".to_owned(),
@@ -517,6 +557,7 @@ mod tests {
             AdmissionError::DiskQuota { .. } => "disk_quota",
             AdmissionError::RequestTooLarge { .. } => "request_too_large",
             AdmissionError::Busy => "busy",
+            AdmissionError::CrossSlot => "cross_slot",
             AdmissionError::Backend { .. } => "backend",
         }
     }
@@ -534,6 +575,7 @@ mod tests {
             vec![
                 "backend",
                 "busy",
+                "cross_slot",
                 "disk_quota",
                 "ingress",
                 "memory_at_write",
@@ -576,6 +618,18 @@ mod tests {
                 e.code().is_retryable(),
                 "{e:?}: the native code's own retryability disagrees"
             );
+            // The permanent words are a CLOSED set, listed here. A refusal
+            // that invents a fourth one reaches a client as a code its
+            // `is_retryable` table has never seen, and the safe reading of an
+            // unknown word is not something this file gets to assume.
+            if !retryable {
+                assert!(
+                    ["ERR", "CROSSSLOT"].contains(&e.resp3_code()),
+                    "{e:?}: {} is not one of the permanent code words this \
+                     build documents",
+                    e.resp3_code()
+                );
+            }
         }
     }
 
