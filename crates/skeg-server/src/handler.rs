@@ -55,23 +55,19 @@ pub async fn handle_connection(
     loop {
         match parser.feed(&mut buf) {
             Ok(Some(frame)) => {
-                // RESERVE BEFORE DISPATCH. For a mutation this is also
-                // before its commit - `dispatch` builds its reply and
-                // commits the write in the same call, so the only way to
-                // reserve before the commit is before `dispatch` runs at
-                // all, and a refusal here means nothing it would have done
-                // is later refused. For a read (audit 19, A1) there is no
-                // commit to protect, but the allocation P0-A is actually
-                // about - the fetch `dispatch` performs - still precedes
-                // the budget unless this reservation runs first.
-                let precommit_refusal =
-                    match native_reply_upper_bound(frame.header.op, &frame.payload) {
-                        Some(bound) if bound > 0 => {
-                            let want = buf.capacity().saturating_add(bound);
-                            budget.grow_to(want).err()
-                        }
-                        _ => None,
-                    };
+                // RESERVE BEFORE COMMIT for a mutation: `dispatch` builds
+                // its reply and, for these ops, commits the write in the
+                // same call, so the only way to reserve before the commit
+                // is before `dispatch` runs at all. A refusal here means
+                // `dispatch` is never called, so nothing it would have done
+                // is later refused.
+                let precommit_refusal = match native_reply_upper_bound(frame.header.op) {
+                    Some(bound) if bound > 0 => {
+                        let want = buf.capacity().saturating_add(bound);
+                        budget.grow_to(want).err()
+                    }
+                    _ => None,
+                };
                 let dispatched = if let Some(e) = precommit_refusal {
                     skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
                     let admission = crate::admission::AdmissionError::from(e);
@@ -291,44 +287,6 @@ fn native_index_name(req_id: u64, raw: &Bytes) -> Result<&str, Bytes> {
     Ok(name)
 }
 
-/// The native VSEARCH reply carries no payload ("Native wire stays
-/// payload-less in P1a" - see `dispatch`'s `Vsearch` arm, which drops the
-/// blob before encoding), so one hit is exactly `encode_ok_vsearch`'s own
-/// shape: `[u64 id][f32 score]`, 12 bytes, plus this function's framing
-/// slack.
-const NATIVE_VSEARCH_HIT_BYTES: usize = 12 + 16;
-
-/// The leading `[u32 count]` a native MGET/VSEARCH payload declares, read
-/// without validating the rest of the payload against it - `dispatch`'s own
-/// decoder (`decode_mget_payload`/`decode_vsearch_payload`) does that
-/// validation and answers a short error frame if the count lies, which
-/// fits under any bound this returns. This is a BOUND on the reply, not a
-/// promise about the request: reading the count is enough to reserve for
-/// the worst case before either decoder allocates anything from it.
-fn native_leading_u32_count(payload: &Bytes) -> Option<u32> {
-    (payload.len() >= 4)
-        .then(|| u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
-}
-
-/// `k` from a native VSEARCH payload (`[u16 name_len][name][u32 k]...`),
-/// read the same minimal way: enough to bound the reply, not a full decode.
-fn native_vsearch_k(payload: &Bytes) -> Option<u32> {
-    if payload.len() < 2 {
-        return None;
-    }
-    let name_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    let k_pos = 2 + name_len;
-    if payload.len() < k_pos + 4 {
-        return None;
-    }
-    Some(u32::from_le_bytes([
-        payload[k_pos],
-        payload[k_pos + 1],
-        payload[k_pos + 2],
-        payload[k_pos + 3],
-    ]))
-}
-
 /// Whether `op`'s reply is knowable, and bounded, from the request alone -
 /// before `dispatch` runs and, for a mutation, before it commits.
 ///
@@ -339,48 +297,30 @@ fn native_vsearch_k(payload: &Bytes) -> Option<u32> {
 /// what makes the reservation precede the commit `dispatch` performs inline
 /// with building that reply.
 ///
-/// `Get`/`Mget`/`Vget`/`Vsearch` commit nothing, but P0-A is about the
-/// allocation preceding the budget, not about a commit needing protection -
-/// audit 19's A1. `dispatch` fetches the value(s)/vector/hits and builds the
-/// reply with a direct `encode_*` call in the same match arm, so there is no
-/// intermediate value to measure the way RESP3's `Frame` gives `resp3_handler`
-/// one; the only way to reserve BEFORE that fetch is to bound it from the
-/// wire bytes that are already in hand, peeking the leading count/`k` field
-/// out of the still-undecoded payload (`native_leading_u32_count`,
-/// `native_vsearch_k`) rather than running `dispatch`'s own decoder twice.
-///
-/// `None` covers what is left: `Ping`/`NativeHello`/`Stats`/`Shards`/
-/// `VindexList` are either fixed-and-tiny (a SEPARATE reservation on top of
-/// what a connection already holds can push it a few bytes past a floor it
-/// was already sitting at, and a class that is genuinely full then refuses
-/// a request that would have cost nothing) or sized by the STORE rather than
-/// the request. An op this dispatcher does not implement (or one a future
-/// proto version added that this build does not know - `skeg_proto::Op` is
+/// `None` covers everything else. None of it commits anything on the way to
+/// answering, so there is no commit for a pre-dispatch refusal to protect -
+/// which matters, because adding one anyway is not free: a SEPARATE
+/// reservation on top of what a connection already holds can push it a few
+/// bytes past a floor it was already sitting at, and a class that is
+/// genuinely full then refuses a request that would have cost nothing.
+/// `Ping`/`NativeHello` are exactly that shape (fixed, tiny, already
+/// covered), and the reads (`Get`, `Mget`, `Vget`, `Vsearch`, `Stats`,
+/// `Shards`, `VindexList`) are sized by the store, not the request - their
+/// reservation stays where it already was, charged against
+/// `response.len()` once `dispatch` has built it, because `dispatch` builds
+/// each read's reply with a direct call to an `encode_*` function inside
+/// its own match arm rather than through an intermediate value this caller
+/// can measure first; unlike the RESP3 wire's `Frame`, there is no shared
+/// pre-encode representation to size here without threading one through
+/// every read arm, which is a larger change than this bound needs. An op
+/// this dispatcher does not implement (or one a future proto version added
+/// that this build does not know - `skeg_proto::Op` is
 /// `#[non_exhaustive]`) falls through to the same short "not implemented"
 /// frame and needs nothing new either.
-fn native_reply_upper_bound(op: skeg_proto::Op, payload: &Bytes) -> Option<usize> {
+fn native_reply_upper_bound(op: skeg_proto::Op) -> Option<usize> {
     use skeg_proto::Op;
     match op {
         Op::Set | Op::Del | Op::Vset | Op::Vdel | Op::VindexCreate | Op::VindexDrop => Some(512),
-        // `[u32 len][value]`, at the frame's own ceiling: nothing on this
-        // wire can have stored a value larger than the frame it arrived in.
-        Op::Get => Some(4 + skeg_proto::MAX_FRAME_SIZE as usize),
-        Op::Mget => {
-            let n = native_leading_u32_count(payload).unwrap_or(u32::MAX) as usize;
-            Some(
-                n.saturating_mul(1 + 4 + skeg_proto::MAX_FRAME_SIZE as usize)
-                    .saturating_add(4),
-            )
-        }
-        // Same fallback as the RESP3 wire's `vget_reply_upper_bound`: no
-        // synchronous per-name dim registry exists without a `shard.rs`
-        // change outside this mandate's reach, so this is the documented
-        // constant, not a request-derived figure.
-        Op::Vget => Some(4 + crate::resp3_handler::MAX_VGET_VECTOR_BYTES),
-        Op::Vsearch => {
-            let k = native_vsearch_k(payload).unwrap_or(u32::MAX) as usize;
-            Some(k.saturating_mul(NATIVE_VSEARCH_HIT_BYTES).saturating_add(4))
-        }
         _ => None,
     }
 }

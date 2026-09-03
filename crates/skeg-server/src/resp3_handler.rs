@@ -838,29 +838,6 @@ fn vmset_reply_upper_bound(args: &[Bytes]) -> usize {
         .saturating_add(FRAME_NODE_OVERHEAD)
 }
 
-/// The upper bound of a single `GET`'s reply: one value, at the wire's own
-/// ceiling on how large a stored value may ever be (`SET`'s value is a bulk
-/// string, capped at `MAX_BULK_LEN` by the parser at write time - the same
-/// ceiling this read now assumes as its worst case). Reserved BEFORE
-/// `shards.get` runs, not after: the store answers with AT MOST this many
-/// bytes, so a class too small to ever hold the worst case refuses the
-/// request instead of allocating first and finding out.
-fn get_reply_upper_bound() -> usize {
-    skeg_resp3::MAX_BULK_LEN.saturating_add(FRAME_NODE_OVERHEAD)
-}
-
-/// The upper bound of an `MGET`'s reply: `get_reply_upper_bound` once per
-/// key. `keys.len()` is already bounded by the parser's `MAX_AGGREGATE_LEN`,
-/// but this makes no further assumption about how many of those keys hold a
-/// value anywhere near the per-value ceiling - the worst case is every one
-/// of them at once, which is the same reasoning `vmset_reply_upper_bound`
-/// applies per item.
-fn mget_reply_upper_bound(keys: &[Bytes]) -> usize {
-    keys.len()
-        .saturating_mul(get_reply_upper_bound())
-        .saturating_add(FRAME_NODE_OVERHEAD)
-}
-
 /// The largest vector `SKEG.VGET` may ever answer with, in bytes of
 /// little-endian `f32`.
 ///
@@ -875,7 +852,7 @@ fn mget_reply_upper_bound(keys: &[Bytes]) -> usize {
 /// bound itself: 1 MiB is `262_144` `f32`s, an order of magnitude past any
 /// embedding dimension in production use, and the same shape of ceiling
 /// `MAX_VGET_VECTOR_BYTES` names so nobody has to rediscover the number.
-pub(crate) const MAX_VGET_VECTOR_BYTES: usize = 1024 * 1024;
+const MAX_VGET_VECTOR_BYTES: usize = 1024 * 1024;
 
 fn vget_reply_upper_bound() -> usize {
     MAX_VGET_VECTOR_BYTES.saturating_add(FRAME_NODE_OVERHEAD)
@@ -968,45 +945,67 @@ fn reply_upper_bound(cmd: &Command) -> Option<usize> {
         | Command::SkegQosSet { .. } => Some(SMALL_REPLY_BOUND),
         Command::SkegVmset { args } => Some(vmset_reply_upper_bound(args)),
 
-        // ---- reads whose worst-case reply IS computable from the request,
-        // even though nothing here commits. P0-A is about the allocation
-        // preceding the budget, not about a commit needing protection - a
-        // `SKEG.VSEARCH k=4096 WITHPAYLOAD` materialises its hits and their
-        // payloads (id, score, up to a megabyte of blob each) into a `Frame`
-        // BEFORE `frame_upper_bound` ever runs on it, so measuring the frame
-        // after the fact catches the SECOND allocation (`encode_frame`'s
-        // buffer) and misses the first (the fetch itself). Reserving these
-        // BEFORE `shards.vget`/`shards.vsearch`/`shards.get` runs closes
-        // that gap the same way a mutation's pre-dispatch reservation does,
-        // and it is what makes summing pipelined replies into
-        // `reply_reserved` (below) actually bound them: `reply_upper_bound`
-        // returning `None` for these let up to `PIPELINE_WINDOW` completed,
-        // fully-payload-bearing reads sit in `inflight` uncharged. ----
-        Command::Get { .. } => Some(get_reply_upper_bound()),
-        Command::Mget { keys } => Some(mget_reply_upper_bound(keys)),
+        // ---- reads whose worst-case reply IS computable from the request
+        // AND that are pipelineable - which together is what makes a
+        // pre-dispatch reservation both possible and necessary. P0-A is
+        // about the allocation preceding the budget, not about a commit
+        // needing protection: a `SKEG.VSEARCH k=4096 WITHPAYLOAD` materialises
+        // its hits and their payloads (id, score, up to a megabyte of blob
+        // each) into a `Frame` BEFORE `frame_upper_bound` ever runs on it, so
+        // measuring the frame after the fact catches the SECOND allocation
+        // (`encode_frame`'s buffer) and misses the first (the fetch itself).
+        // Because `SkegVget`/`SkegVsearch` are pipelineable (`is_pipelineable`),
+        // a `Some` bound here also sums into `reply_reserved` for the
+        // pipeline window - closing audit 19 A1's reproduced hazard: up to
+        // `PIPELINE_WINDOW` completed, payload-bearing reads sitting in
+        // `inflight` uncharged (measured at 20,809,984 bytes under a 4 MiB
+        // class, 100 pipelined `SKEG.VSEARCH k=50 WITHPAYLOAD`). ----
         Command::SkegVget { .. } => Some(vget_reply_upper_bound()),
         Command::SkegVsearch { args } => Some(vsearch_reply_upper_bound(args)),
 
-        // ---- everything else commits nothing on the way to answering, and
-        // ALSO has no bound computable from the request alone: `Exists`'s
-        // reply is a bare integer regardless of how many keys it counted,
+        // ---- everything else commits nothing on the way to answering, is
+        // NOT pipelineable (`Get`/`Mget`/`Exists` are deliberately excluded -
+        // see `is_pipelineable`), or has no bound computable from the
+        // request alone - in every one of those cases a pre-dispatch
+        // reservation buys nothing `frame_upper_bound` does not already give
+        // it, and can cost real correctness. ----
+        //
+        // `Get`/`Mget`: no pipeline accumulation is possible for them (never
+        // pipelined, so never more than one such reply outstanding on a
+        // connection at a time - not the hazard above), and the one bound
+        // computable from the request alone is the wire's own ceiling on a
+        // stored value (`MAX_BULK_LEN`, 64 MiB) - which, multiplied by even
+        // a handful of `MGET` keys, refuses ordinary requests under any
+        // realistically sized class (confirmed: it broke RESP3 conformance's
+        // own `kv.mget.order.with.hole`, a four-key MGET, needing >512 MiB
+        // against a ~270 MiB connection allowance). A bound this far from
+        // the common case is not a safety margin, it is a different feature.
+        // `frame_upper_bound` already reserves their real, fetched size
+        // before `encode_frame` runs - the literal P0-A fix - and no
+        // accumulation multiplies a single barrier-path GET's cost.
+        //
+        // `Exists`'s reply is a bare integer regardless of key count.
         // `Hello`/`Select`/`SkegAuth`/`SkegWhoami`/the quota-and-QoS
         // getters/`Unknown`/`Ping`/`Echo` are small but do not need a
         // SEPARATE reservation on top of what they already hold - adding one
         // pushed an idle connection sitting exactly at its floor a few bytes
         // over it, which a genuinely saturated class then refused, and
         // starving an existing connection on a class that is full is the one
-        // thing admission must not do. `SkegStats`/`SkegShards`/
-        // `SkegVindexList`/`SkegCheck`/`SkegVowner`/`SkegHealth`/
-        // `SkegVindexShards`/`SkegVgraph` are sized by how much the STORE
-        // holds (index count, shard count, graph sample edges), not by
-        // anything in the request - found-not-fixed by this pass, same
-        // shape of gap A1 named for the ops above, lower severity because
-        // none of them scale with an attacker-chosen per-request multiplier
-        // the way `k` or a payload blob does. Their bound is instead
-        // measured, exactly, from the `Frame` dispatch built - see
-        // `frame_upper_bound` in `flush_reply`. ----
-        Command::Hello(_)
+        // thing admission must not do.
+        //
+        // `SkegStats`/`SkegShards`/`SkegVindexList`/`SkegCheck`/`SkegVowner`/
+        // `SkegHealth`/`SkegVindexShards`/`SkegVgraph` are sized by how much
+        // the STORE holds (index count, shard count, graph sample edges),
+        // not by anything in the request - found-not-fixed by this pass,
+        // lower severity than `VGET`/`VSEARCH` because none of them scale
+        // with an attacker-chosen per-request multiplier the way `k` or a
+        // payload blob does, though `SkegVgraph`'s pipelineability means the
+        // same accumulation shape is theoretically open there too. Their
+        // bound is instead measured, exactly, from the `Frame` dispatch
+        // built - see `frame_upper_bound` in `flush_reply`. ----
+        Command::Get { .. }
+        | Command::Mget { .. }
+        | Command::Hello(_)
         | Command::Select { .. }
         | Command::SkegWhoami
         | Command::SkegAuth { .. }
