@@ -6421,7 +6421,18 @@ impl ShardSet {
         // Erasure must remove derived routers too, or centroids trained on the
         // erased vectors survive on disk (review P0). Scoped names are
         // `{tenant}::name`; drop every router under this tenant's prefix.
-        let prefix = format!("{tenant}::");
+        //
+        // The prefix comes from `scope_key`, the same helper that WRITES the
+        // keys, and not from a hand-rolled `format!`. It was hand-rolled, and
+        // it rendered the `u128` in decimal - `42::` - while every key carries
+        // 32 hex digits of `to_le_bytes`. It matched nothing, so no non-zero
+        // tenant ever lost a router and this whole block was dead. One helper
+        // writes the prefix and one reads it, or they drift again.
+        //
+        // `scope_key(0, "")` is the empty string, which every key starts with:
+        // tenant 0 returned at the top of this function, before anything here.
+        debug_assert_ne!(tenant, 0, "tenant 0 is refused above; its prefix is empty");
+        let prefix = scope_key(tenant, "");
         let scoped: Vec<String> = self
             .inner
             .routers

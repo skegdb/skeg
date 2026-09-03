@@ -200,7 +200,6 @@ fn rename_registry_entry(path: &std::path::Path, from: &str, to: &str) {
 }
 
 #[tokio::test]
-#[ignore = "red until erase_tenant builds the router prefix with scope_key"]
 async fn erasing_a_tenant_takes_its_semantic_router_with_it() {
     // A router is centroids TRAINED ON the tenant's vectors: it survives the
     // index it describes, it is written to a sidecar in the shard-set root,

@@ -39,6 +39,14 @@ the server, so there is no owner to serve it under - and serving it under a
 guess is the misattribution the create door exists to prevent. The registry
 format is unchanged.
 
+**`ERASE TENANT` now removes the tenant's semantic routers.** It swept the
+router map with a prefix built by hand from the tenant `u128`, whose `Display`
+is decimal (`42::`), against keys carrying the tenant's 32 hex digits. The
+prefix matched nothing, so no non-zero tenant ever lost a router: an erasure
+that reported success left the centroids trained on the erased vectors both on
+disk and loaded. The prefix now comes from the same helper that writes the
+keys.
+
 ### A vector and its payload are one write
 
 `SKEG.VSET name id vector payload` published the vector first and its blob
