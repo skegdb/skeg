@@ -2973,11 +2973,15 @@ fn unscope_key(key: &str) -> (u128, String) {
 ///   count has to travel.
 /// - a ROUTED index can hold the same logical row twice - a boundary replica,
 ///   or a crash between a move's write and its source delete - so a count
-///   would double it. Those are left out here and counted in the next commit.
+///   would double it. Its ids travel instead, and the coordinator applies the
+///   owner map's rule: one entry per logical id, however many copies exist.
 #[derive(Debug, Default)]
 struct ShardReady {
     /// `(scoped name, live rows here)` for the hash-placed indexes.
     counts: Vec<(String, u64)>,
+    /// `(scoped name, live ids here)` for the routed ones. Ids rather than a
+    /// count, because only the union across shards is the answer.
+    routed_ids: Vec<(String, Vec<u64>)>,
 }
 
 // With `read_only` set the shard rejects every mutation and skips background
@@ -3099,11 +3103,15 @@ fn run_shard(
         let mut report = ShardReady::default();
         if !read_only {
             let live = collect_live_rows(&vindexes);
-            report.counts = live
-                .iter()
-                .filter(|(name, _)| !routed.contains(name.as_str()))
-                .map(|(name, (_, rows))| (name.clone(), rows.len() as u64))
-                .collect();
+            for (name, (_, rows)) in &live {
+                if routed.contains(name.as_str()) {
+                    report
+                        .routed_ids
+                        .push((name.clone(), rows.iter().map(|&(id, _)| id).collect()));
+                } else {
+                    report.counts.push((name.clone(), rows.len() as u64));
+                }
+            }
             let reclaimed = reclaim_orphan_blobs(&vlog, &live).await;
             if reclaimed > 0 {
                 skeg_telemetry::add_counter(
@@ -5501,6 +5509,30 @@ impl ShardSet {
             for (name, rows) in &report.counts {
                 *per_tenant.entry(tenant_of_scoped_index(name)).or_default() += rows;
             }
+        }
+        // A routed index is the case a per-shard count cannot answer: a
+        // boundary replica is a second PHYSICAL copy of one LOGICAL row, and
+        // a crash between a move's write to the destination and the delete of
+        // its source leaves another. Adding the shards up would charge the
+        // tenant twice for a row it has once - and a restart is exactly when
+        // both of those states are on disk.
+        //
+        // So: one entry per logical id, across every shard that holds a copy,
+        // which is the same rule `rebuild_owner_maps` applies when it decides
+        // who is primary. The dedup is done here rather than by calling that
+        // function because `open` is synchronous - it cannot await a request
+        // round trip - and because the answer needed here is a cardinality,
+        // not a placement.
+        let mut ids: HashMap<&str, HashSet<u64>> = HashMap::new();
+        for report in &reports {
+            for (name, shard_ids) in &report.routed_ids {
+                ids.entry(name.as_str())
+                    .or_default()
+                    .extend(shard_ids.iter().copied());
+            }
+        }
+        for (name, ids) in ids {
+            *per_tenant.entry(tenant_of_scoped_index(name)).or_default() += ids.len() as u64;
         }
         for (tenant, count) in per_tenant {
             quota.rebuild(tenant, count);
@@ -10247,7 +10279,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "opens in: quota: rebuild routed counts via owner-map dedup at open"]
     async fn test_quota_survives_restart_after_move() {
         const T: u128 = 13;
         const N: u64 = 60;
@@ -10283,7 +10314,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "opens in: quota: rebuild routed counts via owner-map dedup at open"]
     async fn test_quota_survives_restart_with_replica() {
         const T: u128 = 17;
         const N: u64 = 60;
@@ -10331,7 +10361,6 @@ mod tests {
     /// its source leaves two physical copies of one logical row. The reopen
     /// has to reconcile them to ONE, the same way the owner map does.
     #[tokio::test]
-    #[ignore = "opens in: quota: rebuild routed counts via owner-map dedup at open"]
     async fn test_quota_crash_between_move_vset_and_vdel_reconciles_at_reopen() {
         const T: u128 = 19;
         const N: u64 = 60;
