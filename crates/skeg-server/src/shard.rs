@@ -3498,6 +3498,19 @@ async fn drop_vindex(
     }
     // Past this point the drop is COMMITTED: the catalogue no longer lists it.
     drop(arc);
+    // `fragment` is what THIS shard physically held, and the quota counts
+    // LOGICAL rows. For a hash-placed index the two agree - an id lives on
+    // exactly one shard - but a routed one keeps a second physical copy of
+    // every boundary row, so dropping it credits back more slots than the
+    // tenant ever spent and leaves the counter below its own remaining
+    // contents (measured: 70 counted, 59 replicas, 0 counted after the drop,
+    // 10 rows still on disk). Crediting a logical count would have to be
+    // decided by the coordinator, which holds the owner map; a drop decides
+    // nothing there today, and `EraseTenant` reaches this from inside a
+    // shard. Recorded, not fixed here. The next open counts the rows again
+    // (`test_quota_drop_of_a_replicated_index_is_repaired_by_the_next_open`),
+    // which bounds how long a tenant can be under-counted but does not make
+    // it right.
     quota.sub(tenant, fragment);
     if was_disk {
         // Cleanup, after the fact. A failure here is NOT a failed drop - the
@@ -10410,7 +10423,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "opens in: quota: verify against drop and orphan states"]
     async fn test_quota_drop_index_credits_then_restart() {
         const T: u128 = 23;
         let dir = TempDir::new().unwrap();
@@ -10454,7 +10466,6 @@ mod tests {
     /// Recovery does not serve it, so the rebuild must not count it either -
     /// otherwise a tenant pays for rows nothing can read.
     #[tokio::test]
-    #[ignore = "opens in: quota: verify against drop and orphan states"]
     async fn test_quota_orphan_records_not_double_counted() {
         const T: u128 = 29;
         let dir = TempDir::new().unwrap();
@@ -10495,6 +10506,135 @@ mod tests {
             shards.tenant_vector_count(T),
             4,
             "an orphan directory the catalogue does not name is not the tenant's"
+        );
+    }
+
+    /// A DROP credits what each shard PHYSICALLY held, and a routed index
+    /// keeps a second physical copy of every boundary row - so dropping one
+    /// takes back more slots than the tenant ever spent and the counter ends
+    /// up BELOW the tenant's remaining contents. Measured on this fixture:
+    /// 70 counted before the drop (10 + 60 logical), 59 replicas, 0 counted
+    /// after, against 10 rows still on disk.
+    ///
+    /// Pre-existing and NOT fixed here: crediting a logical count would have
+    /// to happen at the coordinator, which is not where a drop decides
+    /// anything today, and `EraseTenant` reaches the same code from inside a
+    /// shard. What this commit gives it is the repair - the next open counts
+    /// the rows again - so the test asserts that and leaves the transient
+    /// undercount described rather than pinned, which would only have to be
+    /// unpinned when the drop is fixed.
+    #[tokio::test]
+    async fn test_quota_drop_of_a_replicated_index_is_repaired_by_the_next_open() {
+        const T: u128 = 37;
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let keep = scope_key(T, "keep");
+        let rep = scope_key(T, "rep");
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            for n in [&keep, &rep] {
+                shards
+                    .vindex_create_scoped(n, QUOTA_DIM as u32, 1, 1)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..10 {
+                shards
+                    .vset(&keep, id, quota_row(id), T, Some(500), None)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..N {
+                shards
+                    .vset(&rep, id, quota_row(id), T, Some(500), None)
+                    .await
+                    .unwrap();
+            }
+            shards.reshard(&rep, 0.25, 10, T).await.expect("reshard");
+            let replicated = shards.overlap(&rep, 4.0, T).await.expect("overlap");
+            assert!(replicated > 0, "fixture: the overlap has to replicate");
+            shards.vindex_drop(&rep, T).await.unwrap();
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            10,
+            "the open counts what is on disk, whatever the drop credited"
+        );
+    }
+
+    /// A committed vindex that will not open is dropped as an ORPHAN: the
+    /// registry entry goes, the files stay, and the quota is deliberately
+    /// left alone because only the open index knew how many rows it held.
+    /// The source says the count "stays high until it is rebuilt from the
+    /// data"; this is that rebuild.
+    #[tokio::test]
+    async fn test_quota_orphan_drop_leaves_the_count_high_until_the_next_open() {
+        use std::os::unix::fs::PermissionsExt;
+        const T: u128 = 41;
+        let dir = TempDir::new().unwrap();
+        let keep = scope_key(T, "keep");
+        let gone = scope_key(T, "gone");
+        let blocked: Vec<std::path::PathBuf> = (0..2)
+            .map(|s| {
+                dir.path()
+                    .join(format!("shard-{s}"))
+                    .join(format!("vindex-{gone}"))
+            })
+            .collect();
+        {
+            let shards = ShardSet::open(dir.path(), 2).unwrap();
+            for n in [&keep, &gone] {
+                shards
+                    .vindex_create_scoped(n, QUOTA_DIM as u32, 1, 1)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..4 {
+                shards
+                    .vset(&keep, id, quota_row(id), T, Some(500), None)
+                    .await
+                    .unwrap();
+            }
+            for id in 0..6 {
+                shards
+                    .vset(&gone, id, quota_row(id), T, Some(500), None)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(shards.tenant_vector_count(T), 10);
+            // Out of the resident map, then out of reach: the drop has to
+            // decide from the catalogue and find an index it cannot reopen.
+            for shard in 0..2 {
+                shards
+                    .call(shard, ShardReq::Evict { name: gone.clone() })
+                    .await
+                    .unwrap();
+            }
+            let saved: Vec<_> = blocked
+                .iter()
+                .map(|p| std::fs::metadata(p).unwrap().permissions())
+                .collect();
+            for p in &blocked {
+                std::fs::set_permissions(p, PermissionsExt::from_mode(0o000)).unwrap();
+            }
+            shards.vindex_drop(&gone, T).await.unwrap();
+            assert_eq!(
+                shards.tenant_vector_count(T),
+                10,
+                "an orphan drop cannot credit what it never opened"
+            );
+            for (p, s) in blocked.iter().zip(saved) {
+                std::fs::set_permissions(p, s).unwrap();
+            }
+        }
+
+        let shards = ShardSet::open(dir.path(), 2).unwrap();
+        assert_eq!(
+            shards.tenant_vector_count(T),
+            4,
+            "and the next open is where the tenant gets those slots back"
         );
     }
 
