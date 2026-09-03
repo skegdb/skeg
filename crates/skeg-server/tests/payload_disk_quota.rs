@@ -564,7 +564,6 @@ async fn two_tenants_on_one_disk_a_at_its_limit_cannot_touch_b() {
 /// It must classify like its sibling, the vector-count quota: typed,
 /// `AdmissionError::DiskQuota`, permanent.
 #[tokio::test]
-#[ignore = "opens in 'server: classify a disk-quota refusal as AdmissionError::DiskQuota'"]
 async fn a_disk_quota_refusal_on_vset_is_typed_admission_not_storage() {
     const T: u128 = 0x11A;
     let dir = tempfile::TempDir::new().unwrap();
@@ -601,7 +600,6 @@ async fn a_disk_quota_refusal_on_vset_is_typed_admission_not_storage() {
 /// staging (the other call site inside the Vset worker) must classify
 /// identically.
 #[tokio::test]
-#[ignore = "opens in 'server: classify a disk-quota refusal as AdmissionError::DiskQuota'"]
 async fn a_disk_quota_refusal_on_an_overwrites_carried_blob_is_typed_admission() {
     const T: u128 = 0x11B;
     let dir = tempfile::TempDir::new().unwrap();
@@ -639,7 +637,6 @@ async fn a_disk_quota_refusal_on_an_overwrites_carried_blob_is_typed_admission()
 /// blob path, and audit/17 A2 asks for "one place": the same typed refusal,
 /// not a second classification duplicated at the KV call site.
 #[tokio::test]
-#[ignore = "opens in 'server: classify a disk-quota refusal as AdmissionError::DiskQuota'"]
 async fn a_disk_quota_refusal_on_a_kv_set_is_also_typed_admission() {
     const T: u128 = 0x11C;
     let dir = tempfile::TempDir::new().unwrap();

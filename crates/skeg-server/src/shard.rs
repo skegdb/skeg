@@ -285,6 +285,35 @@ struct Admitted {
 /// counter, by the identical check inside `VLog::set_scoped`. `None` (no
 /// backend, or the caller is an internal relocation - see the call sites)
 /// skips enforcement, matching every other admission check on this path.
+/// Why staging a payload blob failed. The disk quota gets its own arm
+/// because it is not a storage fault - it is an admission refusal, classified
+/// the same way a KV `SET`'s is (see [`disk_quota_refused`]), and travelling
+/// it as a plain string is the exact shape `admission.rs` exists to delete
+/// (audit/17 A2).
+enum StagePayloadError {
+    /// `needed` is the blob's own length - not the padded on-disk record its
+    /// key and durability framing would add, which this call site does not
+    /// have in hand, but the number a caller can already reason about.
+    DiskQuota {
+        needed: u64,
+    },
+    Other(skeg_core::Error),
+}
+
+/// Write a payload blob to the key of the version it belongs to. `Ok(true)`
+/// once the blob is there.
+///
+/// Split out because both the supplied-payload and the carry-forward paths
+/// write to the same place under the same failpoint, and a second copy of that
+/// is a second place for the key to be built differently.
+///
+/// `disk_limit` is the tenant's `max_disk_bytes`, the same limit a KV `SET`
+/// enforces (`docs/adr-payload-transaction.md`, "Disk quota covers the
+/// blob"). A blob key carries the same 16-byte tenant prefix a KV key does,
+/// so it is charged against - and can be refused against - the identical
+/// counter, by the identical check inside `VLog::set_scoped`. `None` (no
+/// backend, or the caller is an internal relocation - see the call sites)
+/// skips enforcement, matching every other admission check on this path.
 async fn stage_payload_blob(
     vlog: &VLog,
     scope: BlobScope<'_>,
@@ -292,11 +321,13 @@ async fn stage_payload_blob(
     version: u64,
     blob: &[u8],
     disk_limit: Option<u64>,
-) -> Result<bool, String> {
+) -> Result<bool, StagePayloadError> {
     crate::fp_at!(
         crate::failpoint::WriteFailpoint::PayloadPrepare,
         scope.name,
-        Err("vset payload failed: failpoint: payload staging refused".to_owned())
+        Err(StagePayloadError::Other(skeg_core::Error::Io(
+            std::io::Error::other("failpoint: payload staging refused")
+        )))
     );
     vlog.tenant(scope.tenant)
         .with_disk_limit(disk_limit)
@@ -306,7 +337,28 @@ async fn stage_payload_blob(
             skeg_telemetry::tick_counter(skeg_telemetry::Counter::PayloadBlobsStaged);
             true
         })
-        .map_err(|e| format!("vset payload failed: {e}"))
+        .map_err(|e| match e {
+            skeg_core::Error::DiskQuota => StagePayloadError::DiskQuota {
+                needed: blob.len() as u64,
+            },
+            other => StagePayloadError::Other(other),
+        })
+}
+
+/// One place a `skeg_core::Error::DiskQuota` becomes the typed refusal both
+/// the KV `SET`/`APPEND` path and the payload blob path answer with
+/// (audit/17 A2: "one place", not a second classification duplicated at the
+/// KV call site). `limit` is `None` only when the caller had no limit to
+/// enforce, which cannot itself produce `DiskQuota` - the `unwrap_or(0)` is
+/// defensive, not reachable in practice.
+fn disk_quota_refused(tenant: u128, limit: Option<u64>, needed: u64) -> ShardResp {
+    ShardResp::Refused(ShardError::Admission(
+        crate::admission::AdmissionError::DiskQuota {
+            tenant,
+            limit: limit.unwrap_or(0),
+            needed,
+        },
+    ))
 }
 
 enum VectorBackend {
@@ -4654,16 +4706,20 @@ async fn process(
                                 .await
                         }
                         Ok(None) => Ok(false),
-                        Err(e) => Err(format!("vset payload failed: {e}")),
+                        Err(e) => Err(StagePayloadError::Other(e)),
                     },
                     None => Ok(false),
                 },
             };
             let staged = match staged {
                 Ok(staged) => staged,
-                Err(e) => {
+                Err(StagePayloadError::DiskQuota { needed }) => {
                     refund(&admitted);
-                    return ShardResp::Err(e);
+                    return disk_quota_refused(tenant, disk_limit, needed);
+                }
+                Err(StagePayloadError::Other(e)) => {
+                    refund(&admitted);
+                    return ShardResp::Err(format!("vset payload failed: {e}"));
                 }
             };
             let payload_ref = if staged {
@@ -5204,6 +5260,7 @@ async fn process(
             Err(e) => ShardResp::Err(e.to_string()),
         },
         ShardReq::Set(key, val, dur, tenant, disk_limit) => {
+            let needed = val.len() as u64;
             match vlog
                 .tenant(tenant)
                 .with_disk_limit(disk_limit)
@@ -5211,6 +5268,7 @@ async fn process(
                 .await
             {
                 Ok(()) => ShardResp::Done,
+                Err(skeg_core::Error::DiskQuota) => disk_quota_refused(tenant, disk_limit, needed),
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
@@ -5225,6 +5283,11 @@ async fn process(
             }
         }
         ShardReq::Append(key, val, dur, tenant, disk_limit) => {
+            // The size of the increment, not the resulting value: the exact
+            // combined length lives inside `append_scoped`, which this call
+            // site does not see, and the increment is still an honest answer
+            // to "how much more did this write ask for".
+            let needed = val.len() as u64;
             match vlog
                 .tenant(tenant)
                 .with_disk_limit(disk_limit)
@@ -5232,6 +5295,7 @@ async fn process(
                 .await
             {
                 Ok(len) => ShardResp::Len(len),
+                Err(skeg_core::Error::DiskQuota) => disk_quota_refused(tenant, disk_limit, needed),
                 Err(e) => ShardResp::Err(e.to_string()),
             }
         }
