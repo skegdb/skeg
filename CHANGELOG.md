@@ -58,6 +58,34 @@ after the tag (skeg-py and skeg-client-rs depend on the published crates;
 skeg-gleam implements the wire directly and can be updated before).
 
 
+### A flush that failed says so
+
+`flush_batch` returned `()` in both group committers and the `Flush` message
+answered `Ok(())` whatever happened, so `VLog::flush()` reported a barrier
+over a batch whose write returned `ENOSPC` or whose sync returned `EIO`. The
+shard's shutdown discarded the result outright. Individual writers were
+already told the truth; the caller who asked for the barrier was not, and
+nothing outside the process counted the failure.
+
+Both committers now return `io::Result<()>` and the reply carries it. The
+shared (device-global) committer aggregates per file: one file's failed write
+no longer takes the healthy files' writers down with it, and no longer buys
+the flusher an `Ok(())` - the error says how many of the batch's files did not
+commit, and keeps the `ErrorKind` when they all failed the same way, so a
+caller looking for ENOSPC still finds it.
+
+Every failed flush ticks the new counter `skeg_vlog_flush_failures_total`
+(`/metrics` and `SKEG.STATS`), including the three that have no caller to
+answer: a full batch, the batch timer, and the last flush as the committer
+shuts down. There is no healthy value above zero. The shard's shutdown flush
+logs at ERROR.
+
+Nothing about which bytes go where changed, and the durability tiers are
+untouched. `docs/adr-flush-barrier.md` records the contract and the four
+things it deliberately does not fix - among them that a flush with nothing
+pending issues no sync, and that no client-visible barrier exists on either
+wire.
+
 ### A refusal now says whether retrying is worth it, on both wires
 
 A request can be refused before it runs for half a dozen reasons, and the
