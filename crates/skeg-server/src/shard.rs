@@ -906,18 +906,12 @@ enum ShardReq {
         tenant: u128,
         /// Tenant's max vectors, if any. `None` skips quota enforcement.
         limit: Option<u64>,
-        /// True when this write moves or replicates a row the tenant ALREADY
-        /// owns, so it must not consume a quota slot.
-        ///
-        /// The quota counts a tenant's LOGICAL cardinality, and a per-shard
-        /// check cannot see that: a shard decides `was_new` from its own
-        /// contents, so a row arriving from elsewhere looks new every time.
-        /// Two opposite bugs came from it. A cross-shard overwrite took a slot
-        /// for a row the tenant already had, and was refused at exactly the
-        /// limit. And a reshard move wrote with no limit (no increment) while
-        /// its delete credited one back, leaking the counter downward once per
-        /// moved row - so a tenant ended up counted below its own contents.
-        internal: bool,
+        /// What this write means for the tenant's logical cardinality. The
+        /// quota counts distinct rows and a shard can only see its own, so
+        /// the coordinator - which knows whether the row is arriving, being
+        /// overwritten, moved or replicated - says which it is and
+        /// [`QuotaEffect`](crate::quota::QuotaEffect) decides what it costs.
+        effect: crate::quota::QuotaEffect,
         /// Which copy of the row this is.
         ///
         /// `Some` when the coordinator knows: a user write ALLOCATES one under
@@ -999,11 +993,11 @@ enum ShardReq {
         id: u64,
         /// Owning tenant, so its vector quota is credited on a real delete.
         tenant: u128,
-        /// True when this removes a copy the tenant still owns elsewhere: the
-        /// far side of an internal write, or a replica whose primary has
-        /// already been credited. The row is not leaving the tenant, so
-        /// crediting again would drop the counter for a row that still exists.
-        internal: bool,
+        /// What this delete means for the tenant's logical cardinality. Only
+        /// [`Delete`](crate::quota::QuotaEffect::Delete) credits: the far
+        /// side of a move and a replica whose primary was already credited
+        /// remove a copy of a row the tenant still has.
+        effect: crate::quota::QuotaEffect,
         /// Which copy of the row this removes. Same rule as `Vset`: allocated
         /// for a user delete, carried for the far side of a move or a replica,
         /// `None` on the hash-placed path.
@@ -4220,7 +4214,7 @@ async fn process(
             vector,
             tenant,
             limit,
-            internal,
+            effect,
             version,
             payload,
         } => {
@@ -4262,9 +4256,9 @@ async fn process(
                     // Quota: only a NEW id consumes a slot. Reserve before the
                     // insert (race-free under this write lock) so an
                     // over-limit insert is rejected without storing; an
-                    // overwrite never touches the quota. `internal` first: a
-                    // moved or replicated row is new to THIS shard and not to
-                    // the tenant.
+                    // overwrite never touches the quota. The effect decides
+                    // first: a moved or replicated row is new to THIS shard
+                    // and not to the tenant.
                     //
                     // `None` means nobody upstream is tracking this row's
                     // versions - the hash-placed path, where the row never
@@ -4281,7 +4275,7 @@ async fn process(
                     // so the write after the wrap would be silently dropped.
                     let version =
                         version.unwrap_or_else(|| VectorVersion::new(previous).next().get());
-                    let was_new = !internal && !existed_before;
+                    let was_new = effect.charges(!existed_before);
                     if was_new
                         && let Some(max) = limit
                         && quota.try_add(tenant, 1, max).is_err()
@@ -4719,7 +4713,7 @@ async fn process(
             name,
             id,
             tenant,
-            internal,
+            effect,
             version,
         } => {
             let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
@@ -4748,7 +4742,7 @@ async fn process(
                     match result {
                         Ok(existed) => {
                             if existed {
-                                if !internal {
+                                if effect.credits() {
                                     quota.sub(tenant, 1);
                                 }
                                 let scope = BlobScope {
@@ -6633,7 +6627,11 @@ impl ShardSet {
                 limit,
                 // An overwrite of a row the tenant already owns changes no
                 // cardinality, wherever the old copy happened to live.
-                internal: old.is_some(),
+                effect: if old.is_some() {
+                    crate::quota::QuotaEffect::Overwrite
+                } else {
+                    crate::quota::QuotaEffect::Insert
+                },
                 version: Some(version),
                 payload,
             };
@@ -6677,7 +6675,7 @@ impl ShardSet {
                                     id,
                                     tenant,
                                     // The row moved; it did not leave.
-                                    internal: true,
+                                    effect: crate::quota::QuotaEffect::Move,
                                     // At the version of the copy that
                                     // replaced it, so the tombstone stands
                                     // against anything older that is still in
@@ -6729,9 +6727,10 @@ impl ShardSet {
             vector,
             tenant,
             limit,
-            // Hash placement never moves a row, so the shard's own `was_new`
-            // is the whole truth here.
-            internal: false,
+            // Hash placement never moves a row, so the shard's own answer to
+            // "did I hold this id already" is the whole truth here - which is
+            // exactly what `Insert` defers to.
+            effect: crate::quota::QuotaEffect::Insert,
             // And so is the shard's own version counter: an id maps to exactly
             // one shard, for ever, so nothing else can hold a copy of it.
             version: None,
@@ -7050,7 +7049,7 @@ impl ShardSet {
                             tenant,
                             limit: None,
                             // A reshard move: the row arrives, it is not new.
-                            internal: true,
+                            effect: crate::quota::QuotaEffect::Move,
                             version: Some(version),
                             payload,
                         };
@@ -7078,7 +7077,7 @@ impl ShardSet {
                                 // Same move, far side. Crediting here while the
                                 // destination does not charge is what leaked
                                 // the counter downward once per moved row.
-                                internal: true,
+                                effect: crate::quota::QuotaEffect::Move,
                                 // The version this move read. A source copy
                                 // that has been written again since carries a
                                 // higher one, and the delete then does not
@@ -7187,7 +7186,7 @@ impl ShardSet {
                         limit: None,
                         // A boundary replica: a second physical copy of one
                         // logical row.
-                        internal: true,
+                        effect: crate::quota::QuotaEffect::Replica,
                         // Carried, not allocated: a replica is the SAME copy
                         // of the row, in a second place. Allocating here would
                         // make the replica outrank its own primary.
@@ -7231,7 +7230,9 @@ impl ShardSet {
                             name: name.to_owned(),
                             id,
                             tenant,
-                            internal: true,
+                            // Taking back the replica this overlap wrote: it
+                            // never had a slot, so removing it gives none.
+                            effect: crate::quota::QuotaEffect::Replica,
                             version: Some(version),
                         };
                         match self.call(usize::from(second), undo).await {
@@ -7488,7 +7489,7 @@ impl ShardSet {
             tenant,
             // The row really is leaving the tenant: this is the one delete
             // that credits the quota.
-            internal: false,
+            effect: crate::quota::QuotaEffect::Delete,
             version: Some(version),
         };
         let existed = match self.call(shard, req).await? {
@@ -7517,7 +7518,7 @@ impl ShardSet {
                         // The primary's delete above already credited this row.
                         // Crediting again would drop the counter by two for one
                         // logical row.
-                        internal: true,
+                        effect: crate::quota::QuotaEffect::Replica,
                         // The same delete, in a second place: one version.
                         version: Some(version),
                     },
@@ -7989,7 +7990,7 @@ mod tests {
             vector,
             tenant: 0,
             limit: None,
-            internal: true,
+            effect: crate::quota::QuotaEffect::Move,
             version: Some(version),
             payload: Some(Bytes::from_static(blob.as_bytes())),
         };

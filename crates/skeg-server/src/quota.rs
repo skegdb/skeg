@@ -38,6 +38,83 @@ pub struct TenantQos {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotaExceeded;
 
+/// What one physical vector write or delete means for the tenant's LOGICAL
+/// cardinality - which is the quantity the quota counts.
+///
+/// It replaced a `bool` called `internal`, and the reason is that "internal"
+/// answered the wrong question. The quota counts a tenant's distinct rows; a
+/// single shard cannot see that, because it decides "is this id new" from its
+/// own contents and a row arriving from another shard looks new every time.
+/// Two opposite bugs came out of a boolean: a cross-shard overwrite took a
+/// slot for a row the tenant already had, and was refused at exactly the
+/// limit; and a reshard move wrote with no limit (so no increment) while its
+/// source delete credited one back, walking the counter downward once per
+/// moved row until a tenant was counted below its own contents.
+///
+/// The variant says what the operation IS, and the decision is derived here,
+/// in one place, by matches that name every variant - so a sixth kind of
+/// write cannot be added without someone deciding what it costs.
+///
+/// One enum for both directions, because both questions are the same
+/// question. A `Vset` never carries [`Delete`](Self::Delete) and a `Vdel`
+/// never carries [`Insert`](Self::Insert) or [`Overwrite`](Self::Overwrite);
+/// those arms are still spelled out below rather than folded into a default,
+/// since "unreachable" and "free" are different claims and only one of them
+/// is safe to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaEffect {
+    /// A user write of a row the tenant does not have. The only write that
+    /// can consume a slot - and only if the shard taking it holds no copy of
+    /// the id already, which is what makes an overwrite on the hash-placed
+    /// path free without the coordinator having to know it is one.
+    Insert,
+    /// A user write over a row the tenant already owns, wherever the old copy
+    /// happens to live. Cardinality unchanged.
+    Overwrite,
+    /// One side of a relocation: the copy written to a row's new owner, or
+    /// the copy removed from its old one. The row is not arriving and not
+    /// leaving, it is moving.
+    Move,
+    /// A second physical copy of one logical row - the boundary replica an
+    /// overlap writes, or that same copy being removed. It never had a slot
+    /// of its own, so it neither takes nor gives one back.
+    Replica,
+    /// The user delete: the row really is leaving the tenant. The one
+    /// operation that credits the counter.
+    Delete,
+}
+
+impl QuotaEffect {
+    /// Does this write consume a quota slot? `absent_here` is the receiving
+    /// shard's own answer to "did I hold this id already".
+    #[must_use]
+    pub fn charges(self, absent_here: bool) -> bool {
+        match self {
+            QuotaEffect::Insert => absent_here,
+            // The tenant already has this row: an overwrite of it, a move of
+            // it, or a second copy of it changes no cardinality.
+            QuotaEffect::Overwrite | QuotaEffect::Move | QuotaEffect::Replica => false,
+            // Not reachable on a write. Charging for it would be the worse
+            // guess of the two.
+            QuotaEffect::Delete => false,
+        }
+    }
+
+    /// Does this delete give a slot back?
+    #[must_use]
+    pub fn credits(self) -> bool {
+        match self {
+            QuotaEffect::Delete => true,
+            // The far side of a move, or a replica whose primary was already
+            // credited. Crediting here drops the counter for a row that still
+            // exists.
+            QuotaEffect::Move | QuotaEffect::Replica => false,
+            // Not reachable on a delete, and nothing was taken to give back.
+            QuotaEffect::Insert | QuotaEffect::Overwrite => false,
+        }
+    }
+}
+
 /// Concurrent per-tenant vector counter. Only tenants with an active limit are
 /// tracked (the caller checks `limit.is_some()` before touching this), so the
 /// map holds nothing for unlimited / single-tenant traffic.
