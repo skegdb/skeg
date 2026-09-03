@@ -9,7 +9,7 @@
 //! `xxh3_64(key) % n_shards`.
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2900,6 +2900,41 @@ fn scope_key(tenant: u128, index: &str) -> String {
     s
 }
 
+/// Whose vector quota the rows of the index at this REGISTRY KEY count
+/// against.
+///
+/// A tenant is never taken from a string a client chose, and this is not one:
+/// the scoped key is written by the server. `scope_key` builds it from a
+/// tenant id the server authenticated; `vindex_create` - the door every
+/// binary protocol and every library caller reaches - refuses `::` in a raw
+/// name; `vindex_create_scoped` is the single pre-scoped entry and its one
+/// in-tree caller is the RESP3 layer, which refuses the separator before
+/// prepending its own prefix; and `read_registry` fails the open outright on
+/// a key that does not round-trip through `scope_key(unscope_key(k))`. By the
+/// time this runs, the key is a value this server wrote, and reading the
+/// owner back out of it is a lookup rather than a guess.
+///
+/// It is also the SAME direction the write path travels: a request from
+/// tenant `T` reaches an index by `scope_key(T, raw)`, so the tenant a write
+/// is charged to is by construction the one this returns. Getting the answer
+/// any other way needs the tenant stored beside the index, which the registry
+/// does not carry - the structural fix, recorded and deliberately not taken
+/// here.
+///
+/// Two states it cannot see. Both are recorded rather than guessed at:
+///
+/// - a `<32 lowercase hex>::name` key an OLDER build let a tenant-0 client
+///   create round-trips through `scope_key`, so it is attributed to the
+///   tenant its name spells. The CHANGELOG already says such a key exists
+///   only in a store written before the door was closed and has to be found
+///   by hand.
+/// - an EMBEDDER calling `ShardSet::vset` with a tenant unrelated to the name
+///   it passes. Both are parameters, and nothing pairs them; the RESP3 and
+///   native handlers always scope the name with the tenant they charge.
+fn tenant_of_scoped_index(key: &str) -> u128 {
+    unscope_key(key).0
+}
+
 /// Inverse of [`scope_key`]: split a scoped map key into `(tenant, index)`. A
 /// key with no `::` prefix (or a malformed one) is the tenant-`0` namespace.
 fn unscope_key(key: &str) -> (u128, String) {
@@ -2923,6 +2958,28 @@ fn unscope_key(key: &str) -> (u128, String) {
 // The worker is a thread entry point: it must own `dir` and `rx` for the
 // thread's `'static` lifetime, so by-value arguments are required here.
 //
+/// What a shard hands the coordinator when it becomes queryable, so the
+/// vector quota can be put back before the first write is admitted.
+///
+/// The counter is per TENANT and the rows are per SHARD, so neither side can
+/// finish the sum alone: a shard knows what it holds and not who else holds a
+/// copy of it, and the coordinator knows the routing and not the rows. This
+/// carries the halves across the readiness barrier.
+///
+/// Two shapes, because a logical row is not always one physical row:
+///
+/// - an index with no semantic router is HASH-PLACED. An id maps to exactly
+///   one shard, for ever, so the per-shard counts simply add up and only the
+///   count has to travel.
+/// - a ROUTED index can hold the same logical row twice - a boundary replica,
+///   or a crash between a move's write and its source delete - so a count
+///   would double it. Those are left out here and counted in the next commit.
+#[derive(Debug, Default)]
+struct ShardReady {
+    /// `(scoped name, live rows here)` for the hash-placed indexes.
+    counts: Vec<(String, u64)>,
+}
+
 // With `read_only` set the shard rejects every mutation and skips background
 // compaction and snapshots: the `--mode serve` path over an offline-built
 // index.
@@ -2943,12 +3000,18 @@ fn run_shard(
     // because deciding needs every shard's registry at once. Writable: remove
     // them. Read-only: decline to serve them.
     in_flight: Vec<String>,
+    // Scoped names with a semantic router, decided by the coordinator because
+    // the sidecars live beside the shards rather than inside them. A routed
+    // index can hold the same logical row on two shards, so its rows are
+    // reported as IDS to be deduplicated; everything else is reported as a
+    // count. See `ShardReady`.
+    routed: Arc<HashSet<String>>,
     // Reports the shard's startup outcome to `ShardSet::open`: `Ok` once recovery
     // is done and the request loop is about to run, `Err` if the store cannot be
     // opened (e.g. already locked by another process). `open` blocks on this and
     // aborts startup if any shard reports `Err`. Dropping the sender without
     // signalling (a panic) unblocks the waiter with a recv error.
-    ready: std::sync::mpsc::Sender<Result<(), String>>,
+    ready: std::sync::mpsc::Sender<Result<ShardReady, String>>,
 ) {
     skeg_platform::pin_current_thread_to_performance_core();
 
@@ -3021,13 +3084,27 @@ fn run_shard(
                 error!("shard {shard_id}: reclaiming blobs of resolved '{name}': {e}");
             }
         }
-        // And everything else nothing names any more. Inside the readiness
-        // barrier: the store is quiescent, the registry has just been read,
-        // and no request has had a chance to stage a blob whose commit has
-        // not landed YET - which is the one state this must not mistake for
-        // garbage.
+        // What this shard now holds, read once and used twice: to reclaim the
+        // blobs nothing names any more, and to report the rows the vector
+        // quota has to be rebuilt from. Inside the readiness barrier for both
+        // reasons: the store is quiescent, the registry has just been read,
+        // no request has had a chance to stage a blob whose commit has not
+        // landed YET - the one state the reclamation must not mistake for
+        // garbage - and no write can be admitted against a count that is not
+        // in place, because `open` has not returned.
+        //
+        // Skipped entirely in read-only: it admits no writes, so there is no
+        // quota to enforce and nothing to reclaim, and this is the one O(rows)
+        // pass in a serve-mode open.
+        let mut report = ShardReady::default();
         if !read_only {
-            let reclaimed = reclaim_orphan_blobs(&vlog, &vindexes).await;
+            let live = collect_live_rows(&vindexes);
+            report.counts = live
+                .iter()
+                .filter(|(name, _)| !routed.contains(name.as_str()))
+                .map(|(name, (_, rows))| (name.clone(), rows.len() as u64))
+                .collect();
+            let reclaimed = reclaim_orphan_blobs(&vlog, &live).await;
             if reclaimed > 0 {
                 skeg_telemetry::add_counter(
                     skeg_telemetry::Counter::PayloadBlobsReclaimedAtOpen,
@@ -3050,7 +3127,7 @@ fn run_shard(
                 // still has to rebuild an index is not being served, it is
                 // finishing the startup someone else skipped.
                 let rebuilt = warm_payload_indexes(&vlog, &vindexes, &dir).await;
-                let _ = ready.send(Ok(()));
+                let _ = ready.send(Ok(report));
                 // Ready first, then persist: the file is an optimisation for the
                 // next open, never a precondition for serving this one.
                 //
@@ -3559,6 +3636,46 @@ fn is_payload_blob_key(key: &[u8], tenant: u128, name: &str) -> bool {
 /// `(id, version)` pair it holds live.
 type LiveRows = (IndexGeneration, BTreeSet<(u64, u64)>);
 
+/// Every resident index's [`LiveRows`], keyed by its scoped name.
+///
+/// Read ONCE per open, because two things need it and walking every vindex
+/// twice would double the only O(rows) work inside the readiness barrier: the
+/// orphan blob reclamation below, and the vector-quota rebuild that turns
+/// these rows into a per-tenant count.
+///
+/// Keyed by the NAME, and the incarnation is checked against the GENERATION.
+/// Not by the tenant, and above all not by a tenant recovered from the name: a
+/// vindex name is a client-chosen string, `:` is a legal character in one, and
+/// `scope_key` leaves a tenant-0 name untouched - so a client on tenant 0
+/// could once call its index `<32 hex>::x` and have `unscope_key` read it back
+/// as some other tenant's. That index is still tenant 0's: created by tenant
+/// 0, blobs written under tenant 0, every read of them using tenant 0. Only
+/// the recovery disagreed, and it disagreed by MISSING - the lookup found no
+/// index of that name under that tenant, so every one of its blobs fell into
+/// the "nothing here names this" branch and was deleted, leaving live rows
+/// with no payload and nothing said about it.
+///
+/// The name alone identifies the index: a shard holds at most one per scoped
+/// name, because that is the key of the map being read here. The generation
+/// then pins WHICH incarnation of it, and a generation is minted by the
+/// server, never spelled by a client. The tenant adds nothing those two do not
+/// already decide, and it is the only part of the key a name can lie about.
+fn collect_live_rows(vindexes: &RwLock<VindexSet>) -> HashMap<String, LiveRows> {
+    let vs = vindexes.read();
+    vs.iter()
+        .map(|(scoped, arc)| {
+            let g = arc.read();
+            let rows = g
+                .backend
+                .live_ids_with_versions()
+                .into_iter()
+                .map(|(id, v)| (id, v.get()))
+                .collect();
+            (scoped.clone(), (g.generation, rows))
+        })
+        .collect()
+}
+
 /// Delete every payload blob no live row on this shard names.
 ///
 /// Three kinds of garbage end up here, and they are the same kind of garbage:
@@ -3599,51 +3716,18 @@ type LiveRows = (IndexGeneration, BTreeSet<(u64, u64)>);
 /// If it ever does hurt, the answer is the same one the DROP sweep's bench
 /// records: an index on blob keys, not a return to walking `live_ids` - that
 /// path cannot see an index which will not open.
-async fn reclaim_orphan_blobs(vlog: &VLog, vindexes: &RwLock<VindexSet>) -> u64 {
-    // What each resident index would answer for: its incarnation, and every
-    // (id, version) pair it holds live.
-    //
-    // Keyed by the NAME, and the incarnation is checked against the
-    // GENERATION. Not by the tenant, and above all not by a tenant recovered
-    // from the name: a vindex name is a client-chosen string, `:` is a legal
-    // character in one, and `scope_key` leaves a tenant-0 name untouched - so
-    // a client on tenant 0 can call its index `<32 hex>::x` and have
-    // `unscope_key` read it back as some other tenant's. That index is still
-    // tenant 0's: created by tenant 0, blobs written under tenant 0, every
-    // read of them using tenant 0. Only the recovery disagreed, and it
-    // disagreed by MISSING - the lookup found no index of that name under that
-    // tenant, so every one of its blobs fell into the "nothing here names
-    // this" branch and was deleted, leaving live rows with no payload and
-    // nothing said about it.
-    //
-    // The name alone identifies the index: a shard holds at most one per
-    // scoped name, because that is the key of the map being read here. The
-    // generation then pins WHICH incarnation of it, and a generation is minted
-    // by the server, never spelled by a client. The tenant adds nothing those
-    // two do not already decide, and it is the only part of the key a name can
-    // lie about.
-    let live: HashMap<Vec<u8>, LiveRows> = {
-        let vs = vindexes.read();
-        vs.iter()
-            .map(|(scoped, arc)| {
-                let g = arc.read();
-                let rows = g
-                    .backend
-                    .live_ids_with_versions()
-                    .into_iter()
-                    .map(|(id, v)| (id, v.get()))
-                    .collect();
-                (scoped.as_bytes().to_vec(), (g.generation, rows))
-            })
-            .collect()
-    };
+async fn reclaim_orphan_blobs(vlog: &VLog, live: &HashMap<String, LiveRows>) -> u64 {
     let victims: Vec<Vec<u8>> = {
         let mut v = Vec::new();
         vlog.for_each_key(|k| {
             let Some(key) = parse_payload_blob_key(k) else {
                 return;
             };
-            let named = live.get(key.name);
+            // A vindex name is a Rust `String`, so a blob key whose name
+            // bytes are not UTF-8 names no resident index - the same answer
+            // the byte-for-byte lookup this replaced would give, reached one
+            // step earlier.
+            let named = std::str::from_utf8(key.name).ok().and_then(|n| live.get(n));
             let alive = match (named, key.generation, key.version) {
                 // No such index here. Nothing on this shard can serve it, in
                 // any generation.
@@ -5250,10 +5334,17 @@ impl ShardSet {
         // bind-after-open) means "queryable": no phantom stall on the first
         // query. A shard that fails to open its store reports `Err` and aborts
         // the whole open.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<ShardReady, String>>();
         // One vector quota shared across all shards: a tenant's vectors are
         // spread over shards by id, so the counter must aggregate cross-shard.
         let quota = Arc::new(crate::quota::TenantVectorQuota::new());
+        // The semantic routers, loaded BEFORE the shards start rather than
+        // after they report ready: which indexes are routed decides how each
+        // shard has to report its rows for the quota rebuild, and a shard
+        // cannot know - the sidecars sit beside the shard directories, not
+        // inside them.
+        let routers = load_routers(base_dir);
+        let routed: Arc<HashSet<String>> = Arc::new(routers.keys().cloned().collect());
         let vsearch_admission = (workers > 0).then(|| Arc::new(Semaphore::new(workers)));
         // One disk counter shared across all shards, so the disk quota is global
         // per tenant (a tenant's keys spread over shards by hash).
@@ -5336,6 +5427,7 @@ impl ShardSet {
             let quota = quota.clone();
             let memory = memory.clone();
             let disk_counter = disk_counter.clone();
+            let routed = routed.clone();
             let ready_tx = ready_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("skeg-shard-{id}"))
@@ -5353,6 +5445,7 @@ impl ShardSet {
                         memory,
                         disk_counter,
                         in_flight,
+                        routed,
                         ready_tx,
                     )
                 })?;
@@ -5361,6 +5454,7 @@ impl ShardSet {
         }
         drop(ready_tx); // only shard threads hold senders now
         let mut fatal: Option<String> = None;
+        let mut reports: Vec<ShardReady> = Vec::with_capacity(n_shards);
         for _ in 0..n_shards {
             // Each shard signals exactly once: `Ok` when queryable, `Err` when
             // its store could not be opened. recover_vindexes never panics (bad
@@ -5368,7 +5462,7 @@ impl ShardSet {
             // A hard panic before signalling (e.g. OOM) drops the sender and
             // yields a recv error, which we treat as a failed shard.
             match ready_rx.recv() {
-                Ok(Ok(())) => {}
+                Ok(Ok(report)) => reports.push(report),
                 Ok(Err(msg)) => {
                     fatal.get_or_insert(msg);
                 }
@@ -5389,6 +5483,28 @@ impl ShardSet {
                 "shard startup failed: {msg}"
             )));
         }
+        // ── The vector quota, put back before anything can spend it ──────
+        //
+        // `TenantVectorQuota` is process state and used to start every open
+        // empty, so a tenant sitting at its limit got its whole budget back
+        // by restarting the server: the limit was a limit per uptime. The
+        // shards have just counted what they hold; this is where the halves
+        // are added up.
+        //
+        // Still inside the barrier. Every shard has reported and none has
+        // served a request, `open` has not returned, and the listener binds
+        // after it does - so no write is admitted against a count that is not
+        // yet in place. Read-only opens report nothing and rebuild nothing:
+        // they admit no writes.
+        let mut per_tenant: HashMap<u128, u64> = HashMap::new();
+        for report in &reports {
+            for (name, rows) in &report.counts {
+                *per_tenant.entry(tenant_of_scoped_index(name)).or_default() += rows;
+            }
+        }
+        for (tenant, count) in per_tenant {
+            quota.rebuild(tenant, count);
+        }
         let set = Self {
             inner: Arc::new(ShardSetInner {
                 senders,
@@ -5398,7 +5514,7 @@ impl ShardSet {
                 quota,
                 disk_counter,
                 root: base_dir.to_path_buf(),
-                routers: parking_lot::RwLock::new(load_routers(base_dir)),
+                routers: parking_lot::RwLock::new(routers),
                 owners: parking_lot::RwLock::new(HashMap::new()),
                 versions: parking_lot::RwLock::new(HashMap::new()),
                 memory: memory.clone(),
@@ -10012,7 +10128,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "opens in: quota: rebuild unrouted counts during recover_vindexes"]
     async fn test_quota_survives_restart() {
         const T: u128 = 7;
         const LIMIT: u64 = 3;
@@ -10049,7 +10164,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "opens in: quota: rebuild unrouted counts during recover_vindexes"]
     async fn test_quota_overwrite_same_id_counts_once() {
         const T: u128 = 11;
         let dir = TempDir::new().unwrap();
@@ -10082,7 +10196,6 @@ mod tests {
     /// the first place; an index in the unscoped namespace must not land on
     /// the tenant whose id another name happens to spell.
     #[tokio::test]
-    #[ignore = "opens in: quota: rebuild unrouted counts during recover_vindexes"]
     async fn test_quota_rebuild_charges_each_index_to_its_own_tenant() {
         const A: u128 = 0x2a;
         const B: u128 = 0x2b;
