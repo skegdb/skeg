@@ -923,6 +923,17 @@ enum ShardReq {
     CountTenantKeys(u128),
     /// `(original_index, key)` pairs for a multi-get fragment, plus the tenant.
     MgetBatch(Vec<(usize, Bytes)>, u128),
+    /// `(original_index, key)` pairs whose on-disk RECORD SIZE is wanted, plus
+    /// the tenant. Answered from the index: no segment is read, nothing is
+    /// allocated for a value. This is the preflight half of a KV read - the
+    /// caller sums these, reserves the sum, and only then asks for the values
+    /// (audit 20 B1).
+    ValueSizes(Vec<(usize, Bytes)>, u128),
+    /// `(original_index, key, max_record_bytes)` triples for a multi-get
+    /// fragment, plus the tenant. Each key's record must still fit the bound
+    /// the caller reserved for it; one that has since outgrown it comes back
+    /// as `BoundedGet::Oversize` and is not read.
+    MgetBounded(Vec<(usize, Bytes, u32)>, u128),
     /// Bytes of hot-key cache charged to a tenant on this shard.
     TenantCacheBytes(u128),
     Stats,
@@ -1293,6 +1304,11 @@ enum ShardResp {
     /// Bytes of hot-key cache charged to a tenant on the answering shard.
     CacheBytes(usize),
     MgetBatch(Vec<(usize, Option<Bytes>)>),
+    /// `(original_index, padded_record_bytes)` for every key that exists on
+    /// the answering shard. Absent keys are omitted: nothing to reserve for.
+    ValueSizes(Vec<(usize, u32)>),
+    /// `(original_index, outcome)` for a bounded multi-get fragment.
+    MgetBounded(Vec<(usize, skeg_core::BoundedGet)>),
     /// `(cache_bytes, cache_evictions, n_keys, cache_budget)`.
     Stats(u64, u64, u64, u64),
     /// `(name, dim, kind_wire_byte, backend_wire_byte, n_vectors)` per VINDEX.
@@ -3528,7 +3544,11 @@ fn is_mutation(req: &ShardReq) -> bool {
 fn telemetry_op(req: &ShardReq) -> Option<skeg_telemetry::Op> {
     use skeg_telemetry::Op;
     match req {
-        ShardReq::Get(..) | ShardReq::MgetBatch(..) => Some(Op::Get),
+        ShardReq::Get(..) | ShardReq::MgetBatch(..) | ShardReq::MgetBounded(..) => Some(Op::Get),
+        // The size probe is not an operation a client asked for: it is the
+        // first half of the `MgetBounded` that follows it, and counting both
+        // would double every KV read in the op counters.
+        ShardReq::ValueSizes(..) => None,
         ShardReq::Set(..) | ShardReq::SetMany(..) | ShardReq::Append(..) => Some(Op::Set),
         ShardReq::Del(..) => Some(Op::Del),
         ShardReq::Vset { .. } => Some(Op::VSet),
@@ -5341,6 +5361,40 @@ async fn process(
         ShardReq::TenantCacheBytes(tenant) => {
             ShardResp::CacheBytes(vlog.tenant_cache_bytes(tenant))
         }
+        ShardReq::ValueSizes(items, tenant) => {
+            let view = vlog.tenant(tenant);
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, key) in items {
+                if let Some(size) = view.record_size(&key) {
+                    out.push((idx, size));
+                }
+            }
+            ShardResp::ValueSizes(out)
+        }
+        ShardReq::MgetBounded(items, tenant) => {
+            let view = vlog.tenant(tenant);
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, key, max_record_bytes) in items {
+                match view.get_bounded(&key, max_record_bytes).await {
+                    // Counted HERE, at the fetch, and not in the handler that
+                    // decides whether to allow it: a counter maintained by
+                    // the code under test would be true by construction, and
+                    // what the B1 tests assert is precisely that this line
+                    // was not reached.
+                    Ok(got) => {
+                        if let skeg_core::BoundedGet::Found(v) = &got {
+                            skeg_telemetry::add_counter(
+                                skeg_telemetry::Counter::KvReadBytesFetched,
+                                v.len() as u64,
+                            );
+                        }
+                        out.push((idx, got));
+                    }
+                    Err(e) => return ShardResp::Err(e.to_string()),
+                }
+            }
+            ShardResp::MgetBounded(out)
+        }
         ShardReq::MgetBatch(items, tenant) => {
             let view = vlog.tenant(tenant);
             let mut out = Vec::with_capacity(items.len());
@@ -6130,6 +6184,130 @@ impl ShardSet {
                 ShardResp::MgetBatch(items) => {
                     for (idx, val) in items {
                         result[idx] = val;
+                    }
+                }
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(result)
+    }
+
+    /// The padded on-disk record size of each key that exists, WITHOUT
+    /// reading any of them.
+    ///
+    /// The preflight half of a KV read (audit 20 B1): a caller sums these,
+    /// reserves the sum against its connection budget, and only then asks for
+    /// the values with [`ShardSet::mget_bounded`]. Absent keys are reported as
+    /// `0` - there is nothing to reserve for a reply element that will be a
+    /// null.
+    ///
+    /// Costs one hashmap lookup per key on each shard the keys land on, and
+    /// allocates nothing for a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard is unavailable or storage fails.
+    pub async fn value_sizes(&self, keys: &[Bytes]) -> Result<Vec<u32>, ShardError> {
+        self.value_sizes_scoped(keys, 0).await
+    }
+
+    async fn value_sizes_scoped(
+        &self,
+        keys: &[Bytes],
+        tenant: u128,
+    ) -> Result<Vec<u32>, ShardError> {
+        let n = self.inner.n;
+        let mut buckets: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); n];
+        for (i, key) in keys.iter().enumerate() {
+            buckets[shard_for(key, n)].push((i, key.clone()));
+        }
+        let mut pending = Vec::new();
+        for (shard, bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            self.inner.senders[shard]
+                .send(ShardMsg {
+                    req: ShardReq::ValueSizes(bucket, tenant),
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| ShardError::Unavailable)?;
+            pending.push(rx);
+        }
+        let mut result = vec![0u32; keys.len()];
+        for rx in pending {
+            match rx.await.map_err(|_| ShardError::Unavailable)? {
+                ShardResp::ValueSizes(items) => {
+                    for (idx, size) in items {
+                        result[idx] = size;
+                    }
+                }
+                ShardResp::Err(e) => return Err(ShardError::Storage(e)),
+                ShardResp::Refused(e) => return Err(e),
+                _ => return Err(ShardError::Unavailable),
+            }
+        }
+        Ok(result)
+    }
+
+    /// MGET where each key's record must still fit the bound its caller
+    /// reserved for it.
+    ///
+    /// `bounds` is positional against `keys`; a key whose record has grown
+    /// past its bound since the size was measured comes back as
+    /// [`skeg_core::BoundedGet::Oversize`] and is NOT read. `bounds` shorter
+    /// than `keys` bounds the missing tail at zero, which refuses rather than
+    /// letting an unbounded read through a length mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard is unavailable or storage fails.
+    pub async fn mget_bounded(
+        &self,
+        keys: &[Bytes],
+        bounds: &[u32],
+    ) -> Result<Vec<skeg_core::BoundedGet>, ShardError> {
+        self.mget_bounded_scoped(keys, bounds, 0).await
+    }
+
+    async fn mget_bounded_scoped(
+        &self,
+        keys: &[Bytes],
+        bounds: &[u32],
+        tenant: u128,
+    ) -> Result<Vec<skeg_core::BoundedGet>, ShardError> {
+        let n = self.inner.n;
+        let mut buckets: Vec<Vec<(usize, Bytes, u32)>> = vec![Vec::new(); n];
+        for (i, key) in keys.iter().enumerate() {
+            let bound = bounds.get(i).copied().unwrap_or(0);
+            buckets[shard_for(key, n)].push((i, key.clone(), bound));
+        }
+        let mut pending = Vec::new();
+        for (shard, bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            self.inner.senders[shard]
+                .send(ShardMsg {
+                    req: ShardReq::MgetBounded(bucket, tenant),
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| ShardError::Unavailable)?;
+            pending.push(rx);
+        }
+        let mut result: Vec<skeg_core::BoundedGet> =
+            vec![skeg_core::BoundedGet::Missing; keys.len()];
+        for rx in pending {
+            match rx.await.map_err(|_| ShardError::Unavailable)? {
+                ShardResp::MgetBounded(items) => {
+                    for (idx, got) in items {
+                        result[idx] = got;
                     }
                 }
                 ShardResp::Err(e) => return Err(ShardError::Storage(e)),
@@ -8671,6 +8849,32 @@ impl ShardTenantView<'_> {
     /// Returns an error if any shard is unavailable or storage fails.
     pub async fn mget(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>, ShardError> {
         self.shards.mget_scoped(keys, self.tenant).await
+    }
+
+    /// The padded on-disk record size of each key that exists, without
+    /// reading any of them. See [`ShardSet::value_sizes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard is unavailable or storage fails.
+    pub async fn value_sizes(&self, keys: &[Bytes]) -> Result<Vec<u32>, ShardError> {
+        self.shards.value_sizes_scoped(keys, self.tenant).await
+    }
+
+    /// MGET where each key's record must still fit the bound reserved for it.
+    /// See [`ShardSet::mget_bounded`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard is unavailable or storage fails.
+    pub async fn mget_bounded(
+        &self,
+        keys: &[Bytes],
+        bounds: &[u32],
+    ) -> Result<Vec<skeg_core::BoundedGet>, ShardError> {
+        self.shards
+            .mget_bounded_scoped(keys, bounds, self.tenant)
+            .await
     }
 }
 
