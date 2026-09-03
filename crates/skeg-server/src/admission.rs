@@ -71,10 +71,33 @@ impl AdmissionError {
     /// this one, and no other module is allowed a second opinion.
     #[must_use]
     pub fn retryability(self) -> Retryability {
-        // Stub: opened by `server: one classification for every admission
-        // refusal`.
-        let _ = self;
-        Retryability::Permanent
+        use Retryability::{Permanent, Retryable};
+        // Exhaustive, no `_` arm anywhere in it. A refusal whose
+        // classification nobody chose would default to something, and both
+        // defaults are wrong: "permanent" tells a client to give up on a
+        // condition that clears, "retryable" tells it to loop on one that
+        // does not.
+        match self {
+            // The class is momentarily full, or its ceiling is momentarily
+            // unreadable. Both clear without the client doing anything
+            // different.
+            Self::Ingress(
+                IngressRejected::ClassFull { .. } | IngressRejected::Unreadable { .. },
+            ) => Retryable,
+            // A frame larger than one connection may ever hold. The same
+            // frame will be refused again on the next attempt.
+            Self::Ingress(IngressRejected::OverConnectionAllowance { .. }) => Permanent,
+            // The governor, reached either through ingress or at the write
+            // itself: one classification, written once, for both routes.
+            Self::Ingress(IngressRejected::Governor(m)) | Self::MemoryAtWrite(m) => match m {
+                MemoryRejected::NoHeadroom { .. } => Retryable,
+                MemoryRejected::Unknown | MemoryRejected::ArithmeticOverflow { .. } => Permanent,
+            },
+            // A tenant at its ceiling stays there until somebody deletes a
+            // vector or raises the limit, neither of which is a retry.
+            Self::QuotaExceeded { .. } => Permanent,
+            Self::RequestTooLarge { .. } => Permanent,
+        }
     }
 
     /// The first word of the RESP3 error line, which IS the code a client
@@ -98,10 +121,47 @@ impl AdmissionError {
     /// the client can fix from an accounting fault it cannot.
     #[must_use]
     pub fn code(self) -> ErrCode {
-        // Stub: opened by `server: one classification for every admission
-        // refusal`.
-        let _ = self;
-        ErrCode::Internal
+        match self.retryability() {
+            // Structural, not asserted: there is no way to write a retryable
+            // refusal that does not carry the retryable code.
+            Retryability::Retryable => ErrCode::Backpressure,
+            Retryability::Permanent => self.permanent_code(),
+        }
+    }
+
+    /// Which kind of permanent, for a client deciding what to do next: fix
+    /// the request, or tell an operator. Exhaustive for the same reason
+    /// [`AdmissionError::retryability`] is.
+    fn permanent_code(self) -> ErrCode {
+        match self {
+            // Headroom nobody could read is an accounting fault of this
+            // process. The client cannot fix it by sending anything else, so
+            // calling its request invalid would send it looking in the wrong
+            // place.
+            Self::Ingress(IngressRejected::Governor(MemoryRejected::Unknown))
+            | Self::MemoryAtWrite(MemoryRejected::Unknown) => ErrCode::Internal,
+            // Everything else permanent is about the request: it is too big,
+            // or the tenant it belongs to is full.
+            Self::Ingress(
+                IngressRejected::ClassFull { .. }
+                | IngressRejected::Unreadable { .. }
+                | IngressRejected::OverConnectionAllowance { .. }
+                | IngressRejected::Governor(
+                    MemoryRejected::NoHeadroom { .. } | MemoryRejected::ArithmeticOverflow { .. },
+                ),
+            )
+            | Self::MemoryAtWrite(
+                MemoryRejected::NoHeadroom { .. } | MemoryRejected::ArithmeticOverflow { .. },
+            )
+            | Self::QuotaExceeded { .. }
+            | Self::RequestTooLarge { .. } => ErrCode::InvalidRequest,
+        }
+    }
+}
+
+impl From<IngressRejected> for AdmissionError {
+    fn from(e: IngressRejected) -> Self {
+        Self::Ingress(e)
     }
 }
 
@@ -248,7 +308,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: one classification for every admission refusal`"]
     fn every_admission_error_is_classified_as_the_table_says() {
         for (e, want) in every_admission_error() {
             assert_eq!(
@@ -262,7 +321,6 @@ mod tests {
 
     /// The invariant the whole module exists for: one decision, two wires.
     #[test]
-    #[ignore = "opens in `server: one classification for every admission refusal`"]
     fn retryability_decides_both_the_prefix_and_the_code() {
         for (e, _) in every_admission_error() {
             let retryable = e.retryability() == Retryability::Retryable;
@@ -285,7 +343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: one classification for every admission refusal`"]
     fn a_permanent_refusal_names_the_request_or_the_accounting_but_never_both() {
         for (e, _) in every_admission_error() {
             if e.retryability() == Retryability::Permanent {
@@ -300,7 +357,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: one classification for every admission refusal`"]
     fn an_unreadable_budget_is_the_servers_fault_not_the_requests() {
         assert_eq!(
             AdmissionError::MemoryAtWrite(MemoryRejected::Unknown).code(),
@@ -332,7 +388,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens in `server: one classification for every admission refusal`"]
     fn the_wire_message_is_the_code_word_then_the_reason() {
         let e = AdmissionError::Ingress(IngressRejected::ClassFull {
             held: 1,

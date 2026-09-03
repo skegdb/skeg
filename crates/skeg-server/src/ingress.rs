@@ -158,35 +158,26 @@ pub enum IngressRejected {
 impl IngressRejected {
     /// Should the client try the same frame again?
     ///
-    /// The whole difference between backpressure and an error. A class that is
-    /// momentarily full, or a governor whose headroom the delta has taken,
-    /// clears on its own; a frame larger than one connection may hold does
-    /// not, and telling a client to retry it is telling it to loop.
+    /// Not decided here. This is one of several ways a request can be refused
+    /// before it runs, and the whole point of
+    /// [`crate::admission::AdmissionError`] is that they are classified in
+    /// ONE place: a second opinion living next to the ingress budget is how
+    /// the RESP3 wire and the native wire came to disagree in the first
+    /// place.
     #[must_use]
-    pub fn is_retryable(self) -> bool {
-        match self {
-            IngressRejected::ClassFull { .. } | IngressRejected::Unreadable { .. } => true,
-            IngressRejected::OverConnectionAllowance { .. } => false,
-            IngressRejected::Governor(e) => match e {
-                MemoryRejected::NoHeadroom { .. } => true,
-                MemoryRejected::Unknown | MemoryRejected::ArithmeticOverflow { .. } => false,
-            },
-        }
+    pub fn retryability(self) -> crate::admission::Retryability {
+        crate::admission::AdmissionError::from(self).retryability()
     }
 
     /// The error line a client sees, code first.
     ///
     /// The first word IS the code, so a retryable refusal must not be dressed
     /// as `ERR`: that turns backpressure into a failure the caller gives up
-    /// on.
+    /// on. Composed by the classifier, so this line and the native error code
+    /// cannot say different things.
     #[must_use]
     pub fn wire_message(self) -> String {
-        let code = if self.is_retryable() {
-            "BACKPRESSURE"
-        } else {
-            "ERR"
-        };
-        format!("{code} {self}")
+        crate::admission::AdmissionError::from(self).wire_message()
     }
 }
 
@@ -629,7 +620,7 @@ pub async fn grow_or_stall(
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
-    if !last.is_retryable() {
+    if last.retryability() == crate::admission::Retryability::Permanent {
         return Err(last);
     }
     skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressStalls);
@@ -878,7 +869,11 @@ mod tests {
             matches!(err, IngressRejected::OverConnectionAllowance { .. }),
             "wrong refusal: {err:?}"
         );
-        assert!(!err.is_retryable(), "retrying will not make it fit");
+        assert_eq!(
+            err.retryability(),
+            crate::admission::Retryability::Permanent,
+            "retrying will not make it fit"
+        );
         assert!(
             err.wire_message().starts_with("ERR "),
             "a permanent refusal must not wear a retryable code: {}",
