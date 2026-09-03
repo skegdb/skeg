@@ -1125,6 +1125,22 @@ fn probe_default() -> usize {
 /// never resharded has none, and `read_dir` simply does not yield one. Only a
 /// file that exists under the name and does not parse refuses, and the error
 /// names it, because renaming or removing that file is the whole repair.
+///
+/// # Known gap: a sidecar that was DELETED reads as one that never existed
+///
+/// The two cases are the same absence on disk, and this function cannot tell
+/// them apart: an index that WAS resharded and whose sidecar was deleted - or
+/// not restored from a backup - opens as unrouted and gets exactly the damage
+/// the corrupt branch above refuses. Measured at 79 counted against 40 logical
+/// rows, plus point ops placed by hash over rows the reshard moved.
+///
+/// Nothing here can close it, because the question is "was this index ever
+/// routed", and only the vindex registry could answer it - it does not record
+/// that today. Recording it there turns a missing sidecar into the same
+/// refusal a corrupt one now gets, and that is the fix. Until then it is an
+/// operator check, stated in the CHANGELOG: after restoring or hand-editing a
+/// store root, every resharded vindex must still have its `router-<name>.bin`,
+/// and the repair is to put the file back or to reshard the index again.
 fn load_routers(root: &Path) -> std::io::Result<HashMap<String, Arc<crate::router::Router>>> {
     let mut out = HashMap::new();
     // The root is created by the layout manifest before this runs, so a

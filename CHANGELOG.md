@@ -131,11 +131,32 @@ One case is left, and it errs the safe way: dropping a committed index that
 will not open credits nothing at all, because only the open index knew what it
 held, so the tenant stays charged until the next open counts again.
 
+**A DROP of a routed index can now be slow.** The logical credit is read from
+the owner map, and if nothing has needed that map yet this uptime it is built
+first, with one `LiveIds` round trip to every shard - O(rows) work inside a
+command that used to be O(1) on the accounting side. Measured at **77.7 ms for
+a 5000-row index over 2 shards dropped immediately after an open**; a map that
+is already warm costs nothing. It is the first drop after a restart that pays,
+and only for an index that was resharded.
+
 **A vindex router sidecar that will not read now fails the open**, naming the
 file. It used to warn and be skipped, which left the index looking unrouted:
 point ops placed by hash over rows a reshard had moved, and the vector count
-doubled where an overlap had replicated. A sidecar that is ABSENT is
-unchanged and still normal - an index that was never resharded has none.
+doubled where an overlap had replicated. This applies to a read-only
+`--mode serve` open too, which now also refuses to start: a replica routing by
+hash over re-partitioned rows answers wrongly whether or not it can write.
+
+**Known gap: a sidecar that is MISSING is not detected, and costs the same.**
+An absent sidecar is legitimate - an index that was never resharded has none -
+and nothing on disk distinguishes that from the sidecar of a resharded index
+being deleted or not restored from a backup. In the second case the index
+opens as unrouted and the count doubles exactly as the corrupt case used to:
+**79 against 40 logical rows**, measured. If a vindex was ever resharded, its
+`router-<name>.bin` must be present; check for it after any restore or manual
+cleanup of the store root, and either put the file back or reshard the index
+again, which writes a new one. The fix that would close it is recording in the
+vindex registry that an index is routed, so a missing sidecar becomes a refusal
+like a corrupt one; the registry does not carry that today.
 
 ### A vector and its payload are one write
 
