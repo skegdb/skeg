@@ -927,3 +927,324 @@ async fn a_saturated_class_still_answers_ping_and_refuses_a_grower_by_name() {
     );
     drop((holders, filler));
 }
+
+// ------------------------------------------------- the reply side, reads (A1)
+
+/// One RESP3 bulk string argument.
+fn bulk(arg: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+    out.extend_from_slice(arg);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// One RESP3 array command from bulk-string arguments.
+fn resp_array(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+    for a in args {
+        bulk(a, &mut out);
+    }
+    out
+}
+
+fn f32_le(v: f32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// `SKEG.VINDEX.CREATE name dim 0` (flat, f32) as raw RESP3 bytes.
+fn vindex_create_flat(name: &str, dim: usize) -> Vec<u8> {
+    resp_array(&[
+        b"SKEG.VINDEX.CREATE",
+        name.as_bytes(),
+        dim.to_string().as_bytes(),
+        b"0",
+    ])
+}
+
+/// `SKEG.VSET name id vector PAYLOAD blob` as raw RESP3 bytes.
+fn vset_with_payload(name: &str, id: u64, dim: usize, payload_len: usize) -> Vec<u8> {
+    let mut vector = Vec::with_capacity(dim * 4);
+    for _ in 0..dim {
+        vector.extend_from_slice(&f32_le(0.5));
+    }
+    let payload = vec![b'p'; payload_len];
+    resp_array(&[
+        b"SKEG.VSET",
+        name.as_bytes(),
+        id.to_string().as_bytes(),
+        &vector,
+        b"PAYLOAD",
+        &payload,
+    ])
+}
+
+/// `SKEG.VSEARCH name k l_search vector WITHPAYLOAD` as raw RESP3 bytes.
+fn vsearch_withpayload(name: &str, k: usize, dim: usize) -> Vec<u8> {
+    let mut vector = Vec::with_capacity(dim * 4);
+    for _ in 0..dim {
+        vector.extend_from_slice(&f32_le(0.5));
+    }
+    resp_array(&[
+        b"SKEG.VSEARCH",
+        name.as_bytes(),
+        k.to_string().as_bytes(),
+        b"0",
+        &vector,
+        b"WITHPAYLOAD",
+    ])
+}
+
+/// Read one whole RESP3 reply (one top-level frame) off `s`, with a deadline.
+/// Good enough for a short `+OK`/`-ERR .../:` line; not a general RESP parser.
+async fn read_one_reply(s: &mut TcpStream, within: Duration) -> String {
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(within, s.read(&mut scratch))
+            .await
+            .expect("a reply must arrive")
+            .expect("read");
+        assert!(n > 0, "the server closed with no reply");
+        buf.extend_from_slice(&scratch[..n]);
+        if buf.ends_with(b"\r\n") {
+            return String::from_utf8_lossy(&buf).into_owned();
+        }
+    }
+}
+
+/// audit/19 A1: `SKEG.VSET ... PAYLOAD <blob>` over `MAX_PAYLOAD_BYTES` is
+/// refused before it ever reaches the shard - a typed `RequestTooLarge`, not
+/// a silent unbounded store. Without this cap `SKEG.VSEARCH WITHPAYLOAD`'s
+/// reply bound would have nothing honest to multiply `k` by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens in the next commit: server: reserve read replies (VSEARCH/VGET/GET/MGET) before the shard call (A1)"]
+async fn a_vset_payload_over_the_cap_is_refused_by_name() {
+    let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
+    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&vindex_create_flat("payload-cap", 4))
+        .await
+        .expect("create");
+    let _ = read_one_reply(&mut s, Duration::from_secs(5)).await;
+
+    // One byte over the cap: the boundary is the point, not a wildly
+    // oversized request that might be refused for some other reason.
+    s.write_all(&vset_with_payload("payload-cap", 1, 4, 1024 * 1024 + 1))
+        .await
+        .expect("vset");
+    let text = read_one_reply(&mut s, Duration::from_secs(10)).await;
+    assert!(
+        text.starts_with("-ERR "),
+        "a payload over the cap is a permanent refusal, not backpressure: {text:?}"
+    );
+    assert!(
+        text.contains("payload") && text.contains("1048576"),
+        "the refusal must name what was too large and by how much: {text:?}"
+    );
+
+    // And it never touched the shard: the id it tried to write is absent.
+    let mut check = TcpStream::connect(addr).await.expect("connect");
+    check
+        .write_all(&resp_array(&[b"SKEG.VGET", b"payload-cap", b"1"]))
+        .await
+        .expect("vget");
+    let text = read_one_reply(&mut check, Duration::from_secs(5)).await;
+    assert!(
+        text.starts_with("_") || text.starts_with("$-1"),
+        "the refused write must not have reached the shard: {text:?}"
+    );
+}
+
+/// audit/19 A1, exit criterion: a `SKEG.VSEARCH k WITHPAYLOAD` whose worst
+/// case (`k` hits, each up to `MAX_PAYLOAD_BYTES`) does not fit this
+/// connection's allowance is refused BEFORE the shard call - proven against
+/// an index name that does NOT exist, so a real shard call would answer
+/// "not found" and a pre-dispatch admission refusal answers something else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens in the next commit: server: reserve read replies (VSEARCH/VGET/GET/MGET) before the shard call (A1)"]
+async fn a_max_vsearch_withpayload_reply_too_large_is_refused_before_the_shard_call() {
+    // k=4096 WITHPAYLOAD needs roughly 4096 * 1 MiB - far past any
+    // per-connection allowance a small class can grant.
+    let ingress = budget(8 * CHUNK_BYTES, Duration::from_millis(50));
+    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&vsearch_withpayload("does-not-exist", 4096, 4))
+        .await
+        .expect("vsearch");
+    let text = read_one_reply(&mut s, Duration::from_secs(10)).await;
+    assert!(
+        text.starts_with("-ERR ") || text.starts_with("-BACKPRESSURE "),
+        "an oversized reply must be refused before dispatch: {text:?}"
+    );
+    assert!(
+        !text.to_lowercase().contains("not found") && !text.to_lowercase().contains("vindex"),
+        "this refusal must come from admission, not from the shard resolving \
+         (and refusing) a vindex name - which would prove the shard WAS \
+         called: {text:?}"
+    );
+}
+
+/// audit/19 A1, the reproduced hazard: pipelined `SKEG.VSEARCH k WITHPAYLOAD`
+/// reads on ONE connection, sent without reading their replies. Before this
+/// fix `reply_upper_bound` returned `None` for a read, so `exec_pipelined`
+/// spawned every one of them unreserved and up to `PIPELINE_WINDOW` (128)
+/// complete, payload-bearing replies could sit in `inflight` never charged -
+/// the auditor measured 20,809,984 bytes of them under a 4 MiB class. Now
+/// each pipelined read's bound is summed into `reply_reserved` before it is
+/// allowed to run, so a class that cannot afford them all refuses the
+/// requests it cannot afford instead of quietly completing and holding
+/// every one.
+///
+/// `k=1` here, not the auditor's `k=50`: this test's bound is the WORST
+/// CASE (`MAX_PAYLOAD_BYTES` per hit, since the reservation cannot know a
+/// real stored payload is smaller), so even `k=1 WITHPAYLOAD` already
+/// reserves past a megabyte - the point is proving the PIPELINE WINDOW's
+/// running sum is enforced (several small, real reservations exhausting a
+/// class together), not reproducing the auditor's exact numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens in the next commit: server: reserve read replies (VSEARCH/VGET/GET/MGET) before the shard call (A1)"]
+async fn pipelined_vsearch_withpayload_reads_are_reserved_not_left_uncharged() {
+    const DIM: usize = 8;
+    const K: usize = 1;
+    const BURST: usize = 20;
+
+    // Sized to admit a handful of k=1 WITHPAYLOAD reservations
+    // (MAX_PAYLOAD_BYTES-bounded, chunk-rounded to a bit over 2.5 MiB each)
+    // but not all 20 of them summed - the class the auditor used was
+    // 4 MiB for k=50; this is a different point on the same curve, chosen
+    // so the test does not depend on exactly how many of BURST get through,
+    // only that some do and some do not.
+    let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
+    let (addr, _dir) = resp3_server(&ingress, 8).await;
+
+    let mut setup = TcpStream::connect(addr).await.expect("connect");
+    setup
+        .write_all(&vindex_create_flat("pipeline-idx", DIM))
+        .await
+        .expect("create");
+    let _ = read_one_reply(&mut setup, Duration::from_secs(5)).await;
+    setup
+        .write_all(&vset_with_payload("pipeline-idx", 0, DIM, 256))
+        .await
+        .expect("vset");
+    let text = read_one_reply(&mut setup, Duration::from_secs(5)).await;
+    assert!(text.starts_with('+'), "setup vset must succeed: {text:?}");
+    drop(setup);
+
+    // The burst: BURST pipelined VSEARCH k=K WITHPAYLOAD requests, written
+    // back to back on one connection with nothing read from it yet - the
+    // exact shape the auditor reproduced.
+    let mut conn = TcpStream::connect(addr).await.expect("connect");
+    let request = vsearch_withpayload("pipeline-idx", K, DIM);
+    for _ in 0..BURST {
+        conn.write_all(&request).await.expect("vsearch");
+    }
+
+    // Drain every reply the pipeline window and its backlog produce, timing
+    // each read so a connection that goes silent (rather than closing or
+    // refusing by name) is a hang here, not a false pass.
+    let mut ok = 0usize;
+    let mut refused = 0usize;
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let n = match tokio::time::timeout(Duration::from_secs(5), conn.read(&mut scratch)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break,
+            Err(_) => break, // no more replies arriving within the window
+        };
+        buf.extend_from_slice(&scratch[..n]);
+        // Count top-level replies by their leading byte, draining what has
+        // fully arrived: `*` (array, a VSEARCH hit list) or `-` (an error).
+        while !buf.is_empty() {
+            let Some(end) = find_reply_end(&buf) else {
+                break;
+            };
+            match buf[0] {
+                b'*' => ok += 1,
+                b'-' => refused += 1,
+                other => panic!("unexpected reply lead byte {other:?}: {buf:?}"),
+            }
+            buf.drain(..end);
+        }
+    }
+
+    assert!(
+        ok + refused > 0,
+        "no replies arrived at all: nothing was proved"
+    );
+    assert!(
+        ok > 0,
+        "a class sized for a handful of these must admit at least one: \
+         {ok} completed, {refused} refused"
+    );
+    // The property under test: SOME requests were refused rather than the
+    // server completing and holding all BURST of them (which is what
+    // `held_bytes` staying at the class's per-connection floor while a
+    // multi-megabyte backlog of completed replies sat uncharged looked
+    // like before this fix).
+    assert!(
+        refused > 0,
+        "a class sized for only a handful of a {BURST}-request pipelined \
+         burst of k={K} WITHPAYLOAD reads must refuse some of them - {ok} \
+         completed and 0 were refused, which is the unreserved-pipeline \
+         shape audit 19 A1 reproduced"
+    );
+
+    until(
+        "the connection to settle back near its floor",
+        Duration::from_secs(10),
+        || ingress.held_bytes() <= ingress.per_connection_max(),
+    )
+    .await;
+}
+
+/// Best-effort: the byte length of one complete top-level RESP3 reply at the
+/// front of `buf`, if it has fully arrived. Handles exactly the two shapes
+/// this test's replies take (`-...\r\n` and `*n\r\n` arrays of
+/// `$len\r\nbytes\r\n` / `,double\r\n` / `_\r\n` elements), not the whole
+/// grammar.
+fn find_reply_end(buf: &[u8]) -> Option<usize> {
+    fn line_end(buf: &[u8], from: usize) -> Option<usize> {
+        buf[from..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| from + p + 2)
+    }
+    match buf.first()? {
+        b'-' | b':' => line_end(buf, 0),
+        b'*' => {
+            let header_end = line_end(buf, 0)?;
+            let n: usize = std::str::from_utf8(&buf[1..header_end - 2])
+                .ok()?
+                .parse()
+                .ok()?;
+            let mut pos = header_end;
+            for _ in 0..n {
+                match *buf.get(pos)? {
+                    b'$' => {
+                        let h = line_end(buf, pos)?;
+                        let len: usize = std::str::from_utf8(&buf[pos + 1..h - 2])
+                            .ok()?
+                            .parse()
+                            .ok()?;
+                        pos = h + len + 2;
+                        if buf.len() < pos {
+                            return None;
+                        }
+                    }
+                    b'_' => pos = line_end(buf, pos)?,
+                    b',' | b':' => pos = line_end(buf, pos)?,
+                    _ => return None,
+                }
+            }
+            Some(pos)
+        }
+        _ => None,
+    }
+}
