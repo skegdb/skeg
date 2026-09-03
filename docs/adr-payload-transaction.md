@@ -234,6 +234,23 @@ existing rebuild already covers it byte for byte, and the reclamation that
 runs after it (still inside the barrier, before `ready.send`) removes what a
 crash left staged. No request is admitted until both have run.
 
+**MSET.** `VLog::set_many` shared none of the above until audit/17 round 2:
+it wrote its whole batch with no limit check at all - a deterministic
+bypass, not a race. `set_many_with_disk_limit` closes it with the batch's
+net delta (its sum, folding a duplicate key inside one batch to its LAST
+occurrence, the same way the per-key write loop already does) checked and
+reserved atomically, in the SAME critical section as `set_scoped` above,
+before a single byte of the batch is written - so a batch that would cross
+the limit writes NONE of its members, the same all-or-nothing contract
+`set_many` already has for a crash. One caveat inherited, not introduced:
+an `MSET` whose keys span shards was never atomic ACROSS shards (each
+shard's portion is its own commit, sequentially), so the disk quota follows
+the same shape - a batch split across two shards can have one shard's
+portion admitted and written before the other shard's is checked, and
+refused. A single-shard deployment, or a batch whose keys all hash to one
+shard, gets true all-or-nothing for the quota exactly as it already did for
+the write itself.
+
 ## Compatibility
 
 A store written before generations existed reads as `IndexGeneration::LEGACY` -
