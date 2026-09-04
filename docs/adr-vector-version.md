@@ -145,7 +145,12 @@ back means restoring it from before the upgrade.
   routed index has not migrated here yet - so the coordinator defers to the
   shard `point_shard` would place it on (`version: None`, the same pattern an
   unrouted `vset` already uses) and that shard checks `backend.contains(id)`
-  under its own write lock before doing anything. An id truly never written
+  under its own write lock before doing anything. That deferral is only sound
+  while the map the coordinator read cannot change underneath it, which it
+  could until `docs/adr-placement-authority.md`: a rebuild publishing between
+  `point_shard` and the version read sent the delete to a shard the row had
+  already left (audit 18). The whole span is now held under that index's
+  shared placement authority. An id truly never written
   costs nothing there: no version, no WAL record, no tombstone. This is what
   used to let `SKEG.VDEL idx <random id>` in a loop grow the flat
   `absent_tombstones` map (16 B/call) or the disk WAL and `tombstones` map

@@ -649,6 +649,45 @@ a `JoinSet` cancels its outstanding tasks when it is dropped, so one malformed
 item could cancel a sibling that had already committed its write and had not
 yet published the row. That row was durable, acknowledged and unreachable.
 
+### One placement authority per index (P0)
+
+A routed vindex's owner map says which shard holds each row. Point ops read it
+to decide and write it to record; `rebuild_owner_maps` scanned every shard and
+then replaced the whole map. Nothing ordered the two, so a publish whose scan
+predated a point op undid that op's record - and both directions were real
+losses.
+
+A `VDEL` read the map four times (shard, version, replica slot, removal) with
+shard round trips between them. A publish landing in one of those gaps sent the
+delete to the shard the row had already left: the client got `false` while the
+row stayed live and searchable, and because the delete "did not exist" its map
+entry was never removed either. Audit 18 reproduced it on real rows in 30-70%
+of runs. A `VSET` in the same window committed on its new owner, published its
+entry, and had the entry replaced by the rebuild's pre-scan copy - which names
+the shard the VSET's own cleanup had just emptied. An acknowledged write, and
+nothing could read it. A `VINDEX.DROP` during a first reshard counted the rows
+the reshard had moved so far and left the tenant charged for the rest.
+
+Each index now has one authority: a `tokio::sync::RwLock` per scoped name.
+Exclusive for a rebuild (the scan AND the publish) and for the removal of an
+index's derived state; shared for the whole decision-and-commit of `VSET`,
+`VDEL`, `VGET`, `owners_of`, `SKEG.CHECK`, the drop's cardinality read, and
+each row of a reshard or an overlap. PER INDEX, so a reshard of one tenant's
+index does not stall another tenant's point ops. Lock order is
+`placement -> owner stripe -> shard mailbox`, documented in the module and
+enforced by making the owner map reachable only through accessors that take the
+guard as an argument. `VSEARCH` stays outside it deliberately - it uses the map
+only as a tie-break after comparing versions - and says so.
+
+No wire change: the epoch behind the lock is internal. Measured 2026-09-04,
+release, dim 16, 2 shards, quiet machine: the exclusive window is 829 µs at
+20k rows (799 µs before) and 10,1 ms at 200k (10,3 ms before), and routed
+point ops are at parity (VSET p50 41,5 µs / p99 87,2 µs against 43,7 / 115,5;
+VDEL 11,5 / 29,4 against 12,0 / 63,3). See
+[`docs/adr-placement-authority.md`](docs/adr-placement-authority.md) for the
+security definitions and what is still open - chiefly that the 200k window is
+the one every reader of that index waits behind.
+
 ### A vector row says which copy of it is live
 
 A vector id can have more than one physical copy at once - mid-reshard, as a
