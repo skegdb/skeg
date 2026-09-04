@@ -502,6 +502,11 @@ async fn flush_batch(
 /// that matters: a batch that failed entirely on `StorageFull` still reaches a
 /// caller looking for ENOSPC. Mixed kinds collapse to `Other`, because no
 /// single one of them would be the truth.
+///
+/// The count is of FAILURES, not of files: a failed sync is one of them and
+/// belongs to no file. `file_count` says how big the batch was, so "2 failures
+/// committing a batch of 3 files" cannot be misread as "2 of 3 files", which
+/// it may not be.
 fn aggregate(failures: Vec<io::Error>, file_count: usize) -> Option<io::Error> {
     let first = failures.first()?;
     if failures.len() == 1 {
@@ -515,9 +520,8 @@ fn aggregate(failures: Vec<io::Error>, file_count: usize) -> Option<io::Error> {
         .collect::<Vec<_>>()
         .join("; ");
     let msg = format!(
-        "{} of {} files in the batch did not commit: {joined}",
-        failures.len(),
-        file_count
+        "{} failures committing a batch of {file_count} files: {joined}",
+        failures.len()
     );
     Some(if uniform {
         io::Error::new(kind, msg)
@@ -736,8 +740,8 @@ mod tests {
         let err = flush_result.expect_err("flush answered Ok with both its files broken");
         let msg = err.to_string();
         assert!(
-            msg.contains("2 of 2"),
-            "the aggregate error must say how many files failed, got: {msg}"
+            msg.contains("2 failures") && msg.contains("batch of 2 files"),
+            "the aggregate error must count the failures and the batch, got: {msg}"
         );
     }
 
