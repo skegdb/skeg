@@ -337,3 +337,252 @@ async fn a_drop_during_a_reshard_credits_every_logical_row() {
     let shards = open(dir.path());
     assert_eq!(shards.tenant_vector_count(T), 0, "and it stays credited");
 }
+
+/// What the maintenance loop under test is.
+#[derive(Clone, Copy)]
+enum Maintenance {
+    /// Moves rows AND republishes the whole map at the end.
+    Reshard,
+    /// Adds replica slots to existing entries.
+    Overlap,
+}
+
+/// The state one id must be in when the dust settles, decided by the LAST
+/// operation the client got an ack for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Expect {
+    Untouched,
+    Rewritten,
+    Deleted,
+}
+
+/// One run of the oracle: every id gets at most one point op, concurrently with
+/// a maintenance pass, and afterwards every id must hold exactly what its last
+/// acknowledged op said - in RAM and again after a reopen.
+async fn last_acked_op_wins(kind: Maintenance, run: usize) {
+    const N: u64 = 300;
+    let dir = tempfile::TempDir::new().unwrap();
+    let tag = match kind {
+        Maintenance::Reshard => "reshard",
+        Maintenance::Overlap => "overlap",
+    };
+    let name = scoped(T, &format!("pa-oracle-{tag}-{run}"));
+    let shards = open(dir.path());
+    match kind {
+        // The concurrent pass is this index's FIRST reshard, so it really
+        // MOVES rows while the point ops run. A second reshard of an index
+        // already in place moves nothing and races nothing.
+        Maintenance::Reshard => {
+            shards
+                .vindex_create_scoped(&name, DIM as u32, 4, 1)
+                .await
+                .unwrap();
+            for id in 0..N {
+                shards
+                    .vset(&name, id, vec_for(id), T, LIMIT, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        // `overlap` needs a router, so this one starts from a resharded index.
+        Maintenance::Overlap => routed_index(&shards, &name, N).await,
+    }
+
+    // One op per id, fixed up front so the oracle is a function of the id and
+    // not of who won a race.
+    let plan: Vec<(u64, Expect)> = (0..N)
+        .map(|id| {
+            (
+                id,
+                match id % 3 {
+                    0 => Expect::Rewritten,
+                    1 => Expect::Deleted,
+                    _ => Expect::Untouched,
+                },
+            )
+        })
+        .collect();
+
+    let maintenance = {
+        let (s, n) = (shards.clone(), name.clone());
+        tokio::spawn(async move {
+            match kind {
+                Maintenance::Reshard => s.reshard(&n, 0.25, 10, T).await,
+                Maintenance::Overlap => s.overlap(&n, 4.0, T).await,
+            }
+        })
+    };
+    let ops = {
+        let (s, n, plan) = (shards.clone(), name.clone(), plan.clone());
+        tokio::spawn(async move {
+            for (id, want) in plan {
+                match want {
+                    Expect::Rewritten => s
+                        .vset(&n, id, other_cluster(id), T, LIMIT, None)
+                        .await
+                        .unwrap(),
+                    // A live row. `false` here IS the B0 defect: the delete
+                    // addressed a shard the row had already left.
+                    Expect::Deleted => assert!(
+                        s.vdel(&n, id, T).await.unwrap(),
+                        "VDEL of a live id {id} answered false"
+                    ),
+                    Expect::Untouched => {}
+                }
+            }
+        })
+    };
+    ops.await.unwrap();
+    let touched = maintenance.await.unwrap().expect("maintenance pass");
+    assert!(
+        touched > 0,
+        "the maintenance pass moved/replicated nothing: this run raced nothing"
+    );
+
+    let verify = async |shards: &ShardSet, when: &str| {
+        for &(id, want) in &plan {
+            let got = shards.vget(&name, id).await.unwrap();
+            match want {
+                Expect::Untouched => assert_eq!(
+                    got.as_deref(),
+                    Some(vec_for(id).as_slice()),
+                    "{when}: id {id} was not touched and must be unchanged"
+                ),
+                Expect::Rewritten => assert_eq!(
+                    got.as_deref(),
+                    Some(other_cluster(id).as_slice()),
+                    "{when}: id {id} must hold the value its acknowledged VSET wrote"
+                ),
+                Expect::Deleted => assert_eq!(
+                    got, None,
+                    "{when}: id {id} was deleted and acknowledged, and came back"
+                ),
+            }
+        }
+        // A deleted row must not be findable either: a copy the map stopped
+        // naming is still reachable by search.
+        for &(id, want) in &plan {
+            if want != Expect::Deleted {
+                continue;
+            }
+            let hits = shards
+                .vsearch(&name, vec_for(id), 5, 64, T, false, None)
+                .await
+                .unwrap();
+            assert!(
+                !hits.iter().any(|(h, _, _)| *h == id),
+                "{when}: deleted id {id} is still searchable"
+            );
+        }
+        assert!(
+            shards.check(&name).await.unwrap().is_empty(),
+            "{when}: the index reports its own owner map as inconsistent"
+        );
+    };
+
+    verify(&shards, "in RAM").await;
+    let live = plan.iter().filter(|(_, w)| *w != Expect::Deleted).count() as u64;
+    assert_eq!(shards.tenant_vector_count(T), live);
+
+    drop(shards);
+    let shards = open(dir.path());
+    verify(&shards, "after a reopen").await;
+    assert_eq!(shards.tenant_vector_count(T), live);
+}
+
+/// SD1 + SD2, on every id of an index rather than on one chosen row: a reshard
+/// running underneath a full round of point ops must leave each id holding what
+/// its own last acknowledged op said. Five runs - this one is a race, not a
+/// gate, so a single green run says very little.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reshard_and_concurrent_point_ops_agree_with_the_last_acked_op() {
+    for run in 0..5 {
+        last_acked_op_wins(Maintenance::Reshard, run).await;
+    }
+}
+
+/// The same oracle against `overlap`, which writes the replica slot of an entry
+/// a concurrent VDEL may be removing, plus `check()` on the way out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlap_and_concurrent_point_ops_agree_with_the_last_acked_op() {
+    for run in 0..5 {
+        last_acked_op_wins(Maintenance::Overlap, run).await;
+    }
+}
+
+/// SD5. The authority is per SCOPED NAME, so freezing one tenant's placement
+/// must leave another tenant's point ops running. A global lock passes every
+/// other test in this file and fails this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_tenants_do_not_block_each_other_across_a_reshard() {
+    const A: u128 = 11;
+    const B: u128 = 22;
+    const N: u64 = 120;
+    let dir = tempfile::TempDir::new().unwrap();
+    let shards = open(dir.path());
+    // The same raw name under two tenants: two scoped keys, two authorities.
+    let (a, b) = (scoped(A, "pa-iso"), scoped(B, "pa-iso"));
+    for (name, tenant) in [(&a, A), (&b, B)] {
+        shards
+            .vindex_create_scoped(name, DIM as u32, 4, 1)
+            .await
+            .unwrap();
+        for id in 0..N {
+            shards
+                .vset(name, id, vec_for(id), tenant, LIMIT, None)
+                .await
+                .unwrap();
+        }
+        assert!(shards.reshard(name, 0.25, 10, tenant).await.unwrap() > 0);
+    }
+
+    arm_gate_at(FP, &a);
+    let frozen = {
+        let (s, n) = (shards.clone(), a.clone());
+        tokio::spawn(async move { s.reshard(&n, 0.25, 10, A).await })
+    };
+    wait_reached(FP, &a).await;
+
+    // Tenant A's placement is now held exclusive and parked. Tenant B must get
+    // through a full round of point ops regardless.
+    let work = async {
+        for id in 0..25 {
+            shards
+                .vset(&b, id, other_cluster(id), B, LIMIT, None)
+                .await
+                .unwrap();
+        }
+        for id in 25..50 {
+            assert!(shards.vdel(&b, id, B).await.unwrap());
+        }
+        shards.vget(&b, 0).await.unwrap()
+    };
+    let got = tokio::time::timeout(Duration::from_secs(10), work)
+        .await
+        .expect(
+            "tenant B's point ops blocked behind tenant A's frozen reshard: the \
+             placement authority is not per index",
+        );
+    assert_eq!(got.as_deref(), Some(other_cluster(0).as_slice()));
+    assert!(
+        !frozen.is_finished(),
+        "tenant A's reshard was supposed to still be parked"
+    );
+
+    release_gate_at(FP, &a);
+    frozen.await.unwrap().expect("reshard");
+    assert!(
+        fired_gate_at(FP, &a),
+        "the gate never fired: this test proved nothing"
+    );
+    // And A came through its own reshard untouched by any of that.
+    for id in 0..N {
+        assert_eq!(
+            shards.vget(&a, id).await.unwrap().as_deref(),
+            Some(vec_for(id).as_slice()),
+            "tenant A lost id {id} across its own reshard"
+        );
+    }
+    assert_eq!(shards.tenant_vector_count(A), N);
+    assert_eq!(shards.tenant_vector_count(B), N - 25);
+}
