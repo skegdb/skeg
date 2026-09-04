@@ -465,6 +465,98 @@ mod tests {
         skeg_telemetry::counter_value(skeg_telemetry::Counter::VlogFlushFailures)
     }
 
+    /// An accepted barrier over bytes nothing has synced is the same lie as an
+    /// accepted barrier over a failed sync - it just takes a `Relaxed` writer
+    /// to reach it.
+    ///
+    /// SD-1: `Relaxed` is a client-reachable path, not a compaction-only one
+    /// (`PAYLOAD_DURABILITY`, `shard.rs:1471`, is the durability of every VSET
+    /// payload blob and of four tombstone sweeps). A flush that answers `Ok`
+    /// having issued no sync at all confirms a barrier that did not happen.
+    #[tokio::test]
+    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
+    async fn an_explicit_flush_syncs_what_a_relaxed_batch_left_unsynced() {
+        force_per_file();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![1u8; 64], Durability::Relaxed);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        assert!(flush_rx.await.unwrap().is_ok(), "the disk is healthy");
+        assert_eq!(write_rx.await.unwrap().unwrap(), (0, 64));
+        assert_eq!(
+            file.sync_count(),
+            1,
+            "an accepted barrier over Relaxed bytes must have synced them"
+        );
+    }
+
+    /// The same lie, one step later: the batch has already gone out on the
+    /// timer, so the explicit flush finds nothing pending - and answers `Ok`
+    /// over bytes that are still only in the page cache.
+    #[tokio::test]
+    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
+    async fn an_explicit_flush_over_an_empty_batch_still_syncs_earlier_relaxed_bytes() {
+        force_per_file();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
+
+        // The ack only arrives once the containing batch has been flushed, so
+        // by here the timer has already taken it - with no sync, because every
+        // entry in it asked for Relaxed.
+        gc.append(vec![2u8; 64], Durability::Relaxed).await.unwrap();
+        assert_eq!(
+            file.sync_count(),
+            0,
+            "fixture: a Relaxed batch is not supposed to sync"
+        );
+
+        gc.flush().await.unwrap();
+        assert_eq!(
+            file.sync_count(),
+            1,
+            "a barrier over an empty batch must still sync what an earlier Relaxed batch left"
+        );
+    }
+
+    /// And when that barrier sync is the thing that fails, the caller hears
+    /// about it - the same contract as a batch sync failure.
+    #[tokio::test]
+    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
+    async fn a_barrier_that_could_not_sync_reports_the_failure() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
+
+        gc.append(vec![3u8; 64], Durability::Relaxed).await.unwrap();
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+        let result = gc.flush().await;
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key),
+            "the sync failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            result.is_err(),
+            "a barrier whose sync failed answered Ok: {result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a barrier that could not land must be counted exactly once"
+        );
+    }
+
     /// A write that never reached the disk must not come back as a barrier.
     ///
     /// SD-1: an acknowledged `flush()` means every record submitted before it

@@ -597,6 +597,117 @@ mod tests {
         skeg_telemetry::counter_value(skeg_telemetry::Counter::VlogFlushFailures)
     }
 
+    fn orphaned_entries() -> u64 {
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::VlogCommitOrphanedEntries)
+    }
+
+    /// A barrier on a device-global committer answers for every shard on the
+    /// device, so it has to cover every file that has bytes nothing synced.
+    ///
+    /// SD-1, the shared committer's form: a batch of `Relaxed` entries writes
+    /// and does not sync, so without this an explicit flush confirms a barrier
+    /// over two files' worth of page cache.
+    #[tokio::test]
+    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
+    async fn a_barrier_syncs_every_file_a_relaxed_batch_left_dirty() {
+        let dir = TempDir::new().unwrap();
+        let a = Arc::new(PlatformFile::create(&dir.path().join("a.bin")).unwrap());
+        let b = Arc::new(PlatformFile::create(&dir.path().join("b.bin")).unwrap());
+
+        let (tx, _task) = queued_loop();
+        let (append_a, a_rx) = append_msg(1, vec![1u8; 64], Durability::Relaxed);
+        let (append_b, b_rx) = append_msg(2, vec![2u8; 32], Durability::Relaxed);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(attach_msg(1, a.clone())).await.unwrap();
+        tx.send(attach_msg(2, b.clone())).await.unwrap();
+        tx.send(append_a).await.unwrap();
+        tx.send(append_b).await.unwrap();
+        tx.send(flush).await.unwrap();
+
+        assert!(flush_rx.await.unwrap().is_ok(), "the disk is healthy");
+        assert_eq!(a_rx.await.unwrap().unwrap(), (0, 64));
+        assert_eq!(b_rx.await.unwrap().unwrap(), (0, 32));
+        assert_eq!(
+            (a.sync_count(), b.sync_count()),
+            (1, 1),
+            "a barrier must cover every file it left dirty, not whichever one it wrote first"
+        );
+    }
+
+    /// The batch path syncs ONE file - that is the whole point of this
+    /// committer - so the files it did not name are still carrying unsynced
+    /// bytes. The next barrier is what owes them a sync.
+    #[tokio::test]
+    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
+    async fn a_barrier_picks_up_the_files_a_batch_sync_did_not_name() {
+        let dir = TempDir::new().unwrap();
+        let a = Arc::new(PlatformFile::create(&dir.path().join("ba.bin")).unwrap());
+        let b = Arc::new(PlatformFile::create(&dir.path().join("bb.bin")).unwrap());
+        let sc = SharedCommitter::new();
+        let ea = sc.attach(a.clone(), 0).await;
+        let eb = sc.attach(b.clone(), 0).await;
+
+        // Both acks arrive once the containing batch has been flushed by the
+        // deadline, which syncs exactly one of the two files.
+        let (ra, rb) = tokio::join!(
+            ea.append(vec![1u8; 64], Durability::Kernel),
+            eb.append(vec![2u8; 64], Durability::Kernel),
+        );
+        ra.unwrap();
+        rb.unwrap();
+
+        ea.flush().await.unwrap();
+        assert_eq!(
+            (a.sync_count(), b.sync_count()),
+            (1, 1),
+            "the file the batch sync did not name was left unsynced by the barrier too"
+        );
+    }
+
+    /// An `append` whose file went away is a CANCELLED write, not a failing
+    /// disk. `skeg_vlog_flush_failures_total` is documented as having no
+    /// healthy value above zero, so a client closing a connection must not be
+    /// able to move it.
+    #[tokio::test]
+    #[ignore = "opens in the commit that stops a cancelled append reading as a disk failure"]
+    async fn a_cancelled_append_does_not_look_like_a_failing_disk() {
+        let _counter = counter_guard().await;
+        let before_failures = flush_failures();
+        let before_orphaned = orphaned_entries();
+        let dir = TempDir::new().unwrap();
+        let file = Arc::new(PlatformFile::create(&dir.path().join("gone.bin")).unwrap());
+
+        let (tx, _task) = queued_loop();
+        let (append, append_rx) = append_msg(1, vec![9u8; 16], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(attach_msg(1, file.clone())).await.unwrap();
+        // The detach is `EntryInner::drop`: the last handle to the file went
+        // while an append for it was still in flight behind it in the inbox.
+        tx.send(Msg::Detach { file_id: 1 }).await.unwrap();
+        tx.send(append).await.unwrap();
+        tx.send(flush).await.unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        assert!(
+            append_rx.await.unwrap().is_err(),
+            "the waiter is still owed the truth about its own append"
+        );
+        assert!(
+            flush_result.is_ok(),
+            "a cancelled append made the flush read as a disk failure: {flush_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before_failures,
+            "a cancelled append must not move a durability alarm"
+        );
+        assert_eq!(
+            orphaned_entries(),
+            before_orphaned + 1,
+            "the cancelled entry must still be counted, on its own benign metric"
+        );
+    }
+
     /// One batch, two files, one broken. The waiters of the file that
     /// committed are owed their offsets; the flusher is owed the truth about
     /// the one that did not.
