@@ -29,15 +29,32 @@ fn vec_for(id: u64, generation: u64) -> Vec<f32> {
 
 /// Recursive directory copy - what `cp -R` does, which is what an operator
 /// (or a snapshotting filesystem) does.
+///
+/// A file the writer removed between `read_dir` and `copy` (a segment
+/// rotated away, a WAL replaced) is not part of the copy: the hot-copy test
+/// is about what the copy CONTAINS being consistent, not about racing the
+/// writer for a file that no longer exists. `cp -R` would print a warning
+/// and go on; so does this. Any other error is real and propagates.
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &to)?;
+        let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+        let is_dir = match entry.file_type() {
+            Ok(t) => t.is_dir(),
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let r = if is_dir {
+            copy_dir(&entry.path(), &to)
         } else {
-            std::fs::copy(entry.path(), &to)?;
+            std::fs::copy(entry.path(), &to).map(|_| ())
+        };
+        match r {
+            Ok(()) => {}
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(())
