@@ -156,3 +156,22 @@ on.
 - **The map stays derived and process-local.**
 - **`vsearch` may disagree with a point read about which SHARD served a row**
   for the duration of a rebuild. Never about the id, never about the value.
+
+
+## Addendum (audit 24, 2026-09-04)
+
+Two defects in the registry that hands out the per-index lock, both fixed:
+
+- A dropped index's authority. `drop_router_state` removed the registry entry
+  while holding the exclusive guard; a point op already queued on that lock
+  was served on an orphan and `publish_owner_at` recreated the owner map of an
+  index that no longer existed. Now every acquisition, shared or exclusive,
+  re-checks under the registry mutex that the lock it holds is still the
+  registry's entry for that name: a shared holder whose entry is gone answers
+  as a dropped index does; an exclusive one resolves again.
+- The registry grew without bound: any point op on any name created an
+  entry, so `VGET nope-<n>` was an authenticated way to leak. The last shared
+  guard on a name with no router and no owner map removes the entry (checked
+  under the registry mutex, where resolvers clone, so a concurrent resolver
+  keeps it alive). Entries now number at most the routed indexes plus the
+  point ops in flight.

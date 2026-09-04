@@ -5530,7 +5530,41 @@ struct ShardSetInner {
 /// Owned rather than borrowed so it can be held across the shard calls in the
 /// middle of that span. Every owner-map accessor takes one by reference: that
 /// is what makes "read the map without the authority" a compile error.
-type PlacementShared = tokio::sync::OwnedRwLockReadGuard<u64>;
+pub(crate) struct PlacementShared {
+    guard: tokio::sync::OwnedRwLockReadGuard<u64>,
+    lock: Arc<tokio::sync::RwLock<u64>>,
+    name: String,
+    inner: Arc<ShardSetInner>,
+}
+
+impl std::ops::Deref for PlacementShared {
+    type Target = u64;
+    fn deref(&self) -> &u64 {
+        &self.guard
+    }
+}
+
+impl Drop for PlacementShared {
+    /// The registry entry for a name nobody else holds, that has no router and
+    /// no owner map, goes with the last guard. Without this every point op on
+    /// a name that does not exist (`VGET nope`) left an entry behind for ever:
+    /// an authenticated client could grow the registry without bound. Checked
+    /// under the registry mutex, where `placement_of` clones, so a concurrent
+    /// resolver keeps the entry alive (count > 3: registry, this, the guard).
+    fn drop(&mut self) {
+        let mut reg = self.inner.placement.lock();
+        let ours = reg
+            .get(&self.name)
+            .is_some_and(|a| Arc::ptr_eq(a, &self.lock));
+        if ours
+            && Arc::strong_count(&self.lock) <= 3
+            && !self.inner.routers.read().contains_key(&self.name)
+            && !self.inner.owners.read().contains_key(&self.name)
+        {
+            reg.remove(&self.name);
+        }
+    }
+}
 
 /// The EXCLUSIVE placement authority for one index. Only a rebuild and
 /// `drop_router_state` take it.
@@ -8315,13 +8349,50 @@ impl ShardSet {
     /// A shard being unavailable while the map is built.
     async fn placement_shared(&self, name: &str) -> Result<PlacementShared, ShardError> {
         self.ensure_owner_map(name).await?;
-        Ok(self.placement_of(name).read_owned().await)
+        let lock = self.placement_of(name);
+        let guard = Arc::clone(&lock).read_owned().await;
+        // A drop that ran while this op was queued removed the entry under its
+        // exclusive guard: the lock this op holds is an orphan, and serving on
+        // it would recreate the derived state of an index that no longer
+        // exists. The identity check turns that into the answer a dropped
+        // index gives.
+        if !self.placement_is_current(name, &lock) {
+            return Err(ShardError::Storage(format!("vindex '{name}' not found")));
+        }
+        Ok(PlacementShared {
+            guard,
+            lock,
+            name: name.to_owned(),
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Whether `lock` is still the registry's authority for `name`.
+    fn placement_is_current(&self, name: &str, lock: &Arc<tokio::sync::RwLock<u64>>) -> bool {
+        self.inner
+            .placement
+            .lock()
+            .get(name)
+            .is_some_and(|a| Arc::ptr_eq(a, lock))
+    }
+
+    #[cfg(test)]
+    fn placement_registry_len(&self) -> usize {
+        self.inner.placement.lock().len()
     }
 
     /// Take the EXCLUSIVE placement authority for `name`: a rebuild, or the
     /// removal of the index's derived state.
     async fn placement_exclusive(&self, name: &str) -> PlacementExclusive {
-        self.placement_of(name).write_owned().await
+        loop {
+            let lock = self.placement_of(name);
+            let guard = Arc::clone(&lock).write_owned().await;
+            // Same identity rule as the shared side: an entry a drop removed
+            // while this waited is not the authority any more; resolve again.
+            if self.placement_is_current(name, &lock) {
+                return guard;
+            }
+        }
     }
 
     /// The shard a point op for `id` addresses: the owner map for a
@@ -8970,6 +9041,76 @@ impl ShardTenantView<'_> {
 
 #[cfg(test)]
 mod tests {
+    mod placement_registry {
+        use crate::shard::ShardSet;
+
+        /// audit 24 A1: a point op queued behind a drop resolved the lock
+        /// before the drop removed it; served on that orphan it recreated the
+        /// dropped index's owner map. It must answer as a dropped index does.
+        #[tokio::test]
+        async fn a_point_op_queued_behind_a_drop_does_not_recreate_the_index() {
+            let dir = tempfile::tempdir().unwrap();
+            let shards = std::sync::Arc::new(
+                ShardSet::open_mode_with_workers(
+                    dir.path(),
+                    2,
+                    false,
+                    skeg_vector::QuantKind::Int8,
+                    1,
+                )
+                .unwrap(),
+            );
+            shards.vindex_create("dp", 4, 0, 1).await.unwrap();
+            shards
+                .vset("dp", 1, vec![1.0, 0.0, 0.0, 0.0], 0, None, None)
+                .await
+                .unwrap();
+            let exclusive = shards.placement_exclusive("dp").await;
+            let s2 = std::sync::Arc::clone(&shards);
+            let queued = tokio::spawn(async move { s2.vget("dp", 1).await });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                !queued.is_finished(),
+                "the read must queue behind the exclusive holder"
+            );
+            shards.drop_router_state_locked("dp").unwrap();
+            drop(exclusive);
+            let answer = queued.await.unwrap();
+            assert!(
+                answer.is_err(),
+                "a read served after the drop must not succeed: {answer:?}"
+            );
+            assert!(
+                !shards.inner.owners.read().contains_key("dp"),
+                "the dropped index's owner map was recreated"
+            );
+            assert_eq!(
+                shards.placement_registry_len(),
+                0,
+                "the orphan lock must be gone"
+            );
+        }
+
+        /// audit 24 A2: `VGET` on a name that does not exist left a registry
+        /// entry behind for ever.
+        #[tokio::test]
+        async fn unknown_names_leave_no_placement_entry_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            let shards = ShardSet::open_mode_with_workers(
+                dir.path(),
+                2,
+                false,
+                skeg_vector::QuantKind::Int8,
+                1,
+            )
+            .unwrap();
+            for i in 0..200u32 {
+                let _ = shards.vget(&format!("nope-{i}"), 1).await;
+            }
+            assert_eq!(shards.placement_registry_len(), 0);
+        }
+    }
+
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{Barrier, mpsc};
