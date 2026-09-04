@@ -64,7 +64,7 @@ jobs:
             echo "::error::could not install the aarch64 cross-linker after 3 attempts"
             exit 1
           fi
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: cargo build
         run: |
           cargo build --release --locked \
