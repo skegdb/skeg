@@ -32,7 +32,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::failpoint::{self, CommitFailpoint};
-use crate::group_commit::{Durability, count_failure};
+use crate::group_commit::{Durability, FlushKind, count_failure};
 
 /// Inbox cap. Matches the design doc `SharedCommitter` budget; full
 /// inbox makes `send().await` block, propagating backpressure up to
@@ -250,6 +250,17 @@ impl SharedCommitterEntry {
 struct FileState {
     file: Arc<PlatformFile>,
     next_offset: u64,
+    /// Bytes written to this file that no sync has covered yet.
+    ///
+    /// Per file, unlike the per-file committer's single counter, because this
+    /// committer's batch path syncs exactly ONE of the files it wrote - that
+    /// is the whole point of it on a device-global platform - so every other
+    /// file in the batch keeps its count and is owed a sync by the next
+    /// barrier. Conservative on purpose: on Apple the single `F_FULLFSYNC`
+    /// does flush the device, so those syncs are redundant there, and the
+    /// alternative is trusting that premise in the one place where being
+    /// wrong loses data.
+    dirty_bytes: u64,
 }
 
 struct BatchEntry {
@@ -284,7 +295,13 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
                         // batch is otherwise indistinguishable from a clean
                         // one. This is the last barrier EVERY shard on the
                         // device gets, not one file's.
-                        if let Err(e) = flush_batch(&mut state, &mut batch).await {
+                        //
+                        // A `Barrier`, not a `Batch`: the last flush on the
+                        // way down also owes a sync for whatever the batch
+                        // path left unsynced on every file.
+                        if let Err(e) =
+                            flush_batch(&mut state, &mut batch, FlushKind::Barrier).await
+                        {
                             tracing::error!(
                                 error = %e,
                                 "shared committer: the last flush before shutdown did not land"
@@ -293,7 +310,11 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
                         return;
                     }
                     Some(Msg::Attach { file_id, file, initial_offset, reply }) => {
-                        state.insert(file_id, FileState { file, next_offset: initial_offset });
+                        state.insert(file_id, FileState {
+                            file,
+                            next_offset: initial_offset,
+                            dirty_bytes: 0,
+                        });
                         let _ = reply.send(());
                     }
                     Some(Msg::Detach { file_id }) => {
@@ -319,7 +340,8 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
                         }
                     }
                     Some(Msg::Flush { reply }) => {
-                        let result = flush_batch(&mut state, &mut batch).await;
+                        let result =
+                            flush_batch(&mut state, &mut batch, FlushKind::Barrier).await;
                         batch_bytes = 0;
                         batch_deadline = None;
                         let _ = reply.send(result);
@@ -338,7 +360,7 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
             // result: every waiter in the batch is answered individually
             // inside `flush_batch`. The failure is still worth a line, because
             // it is the first sign the device under this process is going.
-            if let Err(e) = flush_batch(&mut state, &mut batch).await {
+            if let Err(e) = flush_batch(&mut state, &mut batch, FlushKind::Batch).await {
                 tracing::error!(error = %e, "shared committer: batch flush did not land");
             }
             batch_bytes = 0;
@@ -357,12 +379,24 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
 /// asked to cover. `Ok(())` means every file in the batch wrote and the sync
 /// that covers them succeeded.
 ///
-/// An empty batch is `Ok(())`: there was nothing to make durable.
+/// An empty batch is `Ok(())` for a [`FlushKind::Batch`]. For a
+/// [`FlushKind::Barrier`] it is only `Ok(())` once no file is carrying bytes a
+/// sync has not covered.
 async fn flush_batch(
     state: &mut HashMap<FileId, FileState>,
     batch: &mut Vec<BatchEntry>,
+    kind: FlushKind,
 ) -> io::Result<()> {
     if batch.is_empty() {
+        // Nothing to write - but a barrier still owes a sync for every file
+        // the batch path left behind, which on this committer is every file it
+        // ever wrote except the one it happened to sync.
+        if kind == FlushKind::Barrier {
+            return match sync_dirty_files(state).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(count_failure(e)),
+            };
+        }
         return Ok(());
     }
     // Env-gated batch-size probe (device-global committer).
@@ -387,7 +421,7 @@ async fn flush_batch(
     // amortisation, not parallel writes. (Spawning parallel writes
     // adds task-launch noise without a measurable throughput win for
     // the small batches typical at the M-series fsync floor.)
-    let mut sync_target: Option<Arc<PlatformFile>> = None;
+    let mut sync_target: Option<(FileId, Arc<PlatformFile>)> = None;
     let mut successful_acks: Vec<AckSlot> = Vec::new();
     // One entry per file this batch could not commit. Bounded by the number
     // of files in the batch, itself bounded by MAX_BATCH_ENTRIES.
@@ -433,8 +467,12 @@ async fn flush_batch(
         match write_result {
             Ok(()) => {
                 fs.next_offset = end;
+                // On the disk, not yet proven durable. Saturating: a committer
+                // that wrapped a u64 of unsynced bytes should stop counting,
+                // not wrap to zero and claim it owes no barrier.
+                fs.dirty_bytes = fs.dirty_bytes.saturating_add(end - start);
                 if sync_target.is_none() {
-                    sync_target = Some(file);
+                    sync_target = Some((file_id, file));
                 }
                 successful_acks.extend(acks);
             }
@@ -449,24 +487,36 @@ async fn flush_batch(
         }
     }
 
-    // One sync covers every successful write in this batch (the whole
-    // point of the shared committer on a DeviceGlobal platform).
-    let sync_res = match (batch_durability, sync_target.as_ref()) {
-        (Durability::Relaxed, _) | (_, None) => Ok(()),
-        (Durability::Kernel, Some(f)) => {
-            if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(f)) {
-                Err(failpoint::injected("shared batch sync"))
-            } else {
-                skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-                f.sync_data().await
+    // A batch: one sync covers every successful write in it (the whole point
+    // of the shared committer on a DeviceGlobal platform). A barrier: every
+    // file still carrying unsynced bytes, because the caller asked about all
+    // of them and not about whichever one this batch wrote first.
+    let sync_res = if kind == FlushKind::Barrier {
+        sync_dirty_files(state).await
+    } else {
+        match (batch_durability, sync_target.as_ref()) {
+            (Durability::Relaxed, _) | (_, None) => Ok(()),
+            (Durability::Kernel, Some((id, f))) => {
+                let r = if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(f))
+                {
+                    Err(failpoint::injected("shared batch sync"))
+                } else {
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                    f.sync_data().await
+                };
+                clear_dirty_on_success(state, *id, &r);
+                r
             }
-        }
-        (Durability::Power, Some(f)) => {
-            if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(f)) {
-                Err(failpoint::injected("shared batch sync"))
-            } else {
-                skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-                f.sync_durable().await
+            (Durability::Power, Some((id, f))) => {
+                let r = if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(f))
+                {
+                    Err(failpoint::injected("shared batch sync"))
+                } else {
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                    f.sync_durable().await
+                };
+                clear_dirty_on_success(state, *id, &r);
+                r
             }
         }
     };
@@ -489,6 +539,70 @@ async fn flush_batch(
     match aggregate(failures, file_count) {
         None => Ok(()),
         Some(e) => Err(count_failure(e)),
+    }
+}
+
+/// A batch sync covers only the file it was called on: clear that file's
+/// count, and only that one.
+///
+/// Deliberately not "clear them all because `F_FULLFSYNC` is device-wide". It
+/// is, on Apple, and there the extra syncs a barrier then issues are
+/// redundant. But this is the one place where believing the premise and being
+/// wrong loses data, so the count is only cleared for the file a sync
+/// demonstrably named.
+fn clear_dirty_on_success(
+    state: &mut HashMap<FileId, FileState>,
+    file_id: FileId,
+    result: &io::Result<()>,
+) {
+    if result.is_ok()
+        && let Some(fs) = state.get_mut(&file_id)
+    {
+        fs.dirty_bytes = 0;
+    }
+}
+
+/// Sync every file carrying bytes no sync has covered, because someone asked
+/// for a barrier.
+///
+/// Always `sync_durable`, never a batch's tier: the caller asked whether the
+/// data is on stable storage. Each file is synced at most once; a file whose
+/// sync fails keeps its count, so the next barrier tries again. Returns the
+/// first failure, which is what fails this flush's waiters - one representative
+/// error, with the rest aggregated by the caller.
+async fn sync_dirty_files(state: &mut HashMap<FileId, FileState>) -> io::Result<()> {
+    let dirty: Vec<FileId> = state
+        .iter()
+        .filter(|(_, fs)| fs.dirty_bytes > 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut first_err: Option<io::Error> = None;
+    for id in dirty {
+        let Some(fs) = state.get(&id) else { continue };
+        let file = fs.file.clone();
+        let result = if failpoint::hit(CommitFailpoint::SharedBatchSync, failpoint::file_key(&file))
+        {
+            Err(failpoint::injected("shared barrier sync"))
+        } else {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+            file.sync_durable().await
+        };
+        match result {
+            Ok(()) => {
+                if let Some(fs) = state.get_mut(&id) {
+                    fs.dirty_bytes = 0;
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        None => Ok(()),
+        Some(e) => Err(e),
     }
 }
 
@@ -608,7 +722,6 @@ mod tests {
     /// and does not sync, so without this an explicit flush confirms a barrier
     /// over two files' worth of page cache.
     #[tokio::test]
-    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
     async fn a_barrier_syncs_every_file_a_relaxed_batch_left_dirty() {
         let dir = TempDir::new().unwrap();
         let a = Arc::new(PlatformFile::create(&dir.path().join("a.bin")).unwrap());
@@ -638,7 +751,6 @@ mod tests {
     /// committer - so the files it did not name are still carrying unsynced
     /// bytes. The next barrier is what owes them a sync.
     #[tokio::test]
-    #[ignore = "opens in the commit that makes an explicit flush a real barrier"]
     async fn a_barrier_picks_up_the_files_a_batch_sync_did_not_name() {
         let dir = TempDir::new().unwrap();
         let a = Arc::new(PlatformFile::create(&dir.path().join("ba.bin")).unwrap());
@@ -992,8 +1104,16 @@ mod tests {
         );
     }
 
+    /// A `Relaxed` batch does not sync ON THE BATCH PATH. That is the tier
+    /// doing its job, and it is what keeps a compaction relocation cheap.
+    ///
+    /// The second half used to assert that an explicit `flush()` after it did
+    /// not sync either, and that assertion WAS the bug audit 23 named: a
+    /// barrier is not the batch's tier, and answering `Ok` to one over bytes
+    /// nothing had synced confirmed a barrier that never happened. It now pins
+    /// the opposite, which is why this test changed rather than moved.
     #[tokio::test]
-    async fn test_relaxed_alone_skips_fsync() {
+    async fn test_relaxed_alone_skips_fsync_until_a_barrier_asks() {
         let dir = TempDir::new().unwrap();
         let file = make_file(&dir);
         let sc = SharedCommitter::new();
@@ -1003,8 +1123,18 @@ mod tests {
             .append(vec![0u8; 64], Durability::Relaxed)
             .await
             .unwrap();
+        assert_eq!(
+            file.sync_count(),
+            0,
+            "the batch path must honour Relaxed and not sync"
+        );
+
         entry.flush().await.unwrap();
-        assert_eq!(file.sync_count(), 0);
+        assert_eq!(
+            file.sync_count(),
+            1,
+            "an explicit barrier must sync the bytes the Relaxed batch left"
+        );
     }
 
     /// Correctness gate: 4 shards drive Power appends concurrently
