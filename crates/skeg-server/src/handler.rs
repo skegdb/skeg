@@ -77,7 +77,18 @@ pub async fn handle_connection(
                         &admission.to_string(),
                     ))
                 } else {
-                    dispatch(&frame, &shards).await
+                    // The read preflight's side of the connection: what this
+                    // socket already holds, and the budget a KV read's own
+                    // reply has to be granted BEFORE the values are fetched.
+                    // Same figure the reply charge below uses, so a read that
+                    // was admitted here is not charged twice.
+                    let held = buf.capacity();
+                    dispatch(
+                        &frame,
+                        &shards,
+                        &mut crate::resp3_handler::ReadAdmission::new(&mut budget, held),
+                    )
+                    .await
                 };
                 if let Some(response) =
                     dispatched.map(|response| response_for_version(response, frame.header.version))
@@ -259,6 +270,21 @@ fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
     encode_err(req_id, code, &message)
 }
 
+/// A read refusal as a native `Err` frame.
+///
+/// The twin of the RESP3 renderer, over the SAME `ReadRefusal` value: the
+/// classification is decided once, in the preflight, and each wire only
+/// chooses how to spell it. That is what stops a client getting a weaker
+/// answer by picking a protocol.
+fn read_refusal_response(req_id: u64, refusal: &crate::resp3_handler::ReadRefusal) -> Bytes {
+    match refusal {
+        crate::resp3_handler::ReadRefusal::Admission(a) => {
+            encode_err(req_id, a.code(), &a.to_string())
+        }
+        crate::resp3_handler::ReadRefusal::Shard(e) => shard_err_to_response(req_id, e),
+    }
+}
+
 /// The index name of a native request: UTF-8, and free of the tenant-scope
 /// separator.
 ///
@@ -321,13 +347,23 @@ fn native_reply_upper_bound(op: skeg_proto::Op) -> Option<usize> {
     use skeg_proto::Op;
     match op {
         Op::Set | Op::Del | Op::Vset | Op::Vdel | Op::VindexCreate | Op::VindexDrop => Some(512),
+        // The one read whose worst case IS knowable from the request: a
+        // vector, and the ceiling on one is a constant
+        // (`MAX_VGET_VECTOR_BYTES`). RESP3 has reserved it since audit 19 A1;
+        // this wire answers with the same bytes and had no bound at all, so a
+        // client could get a weaker admission by choosing the protocol.
+        Op::Vget => Some(crate::resp3_handler::vget_reply_upper_bound()),
         _ => None,
     }
 }
 
 /// Dispatch a parsed frame to the shard set and return an optional response.
 #[allow(clippy::too_many_lines)] // one arm per protocol op; splitting hurts readability
-async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
+async fn dispatch(
+    frame: &Frame,
+    shards: &ShardSet,
+    read_admission: &mut crate::resp3_handler::ReadAdmission<'_>,
+) -> Option<Bytes> {
     let req_id = frame.header.req_id;
     let payload = &frame.payload;
 
@@ -387,11 +423,25 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
             Err(e) => Some(shard_err_to_response(req_id, &e)),
         },
 
+        // Through the same preflight the RESP3 wire runs: the value's length
+        // comes from the index, the reply is reserved for it, and only then
+        // is the value read (audit 20 B1). `TenantId::ZERO` because this
+        // listener has no tenant - `scope_key` leaves the key byte-identical
+        // for it, so the store sees exactly what it saw before.
         skeg_proto::Op::Get => match decode_key_payload(payload) {
-            Ok(key) => match shards.get(&key).await {
-                Ok(Some(val)) => Some(encode_ok_value(req_id, &val)),
-                Ok(None) => Some(encode_err(req_id, ErrCode::NotFound, "key not found")),
-                Err(e) => Some(shard_err_to_response(req_id, &e)),
+            Ok(key) => match crate::resp3_handler::fetch_within_budget(
+                std::slice::from_ref(&key),
+                shards,
+                crate::tenant::TenantId::ZERO,
+                Some(read_admission),
+            )
+            .await
+            {
+                Ok(mut values) => match values.pop().flatten() {
+                    Some(val) => Some(encode_ok_value(req_id, &val)),
+                    None => Some(encode_err(req_id, ErrCode::NotFound, "key not found")),
+                },
+                Err(refusal) => Some(read_refusal_response(req_id, &refusal)),
             },
             Err(e) => Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
         },
@@ -419,9 +469,16 @@ async fn dispatch(frame: &Frame, shards: &ShardSet) -> Option<Bytes> {
         },
 
         skeg_proto::Op::Mget => match decode_mget_payload(payload) {
-            Ok(keys) => match shards.mget(&keys).await {
+            Ok(keys) => match crate::resp3_handler::fetch_within_budget(
+                &keys,
+                shards,
+                crate::tenant::TenantId::ZERO,
+                Some(read_admission),
+            )
+            .await
+            {
                 Ok(results) => Some(encode_ok_mget(req_id, &results)),
-                Err(e) => Some(shard_err_to_response(req_id, &e)),
+                Err(refusal) => Some(read_refusal_response(req_id, &refusal)),
             },
             Err(e) => Some(encode_err(req_id, ErrCode::InvalidRequest, &e.to_string())),
         },
@@ -608,13 +665,47 @@ mod tests {
             .feed(&mut buf)
             .expect("the request must parse")
             .expect("one whole frame");
-        let response = dispatch(&frame, shards).await.expect("a response");
+        // A budget with no ceiling: these tests are about what the dispatcher
+        // DOES, not about what admission refuses, and the read preflight has
+        // its own tests over real sockets in `tests/read_preflight.rs`.
+        let ingress = std::sync::Arc::new(crate::ingress::IngressBudget::new(
+            std::sync::Arc::new(
+                crate::memory::MemoryGovernor::new(
+                    std::sync::Arc::new(UnlimitedMemory),
+                    None,
+                    Some(0),
+                )
+                .expect("a governor over unlimited headroom"),
+            ),
+            None,
+            None,
+            None,
+            u64::from(u32::MAX),
+        ));
+        let mut budget = ingress.try_accept().expect("a connection budget");
+        let response = dispatch(
+            &frame,
+            shards,
+            &mut crate::resp3_handler::ReadAdmission::new(&mut budget, 0),
+        )
+        .await
+        .expect("a response");
         let mut parser = FrameParser::new();
         let mut buf = BytesMut::from(&response[..]);
         parser
             .feed(&mut buf)
             .expect("the response must parse")
             .expect("one whole frame")
+    }
+
+    /// A memory source that reports no ceiling, so the governor never refuses.
+    #[derive(Debug)]
+    struct UnlimitedMemory;
+
+    impl crate::memory::MemorySource for UnlimitedMemory {
+        fn headroom(&self) -> crate::memory::Headroom {
+            crate::memory::Headroom::Unlimited
+        }
     }
 
     /// `[u8 code][u8 len][msg]` - the shape `encode_err` writes.

@@ -421,7 +421,6 @@ async fn native_seed(addr: std::net::SocketAddr, n: usize, value_len: usize) -> 
 
 /// A native `MGET` is the same request on the other wire, and B1 asks for the
 /// same order there: the sizes first, the reservation second, the fetch last.
-#[ignore = "opens with the native wire, next commit"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_mget_over_the_allowance_is_refused_before_the_fetch() {
     let _turn = COUNTER_TESTS.lock().await;
@@ -467,7 +466,6 @@ async fn a_native_mget_over_the_allowance_is_refused_before_the_fetch() {
 /// `APPEND` to build one incrementally. What the counter shows is that the
 /// bytes handed back were fetched through the bounded path and counted there,
 /// which is the thing the old `shards.get` route could not do.
-#[ignore = "opens with the native wire, next commit"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_get_is_served_through_the_bounded_read() {
     let _turn = COUNTER_TESTS.lock().await;
@@ -498,7 +496,6 @@ async fn a_native_get_is_served_through_the_bounded_read() {
 /// Proven against an index that does NOT exist, so a real shard call would
 /// answer "vector not found" and only a pre-dispatch refusal answers
 /// something else.
-#[ignore = "opens with the native wire, next commit"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_native_vget_is_reserved_before_the_shard_call() {
     // A 4 MiB class gives a 1 MiB allowance, under the ~2 MiB charge a 1 MiB
