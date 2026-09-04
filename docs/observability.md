@@ -232,6 +232,7 @@ spelling from it, so they cannot say different things.
 | request over a fixed ceiling (`SKEG.VMSET` items or bytes, native frame payload) | no | `-ERR ...: at most N, got M ...` | `2` InvalidRequest |
 | headroom could not be read at all | no | `-ERR ...` | `3` Internal |
 | vector of the wrong dimension | no | `-ERR vindex '...' dim N but vector has M` | `2` InvalidRequest |
+| `MSET` whose keys do not all route to one shard | no | `-CROSSSLOT Keys in request don't hash to the same slot` | `2` InvalidRequest |
 
 **RESP3: two words mean retry, not one.** `BACKPRESSURE` for everything the
 server decides, and `RATELIMITED` for a tenant backend's rate limit, which is
@@ -241,6 +242,24 @@ backend can introduce a fourth word this server has never seen, which it
 classifies as permanent and counts in
 `skeg_backend_refusal_unclassified_total`. On the native wire there is no such
 ambiguity: one byte, `0x04`.
+
+**Three words are reserved on the RESP3 wire**, and a tenant backend's
+message passes through verbatim: a backend that writes `BACKPRESSURE`,
+`RATELIMITED` or `CROSSSLOT` at the front of its own refusal produces a line
+whose word says one thing while the native error byte says another. Backends
+are deployment code rather than client input, so this is a note and not a
+check; if you write one, do not open with those three.
+
+**And one word means "never", not "not now".** `CROSSSLOT` is the last row of
+the table and the one exception to "permanent is spelled `ERR`": Redis spells
+a multi-key command whose keys do not share a slot that way, and a client that
+already routes on the word should not have to learn a second spelling for the
+same condition. It is permanent - the same keys hash the same way on every
+attempt - so a client's `is_retryable` table must place it on the give-up
+side, and its caller must split the batch rather than resend it.
+`skeg_crossslot_refused_total` counts these; a climb is a client that is
+sending multi-key `MSET`s to a multi-shard store and getting none of them
+written.
 
 An unclassified backend refusal is `3` Internal there, not `2`: what failed
 is the server's reading of the backend's answer, and the caller's request may
@@ -271,6 +290,40 @@ A frame declaring more than the connection may ever hold is now refused
 by name on the header. Before 0.7.4 the server closed the socket without
 a word, which a client reads as a network fault and answers by
 reconnecting and sending the same frame.
+
+## Refusals in the log: counted in full, shouted about once
+
+A refusal is caused by the CALLER, and a caller that keeps causing one keeps
+causing it as fast as it can send. Logging a line per refusal turns a 54-byte
+request into ~119 bytes of log: measured on the real binary, one anonymous
+connection produced 36 832 refusals/s = **4.38 MB/s of log, 2.2x the bytes it
+sent** (audit/22, 2026-09-04). That is a denial-of-service surface against
+your disk and your log pipeline, not against the server's memory, and no
+counter or budget was watching it.
+
+So the two channels do different jobs:
+
+- **`debug!`: every refusal, always.** Turn it on for one connection's worth
+  of investigation, not for a fleet.
+- **`warn!`: at most one line per KIND of refusal per 10 seconds**
+  (`REFUSAL_WARN_WINDOW`). Nine kinds, one clock each, claimed with a CAS -
+  so a flood of one kind cannot silence the first occurrence of another, and
+  two threads refusing in the same instant produce one line rather than two.
+  The line says the window applies, so a reader does not mistake one line for
+  one event.
+- **`skeg_*_refused_total`: every refusal, unsampled.** This is the volume.
+  Alert on the counter's rate; use the warn line to notice, not to count.
+
+Same rule on both wires, and the same code: `shard_error` (RESP3) and
+`shard_err_to_response` (native) choose the level per arm. What is sampled is
+what the caller decided - every `AdmissionError`, a full VSEARCH pool, and a
+request wrong for the index it names. What is NOT sampled is what the SERVER
+suffered - storage errors, an unreachable shard - because no client is
+throttling those and an operator needs each one.
+
+After the change, the same 20 000-refusal flood produces **one warn line, 327
+bytes**, and `skeg_crossslot_refused_total` reads 20 000 on the same
+connection (2026-09-04).
 
 ## Prometheus scrape config
 

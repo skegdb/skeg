@@ -235,24 +235,36 @@ fn native_vindex_kind_is_allowed(version: u8, kind: u8) -> Result<(), &'static s
 /// Exhaustive: a variant added to `ShardError` does not compile until
 /// somebody says which code it carries.
 fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
-    warn!("shard error: {e}");
+    // Level per arm, same rule as the RESP3 handler's `shard_error`: a
+    // refusal the caller caused is sampled, a fault the server had is not.
+    // Both wires share one implementation of that decision for the same
+    // reason they share one classification.
     let (code, message) = match e {
         // The message WITHOUT the code word: the byte carries it here, and
         // repeating it in the text is how a client ends up parsing both.
-        ShardError::Admission(a) => (a.code(), a.to_string()),
+        ShardError::Admission(a) => {
+            crate::admission::log_refusal(a);
+            (a.code(), a.to_string())
+        }
         // Same mapping as the RESP3 handler's, to the same classification:
         // a full pool is momentary, and the code says so.
         ShardError::Busy => {
             let busy = crate::admission::AdmissionError::Busy;
+            crate::admission::log_refusal(&busy);
             (busy.code(), busy.to_string())
         }
         ShardError::InvalidRequest(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            crate::admission::log_invalid_request(msg);
             (ErrCode::InvalidRequest, msg.clone())
         }
-        ShardError::Unavailable => (ErrCode::Internal, e.to_string()),
+        ShardError::Unavailable => {
+            warn!("shard error: {e}");
+            (ErrCode::Internal, e.to_string())
+        }
         ShardError::Storage(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            warn!("shard error: {e}");
             (ErrCode::Internal, e.to_string())
         }
     };

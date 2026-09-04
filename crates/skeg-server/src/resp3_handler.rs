@@ -2518,22 +2518,37 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
 /// Exhaustive: a variant added to `ShardError` does not compile until
 /// somebody says which code word it carries.
 fn shard_error(e: &crate::shard::ShardError) -> Frame {
-    warn!("shard error: {e}");
+    // The log level is decided PER ARM, not once at the top. A refusal is
+    // caused by the caller and arrives as fast as the caller can send: it
+    // goes to `debug!` with a sampled `warn!` (audit/22 A1), and the
+    // per-kind counters carry the volume. A fault the SERVER had - storage,
+    // an unreachable shard - keeps every one of its warn lines, because
+    // there is no client throttling those and an operator needs each one.
     match e {
-        crate::shard::ShardError::Admission(a) => Frame::Error(a.wire_message()),
+        crate::shard::ShardError::Admission(a) => {
+            crate::admission::log_refusal(a);
+            Frame::Error(a.wire_message())
+        }
         // A full VSEARCH pool is an admission refusal that predates the
         // enum, so it is mapped to its classification here rather than
         // classified here: the retryable bit is still decided in one place.
         crate::shard::ShardError::Busy => {
-            Frame::Error(crate::admission::AdmissionError::Busy.wire_message())
+            let busy = crate::admission::AdmissionError::Busy;
+            crate::admission::log_refusal(&busy);
+            Frame::Error(busy.wire_message())
         }
         crate::shard::ShardError::InvalidRequest(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            crate::admission::log_invalid_request(msg);
             Frame::Error(format!("ERR {msg}"))
         }
-        crate::shard::ShardError::Unavailable => Frame::Error(format!("ERR {e}")),
+        crate::shard::ShardError::Unavailable => {
+            warn!("shard error: {e}");
+            Frame::Error(format!("ERR {e}"))
+        }
         crate::shard::ShardError::Storage(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            warn!("shard error: {e}");
             Frame::Error(format!("ERR {e}"))
         }
     }
@@ -2732,7 +2747,11 @@ async fn kv_mset(
         }
     }
     // Scope every key up front (the owned keys back the borrows below), then
-    // hand the whole set to `mset`, which writes one atomic batch per shard.
+    // hand the whole set to `mset`, which writes ONE atomic batch - and
+    // refuses the command with `CROSSSLOT` if the scoped keys do not all
+    // route to one shard, before any of it runs. Scoping happens first
+    // because it is the scoped key that routes: two tenants sending the same
+    // key names do not necessarily span the same shards.
     let scoped: Vec<_> = args.chunks(2).map(|c| scope_key(tenant, &c[0])).collect();
     let pairs: Vec<(&[u8], &[u8])> = scoped
         .iter()
@@ -3785,6 +3804,58 @@ mod tests {
             let r = kv_get(&args(&[k]), &shards, TenantId::ZERO, None).await;
             assert!(matches!(r, Frame::Bulk(ref b) if &b[..] == v.as_bytes()));
         }
+    }
+
+    /// audit/22 A1: a client that keeps sending a refused MSET keeps being
+    /// refused, and the branch that made CROSSSLOT the ordinary answer must
+    /// not turn that into one log line per request. Measured before the fix:
+    /// 36 832 refusals/s from one anonymous connection = 4.38 MB/s of log,
+    /// 2.2x the bytes the client sent.
+    ///
+    /// The counter is asserted as a lower-bounded delta: it is a process-wide
+    /// static and this binary runs its tests in parallel, so an equality
+    /// would be a claim about every other test as well.
+    #[tokio::test]
+    async fn a_thousand_refused_msets_move_the_counter_not_the_log() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        // Two keys that route apart, found rather than hard-coded.
+        let a = (0u32..10_000)
+            .map(|i| format!("lga{i}"))
+            .find(|k| crate::shard::shard_for(k.as_bytes(), 4) == 0)
+            .expect("a key on shard 0");
+        let b = (0u32..10_000)
+            .map(|i| format!("lgb{i}"))
+            .find(|k| crate::shard::shard_for(k.as_bytes(), 4) == 1)
+            .expect("a key on shard 1");
+
+        let (counts, _guard) = crate::admission::capture::counting();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::CrossSlotRefused);
+        for _ in 0..1000 {
+            let resp = kv_mset(&args(&[&a, "1", &b, "2"]), &shards, TenantId::ZERO, None).await;
+            assert!(
+                matches!(resp, Frame::Error(ref e) if e.starts_with("CROSSSLOT")),
+                "every one of them is refused: {resp:?}"
+            );
+        }
+        let after = skeg_telemetry::counter_value(skeg_telemetry::Counter::CrossSlotRefused);
+
+        assert!(
+            after - before >= 1000,
+            "the refusals must all be counted (delta {})",
+            after - before
+        );
+        assert!(
+            counts.warns() <= 1,
+            "1000 refused MSETs produced {} warn lines. One per kind per \
+             window is the bound; the counter above is the volume",
+            counts.warns()
+        );
+        assert!(
+            counts.debugs() >= 1000,
+            "every refusal is still logged at debug ({} lines)",
+            counts.debugs()
+        );
     }
 
     #[tokio::test]

@@ -47,15 +47,75 @@ and MSET; in a 256 MiB container the ingress class is ~21 MiB and a maximum
 VMSET is refused rather than OOM-killing the process.
 
 **Clients and SDKs.** `SKEG.VMSET` replies with an array of one result per
-item, in request order, instead of an integer. The native wire has a new
-error code `0x04 Backpressure` (retry); old decoders that map unknown codes
-to `Internal` keep working but lose the retry hint. On RESP3, retryable
-refusals begin with `BACKPRESSURE` or, from a tenant backend, `RATELIMITED`:
+item, in request order, instead of an integer. `MSET` refuses a batch whose
+keys do not all route to one shard - see the next paragraph, it is the change
+most likely to break working code. The native wire has a new error code
+`0x04 Backpressure` (retry); old decoders that map unknown codes to
+`Internal` keep working but lose the retry hint. On RESP3, retryable refusals
+begin with `BACKPRESSURE` or, from a tenant backend, `RATELIMITED`:
 `is_retryable` must be a table, not a prefix check. A vindex name containing
 `::` is refused at create. Conformance cases carry `want.retryable`. The
 SDK changes are listed per repository in the skeg-internal handoff and land
 after the tag (skeg-py and skeg-client-rs depend on the published crates;
 skeg-gleam implements the wire directly and can be updated before).
+
+**`MSET` across shards is now refused, not half written.** A multi-key `MSET`
+whose keys do not all route to the same shard is answered
+
+```
+-CROSSSLOT Keys in request don't hash to the same slot
+```
+
+with nothing written, instead of being committed shard by shard. It is a
+permanent refusal (`ErrCode::InvalidRequest` = `2` on the native wire) and a
+client must not retry it unchanged. **On a default deployment the shard count
+is the host's performance-core count, so most multi-key `MSET`s will be
+refused**: assume every batch of more than one key needs changing. With `c`
+shards, a batch of `k` unrelated keys survives with probability `c^(1-k)` -
+at eight shards that is 1.6% for three keys and effectively never for ten.
+
+**The simple shape is one key per `MSET`** (or `SET`), and it needs nothing
+from the server. **Grouping a batch by shard also works**, on single-tenant
+and multi-tenant deployments alike, and everything it needs is published:
+
+1. `SKEG.WHOAMI` returns `tenant=<32 hex> mode=...`. Those 16 bytes are the
+   prefix the server puts in front of your key before it routes it, in that
+   order. Anonymous connections get all zeros and no prefix at all.
+2. `SKEG.SHARDS` returns one row per shard; the count is `n`.
+3. The routing key is `prefix ++ your_key` (just `your_key` when the prefix
+   is all zeros), and the shard is `xxh3_64(routing_key) % n` - XXH3-64 with
+   the default seed.
+
+Group the pairs by that number and send one `MSET` per group.
+`skeg_crossslot_refused_total` counts the refusals, so an operator can see a
+client that has not been updated.
+
+**This recipe is not a stable contract.** The hash, the prefix layout and the
+shard count are internals: they can change in a later release, and a client
+that hard-codes them will start getting `CROSSSLOT` again rather than wrong
+answers. Treat the refusal as the contract and the grouping as an
+optimisation - keep the one-key-per-command fallback for when it stops
+matching.
+
+There are no Redis hash tags: `{tag}` is an ordinary part of the key and does
+not steer routing, so a client cannot force two keys onto one shard the way a
+Redis Cluster client can. Note also that skeg's "slot" is the shard index,
+not Redis's `CRC16 mod 16384`, and **skeg never emits `MOVED` or `ASK`**: a
+cluster-aware client will not try to reroute, it will surface the error. A
+key pair accepted by one deployment can be refused by another with a
+different shard count. The word is shared because the remedy is - split the
+batch. `is_retryable` tables gain a third word, `CROSSSLOT`, on the permanent
+side.
+
+Why a refusal and not a fix: `MSET` is exposed under a name whose public
+meaning is all-or-nothing, and the engine only ever gave it per shard. Each
+shard's portion was its own commit, run in sequence, so a disk-quota or I/O
+failure on a later shard returned `ERR` with an earlier shard's keys already
+durable - a write acknowledged as a failure. Refusing the span is the same
+answer Redis Cluster gives the same shape, and it needs no cross-shard
+transaction. A single-shard store, and any batch whose keys land on one
+shard, is unaffected and keeps the atomic `set_many` and the disk-quota
+reservation it already had.
 
 
 ### A refusal now says whether retrying is worth it, on both wires

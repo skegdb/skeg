@@ -17,9 +17,16 @@
 {"id": "kv.append.accumulates", "cmd": ["APPEND", "cf:app", "cde"], "want": {"integer": 5}}
 {"id": "kv.append.value", "cmd": ["GET", "cf:app"], "want": {"bulk": "abcde"}}
 {"id": "kv.append.arity", "cmd": ["APPEND", "cf:app"], "want": {"error_contains": "wrong number of arguments"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
-{"id": "kv.mset", "cmd": ["MSET", "cf:a", "1", "cf:b", "2", "cf:c", "3"], "want": {"simple": "OK"}}
+{"id": "kv.mset", "cmd": ["MSET", "cf:a", "1"], "want": {"simple": "OK"}, "note": "one pair, so this case says the same thing under every profile and every shard count: a multi-key MSET is refused unless its keys route to one shard, and under the tenant profile the keys are scoped before they route. The multi-key shapes are the profile-anon cases below, whose key literals are pinned by the_conformance_case_keys_route_the_way_the_cases_assume"}
+{"id": "kv.set.b", "cmd": ["SET", "cf:b", "2"], "want": {"simple": "OK"}}
+{"id": "kv.set.c", "cmd": ["SET", "cf:c", "3"], "want": {"simple": "OK"}}
 {"id": "kv.mget.order.with.hole", "cmd": ["MGET", "cf:a", "cf:b", "cf:missing", "cf:c"], "want": {"array_len": 4, "items": [{"bulk": "1"}, {"bulk": "2"}, {"null": true}, {"bulk": "3"}]}}
 {"id": "kv.mset.odd.arity", "cmd": ["MSET", "cf:x", "1", "cf:y"], "want": {"error_contains": "wrong number of arguments for 'MSET'"}, "wire_only": "a typed SDK signature cannot express this; validate.py covers it"}
+{"id": "kv.mset.same.slot", "cmd": ["MSET", "cf:ss:1", "1", "cf:ss:2", "2"], "want": {"simple": "OK"}, "profile": "anon", "note": "these two keys route to one shard at the shard count validate.py pins, so the batch is one atomic set_many and is admitted"}
+{"id": "kv.mset.same.slot.readback", "cmd": ["MGET", "cf:ss:1", "cf:ss:2"], "want": {"array_len": 2, "items": [{"bulk": "1"}, {"bulk": "2"}]}, "profile": "anon"}
+{"id": "kv.mset.crossslot", "cmd": ["MSET", "cf:xs:1", "1", "cf:xs:2", "2"], "want": {"error_contains": "CROSSSLOT Keys in request don't hash to the same slot", "retryable": false}, "profile": "anon", "note": "audit/20 B2: a batch that spans shards would be several commits, so a failure on a later one would leave an earlier one durable behind an error. Redis Cluster refuses the same shape with the same word, and so does this"}
+{"id": "kv.mset.crossslot.wrote.nothing.first", "cmd": ["GET", "cf:xs:1"], "want": {"null": true}, "profile": "anon", "note": "the key on the shard that would have been written FIRST"}
+{"id": "kv.mset.crossslot.wrote.nothing.second", "cmd": ["GET", "cf:xs:2"], "want": {"null": true}, "profile": "anon"}
 {"id": "kv.exists.counts.present.only", "cmd": ["EXISTS", "cf:k1", "cf:a", "cf:missing"], "want": {"integer": 2}}
 {"id": "kv.del.counts.removed.only", "cmd": ["DEL", "cf:k1", "cf:a", "cf:missing"], "want": {"integer": 2}}
 {"id": "kv.del.gone", "cmd": ["GET", "cf:k1"], "want": {"null": true}}

@@ -65,6 +65,19 @@ inside `want` too, so a binary round-trip is one line.
 rely on the state an earlier one left. `HELLO` cases get their own connection
 (they renegotiate the protocol version, which would strand the shared one).
 
+**The shard count is pinned.** `validate.py` starts the server with
+`SKEG_SHARDS=4`. A multi-key `MSET` is refused with `CROSSSLOT` unless its
+keys route to one shard, and the default count is the host's
+performance-core count - so without pinning, the `kv.mset.crossslot` cases
+would assert nothing on a single-core runner and `kv.mset.same.slot` would
+need different key literals on every machine. The literals those cases use
+are checked against that number by
+`the_conformance_case_keys_route_the_way_the_cases_assume` in
+`crates/skeg-server/tests/mset_cross_shard.rs`. Multi-key `MSET` cases are
+therefore labelled `profile: anon`: under the `tenant` profile the keys are
+scoped with a sixteen-byte prefix before they route, which changes where they
+land.
+
 **Namespacing.** KV keys are prefixed `cf:`. VINDEX names cannot hold `:`
 (the server allows only `[A-Za-z0-9._-]`), so indexes are prefixed `cfidx` (RESP3)
 and `cfn` (native).
@@ -129,9 +142,9 @@ them green until a client started looping.
 
 | suite | result |
 |---|---|
-| `resp3-cases.jsonl`, profile `anon` | 106/106 pass |
+| `resp3-cases.jsonl`, profile `anon` | 119/119 pass (2026-09-03) |
 | `resp3-cases.jsonl`, profiles `tenant` / `admin` | 12 cases, **unvalidated** |
-| `native-cases.jsonl` | 49/49 pass |
+| `native-cases.jsonl` | 59/59 pass (2026-09-03) |
 
 **Unvalidated profiles**: `tenant` and `admin` need an `auth.kdb`, and nothing
 ships a CLI that creates one (users are added only through the Rust `AuthStore`
@@ -142,4 +155,8 @@ API). Those 12 cases are written from the source and have never run.
 are refused by the server with `op <Name> not implemented`. Cases pin that
 refusal, so a client cannot ship them believing they work. No client calls them
 today: in `skeg-py`, `OP_EXISTS` and `OP_STATS` are declared in `_wire.py` and
-never used.
+never used. This is why the `CROSSSLOT` refusal has no native case: the
+classification is native-ready (`ErrCode::InvalidRequest`, pinned by a unit
+test in `crates/skeg-server/tests/mset_cross_shard.rs`), but there is no
+native `MSET` for a case to send. When `Op::Mset` is implemented, the case
+belongs in `native-cases.jsonl` alongside its RESP3 twin.
