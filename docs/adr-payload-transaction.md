@@ -285,14 +285,21 @@ quota reserved before the first byte, exactly as above.
 
 What this costs, stated: on a multi-shard store a multi-key `MSET` is refused
 unless its keys collide by luck (`c^(1-k)` for `k` unrelated keys over `c`
-shards), so the shape that always works is one key per command. Grouping into
-a batch per shard needs the client to reproduce `xxh3_64(key) % n_shards`, and
-on a multi-tenant deployment it cannot: the key that routes is the one the
-server scoped with a sixteen-byte tenant prefix, not the one the client sent.
-Note too that this "slot" is the shard index, not Redis's `CRC16 mod 16384` -
-the same key pair can be accepted by one deployment and refused by another
-with a different shard count, and a client cannot compute the slot from the
-key alone. The word is shared because the remedy is: split the batch.
+shards), so a client either sends one key per command or groups its batch by
+shard. Grouping WORKS, and on multi-tenant deployments too: `SKEG.WHOAMI`
+publishes the connection's sixteen-byte prefix as `tenant=<32 hex>` in the
+same byte order `scope_key` prepends it, `SKEG.SHARDS` publishes the count,
+and the routing is `xxh3_64(prefix ++ key) % n` with the default seed. That
+recipe is deliberately NOT a contract - the hash, the prefix layout and the
+count are internals, a later release may change any of them, and a client
+that hard-codes them gets `CROSSSLOT` again rather than a wrong answer.
+The refusal is the contract; the grouping is an optimisation with a fallback.
+
+Note too that this "slot" is the shard index, not Redis's `CRC16 mod 16384`,
+and skeg never emits `MOVED` or `ASK` - a cluster-aware client will not try
+to reroute, it will surface the error. The same key pair can be accepted by
+one deployment and refused by another with a different shard count. The word
+is shared because the remedy is: split the batch.
 
 ## Compatibility
 
