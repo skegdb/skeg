@@ -48,6 +48,9 @@
 //! only thing shared is the answer to "should the caller retry".
 
 use std::fmt;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use skeg_proto::ErrCode;
 
@@ -197,6 +200,24 @@ impl AdmissionError {
         }
     }
 
+    /// Which slot of the warn sampler this refusal shouts from.
+    ///
+    /// Exhaustive, no `_` arm: a new variant that silently shared another
+    /// one's slot would be silenced by traffic it has nothing to do with.
+    #[must_use]
+    pub fn kind_index(&self) -> usize {
+        match self {
+            Self::Ingress(_) => 0,
+            Self::MemoryAtWrite(_) => 1,
+            Self::QuotaExceeded { .. } => 2,
+            Self::DiskQuota { .. } => 3,
+            Self::RequestTooLarge { .. } => 4,
+            Self::Busy => 5,
+            Self::CrossSlot => 6,
+            Self::Backend { .. } => 7,
+        }
+    }
+
     /// The first word of the RESP3 error line, which IS the code a client
     /// routes on.
     ///
@@ -300,6 +321,116 @@ impl AdmissionError {
     }
 }
 
+// ── the log channel is a resource too ─────────────────────────────────────
+//
+// A refusal is caused BY THE CLIENT, and a client that keeps causing it keeps
+// causing it at whatever rate it can send. Logging one line per refusal turns
+// a 54-byte request into ~119 bytes of log: measured on this branch's own
+// path, one anonymous connection produced 36 832 refusals/s = 4.38 MB/s of
+// log, 2.2x amplification over the bytes it sent (audit/22 A1, 2026-09-04).
+// The refusals are already counted, and a counter costs one atomic per
+// refusal however fast they arrive; the log is the channel that does not
+// bound itself.
+//
+// So: every refusal goes to `debug!`, and ONE per kind per window also goes
+// to `warn!`. An operator watching at warn level still learns that a kind of
+// refusal is happening - which is what the level is for - and learns how much
+// of it from `skeg_*_refused_total`, which is what a counter is for.
+
+/// At most one `warn!` per kind of refusal per this window.
+///
+/// Ten seconds: short enough that a burst is visible in the same minute it
+/// happens, long enough that the worst case is one line per kind per ten
+/// seconds no matter what a client does.
+pub const REFUSAL_WARN_WINDOW: Duration = Duration::from_secs(10);
+
+/// One "last shouted about" clock per kind of refusal.
+///
+/// A type rather than a bare static so a test can own one and drive it with
+/// an explicit clock: the shared instance is process-wide, and a test that
+/// asserted on it would be asserting about every other test in the binary.
+pub struct WarnSampler {
+    /// Monotonic milliseconds PLUS ONE of the last warn per kind, so that
+    /// zero can mean "never" without colliding with the instant the process
+    /// started.
+    last: [AtomicU64; REFUSAL_KINDS],
+}
+
+impl WarnSampler {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last: [const { AtomicU64::new(0) }; REFUSAL_KINDS],
+        }
+    }
+
+    /// True at most once per [`REFUSAL_WARN_WINDOW`] per `kind`.
+    ///
+    /// `now_ms` is monotonic milliseconds since some fixed point. The CAS
+    /// loop is what makes the bound hold under concurrency: two threads
+    /// refusing at the same instant race for the slot and exactly one wins,
+    /// rather than both reading the same stale value and both shouting.
+    pub fn admit(&self, kind: usize, now_ms: u64) -> bool {
+        // No window yet: today every refusal is shouted about. The next
+        // commit closes it; the seam is here so the tests that measure the
+        // channel can be red against the behaviour rather than absent.
+        let _ = self.last[kind].load(Ordering::Relaxed);
+        let _ = now_ms;
+        true
+    }
+}
+
+impl Default for WarnSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Kinds the sampler keeps a clock for: one per [`AdmissionError`] variant,
+/// plus [`KIND_INVALID_REQUEST`].
+pub const REFUSAL_KINDS: usize = 9;
+
+/// The slot for [`crate::shard::ShardError::InvalidRequest`], which is not an
+/// admission refusal but is the same THING for this purpose: permanent, and
+/// decided entirely by what the client sent.
+pub const KIND_INVALID_REQUEST: usize = 8;
+
+static REFUSAL_WARNS: WarnSampler = WarnSampler::new();
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn now_ms() -> u64 {
+    u64::try_from(PROCESS_START.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Log one refusal: always at `debug!`, and at `warn!` at most once per kind
+/// per [`REFUSAL_WARN_WINDOW`].
+pub fn log_refusal(e: &AdmissionError) {
+    tracing::debug!(refusal = %e, code = e.resp3_code(), "request refused");
+    if REFUSAL_WARNS.admit(e.kind_index(), now_ms()) {
+        tracing::warn!(
+            refusal = %e,
+            code = e.resp3_code(),
+            window_s = REFUSAL_WARN_WINDOW.as_secs(),
+            "request refused; further refusals of this kind are logged at \
+             debug for the next window - the counters carry the volume"
+        );
+    }
+}
+
+/// [`log_refusal`] for the one shard error that is a client's mistake rather
+/// than an admission decision: a request wrong for the index it names.
+pub fn log_invalid_request(message: &str) {
+    tracing::debug!(reason = message, "request refused as invalid");
+    if REFUSAL_WARNS.admit(KIND_INVALID_REQUEST, now_ms()) {
+        tracing::warn!(
+            reason = message,
+            window_s = REFUSAL_WARN_WINDOW.as_secs(),
+            "request refused as invalid; further refusals of this kind are \
+             logged at debug for the next window"
+        );
+    }
+}
+
 /// The code word a tenant backend's message must begin with for the engine to
 /// read it as "come back later".
 ///
@@ -334,6 +465,70 @@ impl AdmissionError {
         Self::Backend {
             message: rejected.message,
         }
+    }
+}
+
+/// A tracing subscriber that counts events by level, for the tests that
+/// assert on the LOG as a bounded resource.
+///
+/// Hand-rolled rather than pulled from `tracing-subscriber`: what is needed
+/// is two counters, and a layered registry would put a filter between the
+/// call site and the assertion - which is the thing under test.
+///
+/// Installed per THREAD (`tracing::subscriber::set_default`), so a test using
+/// it counts only what its own thread emitted and two tests running in
+/// parallel cannot see each other's lines.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tracing::span;
+    use tracing::{Event, Level, Metadata};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Counts {
+        warn: Arc<AtomicUsize>,
+        debug: Arc<AtomicUsize>,
+    }
+
+    impl Counts {
+        pub(crate) fn warns(&self) -> usize {
+            self.warn.load(Ordering::Relaxed)
+        }
+        pub(crate) fn debugs(&self) -> usize {
+            self.debug.load(Ordering::Relaxed)
+        }
+    }
+
+    pub(crate) struct Capture(Counts);
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let level = *event.metadata().level();
+            if level == Level::WARN {
+                self.0.warn.fetch_add(1, Ordering::Relaxed);
+            } else if level == Level::DEBUG {
+                self.0.debug.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    /// Count events on THIS thread until the returned guard is dropped.
+    pub(crate) fn counting() -> (Counts, tracing::subscriber::DefaultGuard) {
+        let counts = Counts::default();
+        let guard = tracing::subscriber::set_default(Capture(counts.clone()));
+        (counts, guard)
     }
 }
 
@@ -813,6 +1008,108 @@ mod tests {
             limit: 10,
         };
         assert_eq!(e.wire_message(), format!("ERR {e}"));
+    }
+
+    // ── the log is a bounded resource (audit/22 A1) ─────────────────────
+
+    /// One shout per kind per window, and the kinds are independent.
+    ///
+    /// Driven with an explicit clock over a sampler this test OWNS: the
+    /// process-wide one is shared with every other test in this binary, and
+    /// an assertion on it would be an assertion about them.
+    #[test]
+    #[ignore = "opens in the commit that bounds the refusal log"]
+    fn a_sampler_shouts_once_per_window_per_kind() {
+        let sampler = WarnSampler::new();
+        let window = REFUSAL_WARN_WINDOW.as_millis() as u64;
+
+        assert!(sampler.admit(0, 0), "the first refusal of a kind is news");
+        for ms in 0..window {
+            assert!(
+                !sampler.admit(0, ms),
+                "a second shout at {ms}ms is inside the window and must not \
+                 happen: that is the 4.38 MB/s"
+            );
+        }
+        assert!(
+            sampler.admit(0, window),
+            "once the window has passed the kind is news again"
+        );
+        assert!(
+            sampler.admit(1, 0),
+            "a different kind has its own clock: a flood of one must not \
+             silence the first occurrence of another"
+        );
+    }
+
+    /// A thousand identical refusals are one warn and a thousand debugs.
+    #[test]
+    #[ignore = "opens in the commit that bounds the refusal log"]
+    fn a_thousand_refusals_are_logged_once_at_warn() {
+        let (counts, _guard) = capture::counting();
+        for _ in 0..1000 {
+            log_refusal(&AdmissionError::CrossSlot);
+        }
+        assert_eq!(
+            counts.debugs(),
+            1000,
+            "every refusal is still logged - at debug, where the operator \
+             asked for it"
+        );
+        assert!(
+            counts.warns() <= 1,
+            "1000 refusals produced {} warn lines; at most one per kind per \
+             window is the bound (0 is legal: another test may have taken \
+             this kind's turn)",
+            counts.warns()
+        );
+    }
+
+    /// The sampler bounds the CHANNEL, not the signal: the counters still see
+    /// every refusal.
+    #[test]
+    #[ignore = "opens in the commit that bounds the refusal log"]
+    fn sampling_the_log_does_not_sample_the_counter() {
+        let (counts, _guard) = capture::counting();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::QuotaRefused);
+        for _ in 0..500 {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::QuotaRefused);
+            log_refusal(&AdmissionError::QuotaExceeded {
+                tenant: 1,
+                limit: 10,
+            });
+        }
+        let after = skeg_telemetry::counter_value(skeg_telemetry::Counter::QuotaRefused);
+        assert!(
+            after - before >= 500,
+            "the counter must carry every refusal the log stopped carrying \
+             (delta {}, other tests may add more)",
+            after - before
+        );
+        assert!(
+            counts.warns() <= 1,
+            "{} warn lines for 500 refusals",
+            counts.warns()
+        );
+    }
+
+    /// Every kind has its own slot, and no two share one.
+    #[test]
+    fn every_refusal_kind_has_its_own_slot() {
+        let mut seen: Vec<usize> = every_admission_error()
+            .iter()
+            .map(|(e, _)| e.kind_index())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            (0..8).collect::<Vec<_>>(),
+            "each variant needs its own clock, and KIND_INVALID_REQUEST owns \
+             the slot after them"
+        );
+        assert_eq!(KIND_INVALID_REQUEST, 8);
+        assert_eq!(REFUSAL_KINDS, KIND_INVALID_REQUEST + 1);
     }
 
     /// audit/17 A2: this refusal used to leave `stage_payload_blob` as

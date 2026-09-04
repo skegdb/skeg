@@ -3771,6 +3771,59 @@ mod tests {
         }
     }
 
+    /// audit/22 A1: a client that keeps sending a refused MSET keeps being
+    /// refused, and the branch that made CROSSSLOT the ordinary answer must
+    /// not turn that into one log line per request. Measured before the fix:
+    /// 36 832 refusals/s from one anonymous connection = 4.38 MB/s of log,
+    /// 2.2x the bytes the client sent.
+    ///
+    /// The counter is asserted as a lower-bounded delta: it is a process-wide
+    /// static and this binary runs its tests in parallel, so an equality
+    /// would be a claim about every other test as well.
+    #[tokio::test]
+    #[ignore = "opens in the commit that bounds the refusal log"]
+    async fn a_thousand_refused_msets_move_the_counter_not_the_log() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 4).unwrap();
+        // Two keys that route apart, found rather than hard-coded.
+        let a = (0u32..10_000)
+            .map(|i| format!("lga{i}"))
+            .find(|k| crate::shard::shard_for(k.as_bytes(), 4) == 0)
+            .expect("a key on shard 0");
+        let b = (0u32..10_000)
+            .map(|i| format!("lgb{i}"))
+            .find(|k| crate::shard::shard_for(k.as_bytes(), 4) == 1)
+            .expect("a key on shard 1");
+
+        let (counts, _guard) = crate::admission::capture::counting();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::CrossSlotRefused);
+        for _ in 0..1000 {
+            let resp = kv_mset(&args(&[&a, "1", &b, "2"]), &shards, TenantId::ZERO, None).await;
+            assert!(
+                matches!(resp, Frame::Error(ref e) if e.starts_with("CROSSSLOT")),
+                "every one of them is refused: {resp:?}"
+            );
+        }
+        let after = skeg_telemetry::counter_value(skeg_telemetry::Counter::CrossSlotRefused);
+
+        assert!(
+            after - before >= 1000,
+            "the refusals must all be counted (delta {})",
+            after - before
+        );
+        assert!(
+            counts.warns() <= 1,
+            "1000 refused MSETs produced {} warn lines. One per kind per \
+             window is the bound; the counter above is the volume",
+            counts.warns()
+        );
+        assert!(
+            counts.debugs() >= 1000,
+            "every refusal is still logged at debug ({} lines)",
+            counts.debugs()
+        );
+    }
+
     #[tokio::test]
     async fn mset_rejects_odd_arity() {
         let (_dir, shards) = fresh_shards().await;
