@@ -86,7 +86,8 @@ pub async fn handle_connection(
                     dispatch(
                         &frame,
                         &shards,
-                        &mut crate::resp3_handler::ReadAdmission::new(&mut budget, held),
+                        &mut crate::resp3_handler::ReadAdmission::new(&mut budget, held)
+                            .with_reply_cap(NATIVE_REPLY_CAP),
                     )
                     .await
                 };
@@ -288,6 +289,15 @@ fn shard_err_to_response(req_id: u64, e: &ShardError) -> Bytes {
 /// classification is decided once, in the preflight, and each wire only
 /// chooses how to spell it. That is what stops a client getting a weaker
 /// answer by picking a protocol.
+/// The most VALUE bytes a native `GET`/`MGET` reply may carry: one frame,
+/// less the room its own framing needs. A reply past `MAX_FRAME_SIZE` would
+/// be measured, reserved, fetched and then refused by every conforming
+/// client's parser; the preflight refuses it by name instead, before the
+/// store is touched. The margin covers the header and one length prefix per
+/// value at `MAX_MGET_KEYS`.
+const NATIVE_REPLY_CAP: usize =
+    skeg_proto::MAX_FRAME_SIZE as usize - 64 - 8 * crate::resp3_handler::MAX_MGET_KEYS;
+
 fn read_refusal_response(req_id: u64, refusal: &crate::resp3_handler::ReadRefusal) -> Bytes {
     match refusal {
         crate::resp3_handler::ReadRefusal::Admission(a) => {
@@ -698,7 +708,8 @@ mod tests {
         let response = dispatch(
             &frame,
             shards,
-            &mut crate::resp3_handler::ReadAdmission::new(&mut budget, 0),
+            &mut crate::resp3_handler::ReadAdmission::new(&mut budget, 0)
+                .with_reply_cap(NATIVE_REPLY_CAP),
         )
         .await
         .expect("a response");
@@ -752,6 +763,33 @@ mod tests {
         assert!(
             !rows.iter().any(|r| r.name == squat),
             "the refused name must not exist: {rows:?}"
+        );
+    }
+
+    /// audit 25 R6: a native MGET whose values sum past one frame was built,
+    /// charged and then unparseable by any conforming client. Now the
+    /// preflight refuses it by name before a value is fetched.
+    #[tokio::test]
+    async fn a_native_mget_reply_that_would_not_fit_one_frame_is_refused_before_the_fetch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        let value = vec![7u8; 1 << 20];
+        let keys: Vec<Vec<u8>> = (0..20u8).map(|i| vec![b'k', i]).collect();
+        for k in &keys {
+            shards.set(k, &value, Durability::Relaxed).await.unwrap();
+        }
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::KvReadBytesFetched);
+        let frame = native_roundtrip(&shards, skeg_proto::encode_mget(9, &refs)).await;
+        let msg = err_message(&frame);
+        assert!(
+            msg.contains("reply bytes in one frame"),
+            "20 MiB of values must be refused as one frame: {msg}"
+        );
+        assert_eq!(
+            skeg_telemetry::counter_value(skeg_telemetry::Counter::KvReadBytesFetched) - before,
+            0,
+            "the store must not have been read"
         );
     }
 

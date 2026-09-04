@@ -2637,11 +2637,27 @@ pub(crate) struct ReadAdmission<'a> {
     /// given as `other_capacity`, so the charge taken here is the one the
     /// flush finds already paid.
     held: usize,
+    /// The most reply bytes ONE frame of this wire can carry, when the wire
+    /// has such a ceiling. RESP3 has none; the native protocol's frame is
+    /// `MAX_FRAME_SIZE`, and a reply larger than that would be built, charged,
+    /// and then unparseable by every conforming client. Checked against the
+    /// measured sum before anything is fetched.
+    reply_cap: Option<usize>,
 }
 
 impl<'a> ReadAdmission<'a> {
     pub(crate) fn new(budget: &'a mut ConnectionBudget, held: usize) -> Self {
-        Self { budget, held }
+        Self {
+            budget,
+            held,
+            reply_cap: None,
+        }
+    }
+
+    /// The same admission, with a per-frame ceiling on the reply.
+    pub(crate) fn with_reply_cap(mut self, cap: usize) -> Self {
+        self.reply_cap = Some(cap);
+        self
     }
 }
 
@@ -2805,6 +2821,18 @@ pub(crate) async fn fetch_within_budget(
         let Some(reply) = reply_bound_for(&sizes) else {
             return Err(read_sum_overflow(keys.len()));
         };
+        if let Some(cap) = admission.as_ref().and_then(|a| a.reply_cap)
+            && reply > cap
+        {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+            return Err(ReadRefusal::Admission(
+                crate::admission::AdmissionError::RequestTooLarge {
+                    what: "reply bytes in one frame",
+                    limit: cap as u64,
+                    got: reply as u64,
+                },
+            ));
+        }
         let Some(want) = preflight.checked_add(reply) else {
             return Err(read_sum_overflow(keys.len()));
         };
