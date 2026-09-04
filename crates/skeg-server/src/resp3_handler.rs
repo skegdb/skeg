@@ -582,9 +582,17 @@ pub async fn handle_connection_resp3(
             Ok(None) => {
                 // Buffer drained: emit the in-flight burst (bounds latency + lets
                 // its payload writes group-commit together), then read more.
-                while !inflight.is_empty() {
-                    if !emit_front!() {
-                        break 'conn;
+                //
+                // Held only under a failpoint, and only so a test can decide
+                // WHEN the pipeline drains instead of inheriting whatever the
+                // kernel did with the peer's writes. Everything below already
+                // accounts for `reply_reserved`, so a held pipeline keeps its
+                // reservations rather than handing them back under itself.
+                if !crate::fp_ingress!(IngressFailpoint::HoldPipelineDrain, &fp_key) {
+                    while !inflight.is_empty() {
+                        if !emit_front!() {
+                            break 'conn;
+                        }
                     }
                 }
                 // Pull a large chunk per syscall so a pipelined burst buffers
@@ -600,8 +608,14 @@ pub async fn handle_connection_resp3(
                 trim_idle(decoder.buf_mut());
                 // Give back what the trim released BEFORE asking for more:
                 // a connection that bursted once must not still be charged for
-                // its peak while it asks for the next chunk.
-                budget.shrink_to(decoder.buf_mut().capacity());
+                // its peak while it asks for the next chunk. `reply_reserved`
+                // is added because `shrink_to` is a "hold at most this" call
+                // and the replies still in flight are holding their own share
+                // of the charge - normally zero here, since the drain above
+                // just emptied the pipeline, but never negative and never a
+                // reservation given back under a reply that still needs it.
+                let queued = reply_reserved as usize;
+                budget.shrink_to(decoder.buf_mut().capacity().saturating_add(queued));
                 let reserve = read_reserve(decoder.buffered());
                 // What `BytesMut::reserve` will leave the capacity at. It never
                 // shrinks and it grows to at least len + additional, so this is
@@ -609,7 +623,8 @@ pub async fn handle_connection_resp3(
                 let want = decoder
                     .buf_mut()
                     .capacity()
-                    .max(decoder.buffered().saturating_add(reserve));
+                    .max(decoder.buffered().saturating_add(reserve))
+                    .saturating_add(queued);
                 if let Err(e) = crate::ingress::grow_or_stall(&mut budget, want, &fp_key).await {
                     // Back to the floor before the refusal goes out: the bytes
                     // of this frame that did arrive are not worth keeping for a
@@ -640,7 +655,9 @@ pub async fn handle_connection_resp3(
                         // little more when the buffer is exactly full, so the
                         // capacity charged for a moment ago is not necessarily
                         // the capacity that came back.
-                        if let Err(e) = budget.grow_to(decoder.buf_mut().capacity()) {
+                        if let Err(e) =
+                            budget.grow_to(decoder.buf_mut().capacity().saturating_add(queued))
+                        {
                             *decoder.buf_mut() = BytesMut::with_capacity(4096);
                             budget.shrink_to(4096);
                             skeg_telemetry::tick_counter(
