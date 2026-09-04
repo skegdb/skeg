@@ -510,10 +510,18 @@ pub enum Counter {
     /// refusals ALONGSIDE it means the retry is not enough for that key's
     /// write rate.
     KvReadRemeasured = 61,
+    /// Process shutdowns that crossed the accept barrier and began draining.
+    ShutdownStarted = 62,
+    /// Shutdown barriers that completed with every shard durable and joined.
+    ShutdownCompleted = 63,
+    /// Shutdown barriers that returned a non-zero process result.
+    ShutdownFailures = 64,
+    /// Shutdowns that had to abort connection tasks after their drain deadline.
+    ShutdownConnectionTimeouts = 65,
 }
 
 impl Counter {
-    pub const COUNT: usize = 62;
+    pub const COUNT: usize = 66;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -577,6 +585,10 @@ impl Counter {
         Counter::KvReadBytesFetched,
         Counter::KvReadRefused,
         Counter::KvReadRemeasured,
+        Counter::ShutdownStarted,
+        Counter::ShutdownCompleted,
+        Counter::ShutdownFailures,
+        Counter::ShutdownConnectionTimeouts,
     ];
 
     #[inline]
@@ -644,6 +656,10 @@ impl Counter {
             Counter::KvReadBytesFetched => "skeg_kv_read_bytes_total",
             Counter::KvReadRefused => "skeg_kv_read_refused_total",
             Counter::KvReadRemeasured => "skeg_kv_read_remeasured_total",
+            Counter::ShutdownStarted => "skeg_shutdown_started_total",
+            Counter::ShutdownCompleted => "skeg_shutdown_completed_total",
+            Counter::ShutdownFailures => "skeg_shutdown_failures_total",
+            Counter::ShutdownConnectionTimeouts => "skeg_shutdown_connection_timeouts_total",
         }
     }
 }

@@ -3608,6 +3608,21 @@ pub struct DiskVamanaIndex {
     attr: Option<Vec<u64>>,
 }
 
+/// A maintenance operation whose transient heap must be admitted before its
+/// snapshot is materialised.
+///
+/// Kept in the engine rather than inferred from server labels: the engine owns
+/// the job shapes and is the only layer that can conservatively account for
+/// their vectors, graphs, quantisation and parallel scratch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceKind {
+    Flush,
+    RunsMerge,
+    DeletePatch,
+    Consolidate,
+    Ivf,
+}
+
 /// Cold per-index tq1 online-controller state, kept behind a single `Box` on
 /// `DiskVamanaIndex`. `ctl` is `None` unless
 /// [`enable_tq1_controller`](DiskVamanaIndex::enable_tq1_controller) is called.
@@ -3618,6 +3633,85 @@ struct Tq1Runtime {
 }
 
 impl DiskVamanaIndex {
+    /// Conservative upper bound for the additional heap used by one
+    /// maintenance job of `kind`, including its `begin` snapshot.
+    ///
+    /// This deliberately over-counts. At the peak a graph rewrite can retain
+    /// the snapshot, contiguous f32 rows, mutable graph, saved graph reopened
+    /// for serving, quantised tier and per-worker visited bitsets at once.
+    /// `12 * dim` covers three full f32 copies (including the optional QuIVer
+    /// metric); four `Node` copies cover snapshot/mutable/result/reopen; the
+    /// metadata allowance covers ids, versions, origins and hash tables. The
+    /// fixed allowance covers bounded I/O buffers and allocator/rayon slack.
+    /// Saturating arithmetic turns an unrepresentable shape into an
+    /// unreservable `u64::MAX`, never a small estimate.
+    #[must_use]
+    pub fn maintenance_working_set_bytes(&self, kind: MaintenanceKind) -> u64 {
+        const FIXED: u64 = 8 * 1024 * 1024;
+        const META_PER_ROW: u64 = 512;
+
+        let rewrite = |rows: usize| {
+            if rows == 0 {
+                return 0;
+            }
+            let dim = self.dim as u64;
+            let node = std::mem::size_of::<Node>() as u64;
+            let per_row = dim
+                .saturating_mul(12)
+                .saturating_add(node.saturating_mul(4))
+                .saturating_add(META_PER_ROW);
+            let worker_count = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4) as u64;
+            // Two bitsets per build worker, rounded conservatively to a byte
+            // per row each. Real storage is one bit per row.
+            let scratch = (rows as u64).saturating_mul(2).saturating_mul(worker_count);
+            FIXED
+                .saturating_add((rows as u64).saturating_mul(per_row))
+                .saturating_add(scratch)
+        };
+
+        match kind {
+            MaintenanceKind::Flush => {
+                if self.flushing.is_empty() {
+                    rewrite(self.delta.len())
+                } else {
+                    0
+                }
+            }
+            MaintenanceKind::RunsMerge => rewrite(self.run_rows()),
+            MaintenanceKind::DeletePatch => rewrite(self.main_len()),
+            MaintenanceKind::Consolidate => rewrite(
+                self.main_len()
+                    .saturating_add(self.run_rows())
+                    .saturating_add(self.delta.len())
+                    .saturating_add(self.flushing.len()),
+            ),
+            MaintenanceKind::Ivf => {
+                let rows = self.main_len();
+                if rows == 0 {
+                    return 0;
+                }
+                let cells = IvfRouter::cells_for(rows).min(rows) as u64;
+                let dim = self.dim as u64;
+                let workers = std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(4) as u64;
+                // Full f32 input + final assignments + one centroid
+                // accumulator per rayon worker and two reduce generations.
+                FIXED
+                    .saturating_add((rows as u64).saturating_mul(dim).saturating_mul(4))
+                    .saturating_add((rows as u64).saturating_mul(4))
+                    .saturating_add(
+                        cells
+                            .saturating_mul(dim)
+                            .saturating_mul(4)
+                            .saturating_mul(workers.saturating_add(3)),
+                    )
+                    .saturating_add(cells.saturating_mul(4).saturating_mul(workers))
+            }
+        }
+    }
     /// Open an index previously written by [`VamanaIndex::save`]. The graph is
     /// loaded into RAM; `vectors.bin` is streamed once to build the int8
     /// tier-1 quantisation, then left on disk.
@@ -4548,6 +4642,25 @@ impl DiskVamanaIndex {
     /// / [`flush_finish`](Self::flush_finish) off-thread. Meant for the server.
     pub fn set_auto_flush(&mut self, on: bool) {
         self.auto_flush = on;
+    }
+
+    /// Make every acknowledged append in the mutable delta WAL durable.
+    ///
+    /// Inserts append directly to [`Self::delta_log`]. The server calls this
+    /// after it has stopped every request and maintenance task, as the vector
+    /// half of its process shutdown barrier. Segment builders sync their own
+    /// immutable output before publishing it; this method covers the append
+    /// file that remains live between builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem error from `sync_all`.
+    pub fn sync_wal(&self) -> io::Result<()> {
+        crate::fp!(
+            crate::failpoint::WriteFailpoint::DeltaWalSync,
+            Err(io::Error::other("failpoint: delta WAL sync refused"))
+        );
+        self.delta_log.sync_all()
     }
 
     /// Tombstone `id`. Returns `true` if it was live.
@@ -7164,6 +7277,22 @@ mod tests {
     }
     use super::*;
     use ordered_float::OrderedFloat;
+
+    #[test]
+    fn shutdown_wal_sync_is_fallible_and_typed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), 4, 64).unwrap();
+        idx.insert(7, &[1.0; 4]).unwrap();
+
+        crate::failpoint::arm(crate::failpoint::WriteFailpoint::DeltaWalSync);
+        let err = idx.sync_wal().unwrap_err();
+        crate::failpoint::disarm_all();
+        assert!(crate::failpoint::fired(
+            crate::failpoint::WriteFailpoint::DeltaWalSync
+        ));
+        assert!(err.to_string().contains("delta WAL sync"));
+        idx.sync_wal().expect("disarmed barrier succeeds");
+    }
 
     /// The route decision, pinned at its measured boundaries. The dead-fraction
     /// guard exists because its absence cost 407-475s per shard in production:
@@ -9933,5 +10062,34 @@ mod tests {
             on.insert(i as u64, v).unwrap();
         }
         assert!(on.run_count() >= 1, "default auto_flush flushes inline");
+    }
+
+    #[test]
+    fn maintenance_working_set_is_conservative_and_shape_sensitive() {
+        let dim = 64;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(tmp.path(), dim, 64).unwrap();
+        idx.set_auto_flush(false);
+        for id in 0..128 {
+            idx.insert(id, &vec![id as f32; dim]).unwrap();
+        }
+
+        let flush = idx.maintenance_working_set_bytes(MaintenanceKind::Flush);
+        let fold = idx.maintenance_working_set_bytes(MaintenanceKind::Consolidate);
+        let row_f32 = 128_u64 * dim as u64 * 4;
+        assert!(
+            flush >= row_f32,
+            "flush estimate missed its contiguous f32 copy"
+        );
+        assert!(
+            fold >= flush,
+            "a full fold cannot be estimated below a flush"
+        );
+
+        idx.consolidate().unwrap().expect_clean();
+        let patch = idx.maintenance_working_set_bytes(MaintenanceKind::DeletePatch);
+        let ivf = idx.maintenance_working_set_bytes(MaintenanceKind::Ivf);
+        assert!(patch >= row_f32, "delete-patch reads every base vector");
+        assert!(ivf >= row_f32, "IVF reads every base vector");
     }
 }

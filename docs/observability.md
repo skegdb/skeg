@@ -133,6 +133,20 @@ is about a request refused an ANSWER, where
 `skeg_ingress_refused_growth_total` is about a connection refused a
 BUFFER.
 
+Maintenance working sets use that same process governor. A job that cannot
+reserve its estimated transient bytes increments
+`skeg_maintenance_budget_skips_total`; it has not taken a snapshot and is not
+counted as run. Graph-heavy jobs also hold the existing concurrency permits,
+while a flush is exempt from the CPU gate but never from the byte budget.
+
+Four lifecycle counters distinguish a shutdown request from a durable exit:
+`skeg_shutdown_started_total`, `skeg_shutdown_completed_total`,
+`skeg_shutdown_failures_total`, and
+`skeg_shutdown_connection_timeouts_total`. The last two should remain zero.
+The process exit code and final logs remain authoritative because an exporter
+may not scrape the successful final increment before the process exits. See
+the [operations runbook](operations.md#graceful-shutdown).
+
 **Read that last one as "a reply could not be charged", not "a reply was
 large".** A reply is written whether or not the class can cover its
 buffer, because it answers work that has already committed; the counter

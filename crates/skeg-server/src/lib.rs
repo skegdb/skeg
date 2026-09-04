@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{future::Future, io};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
@@ -53,6 +54,15 @@ pub use tenant::{
 /// the product's tier of record (data-oblivious, 4x smaller than int8), cheap to
 /// rebuild since the tier build parallelises across cores. Requires `dim % 4 == 0`.
 pub const DEFAULT_RW_TIER: QuantKind = QuantKind::TurboQuant { bits: 2 };
+
+/// Time allowed for already-accepted connections to finish after shutdown.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+enum WireProtocol {
+    Native,
+    Resp3,
+}
 
 pub struct Server {
     listener: TcpListener,
@@ -328,42 +338,27 @@ impl Server {
     ///
     /// Returns the first error from `TcpListener::accept`.
     pub async fn run(self) -> std::io::Result<()> {
-        let Self {
-            listener,
-            shards,
-            ingress,
-            max_connections,
-            tenant_backend: _,
-        } = self;
-        let fds = raise_descriptor_limit();
-        info!(
-            addr = ?listener.local_addr()?,
-            n_shards = shards.n_shards(),
-            max_fds = fds,
-            "server listening (binary protocol)"
-        );
-        // Same bound as the RESP3 listener, and for the same reason: this loop
-        // spawned a task per connection with nothing counting them, so a peer
-        // that opened sockets and said nothing bought a task and a buffer each
-        // time. A permit is held for the connection's lifetime.
-        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
-        let fp_key: Arc<str> = Arc::from(listener.local_addr()?.port().to_string());
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let Some((budget, stream)) =
-                admit_or_refuse(&ingress, stream, RefusalWire::Native).await
-            else {
-                continue;
-            };
-            let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
-            tune_socket(&stream);
-            let shards = shards.clone();
-            let fp_key = Arc::clone(&fp_key);
-            tokio::spawn(async move {
-                let _permit = permit;
-                handle_connection(stream, shards, budget, fp_key).await;
-            });
-        }
+        self.run_until(std::future::pending::<io::Result<()>>())
+            .await
+    }
+
+    /// Run the binary protocol until `shutdown` resolves, then stop accepting,
+    /// drain connections and execute the durable shard barrier.
+    pub async fn run_until<F>(self, shutdown: F) -> io::Result<()>
+    where
+        F: Future<Output = io::Result<()>>,
+    {
+        self.run_until_with_timeout(shutdown, shutdown_timeout_from_env())
+            .await
+    }
+
+    /// [`Server::run_until`] with an explicit connection-drain deadline.
+    pub async fn run_until_with_timeout<F>(self, shutdown: F, timeout: Duration) -> io::Result<()>
+    where
+        F: Future<Output = io::Result<()>>,
+    {
+        self.run_protocol_until(WireProtocol::Native, shutdown, timeout)
+            .await
     }
 
     /// Like `run`, but speaks RESP3 (Redis wire) on the listener instead of
@@ -374,6 +369,41 @@ impl Server {
     ///
     /// Returns the first error from `TcpListener::accept`.
     pub async fn run_resp3(self) -> std::io::Result<()> {
+        self.run_resp3_until(std::future::pending::<io::Result<()>>())
+            .await
+    }
+
+    /// RESP3 counterpart of [`Server::run_until`].
+    pub async fn run_resp3_until<F>(self, shutdown: F) -> io::Result<()>
+    where
+        F: Future<Output = io::Result<()>>,
+    {
+        self.run_resp3_until_with_timeout(shutdown, shutdown_timeout_from_env())
+            .await
+    }
+
+    /// [`Server::run_resp3_until`] with an explicit connection-drain deadline.
+    pub async fn run_resp3_until_with_timeout<F>(
+        self,
+        shutdown: F,
+        timeout: Duration,
+    ) -> io::Result<()>
+    where
+        F: Future<Output = io::Result<()>>,
+    {
+        self.run_protocol_until(WireProtocol::Resp3, shutdown, timeout)
+            .await
+    }
+
+    async fn run_protocol_until<F>(
+        self,
+        protocol: WireProtocol,
+        shutdown: F,
+        timeout: Duration,
+    ) -> io::Result<()>
+    where
+        F: Future<Output = io::Result<()>>,
+    {
         let Self {
             listener,
             shards,
@@ -387,36 +417,103 @@ impl Server {
             n_shards = shards.n_shards(),
             tenant = tenant_backend.is_some(),
             max_fds = fds,
-            "server listening (RESP3)"
+            protocol = match protocol { WireProtocol::Native => "native", WireProtocol::Resp3 => "resp3" },
+            "server listening"
         );
-        // Bound concurrent connections: each can buffer up to the frame
-        // ceiling, so an unbounded accept loop is a memory-DoS surface
-        // (review P0). SKEG_MAX_CONNECTIONS caps it; a permit is held for the
-        // connection's lifetime.
         let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
         let fp_key: Arc<str> = Arc::from(listener.local_addr()?.port().to_string());
-        loop {
-            let (stream, _) = listener.accept().await?;
-            // The floor comes FIRST, and never awaits. A budget awaited at
-            // accept is a listener that stops accepting, which turns a memory
-            // limit into an availability outage; and taking it before the
-            // permit means a connection parked on the semaphore is one that
-            // already has somewhere to put its bytes.
-            let Some(budget) = admit_or_refuse(&ingress, stream, RefusalWire::Resp3).await else {
+        let mut connections = tokio::task::JoinSet::new();
+        let mut failures = Vec::new();
+        tokio::pin!(shutdown);
+
+        'accept: loop {
+            while let Some(done) = connections.try_join_next() {
+                if let Err(e) = done {
+                    failures.push(format!("connection task failed: {e}"));
+                }
+            }
+            // Take capacity before accept. This preserves the old bounded
+            // backlog without parking an already-admitted socket, and the
+            // select keeps a saturated listener responsive to shutdown.
+            let permit = tokio::select! {
+                signal = &mut shutdown => {
+                    if let Err(e) = signal { failures.push(format!("shutdown signal failed: {e}")); }
+                    break 'accept;
+                }
+                permit = conn_limit.clone().acquire_owned() => {
+                    permit.expect("connection semaphore is never closed")
+                }
+            };
+            let (stream, _) = tokio::select! {
+                signal = &mut shutdown => {
+                    if let Err(e) = signal { failures.push(format!("shutdown signal failed: {e}")); }
+                    break 'accept;
+                }
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        failures.push(format!("listener accept failed: {e}"));
+                        break 'accept;
+                    }
+                }
+            };
+            let refusal_wire = match protocol {
+                WireProtocol::Native => RefusalWire::Native,
+                WireProtocol::Resp3 => RefusalWire::Resp3,
+            };
+            let Some((budget, stream)) = admit_or_refuse(&ingress, stream, refusal_wire).await
+            else {
+                drop(permit);
                 continue;
             };
-            let (budget, stream) = budget;
-            // Acquire before spawning; if the pool is exhausted the accept
-            // loop parks here rather than piling up unbounded tasks.
-            let permit = conn_limit.clone().acquire_owned().await.expect("semaphore");
             tune_socket(&stream);
             let shards = shards.clone();
             let backend = tenant_backend.clone();
             let fp_key = Arc::clone(&fp_key);
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let _permit = permit;
-                handle_connection_resp3(stream, shards, backend, budget, fp_key).await;
+                match protocol {
+                    WireProtocol::Native => {
+                        handle_connection(stream, shards, budget, fp_key).await;
+                    }
+                    WireProtocol::Resp3 => {
+                        handle_connection_resp3(stream, shards, backend, budget, fp_key).await;
+                    }
+                }
             });
+        }
+
+        // Dropping the listener is the accept barrier. Existing tasks retain
+        // only their streams and shard handles.
+        drop(listener);
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::ShutdownStarted);
+        let drain = async {
+            while let Some(done) = connections.join_next().await {
+                if let Err(e) = done {
+                    failures.push(format!("connection task failed: {e}"));
+                }
+            }
+        };
+        if tokio::time::timeout(timeout, drain).await.is_err() {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::ShutdownConnectionTimeouts);
+            let remaining = connections.len();
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            failures.push(format!(
+                "connection drain deadline expired after {} ms with {remaining} task(s)",
+                timeout.as_millis()
+            ));
+        }
+
+        if let Err(e) = shards.shutdown().await {
+            failures.extend(e.failures().iter().cloned());
+        }
+        if failures.is_empty() {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::ShutdownCompleted);
+            Ok(())
+        } else {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::ShutdownFailures);
+            Err(io::Error::other(failures.join("; ")))
         }
     }
 }
@@ -516,6 +613,33 @@ fn max_connections_from_env() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
+fn shutdown_timeout_from_env() -> Duration {
+    std::env::var("SKEG_SHUTDOWN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_millis)
+}
+
+/// Wait for Ctrl-C or SIGTERM. The signal stream is installed before waiting,
+/// so a Unix termination request is consumed by the graceful lifecycle rather
+/// than by the kernel's default immediate exit.
+pub async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 /// Apply per-connection socket tuning: `TCP_NODELAY` for low-latency

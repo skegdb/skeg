@@ -47,6 +47,10 @@ VOLUME ["/var/lib/skeg"]
 # RESP3 / Redis-compat on 6379 if user runs `--entrypoint skeg-resp3`.
 EXPOSE 7379 6379
 
+# Docker's default is already SIGTERM; spelling it here makes the image's
+# durable shutdown contract part of its metadata rather than an assumption.
+STOPSIGNAL SIGTERM
+
 # Listen on all interfaces so the container is reachable from the host via
 # `-p`. This image has no authentication, so the server refuses to start
 # unless the operator explicitly opts in with

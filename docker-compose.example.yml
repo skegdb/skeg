@@ -23,6 +23,9 @@ services:
     image: ghcr.io/skegdb/skeg:latest
     container_name: skeg
     restart: unless-stopped
+    # Longer than SKEG_SHUTDOWN_TIMEOUT_MS: after draining connections the
+    # process still joins maintenance and synchronises every shard.
+    stop_grace_period: 2m
     ports:
       # Loopback-only: this image has no authentication, so the port is
       # published on the host loopback rather than all interfaces.
@@ -43,6 +46,7 @@ services:
   #   container_name: skeg-resp3
   #   entrypoint: ["/usr/local/bin/skeg-resp3"]
   #   restart: unless-stopped
+  #   stop_grace_period: 2m
   #   ports:
   #     - "127.0.0.1:6379:6379"
   #   volumes:

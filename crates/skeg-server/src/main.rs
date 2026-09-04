@@ -226,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
     };
     tracing::info!("skeg listening on {}", server.local_addr()?);
-    let run_result = server.run().await;
+    let run_result = server.run_until(skeg_server::shutdown_signal()).await;
     #[cfg(feature = "tracing-otlp")]
     skeg_server::tracing_otlp::shutdown();
     run_result?;

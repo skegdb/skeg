@@ -103,7 +103,7 @@ pub use turboquant::{FastRotation, Rotation, TurboQuant1, TurboQuant2, TurboQuan
 pub use vamana::{
     ConsolidateBuilt, ConsolidateJob, ConsolidatePace, DeletePatchBuilt, DeletePatchJob,
     DiskVamanaIndex, FinishOutcome, FinishResult, FlushBuilt, FlushJob, IvfBuilt, IvfJob,
-    PayloadRef, RunMergeBuilt, RunMergeJob, VamanaConfig, VamanaIndex, build_phase_times_ns,
-    reset_build_phase_times, run_vacuum_debt, set_speed_enabled,
+    MaintenanceKind, PayloadRef, RunMergeBuilt, RunMergeJob, VamanaConfig, VamanaIndex,
+    build_phase_times_ns, reset_build_phase_times, run_vacuum_debt, set_speed_enabled,
 };
 pub use visited::VisitedBitset;

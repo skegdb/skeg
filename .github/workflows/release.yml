@@ -123,6 +123,8 @@ jobs:
         # workspace suite exhausted the file-descriptor budget locally
         # (EMFILE); lift once the suite owns its FD budget.
         run: cargo test --workspace --release --locked -- --test-threads=1
+      - name: maintenance memory gate (real cgroups, 256/512 MiB)
+        run: scripts/check-maintenance-cgroup.sh
 
   publish-crates:
     if: github.event_name == 'push'

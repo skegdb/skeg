@@ -79,12 +79,17 @@ durable when it is not.
    `skeg_vlog_commit_orphaned_entries_total` instead, which is benign and says
    so.
 
-6. `SKEG_DURABILITY_MODEL=device-global` is honoured on Apple and **refused
+5. `SKEG_DURABILITY_MODEL=device-global` is honoured on Apple and **refused
    everywhere else**, with a `warn!` naming the reason. It is a claim about the
    hardware, not a preference: see the platform section below.
-5. The shard's shutdown flush logs at ERROR instead of discarding its result,
-   and the committers' own shutdown flush is a barrier, not a batch: it is the
-   last one the store gets.
+6. Process shutdown is a fallible barrier. The listener closes first,
+   connections drain to a configured deadline, shard inboxes close, accepted
+   requests and background maintenance are joined, every vector `delta.log`
+   is synchronised, and every VLog is flushed. All shard errors are aggregated
+   and returned to the three binaries; any one makes the process exit non-zero.
+   A zero exit therefore means no worker or mutable WAL was left behind. The
+   committers' own shutdown flush is a barrier, not a batch: it is the last one
+   the store gets.
 
 Nothing about *which bytes go where* changed, and the durability tiers
 themselves are untouched: the offset still refuses to advance past a write
@@ -134,20 +139,14 @@ do, never more.
 Written down because a barrier that is honest about three cases and silent
 about a fourth is worse than one nobody trusts.
 
-1. **A failed shutdown flush does not reach an exit code.** `run_shard` is a
-   thread with a `block_on` that nothing joins, so the error is logged and
-   counted and goes no further. A supervisor watching the exit status of
-   `skeg` learns nothing. Name it in the shutdown runbook:
-   `skeg_vlog_flush_failures_total` is the signal, not the exit status.
-
-2. **No client-visible barrier exists on either wire.** RESP3 has no `FLUSH`
+1. **No client-visible barrier exists on either wire.** RESP3 has no `FLUSH`
    or `SYNC` command; the native protocol reserves `Op::Flush` (0x82) but the
    handler does not dispatch it, so it answers `InvalidRequest: unsupported
    op`. That is honest - nothing lies to a client - but it means a client that
    wants a barrier has no way to ask for one, and this work is not yet
    observable from outside the process except through the counter.
 
-3. **The shared committer's batch path still syncs one file.** Unchanged, and
+2. **The shared committer's batch path still syncs one file.** Unchanged, and
    deliberately: on Apple, where that committer is now the only place it can
    run, one `F_FULLFSYNC` covers the device, and syncing all four files of a
    batch instead measured **4.2x** slower (1 sync 4600 µs vs 4 sequential

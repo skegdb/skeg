@@ -10,7 +10,11 @@
 //!
 //! Env: RAM_N (rows, default 12500 - one shard of the 100k gate), RAM_DIM.
 
-use skeg_vector::{DiskVamanaIndex, QuantKind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use skeg_vector::{DiskVamanaIndex, MaintenanceKind, QuantKind};
 
 fn rss_mb() -> f64 {
     skeg_platform::rss_bytes() as f64 / (1024.0 * 1024.0)
@@ -32,12 +36,46 @@ fn row(phase: &str, reported: usize, base_rss: f64) {
     );
 }
 
+fn peak_while<T>(work: impl FnOnce() -> T) -> (T, u64) {
+    let running = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(skeg_platform::rss_bytes()));
+    let sampler_running = Arc::clone(&running);
+    let sampler_peak = Arc::clone(&peak);
+    let sampler = std::thread::spawn(move || {
+        while sampler_running.load(Ordering::Acquire) {
+            sampler_peak.fetch_max(skeg_platform::rss_bytes(), Ordering::AcqRel);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        sampler_peak.fetch_max(skeg_platform::rss_bytes(), Ordering::AcqRel);
+    });
+    let result = work();
+    running.store(false, Ordering::Release);
+    sampler.join().unwrap();
+    (result, peak.load(Ordering::Acquire))
+}
+
+fn verdict(kind: &str, estimate: u64, before: u64, peak: u64) {
+    let observed = peak.saturating_sub(before);
+    println!(
+        "{kind:<34} estimate {:>7.1} MiB   observed peak +{:>7.1} MiB   margin {:>6.2}x",
+        estimate as f64 / (1024.0 * 1024.0),
+        observed as f64 / (1024.0 * 1024.0),
+        estimate as f64 / observed.max(1) as f64,
+    );
+    if env("RAM_ASSERT_ESTIMATE", 0_u8) != 0 {
+        assert!(
+            observed <= estimate,
+            "{kind} estimator under-counted: estimate={estimate}, observed={observed}"
+        );
+    }
+}
+
 fn main() {
     let n: u64 = env("RAM_N", 12_500);
     let dim: usize = env("RAM_DIM", 1024);
     let tier = QuantKind::TurboQuant { bits: 2 };
-    let dir = std::env::temp_dir().join("skeg_ram_attribution");
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
 
     let base_rss = rss_mb();
     println!(
@@ -57,30 +95,31 @@ fn main() {
     }
     row("delta pieno (nessun flush)", idx.resident_bytes(), base_rss);
 
-    let job = idx.flush_begin().unwrap().unwrap();
-    row(
-        "flush_begin (delta -> staging)",
-        idx.resident_bytes(),
-        base_rss,
-    );
-    let built = job.build(&dir).unwrap();
-    row("dopo build della run", idx.resident_bytes(), base_rss);
-    idx.flush_finish(built).unwrap().expect_clean();
+    let flush_estimate = idx.maintenance_working_set_bytes(MaintenanceKind::Flush);
+    let before = skeg_platform::rss_bytes();
+    let (_, peak) = peak_while(|| {
+        let job = idx.flush_begin().unwrap().unwrap();
+        let built = job.build(&dir).unwrap();
+        idx.flush_finish(built).unwrap().expect_clean();
+    });
+    verdict("flush build", flush_estimate, before, peak);
     row(
         "flush_finish (run al posto)",
         idx.resident_bytes(),
         base_rss,
     );
 
-    let job = idx.consolidate_begin().unwrap().unwrap();
-    row("consolidate_begin", idx.resident_bytes(), base_rss);
-    let built = job.build(&dir).unwrap();
-    row("dopo build del fold", idx.resident_bytes(), base_rss);
-    idx.consolidate_finish(built).unwrap().expect_clean();
+    let fold_estimate = idx.maintenance_working_set_bytes(MaintenanceKind::Consolidate);
+    let before = skeg_platform::rss_bytes();
+    let (_, peak) = peak_while(|| {
+        let job = idx.consolidate_begin().unwrap().unwrap();
+        let built = job.build(&dir).unwrap();
+        idx.consolidate_finish(built).unwrap().expect_clean();
+    });
+    verdict("consolidate build", fold_estimate, before, peak);
     row("consolidate_finish", idx.resident_bytes(), base_rss);
 
     drop(idx);
     let re = DiskVamanaIndex::open_with_tier(&dir, tier).unwrap();
     row("riaperto, a riposo", re.resident_bytes(), base_rss);
-    let _ = std::fs::remove_dir_all(&dir);
 }

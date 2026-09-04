@@ -267,6 +267,18 @@ pub struct MemoryGovernor {
 }
 
 impl MemoryGovernor {
+    #[cfg(test)]
+    pub(crate) fn unlimited_for_tests() -> Arc<Self> {
+        #[derive(Debug)]
+        struct Unlimited;
+        impl MemorySource for Unlimited {
+            fn headroom(&self) -> Headroom {
+                Headroom::Unlimited
+            }
+        }
+        Arc::new(Self::new(Arc::new(Unlimited), None, Some(0)).expect("unlimited governor"))
+    }
+
     /// Build from an operator's headroom ceiling and a source.
     ///
     /// # Errors

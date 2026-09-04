@@ -122,7 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tracing::info!("skeg-server (tenant) listening on {}", server.local_addr()?);
-    server.run_resp3().await?;
+    server
+        .run_resp3_until(skeg_server::shutdown_signal())
+        .await?;
     Ok(())
 }
 

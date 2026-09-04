@@ -105,6 +105,10 @@ pub enum AdmissionError {
     /// A bounded queue inside the engine had no room. Momentary by
     /// construction: what fills it is other traffic, and other traffic ends.
     Busy,
+    /// A maintenance job's conservative working set did not fit the shared
+    /// process budget. No snapshot or mutation happened; retry after other
+    /// work releases memory.
+    MaintenanceBusy,
     /// A multi-key command whose keys do not all route to one shard, refused
     /// whole before any of it ran.
     ///
@@ -189,7 +193,7 @@ impl AdmissionError {
             // What fills a bounded queue is other traffic, and other traffic
             // ends. Telling a client `ERR` here is telling it to give up on
             // the one condition where waiting a moment is exactly right.
-            Self::Busy => Retryable,
+            Self::Busy | Self::MaintenanceBusy => Retryable,
             // The same keys hash the same way on every attempt, and the shard
             // count does not move while the store is open. Nothing about a
             // retry can change the answer.
@@ -226,9 +230,10 @@ impl AdmissionError {
             Self::DiskQuota { .. } => 3,
             Self::RequestTooLarge { .. } => 4,
             Self::Busy => 5,
-            Self::CrossSlot => 6,
-            Self::Backend { .. } => 7,
-            Self::ValueChangedUnderRead { .. } => 8,
+            Self::MaintenanceBusy => 6,
+            Self::CrossSlot => 7,
+            Self::Backend { .. } => 8,
+            Self::ValueChangedUnderRead { .. } => 9,
         }
     }
 
@@ -256,6 +261,7 @@ impl AdmissionError {
             | Self::DiskQuota { .. }
             | Self::RequestTooLarge { .. }
             | Self::Busy
+            | Self::MaintenanceBusy
             | Self::ValueChangedUnderRead { .. }
             | Self::Backend { .. } => match self.retryability() {
                 Retryability::Retryable => "BACKPRESSURE",
@@ -329,6 +335,7 @@ impl AdmissionError {
             | Self::DiskQuota { .. }
             | Self::RequestTooLarge { .. }
             | Self::Busy
+            | Self::MaintenanceBusy
             // The key SET is what is wrong with it: send the same keys in one
             // batch per shard and every one of them is accepted.
             | Self::CrossSlot => ErrCode::InvalidRequest,
@@ -411,12 +418,12 @@ impl Default for WarnSampler {
 
 /// Kinds the sampler keeps a clock for: one per [`AdmissionError`] variant,
 /// plus [`KIND_INVALID_REQUEST`].
-pub const REFUSAL_KINDS: usize = 10;
+pub const REFUSAL_KINDS: usize = 11;
 
 /// The slot for [`crate::shard::ShardError::InvalidRequest`], which is not an
 /// admission refusal but is the same THING for this purpose: permanent, and
 /// decided entirely by what the client sent.
-pub const KIND_INVALID_REQUEST: usize = 9;
+pub const KIND_INVALID_REQUEST: usize = 10;
 
 static REFUSAL_WARNS: WarnSampler = WarnSampler::new();
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -650,6 +657,7 @@ impl fmt::Display for AdmissionError {
             // The text the shard error carried before it was classified, so
             // only the code word in front of it changes.
             Self::Busy => write!(f, "vsearch queue is full"),
+            Self::MaintenanceBusy => write!(f, "maintenance memory budget is busy"),
             // Redis's own wording, so that `wire_message` renders the line a
             // Redis client already knows character for character. Changing a
             // word here changes the wire.
@@ -761,6 +769,7 @@ mod tests {
                 Retryability::Permanent,
             ),
             (AdmissionError::Busy, Retryability::Retryable),
+            (AdmissionError::MaintenanceBusy, Retryability::Retryable),
             (AdmissionError::CrossSlot, Retryability::Permanent),
             (
                 AdmissionError::Backend {
@@ -799,6 +808,7 @@ mod tests {
             AdmissionError::DiskQuota { .. } => "disk_quota",
             AdmissionError::RequestTooLarge { .. } => "request_too_large",
             AdmissionError::Busy => "busy",
+            AdmissionError::MaintenanceBusy => "maintenance_busy",
             AdmissionError::CrossSlot => "cross_slot",
             AdmissionError::ValueChangedUnderRead { .. } => "value_changed_under_read",
             AdmissionError::Backend { .. } => "backend",
@@ -821,6 +831,7 @@ mod tests {
                 "cross_slot",
                 "disk_quota",
                 "ingress",
+                "maintenance_busy",
                 "memory_at_write",
                 "quota_exceeded",
                 "request_too_large",
@@ -1141,11 +1152,11 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen,
-            (0..9).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>(),
             "each variant needs its own clock, and KIND_INVALID_REQUEST owns \
              the slot after them"
         );
-        assert_eq!(KIND_INVALID_REQUEST, 9);
+        assert_eq!(KIND_INVALID_REQUEST, 10);
         assert_eq!(REFUSAL_KINDS, KIND_INVALID_REQUEST + 1);
     }
 

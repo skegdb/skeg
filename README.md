@@ -270,6 +270,7 @@ mask it gets back. No v1 byte changed meaning, so existing clients keep working.
 - [`multi-tenancy.md`](docs/multi-tenancy.md): tenants, key scoping, quotas, fair eviction.
 - [`filtered-search.md`](docs/filtered-search.md): payloads, filter grammar, the planner.
 - [`observability.md`](docs/observability.md): Prometheus, OTel, tracing.
+- [`operations.md`](docs/operations.md): memory limits, graceful stop, Docker/systemd runbook.
 - [`ecosystem.md`](docs/ecosystem.md): federation (hansa) and ingest pipelines.
 - [`roadmap.md`](docs/roadmap.md): planned, conditional, and deliberately not.
 

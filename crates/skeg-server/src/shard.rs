@@ -111,8 +111,8 @@ use skeg_core::{Durability, VLog};
 use crate::payload::{Filter, PayloadIndex, parse_fields};
 use skeg_vector::{
     ConsolidateBuilt, ConsolidateJob, DeletePatchBuilt, DeletePatchJob, DiskVamanaIndex, FlatIndex,
-    FlushBuilt, FlushJob, IvfBuilt, IvfJob, PayloadRef, QuantKind, RunMergeBuilt, RunMergeJob,
-    VectorVersion,
+    FlushBuilt, FlushJob, IvfBuilt, IvfJob, MaintenanceKind, PayloadRef, QuantKind, RunMergeBuilt,
+    RunMergeJob, VectorVersion,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Semaphore, oneshot};
@@ -133,6 +133,10 @@ use xxhash_rust::xxh3::xxh3_64;
 /// VSET updates both atomically and a filtered VSEARCH reads a consistent view.
 struct Vindex {
     backend: VectorBackend,
+    /// The same process-wide governor used by socket and delta admission.
+    /// Maintenance reads it from the entry so every path through the shared
+    /// scheduler is budgeted and a new call site cannot forget to pass it.
+    governor: Arc<crate::memory::MemoryGovernor>,
     /// What this index has promised the process-wide governor for the heap its
     /// delta is holding. Resized as the delta grows, and released when the
     /// `Vindex` is dropped.
@@ -232,14 +236,33 @@ impl Vindex {
     /// An index whose incarnation is not known: the pre-generation one. Used
     /// by the tests that build a `Vindex` by hand, where there is no
     /// catalogue to have recorded anything else.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn new(backend: VectorBackend, kind: u8) -> Self {
-        Self::new_at(backend, kind, IndexGeneration::LEGACY)
+        Self::new_with_governor(
+            backend,
+            kind,
+            crate::memory::MemoryGovernor::unlimited_for_tests(),
+        )
     }
 
-    fn new_at(backend: VectorBackend, kind: u8, generation: IndexGeneration) -> Self {
+    #[cfg(test)]
+    fn new_with_governor(
+        backend: VectorBackend,
+        kind: u8,
+        governor: Arc<crate::memory::MemoryGovernor>,
+    ) -> Self {
+        Self::new_at(backend, kind, IndexGeneration::LEGACY, governor)
+    }
+
+    fn new_at(
+        backend: VectorBackend,
+        kind: u8,
+        generation: IndexGeneration,
+        governor: Arc<crate::memory::MemoryGovernor>,
+    ) -> Self {
         Self {
             backend,
+            governor,
             memory: None,
             kind,
             generation,
@@ -253,10 +276,15 @@ impl Vindex {
 
     /// A vindex reopened from disk: its payload index is empty and must be
     /// rebuilt from the stored blobs before a filtered search can use it.
-    fn recovered(backend: VectorBackend, kind: u8, generation: IndexGeneration) -> Self {
+    fn recovered(
+        backend: VectorBackend,
+        kind: u8,
+        generation: IndexGeneration,
+        governor: Arc<crate::memory::MemoryGovernor>,
+    ) -> Self {
         Self {
             payload_loaded: false,
-            ..Self::new_at(backend, kind, generation)
+            ..Self::new_at(backend, kind, generation, governor)
         }
     }
 
@@ -740,6 +768,33 @@ impl VectorBackend {
             // rounds every insert up to one whole chunk.
             VectorBackend::Flat(i) => i.resident_bytes() as u64,
             VectorBackend::Disk(i) => i.resident_bytes() as u64,
+        }
+    }
+
+    /// Additional heap a maintenance operation can hold at its peak,
+    /// including the snapshot allocated by its `begin` phase.
+    fn maintenance_working_set_bytes(&self, label: &str) -> u64 {
+        let kind = match label {
+            "flush" => MaintenanceKind::Flush,
+            "runs-merge" => MaintenanceKind::RunsMerge,
+            "delete-patch" => MaintenanceKind::DeletePatch,
+            "consolidate" => MaintenanceKind::Consolidate,
+            "ivf" => MaintenanceKind::Ivf,
+            other => panic!("maintenance label has no byte estimator: {other}"),
+        };
+        match self {
+            VectorBackend::Flat(_) => 0,
+            VectorBackend::Disk(i) => i.maintenance_working_set_bytes(kind),
+        }
+    }
+
+    /// Synchronise the only mutable file owned by a persistent vector index.
+    /// Immutable segment files are synced before their membership marker is
+    /// published; flat indexes have no durable state.
+    fn sync_wal(&self) -> std::io::Result<()> {
+        match self {
+            VectorBackend::Flat(_) => Ok(()),
+            VectorBackend::Disk(i) => i.sync_wal(),
         }
     }
 
@@ -2676,12 +2731,13 @@ async fn maintenance_tick_at(
 /// fold; this protects against the broadcast, by letting at most
 /// `SKEG_FOLD_CONCURRENCY` heavy builds run at once and queueing the rest.
 ///
-/// Flushes are exempt: they are frequent, cheap, and gating them behind a
-/// parked fold would stall ingest. The trade is explicit: a gated broadcast
-/// takes longer wall-clock (shards serialise), and in exchange the queries
-/// keep most of the machine. Waiting is safe here because `begin` has already
-/// snapshotted and released the vindex lock, and writes that land while a job
-/// is parked are replayed from the WAL suffix at finish.
+/// Flushes are exempt from this CPU/concurrency gate: they are frequent,
+/// cheap, and gating them behind a parked fold would stall ingest. They still
+/// reserve their complete working set in the byte governor. The trade is
+/// explicit: a gated broadcast takes longer wall-clock (shards serialise),
+/// and in exchange the queries keep most of the machine. Waiting is safe here
+/// because both concurrency permits are acquired before `begin`, while no
+/// vindex lock or snapshot is held.
 fn fold_budget() -> &'static tokio::sync::Semaphore {
     static BUDGET: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     BUDGET.get_or_init(|| {
@@ -2735,6 +2791,18 @@ enum MaintenanceOutcome {
     Failed,
 }
 
+/// All resources held by a maintenance build. They travel INTO the blocking
+/// task and back out with its result: dropping the async caller cannot release
+/// a byte/concurrency permit while an already-started `spawn_blocking` job is
+/// still allocating (Tokio cannot cancel such a job). A panic drops them while
+/// unwinding on the build thread; an ordinary result keeps them through
+/// `finish`.
+struct MaintenanceGuards {
+    _heavy: Option<tokio::sync::OwnedSemaphorePermit>,
+    _fold: Option<tokio::sync::SemaphorePermit<'static>>,
+    _memory: Option<crate::memory::MemoryReservation>,
+}
+
 async fn try_off_thread_maintenance<T, B>(
     arc: &VectorEntry,
     label: &str,
@@ -2780,7 +2848,7 @@ where
     } else {
         None
     };
-    let _heavy = match heavy_sem {
+    let heavy = match heavy_sem {
         Some(s) if wait_for_budget => Some(
             s.acquire_owned()
                 .await
@@ -2804,7 +2872,7 @@ where
     // happened to be busy.
     //
     // Waiting here holds NO lock, so reads and writes proceed normally.
-    let _permit = if is_budgeted(label) {
+    let fold = if is_budgeted(label) {
         if wait_for_budget {
             skeg_telemetry::incr_gauge(skeg_telemetry::Gauge::FoldsWaiting);
             let p = fold_budget().acquire().await;
@@ -2822,11 +2890,26 @@ where
     } else {
         None
     };
-    // Short lock: snapshot only, no O(live) reads and no graph build.
-    let job = {
+    // Reserve bytes while the state used for the estimate is still protected,
+    // BEFORE `begin`: begin itself copies the adjacency/survivor maps and can
+    // be the first large allocation. There is no await under this lock.
+    let (job, memory_permit) = {
         let mut g = arc.write();
+        let bytes = g.backend.maintenance_working_set_bytes(label);
+        let memory_permit = if bytes == 0 {
+            None
+        } else {
+            match g.governor.try_reserve(bytes) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::MaintenanceBudgetSkips);
+                    tracing::warn!(job = label, bytes, error = %e, "maintenance byte budget busy");
+                    return Ok(MaintenanceOutcome::BudgetBusy);
+                }
+            }
+        };
         match begin(&mut g.backend) {
-            Ok(Some(j)) => j,
+            Ok(Some(j)) => (j, memory_permit),
             Ok(None) => return Ok(MaintenanceOutcome::NotNeeded),
             Err(e) => return Err(format!("{label} begin failed: {e}")),
         }
@@ -2842,8 +2925,18 @@ where
     // across 233k writes while folds_waiting read 6. If there is no permit
     // now, maintenance skips and retries next tick; the flush always gets its
     // turn.
-    let built = match tokio::task::spawn_blocking(move || build(job)).await {
-        Ok(Ok(b)) => b,
+    let guards = MaintenanceGuards {
+        _heavy: heavy,
+        _fold: fold,
+        _memory: memory_permit,
+    };
+    let (built, guards) = match tokio::task::spawn_blocking(move || {
+        let result = build(job);
+        (result, guards)
+    })
+    .await
+    {
+        Ok((Ok(b), guards)) => (b, guards),
         result => {
             {
                 let mut g = arc.write();
@@ -2854,9 +2947,9 @@ where
                 );
             }
             return match result {
-                Ok(Err(e)) => Err(format!("{label} build failed: {e}")),
+                Ok((Err(e), _guards)) => Err(format!("{label} build failed: {e}")),
                 Err(e) => Err(format!("{label} build task panicked: {e}")),
-                Ok(Ok(_)) => unreachable!("the successful build arm returned above"),
+                Ok((Ok(_), _)) => unreachable!("the successful build arm returned above"),
             };
         }
     };
@@ -2889,6 +2982,7 @@ where
              change stands, something was left on disk"
         );
     }
+    drop(guards);
     Ok(MaintenanceOutcome::Ran)
 }
 
@@ -2964,6 +3058,7 @@ fn recover_vindexes(
     mmap_graph: bool,
     read_only: bool,
     in_flight: &[String],
+    memory: &Arc<crate::memory::MemoryGovernor>,
 ) -> std::io::Result<(VindexSet, Vec<String>)> {
     let mut set = VindexSet::new();
     // Names this shard resolved. Their payload blobs are KV keys and can only
@@ -3019,6 +3114,7 @@ fn recover_vindexes(
                 VectorBackend::Disk(Box::new(idx)),
                 kind,
                 generation,
+                Arc::clone(memory),
             ))),
         );
     }
@@ -3059,6 +3155,7 @@ async fn get_or_reopen(
     mmap_tier: bool,
     mmap_graph: bool,
     name: &str,
+    memory: &Arc<crate::memory::MemoryGovernor>,
 ) -> Option<VectorEntry> {
     // Fast path: resident. Clone + stamp under a short read lock, no await.
     if let Some(entry) = vindexes.read().get(name).cloned() {
@@ -3118,6 +3215,7 @@ async fn get_or_reopen(
         VectorBackend::Disk(Box::new(idx)),
         kind,
         registry.generation,
+        Arc::clone(memory),
     )));
     entry.read().touch();
     w.insert(name.to_owned(), entry.clone());
@@ -3258,14 +3356,15 @@ fn run_shard(
     // aborts startup if any shard reports `Err`. Dropping the sender without
     // signalling (a panic) unblocks the waiter with a recv error.
     ready: std::sync::mpsc::Sender<Result<ShardReady, String>>,
-) {
+) -> Result<(), String> {
     skeg_platform::pin_current_thread_to_performance_core();
 
     let vsearch_pool = match (workers > 0).then(|| VsearchPool::new(workers)) {
         Some(Ok(pool)) => Some(pool),
         Some(Err(e)) => {
-            let _ = ready.send(Err(format!("vsearch pool startup failed: {e}")));
-            return;
+            let msg = format!("vsearch pool startup failed: {e}");
+            let _ = ready.send(Err(msg.clone()));
+            return Err(msg);
         }
         None => None,
     };
@@ -3276,8 +3375,10 @@ fn run_shard(
     {
         Ok(rt) => rt,
         Err(e) => {
-            error!("shard {shard_id}: runtime build failed: {e}");
-            return;
+            let msg = format!("shard {shard_id}: runtime build failed: {e}");
+            error!("{msg}");
+            let _ = ready.send(Err(msg.clone()));
+            return Err(msg);
         }
     };
 
@@ -3292,8 +3393,9 @@ fn run_shard(
             Err(e) => {
                 // Report the failure so `ShardSet::open` aborts startup instead
                 // of binding a server whose storage never came up.
-                let _ = ready.send(Err(format!("shard {shard_id}: VLog::open: {e}")));
-                return;
+                let msg = format!("shard {shard_id}: VLog::open: {e}");
+                let _ = ready.send(Err(msg.clone()));
+                return Err(msg);
             }
         };
 
@@ -3311,12 +3413,13 @@ fn run_shard(
         // The read/write locks are uncontended in inline mode (~10ns acquire
         // on M1), so there is no measurable cost for the default path.
         let (vindexes, resolved) = match recover_vindexes(
-            shard_id, &dir, tier, mmap_tier, mmap_graph, read_only, &in_flight,
+            shard_id, &dir, tier, mmap_tier, mmap_graph, read_only, &in_flight, &memory,
         ) {
             Ok((vindexes, resolved)) => (Arc::new(RwLock::new(vindexes)), resolved),
             Err(e) => {
-                let _ = ready.send(Err(e.to_string()));
-                return;
+                let msg = e.to_string();
+                let _ = ready.send(Err(msg.clone()));
+                return Err(msg);
             }
         };
         let vindexes: Arc<RwLock<VindexSet>> = vindexes;
@@ -3406,15 +3509,29 @@ fn run_shard(
                     )
                     .await;
                 }
+                // Every background loop is owned by this shard lifecycle. A
+                // watch channel wakes sleeping loops during shutdown; work
+                // already inside an operation finishes before the final file
+                // barriers below are allowed to run.
+                let (background_stop, background_stop_rx) = tokio::sync::watch::channel(false);
+                let mut background = tokio::task::JoinSet::new();
+
                 // Background compaction and snapshots only earn their keep when
                 // the shard accepts writes; a serve-mode shard skips both.
                 if !read_only {
                     // Background compaction: reclaim dead space on this shard.
                     // Telemetry tick each time a compaction run starts.
                     let cvlog = vlog.clone();
-                    tokio::task::spawn_local(async move {
+                    let mut stop = background_stop_rx.clone();
+                    background.spawn_local(async move {
                         loop {
-                            tokio::time::sleep(COMPACTION_INTERVAL).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(COMPACTION_INTERVAL) => {}
+                                changed = stop.changed() => {
+                                    let _ = changed;
+                                    break;
+                                }
+                            }
                             match cvlog.maybe_compact().await {
                                 Ok(Some(_seg_id)) => {
                                     skeg_telemetry::tick_counter(
@@ -3433,12 +3550,19 @@ fn run_shard(
                     let svlog = vlog.clone();
                     let svindexes = vindexes.clone();
                     let sdir = dir.clone();
-                    tokio::task::spawn_local(async move {
+                    let mut stop = background_stop_rx.clone();
+                    background.spawn_local(async move {
                         // Stamp of the last cache written per vindex, so an
                         // idle store stops rewriting the same bytes.
                         let mut written: HashMap<String, (u64, u64)> = HashMap::new();
                         loop {
-                            tokio::time::sleep(SNAPSHOT_INTERVAL).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(SNAPSHOT_INTERVAL) => {}
+                                changed = stop.changed() => {
+                                    let _ = changed;
+                                    break;
+                                }
+                            }
                             snapshot_and_payload_indexes(
                                 &svlog,
                                 &svindexes,
@@ -3462,16 +3586,29 @@ fn run_shard(
                     // snapshot and the final swap, both short.
                     let kvindexes = vindexes.clone();
                     let kdir = dir.clone();
-                    tokio::task::spawn_local(async move {
+                    let mut stop = background_stop_rx.clone();
+                    background.spawn_local(async move {
                         // Phase-shift shards so their idle folds (each a graph
                         // rebuild) do not all run at once and stack their build
                         // buffers into one RSS spike. A process-wide
                         // permit would serialise them exactly; the stagger is the
                         // cheap version with no cross-shard plumbing.
-                        tokio::time::sleep(Duration::from_secs(shard_id as u64 * 2)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(shard_id as u64 * 2)) => {}
+                            changed = stop.changed() => {
+                                let _ = changed;
+                                return;
+                            }
+                        }
                         let mut prev: HashMap<String, usize> = HashMap::new();
                         loop {
-                            tokio::time::sleep(idle_maint_interval()).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(idle_maint_interval()) => {}
+                                changed = stop.changed() => {
+                                    let _ = changed;
+                                    break;
+                                }
+                            }
                             let snap: Vec<(String, VectorEntry)> = {
                                 let g = kvindexes.read();
                                 g.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
@@ -3489,7 +3626,16 @@ fn run_shard(
                     });
                 }
 
+                let mut requests = tokio::task::JoinSet::new();
+                let mut failures = Vec::new();
                 while let Some(msg) = rx.recv().await {
+                    while let Some(done) = requests.try_join_next() {
+                        if let Err(e) = done {
+                            let failure = format!("shard {shard_id}: request task failed: {e}");
+                            error!("{failure}");
+                            failures.push(failure);
+                        }
+                    }
                     // Block here once MAX_INFLIGHT_PER_SHARD tasks are running;
                     // this stops draining the inbox and propagates backpressure.
                     let permit = inflight
@@ -3504,7 +3650,7 @@ fn run_shard(
                     let memory_task = memory.clone();
                     let vsearch_pool = vsearch_pool.clone();
                     let shard_id_u16 = shard_id as u16;
-                    tokio::task::spawn_local(async move {
+                    requests.spawn_local(async move {
                         // Telemetry: classify the op, time the work, record.
                         // `op_kind` is borrowed-only · no Send cost on the
                         // hot path (the enum is `Copy`).
@@ -3540,6 +3686,46 @@ fn run_shard(
                         drop(permit); // release on completion
                     });
                 }
+                // Wake sleepers now. A loop already compacting, snapshotting
+                // or building maintenance completes and is joined below; it
+                // must not race the final file barriers.
+                let _ = background_stop.send(true);
+                // Closing the inbox stops NEW work. Requests already accepted
+                // by the shard are part of the shutdown barrier even if their
+                // connection task hit its own drain deadline: cancelling the
+                // waiter must not cancel a half-applied mutation.
+                while let Some(done) = requests.join_next().await {
+                    if let Err(e) = done {
+                        let failure =
+                            format!("shard {shard_id}: request task failed while draining: {e}");
+                        error!("{failure}");
+                        failures.push(failure);
+                    }
+                }
+                while let Some(done) = background.join_next().await {
+                    if let Err(e) = done {
+                        failures.push(format!(
+                            "shard {shard_id}: background task failed while draining: {e}"
+                        ));
+                    }
+                }
+
+                // Segment files are immutable and synced before publication,
+                // but each disk index has a mutable append WAL. Synchronise
+                // every one and retain every error before moving to the VLog.
+                let indexes: Vec<(String, VectorEntry)> = {
+                    let g = vindexes.read();
+                    g.iter()
+                        .map(|(name, arc)| (name.clone(), arc.clone()))
+                        .collect()
+                };
+                for (name, index) in indexes {
+                    if let Err(e) = index.read().backend.sync_wal() {
+                        failures.push(format!(
+                            "shard {shard_id}: vector WAL sync for '{name}' failed: {e}"
+                        ));
+                    }
+                }
                 // Channel closed: flush the active committer for durability.
                 //
                 // The last barrier this shard gets, and the one nobody is
@@ -3549,12 +3735,48 @@ fn run_shard(
                 // one. The committer counts it in
                 // `skeg_vlog_flush_failures_total`; this line says which
                 // shard, and is the only place the reason is written down.
-                if let Err(e) = vlog.flush().await {
-                    error!("shard {shard_id}: the final flush before shutdown did not land: {e}");
+                #[cfg(feature = "failpoints")]
+                if let Some(ms) = std::env::var("SKEG_TEST_SHUTDOWN_FLUSH_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                #[cfg(feature = "failpoints")]
+                let injected = std::env::var("SKEG_TEST_SHUTDOWN_FLUSH_ERROR")
+                    .ok()
+                    .map(|kind| {
+                        let errno = match kind.as_str() {
+                            "EIO" => 5,
+                            "ENOSPC" => 28,
+                            other => panic!("unknown shutdown flush failpoint {other}"),
+                        };
+                        Err(skeg_core::Error::Io(std::io::Error::from_raw_os_error(
+                            errno,
+                        )))
+                    });
+                #[cfg(not(feature = "failpoints"))]
+                let injected: Option<Result<(), skeg_core::Error>> = None;
+                let flush = match injected {
+                    Some(result) => result,
+                    None => vlog.flush().await,
+                };
+                if let Err(e) = flush {
+                    failures.push(format!(
+                        "shard {shard_id}: final flush before shutdown failed: {e}"
+                    ));
+                }
+                if failures.is_empty() {
+                    Ok(())
+                } else {
+                    for failure in &failures {
+                        error!("{failure}");
+                    }
+                    Err(failures.join("; "))
                 }
             })
-            .await;
-    });
+            .await
+    })
 }
 
 /// True for requests that change durable state. A serve-mode shard rejects
@@ -3660,6 +3882,7 @@ async fn drop_vindex(
     tier: QuantKind,
     mmap_tier: bool,
     mmap_graph: bool,
+    memory: &Arc<crate::memory::MemoryGovernor>,
 ) -> Result<bool, String> {
     // Bound to a local FIRST: a guard built in a `match` scrutinee lives for
     // the whole `match`, so the miss arm below would hold the write lock across
@@ -3685,7 +3908,7 @@ async fn drop_vindex(
             // Listed. Reopening is worth attempting because only the open index
             // knows its quota fragment; if it will not open, the entry is still
             // committed and still has to go.
-            match get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, name).await {
+            match get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, name, memory).await {
                 // `None` from the map means a concurrent drop won the race.
                 Some(_) => match vindexes.write().remove(name) {
                     Some(arc) => DropTarget::Live(arc),
@@ -4198,6 +4421,7 @@ async fn process(
                                         VectorBackend::Disk(Box::new(idx)),
                                         kind,
                                         generation,
+                                        Arc::clone(memory),
                                     ))));
                                     Ok(true)
                                 }
@@ -4209,6 +4433,7 @@ async fn process(
                             VectorBackend::Flat(Box::new(FlatIndex::new(dim, kind))),
                             kind.to_wire().unwrap_or(0),
                             generation,
+                            Arc::clone(memory),
                         ))));
                         Ok(false)
                     }
@@ -4365,7 +4590,8 @@ async fn process(
             ShardResp::Done
         }
         ShardReq::VindexConsolidate { name } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -4386,7 +4612,7 @@ async fn process(
                     )
                     .await
                     {
-                        Ok(_) => {
+                        Ok(MaintenanceOutcome::Ran) => {
                             // Same lesson as the comment above, in a different
                             // field: the maintenance path rebuilds the IVF
                             // router after a consolidate and the explicit
@@ -4408,6 +4634,15 @@ async fn process(
                                 .await;
                             }
                             ShardResp::Done
+                        }
+                        Ok(MaintenanceOutcome::NotNeeded) => ShardResp::Done,
+                        Ok(MaintenanceOutcome::BudgetBusy) => {
+                            ShardResp::Refused(ShardError::Admission(
+                                crate::admission::AdmissionError::MaintenanceBusy,
+                            ))
+                        }
+                        Ok(MaintenanceOutcome::Failed) => {
+                            ShardResp::Err("consolidate failed without an error detail".to_owned())
                         }
                         Err(e) => ShardResp::Err(e),
                     }
@@ -4450,6 +4685,7 @@ async fn process(
         } => {
             match drop_vindex(
                 vlog, vindexes, dir, quota, &name, tenant, credit, tier, mmap_tier, mmap_graph,
+                memory,
             )
             .await
             {
@@ -4533,6 +4769,7 @@ async fn process(
                     tier,
                     mmap_tier,
                     mmap_graph,
+                    memory,
                 )
                 .await
                 {
@@ -4593,7 +4830,8 @@ async fn process(
             // Outer read to look up the entry; clone the Arc and drop the
             // outer lock before taking the per-vindex write. This lets
             // another vindex's ops run in parallel with this one.
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             let Some(arc) = entry else {
                 return ShardResp::Err(format!("vindex '{name}' not found"));
             };
@@ -4899,7 +5137,8 @@ async fn process(
             ShardResp::Done
         }
         ShardReq::Vget { name, id } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -4912,7 +5151,8 @@ async fn process(
             }
         }
         ShardReq::SampleVectors { name, count } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -4947,7 +5187,8 @@ async fn process(
             limit,
             tenant,
         } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -5005,7 +5246,8 @@ async fn process(
             tau,
             tenant,
         } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -5068,7 +5310,8 @@ async fn process(
             }
         }
         ShardReq::LiveIds { name } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 Some(arc) => {
                     let idx = arc.read();
@@ -5102,7 +5345,8 @@ async fn process(
             ShardResp::Count(count_payload_blobs(vlog, tenant, &name))
         }
         ShardReq::StillCurrent { name, id, version } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -5119,7 +5363,8 @@ async fn process(
             }
         }
         ShardReq::GraphSample { name, count } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -5143,7 +5388,8 @@ async fn process(
             effect,
             version,
         } => {
-            let entry = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await;
+            let entry =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await;
             match entry {
                 None => ShardResp::Err(format!("vindex '{name}' not found")),
                 Some(arc) => {
@@ -5260,7 +5506,8 @@ async fn process(
             // inline versions used to be written out separately, which meant a
             // fix to one could miss the other and only show up in production,
             // where `workers > 0`, and never in a dev run, where it is 0.
-            let Some(arc) = get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name).await
+            let Some(arc) =
+                get_or_reopen(vindexes, dir, tier, mmap_tier, mmap_graph, &name, memory).await
             else {
                 return ShardResp::Err(format!("vindex '{name}' not found"));
             };
@@ -5520,8 +5767,18 @@ type VsearchHit = (u64, f32, Option<Bytes>, u64);
 type OwnerMap = ahash::AHashMap<u64, (u8, Option<u8>, u64)>;
 
 struct ShardSetInner {
-    senders: Vec<Sender<ShardMsg>>,
-    handles: Vec<JoinHandle<()>>,
+    /// Empty once shutdown starts. Calls clone one sender under this short
+    /// lock and never hold the guard across an await.
+    senders: Mutex<Vec<Sender<ShardMsg>>>,
+    /// Taken exactly once by `shutdown`; empty afterwards makes Drop
+    /// idempotent and lets clones observe a closed shard set.
+    handles: Mutex<Vec<JoinHandle<Result<(), String>>>>,
+    /// One shared, cancellation-safe shutdown operation. The first caller
+    /// starts a coordinator that owns the worker handles; every concurrent or
+    /// later caller watches the same terminal result instead of mistaking an
+    /// already-taken handle vector for a completed barrier.
+    shutdown_result:
+        std::sync::OnceLock<tokio::sync::watch::Receiver<Option<Result<(), ShardShutdownError>>>>,
     vsearch_admission: Option<Arc<Semaphore>>,
     n: usize,
     /// Per-tenant vector counter, shared across shards and consulted on
@@ -5637,10 +5894,68 @@ type PlacementExclusive = tokio::sync::OwnedRwLockWriteGuard<u64>;
 impl Drop for ShardSetInner {
     fn drop(&mut self) {
         // Drop senders first: workers see the channel disconnect and exit.
-        self.senders.clear();
-        for h in self.handles.drain(..) {
+        self.senders.get_mut().clear();
+        for h in self.handles.get_mut().drain(..) {
             let _ = h.join();
         }
+    }
+}
+
+/// Every shard failure observed by the shutdown barrier. Aggregated rather
+/// than fail-fast so one broken disk cannot hide a second shard that failed to
+/// flush or panicked.
+#[derive(Clone, Debug)]
+pub struct ShardShutdownError {
+    failures: Vec<String>,
+}
+
+impl ShardShutdownError {
+    #[must_use]
+    pub fn failures(&self) -> &[String] {
+        &self.failures
+    }
+}
+
+impl std::fmt::Display for ShardShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shard shutdown failed: {}", self.failures.join("; "))
+    }
+}
+
+impl std::error::Error for ShardShutdownError {}
+
+async fn join_shard_workers(
+    handles: Vec<JoinHandle<Result<(), String>>>,
+) -> Result<(), ShardShutdownError> {
+    let failures = tokio::task::spawn_blocking(move || {
+        let mut failures = Vec::new();
+        for (shard, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failures.push(e),
+                Err(panic) => {
+                    let reason = panic.downcast_ref::<&str>().map_or_else(
+                        || {
+                            panic
+                                .downcast_ref::<String>()
+                                .map_or("unknown panic", String::as_str)
+                        },
+                        |s| *s,
+                    );
+                    failures.push(format!("shard {shard}: worker panicked: {reason}"));
+                }
+            }
+        }
+        failures
+    })
+    .await
+    .map_err(|e| ShardShutdownError {
+        failures: vec![format!("join coordinator failed: {e}")],
+    })?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ShardShutdownError { failures })
     }
 }
 
@@ -5651,6 +5966,15 @@ pub struct ShardSet {
 }
 
 impl ShardSet {
+    fn sender(&self, shard: usize) -> Result<Sender<ShardMsg>, ShardError> {
+        self.inner
+            .senders
+            .lock()
+            .get(shard)
+            .cloned()
+            .ok_or(ShardError::Unavailable)
+    }
+
     /// `base_dir/shard-{id}/`.
     ///
     /// # Errors
@@ -6014,8 +6338,9 @@ impl ShardSet {
         }
         let set = Self {
             inner: Arc::new(ShardSetInner {
-                senders,
-                handles,
+                senders: Mutex::new(senders),
+                handles: Mutex::new(handles),
+                shutdown_result: std::sync::OnceLock::new(),
                 vsearch_admission,
                 n: n_shards,
                 quota,
@@ -6061,6 +6386,42 @@ impl ShardSet {
         &self.inner.memory
     }
 
+    /// Stop every shard, drain work already accepted, flush its active
+    /// committer and join all worker threads.
+    ///
+    /// The method is idempotent and linearizable: the first caller starts one
+    /// coordinator; concurrent and later callers observe its same terminal
+    /// result. Calls through any surviving clone fail with `Unavailable` once
+    /// shutdown has begun.
+    pub async fn shutdown(&self) -> Result<(), ShardShutdownError> {
+        let mut result = self
+            .inner
+            .shutdown_result
+            .get_or_init(|| {
+                let senders = std::mem::take(&mut *self.inner.senders.lock());
+                drop(senders);
+                let handles = std::mem::take(&mut *self.inner.handles.lock());
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                // The coordinator owns the handles independently of the first
+                // waiter. Cancelling that waiter cannot orphan an in-progress
+                // durable barrier or make the next caller answer early.
+                tokio::spawn(async move {
+                    let joined = join_shard_workers(handles).await;
+                    tx.send_replace(Some(joined));
+                });
+                rx
+            })
+            .clone();
+        loop {
+            if let Some(done) = result.borrow_and_update().clone() {
+                return done;
+            }
+            result.changed().await.map_err(|e| ShardShutdownError {
+                failures: vec![format!("shutdown coordinator disappeared: {e}")],
+            })?;
+        }
+    }
+
     /// Number of shards.
     #[must_use]
     pub fn n_shards(&self) -> usize {
@@ -6070,7 +6431,7 @@ impl ShardSet {
     async fn call(&self, shard: usize, req: ShardReq) -> Result<ShardResp, ShardError> {
         let (tx, rx) = oneshot::channel();
         // A bounded `send` awaits if the shard inbox is full: backpressure.
-        self.inner.senders[shard]
+        self.sender(shard)?
             .send(ShardMsg { req, reply: tx })
             .await
             .map_err(|_| ShardError::Unavailable)?;
@@ -6302,7 +6663,7 @@ impl ShardSet {
                 continue;
             }
             let (tx, rx) = oneshot::channel();
-            self.inner.senders[shard]
+            self.sender(shard)?
                 .send(ShardMsg {
                     req: ShardReq::MgetBatch(bucket, tenant),
                     reply: tx,
@@ -6363,7 +6724,7 @@ impl ShardSet {
                 continue;
             }
             let (tx, rx) = oneshot::channel();
-            self.inner.senders[shard]
+            self.sender(shard)?
                 .send(ShardMsg {
                     req: ShardReq::ValueSizes(bucket, tenant),
                     reply: tx,
@@ -6426,7 +6787,7 @@ impl ShardSet {
                 continue;
             }
             let (tx, rx) = oneshot::channel();
-            self.inner.senders[shard]
+            self.sender(shard)?
                 .send(ShardMsg {
                     req: ShardReq::MgetBounded(bucket, tenant),
                     reply: tx,
@@ -6540,7 +6901,11 @@ impl ShardSet {
     /// Used for VINDEX CREATE/DROP, which every shard must apply.
     async fn broadcast(&self, mut make_req: impl FnMut() -> ShardReq) -> Result<(), ShardError> {
         let mut pending = Vec::with_capacity(self.inner.n);
-        for sender in &self.inner.senders {
+        let senders = self.inner.senders.lock().clone();
+        if senders.len() != self.inner.n {
+            return Err(ShardError::Unavailable);
+        }
+        for sender in &senders {
             let (tx, rx) = oneshot::channel();
             sender
                 .send(ShardMsg {
@@ -8973,7 +9338,7 @@ impl ShardSet {
         };
         let mut pending = Vec::with_capacity(targets.len());
         for &shard in &targets {
-            let sender = &self.inner.senders[shard];
+            let sender = self.sender(shard)?;
             let (tx, rx) = oneshot::channel();
             let req = ShardReq::Vsearch {
                 name: name.to_owned(),
@@ -10163,6 +10528,194 @@ mod tests {
             MaintenanceOutcome::Ran,
             "the parked consolidate must complete once a permit frees"
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_reserves_bytes_before_begin_and_releases_on_refusal() {
+        #[derive(Debug)]
+        struct FixedMemory(u64);
+        impl crate::memory::MemorySource for FixedMemory {
+            fn headroom(&self) -> crate::memory::Headroom {
+                crate::memory::Headroom::Known(self.0)
+            }
+        }
+
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(Arc::new(FixedMemory(1024)), None, Some(0)).unwrap(),
+        );
+        let dir = TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(dir.path(), 4, 64).unwrap();
+        idx.set_auto_flush(false);
+        idx.insert(1, &[1.0; 4]).unwrap();
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new_with_governor(
+            VectorBackend::Disk(Box::new(idx)),
+            1,
+            Arc::clone(&governor),
+        )));
+        let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = Arc::clone(&began);
+        let outcome = off_thread_maintenance(
+            &arc,
+            "consolidate",
+            0,
+            move |_| {
+                mark.store(true, Ordering::Release);
+                Ok(Some(()))
+            },
+            |_| Ok(()),
+            |_, ()| Ok(skeg_vector::FinishOutcome::Committed),
+        )
+        .await;
+
+        assert_eq!(outcome, MaintenanceOutcome::BudgetBusy);
+        assert!(
+            !began.load(Ordering::Acquire),
+            "begin allocated before admission"
+        );
+        assert_eq!(governor.reserved_bytes(), 0, "a refusal leaked a permit");
+    }
+
+    #[tokio::test]
+    async fn maintenance_byte_permit_survives_cancellation_and_is_raii_on_failure() {
+        #[derive(Debug)]
+        struct FixedMemory(u64);
+        impl crate::memory::MemorySource for FixedMemory {
+            fn headroom(&self) -> crate::memory::Headroom {
+                crate::memory::Headroom::Known(self.0)
+            }
+        }
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(
+                Arc::new(FixedMemory(256 * 1024 * 1024)),
+                None,
+                Some(0),
+            )
+            .unwrap(),
+        );
+        let dir = TempDir::new().unwrap();
+        let mut idx = DiskVamanaIndex::create_empty(dir.path(), 4, 64).unwrap();
+        idx.set_auto_flush(false);
+        idx.insert(1, &[1.0; 4]).unwrap();
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new_with_governor(
+            VectorBackend::Disk(Box::new(idx)),
+            1,
+            Arc::clone(&governor),
+        )));
+
+        let in_build = Arc::clone(&governor);
+        let failed = try_off_thread_maintenance(
+            &arc,
+            "consolidate",
+            true,
+            |_| Ok(Some(())),
+            move |_| -> std::io::Result<()> {
+                assert!(
+                    in_build.reserved_bytes() > 0,
+                    "build ran without its byte permit"
+                );
+                Err(std::io::Error::other("injected failure"))
+            },
+            |_, ()| Ok(skeg_vector::FinishOutcome::Committed),
+        )
+        .await;
+        assert!(failed.unwrap_err().contains("injected failure"));
+        assert_eq!(
+            governor.reserved_bytes(),
+            0,
+            "failure leaked the byte permit"
+        );
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_arc = Arc::clone(&arc);
+        let task = tokio::spawn(async move {
+            try_off_thread_maintenance(
+                &task_arc,
+                "consolidate",
+                true,
+                |_| Ok(Some(())),
+                move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(std::io::Error::other)?;
+                    Ok(())
+                },
+                |_, ()| Ok(skeg_vector::FinishOutcome::Committed),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("blocking build start deadline")
+            .expect("blocking build started");
+        task.abort();
+        let _ = task.await;
+        assert!(
+            governor.reserved_bytes() > 0,
+            "aborting the async waiter released a permit while spawn_blocking still ran"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while governor.reserved_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking task released its byte permit");
+    }
+
+    #[tokio::test]
+    async fn byte_busy_merge_does_not_consume_the_flush_turn() {
+        #[derive(Debug)]
+        struct FixedMemory(u64);
+        impl crate::memory::MemorySource for FixedMemory {
+            fn headroom(&self) -> crate::memory::Headroom {
+                crate::memory::Headroom::Known(self.0)
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let vdir = dir.path().join("vindex-byte-ladder");
+        let mut idx = DiskVamanaIndex::create_empty(&vdir, 4, 64).unwrap();
+        idx.set_auto_flush(false);
+        for run in 0..RUNS_MERGE_TRIGGER {
+            for row in 0..64_u64 {
+                let id = run as u64 * 64 + row;
+                idx.insert(id, &[id as f32; 4]).unwrap();
+            }
+            let job = idx.flush_begin().unwrap().unwrap();
+            let built = job.build(&vdir).unwrap();
+            idx.flush_finish(built).unwrap().expect_clean();
+        }
+        idx.insert(99_999, &[1.0; 4]).unwrap();
+        let merge = idx.maintenance_working_set_bytes(MaintenanceKind::RunsMerge);
+        let flush = idx.maintenance_working_set_bytes(MaintenanceKind::Flush);
+        assert!(merge > flush, "test shape must separate the two estimates");
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(
+                Arc::new(FixedMemory(flush + (merge - flush) / 2)),
+                None,
+                Some(0),
+            )
+            .unwrap(),
+        );
+        let arc: VectorEntry = Arc::new(RwLock::new(Vindex::new_with_governor(
+            VectorBackend::Disk(Box::new(idx)),
+            1,
+            Arc::clone(&governor),
+        )));
+
+        maintenance_tick_at(&arc, &vdir, 0, false, 1).await;
+
+        let g = arc.read();
+        assert_eq!(
+            g.backend.delta_len(),
+            0,
+            "flush never got its lower-rung turn"
+        );
+        assert_eq!(g.backend.run_count(), RUNS_MERGE_TRIGGER + 1);
+        assert_eq!(governor.reserved_bytes(), 0);
     }
 
     #[tokio::test]
@@ -15807,6 +16360,48 @@ mod tests {
             ratio >= 1.2,
             "per-vindex locks did not parallelise (baseline {baseline:?}, concurrent {concurrent:?}, ratio {ratio:.2}x; expected >= 1.2x)"
         );
+    }
+
+    /// Every caller of the public shutdown barrier must observe the same
+    /// completion. Seeing that another caller already took the worker handles
+    /// is not completion: those workers may still be draining accepted work.
+    #[tokio::test]
+    async fn concurrent_shutdown_callers_wait_for_the_same_barrier() {
+        let dir = TempDir::new().unwrap();
+        let shards = ShardSet::open(dir.path(), 1).unwrap();
+        // Keep the worker inbox alive after shutdown removes its owned sender,
+        // making the join deterministically block until this fixture lets go.
+        let held_sender = shards.sender(0).unwrap();
+
+        let first_shards = shards.clone();
+        let first = tokio::spawn(async move { first_shards.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while shards.sender(0).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first caller did not start shutdown");
+
+        let second_shards = shards.clone();
+        let mut second = tokio::spawn(async move { second_shards.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a concurrent caller returned before the worker barrier completed"
+        );
+        first.abort();
+        let _ = first.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "cancelling the initiating waiter cancelled the shared barrier"
+        );
+
+        drop(held_sender);
+        second.await.unwrap().unwrap();
     }
 }
 

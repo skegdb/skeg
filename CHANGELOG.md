@@ -27,7 +27,7 @@ dependency order):
 | skeg-core | 0.3.4 | 0.3.5 | additive; disk-quota reservation is atomic |
 | skeg-vector | 0.1.8 | **0.2.0** | WAL `SKWL\x03` + `versions.bin`: no downgrade |
 | skeg-tenant | 0.1.3 | 0.1.3 | unchanged |
-| skeg-server | 0.7.2 | **0.8.0** | registry `SVI3`, `payload.idx` v2, `SKEG.VMSET` array reply, `::` refused in names, ingress budget, admission classification |
+| skeg-server | 0.7.2 | **0.8.0** | registry `SVI3`, `payload.idx` v2, `SKEG.VMSET` array reply, `::` refused in names, ingress/maintenance budgets, graceful shutdown, admission classification |
 | skeg-server-tenant | 0.2.4 | 0.2.5 | `--allow-unauthenticated-network`, lenient-mode guard |
 | skeg-multi-tenant | 0.1.0 | **not published** | `skeg-rigging-skeg` 0.1.4 requires `skeg-vector ^0.1`; a published copy would embed the previous engine. Ships after a rigging release that depends on 0.2. |
 
@@ -45,6 +45,21 @@ is at most 1 MiB (`MAX_PAYLOAD_BYTES`); one RESP3 frame at most ~129 MiB; a
 VMSET at most 4096 items / 64 MiB; `max_disk_bytes` now counts payload blobs
 and MSET; in a 256 MiB container the ingress class is ~21 MiB and a maximum
 VMSET is refused rather than OOM-killing the process.
+
+The same governor now admits the transient working set of graph maintenance.
+Set `SKEG_MEMORY_LIMIT_BYTES` only when cgroup accounting is unavailable; keep
+`SKEG_MEMORY_RESERVE_BYTES` below it. A fold, run merge, delete patch or flush
+that cannot reserve its conservative byte estimate does not take a snapshot
+and is retried or answered as retryable `BACKPRESSURE`. Concurrency limits still
+bound simultaneous graph builds; they are not substitutes for the byte limit.
+
+`SIGTERM` and Ctrl-C are graceful. The server stops accepting, drains existing
+connections for `SKEG_SHUTDOWN_TIMEOUT_MS` (30 seconds by default), closes the
+shard inboxes, joins accepted requests and background work, synchronises every
+vector WAL and flushes every VLog. Exit zero means the whole barrier succeeded;
+a connection deadline, worker panic or any shard flush failure produces a
+non-zero exit. Supervisors must allow longer than the connection deadline for
+the subsequent maintenance joins and disk barriers.
 
 **Clients and SDKs.** `SKEG.VMSET` replies with an array of one result per
 item, in request order, instead of an integer. `MSET` refuses a batch whose
@@ -135,10 +150,11 @@ commit, and keeps the `ErrorKind` when they all failed the same way, so a
 caller looking for ENOSPC still finds it.
 
 Every failed flush ticks the new counter `skeg_vlog_flush_failures_total`
-(`/metrics` and `SKEG.STATS`), including the three that have no caller to
-answer: a full batch, the batch timer, and the last flush as the committer
-shuts down. There is no healthy value above zero. The shard's shutdown flush
-logs at ERROR.
+(`/metrics` and `SKEG.STATS`), including the three that have no request caller
+to answer: a full batch, the batch timer, and the last flush as the committer
+shuts down. There is no healthy value above zero. A final shard failure is
+aggregated with failures from every other shard, logged, and makes the server
+process exit non-zero.
 
 An explicit flush is now a **barrier**, not just the batch in front of it.
 Both committers count the bytes they have written that no sync has covered,

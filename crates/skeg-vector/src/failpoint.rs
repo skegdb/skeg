@@ -18,6 +18,8 @@ pub enum WriteFailpoint {
     VersionsSidecarWrite,
     /// Appending a record to the delta WAL.
     DeltaWalAppend,
+    /// Synchronising the delta WAL at a process shutdown barrier.
+    DeltaWalSync,
 }
 
 impl WriteFailpoint {
@@ -28,6 +30,7 @@ impl WriteFailpoint {
         match self {
             WriteFailpoint::VersionsSidecarWrite => 1 << 0,
             WriteFailpoint::DeltaWalAppend => 1 << 1,
+            WriteFailpoint::DeltaWalSync => 1 << 2,
         }
     }
 }

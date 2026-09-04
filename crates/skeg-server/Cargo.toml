@@ -76,6 +76,7 @@ tracing-otlp = [
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+libc = "0.2"
 # The slowloris gate opens a thousand sockets of its own, so the TEST process
 # needs the descriptor headroom too - the default soft limit is 256 on macOS.
 skeg-platform = { path = "../skeg-platform", version = "0.1.6" }

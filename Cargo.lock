@@ -1688,6 +1688,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "futures-util",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
