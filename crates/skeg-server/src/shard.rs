@@ -7,6 +7,39 @@
 //! Requests reach a shard over an `mpsc` channel; the worker replies on a
 //! per-request `tokio::oneshot`. Keys route deterministically by
 //! `xxh3_64(key) % n_shards`.
+//!
+//! # Placement authority, and the order its locks are taken in
+//!
+//! A semantically-resharded vindex cannot compute an id's shard, so the
+//! coordinator keeps an owner map for it. That map is read to DECIDE where a
+//! point op goes and written to RECORD where it put a row, while
+//! `rebuild_owner_maps` replaces the whole thing from a fresh scan. Ordering
+//! those two is not optional: a publish that lands between a decision and its
+//! commit silently undoes the commit (audit 20 §B0, `docs/adr-placement-
+//! authority.md`).
+//!
+//! So each index has ONE authority - `ShardSetInner::placement`, a
+//! `tokio::sync::RwLock` per SCOPED NAME:
+//!
+//! - **exclusive** for the whole per-name body of a rebuild (scan AND publish)
+//!   and for `drop_router_state`;
+//! - **shared for the whole decision-and-commit** of `vset` (routed), `vdel`,
+//!   `vget`, `owners_of`, `check`, the cardinality read of `vindex_drop`, and
+//!   the per-row body of `reshard` and `overlap`;
+//! - **per name, never global**: a global lock would make one tenant's reshard
+//!   stall every other tenant's point ops (SD5).
+//!
+//! **Lock order: `placement(read|write)` -> `owner_stripe(name, id)` -> shard
+//! mailbox.** Never re-entered, and never taken in the other order.
+//! `tokio::sync::RwLock` is FIFO, so a reader that waits for something a
+//! queued writer needs is a deadlock; what keeps the mailbox out of that cycle
+//! is that a shard worker never touches `placement`. `ensure_owner_map` is the
+//! only thing that may upgrade to the exclusive lock, so it runs at the TOP of
+//! an entry point, before any stripe and with no guard in hand. The owner map
+//! itself is reachable only through accessors that take the guard as an
+//! argument, so reading it without the authority does not compile - except at
+//! one site named `owner_primaries_unsynchronised`, which `vsearch` uses
+//! deliberately and which the ADR explains.
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -5471,7 +5504,37 @@ struct ShardSetInner {
     /// duplicate or a wrong-shard entry. Ops on one id take its stripe; ops on
     /// different ids run free; hash-routed vindexes never take a stripe.
     owner_locks: Vec<tokio::sync::Mutex<()>>,
+    /// THE PLACEMENT AUTHORITY: one `RwLock` per SCOPED index name, guarding
+    /// that index's epoch.
+    ///
+    /// The owner stripe above serialises two point ops on the same id. It says
+    /// nothing about a REBUILD, which touches every id of an index and takes no
+    /// stripe at all - so a publish could land between a point op's decision
+    /// and its commit and undo the commit (audit 20 §B0). This is what orders
+    /// them: shared for a decision-and-commit, exclusive for a rebuild.
+    ///
+    /// Per name, so a reshard of one tenant's index does not stall another
+    /// tenant's point ops (SD5). The outer `parking_lot::Mutex` guards only the
+    /// registry lookup - it is never held across an await.
+    ///
+    /// The `u64` is the epoch: bumped on every publish, asserted equal across a
+    /// reshard row's read and its publish, carried as a tracing field. It is
+    /// internal, never on the wire, and not persisted: the map is derived, and
+    /// the store lock is what guarantees a single authority per store.
+    placement: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::RwLock<u64>>>>,
 }
+
+/// The SHARED placement authority for one index, held for the whole span in
+/// which a decision is taken and committed.
+///
+/// Owned rather than borrowed so it can be held across the shard calls in the
+/// middle of that span. Every owner-map accessor takes one by reference: that
+/// is what makes "read the map without the authority" a compile error.
+type PlacementShared = tokio::sync::OwnedRwLockReadGuard<u64>;
+
+/// The EXCLUSIVE placement authority for one index. Only a rebuild and
+/// `drop_router_state` take it.
+type PlacementExclusive = tokio::sync::OwnedRwLockWriteGuard<u64>;
 
 impl Drop for ShardSetInner {
     fn drop(&mut self) {
@@ -5866,6 +5929,7 @@ impl ShardSet {
                 memory: memory.clone(),
                 catalog: tokio::sync::Mutex::new(()),
                 owner_locks: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
+                placement: parking_lot::Mutex::new(HashMap::new()),
             }),
         };
         // Every shard has now applied the decision against its own registry (it
@@ -5880,7 +5944,9 @@ impl ShardSet {
         // store that refuses to open.
         if !read_only {
             for name in &in_flight {
-                if let Err(e) = set.drop_router_state(name) {
+                // No await here, and none needed: `open` has not handed this
+                // set to anybody, so there is no placement to order against.
+                if let Err(e) = set.drop_router_state_locked(name) {
                     error!("router state of resolved vindex '{name}' not removed: {e}");
                 }
             }
@@ -6446,10 +6512,15 @@ impl ShardSet {
         // delete. The tenant then stays charged for rows it no longer has
         // until the next open counts again - the same bargain the orphan
         // branch of `drop_vindex` already strikes, logged the same way.
+        //
+        // Under the SHARED placement authority, which is what makes the count
+        // a count of the whole index: a reshard used to be able to publish a
+        // half-migrated map underneath this read, and the tenant then stayed
+        // charged for every row the loop had not reached (SD4, audit 20 §B0(c)).
         let routed = self.inner.routers.read().contains_key(&name);
         let logical = if routed {
-            match self.ensure_owner_map(&name).await {
-                Ok(()) => self.inner.owners.read().get(&name).map(|m| m.len() as u64),
+            match self.placement_shared(&name).await {
+                Ok(placement) => self.owner_rows_at(&placement, &name),
                 Err(e) => {
                     error!(
                         "vector quota of '{name}' cannot be credited on drop: its owner \
@@ -6494,7 +6565,7 @@ impl ShardSet {
                 // and the record above guarantees the rest follows. Leaving it
                 // would let a recreated name inherit centroids and an owner map
                 // for data nobody has.
-                if let Err(sidecar) = self.drop_router_state(&name) {
+                if let Err(sidecar) = self.drop_router_state(&name).await {
                     error!("router state of partly dropped '{name}' not removed: {sidecar}");
                 }
                 return Err(ShardError::Storage(format!(
@@ -6506,7 +6577,7 @@ impl ShardSet {
         // describes: without this, recreating the same name inherits stale
         // centroids and an owner map for gone data (review P0). Drop the
         // sidecar and the in-RAM state, propagating a sidecar-removal error.
-        self.drop_router_state(&name)?;
+        self.drop_router_state(&name).await?;
         Ok(())
     }
 
@@ -6514,9 +6585,29 @@ impl ShardSet {
     /// map and version allocator. Idempotent (absent sidecar is fine). A
     /// failed removal of a present sidecar is an error - a dropped index must
     /// not leave routing behind.
-    fn drop_router_state(&self, name: &str) -> Result<(), ShardError> {
+    ///
+    /// Under the index's EXCLUSIVE placement authority: this is a placement
+    /// change like any other, and a point op that had already decided against
+    /// the map must not commit into the one being torn down.
+    ///
+    /// # Errors
+    ///
+    /// A present sidecar that cannot be removed.
+    async fn drop_router_state(&self, name: &str) -> Result<(), ShardError> {
+        let _placement = self.placement_exclusive(name).await;
+        self.drop_router_state_locked(name)
+    }
+
+    /// [`drop_router_state`](Self::drop_router_state) WITHOUT taking the
+    /// authority, for the one caller that cannot await it: `open`, where the
+    /// `ShardSet` has not been handed to anybody yet and there is nothing to
+    /// order against.
+    fn drop_router_state_locked(&self, name: &str) -> Result<(), ShardError> {
         self.inner.routers.write().remove(name);
         self.inner.owners.write().remove(name);
+        // The authority itself goes too, so a recreated name starts from a
+        // fresh lock rather than inheriting this one's queue.
+        self.inner.placement.lock().remove(name);
         // The allocator goes with them: a recreated name starts from nothing
         // on disk, and a counter left over from the old index would hand its
         // first row a version far above anything the new one holds. Harmless
@@ -6781,18 +6872,19 @@ impl ShardSet {
         ids: &[u64],
     ) -> Result<Vec<(u8, Option<u8>)>, ShardError> {
         validate_vindex_name(name)?;
-        self.ensure_owner_map(name).await?;
-        let map = self.inner.owners.read();
-        let owned = map.get(name);
+        // One guard for the whole list: two ids answered from two different
+        // maps is a report of a placement that never existed.
+        let placement = self.placement_shared(name).await?;
         Ok(ids
             .iter()
             .map(|&id| {
-                let placement = owned.and_then(|m| m.get(&id).map(|&(p, r, _)| (p, r)));
-                placement.unwrap_or_else(|| {
-                    // Unrouted vindex: placement is computable from the id.
-                    #[allow(clippy::cast_possible_truncation)] // n <= 255 shards
-                    (shard_for(&id.to_le_bytes(), self.inner.n) as u8, None)
-                })
+                self.owner_entry_at(&placement, name, id)
+                    .map(|(p, r, _)| (p, r))
+                    .unwrap_or_else(|| {
+                        // Unrouted vindex: placement is computable from the id.
+                        #[allow(clippy::cast_possible_truncation)] // n <= 255 shards
+                        (shard_for(&id.to_le_bytes(), self.inner.n) as u8, None)
+                    })
             })
             .collect())
     }
@@ -6881,19 +6973,14 @@ impl ShardSet {
                     router.k, self.inner.n
                 ));
             }
-            if let Some(map) = self.inner.owners.read().get(name) {
-                let bad = map
-                    .values()
-                    .filter(|(p, r, _)| {
-                        usize::from(*p) >= self.inner.n
-                            || r.is_some_and(|s| usize::from(s) >= self.inner.n)
-                    })
-                    .count();
-                if bad > 0 {
-                    out.push(format!(
-                        "owner map: {bad} entries name a shard out of range"
-                    ));
-                }
+            // An fsck that reports on a map a rebuild is halfway through
+            // replacing is reporting on nothing.
+            let placement = self.placement_shared(name).await?;
+            let bad = self.owner_out_of_range_at(&placement, name);
+            if bad > 0 {
+                out.push(format!(
+                    "owner map: {bad} entries name a shard out of range"
+                ));
             }
         }
         Ok(out)
@@ -7001,7 +7088,7 @@ impl ShardSet {
             .cloned()
             .collect();
         for name in scoped {
-            self.drop_router_state(&name)?;
+            self.drop_router_state(&name).await?;
         }
         // Every index this tenant had is gone, so the only number that can be
         // right is zero - and it is reached by STATING it, not by adding up
@@ -7203,6 +7290,17 @@ impl ShardSet {
         // duplicate is recoverable (the search path dedups, and the owner map
         // says which copy is live) and a hole is not.
         if let Some(router) = self.router(name) {
+            // THE PLACEMENT AUTHORITY, taken FIRST and held to the map commit
+            // below. Everything between is one decision: which shard owns this
+            // row, and the record that says so. A rebuild publishing in the
+            // middle of it used to leave the record behind and the write
+            // unreadable (SD1).
+            //
+            // Above the stripe, always: this is where the owner map gets built
+            // if it is cold, and that needs the exclusive lock. Taking the
+            // stripe first - which is what this did - means holding it across
+            // a scan of every shard.
+            let placement = self.placement_shared(name).await?;
             // Serialise the whole read-delete-set-record span against a
             // concurrent routed vset/vdel on the SAME id (review finding).
             let _stripe = self.owner_stripe(name, id).lock().await;
@@ -7217,14 +7315,8 @@ impl ShardSet {
                     router.dim
                 )));
             }
-            self.ensure_owner_map(name).await?;
             let owner = router.assign(&vector);
-            let old = self
-                .inner
-                .owners
-                .read()
-                .get(name)
-                .and_then(|m| m.get(&id).copied());
+            let old = self.owner_entry_at(&placement, name, id);
             // Allocated UNDER THE STRIPE, and floored by the version the map
             // already records for this row: strictly greater than every copy
             // that exists, so the write cannot lose to one of them.
@@ -7256,12 +7348,12 @@ impl ShardSet {
             }
             // THE COMMIT POINT: reads route through this map, so the new copy
             // becomes the live one here, before the old one is touched.
-            self.inner
-                .owners
-                .write()
-                .entry(name.to_owned())
-                .or_default()
-                .insert(id, (owner as u8, None, version));
+            #[allow(clippy::cast_possible_truncation)] // n <= 255 shards
+            self.publish_owner_at(&placement, name, id, (owner as u8, None, version));
+            // The decision is committed; the authority is not needed for what
+            // follows, and a cleanup round trip per old copy is not something
+            // to make a rebuild wait behind.
+            drop(placement);
             // Cleanup, after the fact. A failure here leaves a stale duplicate
             // on a shard the map no longer points at: search dedups it and the
             // next overwrite of this id removes it. Reporting an error would
@@ -7531,8 +7623,11 @@ impl ShardSet {
     ///
     /// Returns an error if the index is missing or the shard is unavailable.
     pub async fn vget(&self, name: &str, id: u64) -> Result<Option<Vec<f32>>, ShardError> {
-        self.ensure_owner_map(name).await?;
-        let shard = self.point_shard(name, id);
+        // Held across the call, not just across the lookup: a read that routes
+        // by one map and is answered after another has replaced it is how a
+        // point read and a search stopped agreeing.
+        let placement = self.placement_shared(name).await?;
+        let shard = self.point_shard_at(&placement, name, id);
         let req = ShardReq::Vget {
             name: name.to_owned(),
             id,
@@ -7664,15 +7759,24 @@ impl ShardSet {
                     // the thing being made atomic is exactly what a vset on
                     // this id also does - decide where the live copy is, and
                     // publish that decision.
+                    //
+                    // Under the index's SHARED authority as well, taken before
+                    // the stripe: a move is a placement decision followed by a
+                    // placement commit, exactly like a routed write, and the
+                    // rebuild at the end of this run must not land between the
+                    // two. Per row, not per run - the exclusive lock at the end
+                    // is the only part of a reshard that stops other writers.
+                    //
+                    // The first row through here is also what builds the map if
+                    // this uptime has not needed it yet, which is what makes it
+                    // COMPLETE for the whole run: a `vindex_drop` racing this
+                    // loop counts every logical row, not just the moved ones.
+                    let placement = self.placement_shared(name).await?;
+                    let epoch = *placement;
                     let _stripe = self.owner_stripe(name, id).lock().await;
                     // Re-read UNDER the stripe. Everything above was decided
                     // from a batch collected before this lock existed.
-                    let current = self
-                        .inner
-                        .owners
-                        .read()
-                        .get(name)
-                        .and_then(|m| m.get(&id).copied());
+                    let current = self.owner_entry_at(&placement, name, id);
                     if current.is_some_and(|(_, _, live)| live > version) {
                         // A user write replaced this row while the batch was
                         // in flight, and was acknowledged. What this loop
@@ -7773,12 +7877,15 @@ impl ShardSet {
                         ShardResp::Refused(e) => return Err(e),
                         _ => return Err(ShardError::Unavailable),
                     }
-                    self.inner
-                        .owners
-                        .write()
-                        .entry(name.to_owned())
-                        .or_default()
-                        .insert(id, (owner, None, version));
+                    // The guard has been held since the read above, so the map
+                    // this publishes into is the map that was read. The assert
+                    // is what says so out loud - and what fails first if the
+                    // guard is ever released in the middle of this body.
+                    debug_assert_eq!(
+                        epoch, *placement,
+                        "a reshard row read one placement epoch and published into another"
+                    );
+                    self.publish_owner_at(&placement, name, id, (owner, None, version));
                     moved += 1;
                 }
                 match cursor {
@@ -7791,7 +7898,11 @@ impl ShardSet {
         // entered the map, and every consumer that trusts the map (overlap's
         // primary check, point ops after the hash fallback stops being
         // coincidentally right) needs the full picture.
-        self.rebuild_owner_maps().await?;
+        //
+        // THIS index only. Rebuilding every routed vindex would take every
+        // other tenant's placement authority to republish maps nothing here
+        // touched, which is precisely the cross-tenant stall SD5 forbids.
+        self.rebuild_owner_map(name).await?;
         Ok(moved)
     }
 
@@ -7839,13 +7950,13 @@ impl ShardSet {
                     // the map entry while the replica was in flight, and the
                     // replica then landed on a shard nothing was left to clean
                     // up - reachable by search, invisible to the map.
+                    //
+                    // And under the index's SHARED authority, taken before the
+                    // stripe for the same reason a reshard row does: read the
+                    // primary, write the replica slot, one placement.
+                    let placement = self.placement_shared(name).await?;
                     let _stripe = self.owner_stripe(name, id).lock().await;
-                    let current = self
-                        .inner
-                        .owners
-                        .read()
-                        .get(name)
-                        .and_then(|m| m.get(&id).copied());
+                    let current = self.owner_entry_at(&placement, name, id);
                     // No entry means the row was deleted while the batch was
                     // in flight; a higher version means it was rewritten, and
                     // this copy is the value that write replaced. Only rows
@@ -7947,11 +8058,7 @@ impl ShardSet {
                     // Still under the stripe: the replica has to be IN the map
                     // before a delete can look for it, or the delete finds
                     // nothing to remove and the copy outlives the row.
-                    if let Some(m) = self.inner.owners.write().get_mut(name)
-                        && let Some(e) = m.get_mut(&id)
-                    {
-                        e.1 = Some(second);
-                    }
+                    self.set_replica_at(&placement, name, id, second);
                     replicated += 1;
                 }
                 match cursor {
@@ -7980,12 +8087,51 @@ impl ShardSet {
     /// which is what makes a user write after a restart beat every copy that
     /// already exists.
     ///
+    /// Each index is rebuilt under its OWN exclusive placement authority, and
+    /// the lock is dropped between names: one tenant's rebuild must not stall
+    /// another tenant's point ops (SD5).
+    ///
     /// # Errors
     ///
     /// A shard being unavailable.
     pub async fn rebuild_owner_maps(&self) -> Result<(), ShardError> {
         let names: Vec<String> = self.inner.routers.read().keys().cloned().collect();
         for name in names {
+            let mut g = self.placement_exclusive(&name).await;
+            self.rebuild_owner_map_locked(&name, &mut g).await?;
+        }
+        Ok(())
+    }
+
+    /// [`rebuild_owner_maps`](Self::rebuild_owner_maps) for ONE index.
+    ///
+    /// What a reshard wants at the end of its run: it touched one index, and
+    /// taking every other routed index's authority to rebuild maps nothing
+    /// changed would block their tenants for nothing.
+    ///
+    /// # Errors
+    ///
+    /// A shard being unavailable.
+    pub async fn rebuild_owner_map(&self, name: &str) -> Result<(), ShardError> {
+        if !self.inner.routers.read().contains_key(name) {
+            return Ok(());
+        }
+        let mut g = self.placement_exclusive(name).await;
+        self.rebuild_owner_map_locked(name, &mut g).await
+    }
+
+    /// The per-name body: scan every shard, then publish - all of it under the
+    /// caller's EXCLUSIVE authority for this index, which is the whole point.
+    /// The scan awaits one round trip per shard, and a publish that replaced
+    /// the map without holding the authority across that window is what let a
+    /// concurrent point op's commit be undone (audit 20 §B0).
+    async fn rebuild_owner_map_locked(
+        &self,
+        name: &str,
+        epoch: &mut PlacementExclusive,
+    ) -> Result<(), ShardError> {
+        {
+            let name = name.to_owned();
             let mut map: OwnerMap = ahash::AHashMap::new();
             let mut highest = 0u64;
             for shard in 0..self.inner.n {
@@ -8042,11 +8188,17 @@ impl ShardSet {
             // beats every copy the rebuild just saw.
             self.observe_version(&name, highest);
             // Every shard has been scanned and nothing is published yet: the
-            // one instant at which a point op can still be reading the map
-            // this line is about to throw away. A test parks here and decides
-            // what runs during it.
+            // one instant at which a point op could still be reading the map
+            // this line is about to throw away - if it were not holding the
+            // exclusive authority, which it is. A test parks here and decides
+            // what runs during it; the answer must be "nothing that touches
+            // this index's placement".
             crate::gate_at!(crate::failpoint::PlacementFailpoint::OwnerMapPublish, &name);
             self.inner.owners.write().insert(name, map);
+            // Internal, never on the wire: a placement decision read and
+            // committed under one shared guard is by construction in a single
+            // epoch, and this is what a reshard row asserts against.
+            **epoch = epoch.wrapping_add(1);
         }
         Ok(())
     }
@@ -8136,38 +8288,185 @@ impl ShardSet {
         &self.inner.owner_locks[(h.finish() % self.inner.owner_locks.len() as u64) as usize]
     }
 
+    /// This index's placement authority, created on first use.
+    ///
+    /// The registry mutex is held for the lookup only - never across an await,
+    /// and never while the `RwLock` it hands back is being taken.
+    fn placement_of(&self, name: &str) -> Arc<tokio::sync::RwLock<u64>> {
+        let mut reg = self.inner.placement.lock();
+        if let Some(a) = reg.get(name) {
+            return Arc::clone(a);
+        }
+        let a = Arc::new(tokio::sync::RwLock::new(0));
+        reg.insert(name.to_owned(), Arc::clone(&a));
+        a
+    }
+
+    /// Take the SHARED placement authority for `name`, having first made sure
+    /// the owner map exists.
+    ///
+    /// The only way to obtain a [`PlacementShared`], and therefore the only way
+    /// to reach the owner map at all. `ensure_owner_map` runs FIRST and with no
+    /// guard in hand: it may need the exclusive lock, and a re-entrant call
+    /// would be a deadlock rather than a compile error.
+    ///
+    /// # Errors
+    ///
+    /// A shard being unavailable while the map is built.
+    async fn placement_shared(&self, name: &str) -> Result<PlacementShared, ShardError> {
+        self.ensure_owner_map(name).await?;
+        Ok(self.placement_of(name).read_owned().await)
+    }
+
+    /// Take the EXCLUSIVE placement authority for `name`: a rebuild, or the
+    /// removal of the index's derived state.
+    async fn placement_exclusive(&self, name: &str) -> PlacementExclusive {
+        self.placement_of(name).write_owned().await
+    }
+
     /// The shard a point op for `id` addresses: the owner map for a
     /// semantically-resharded vindex, hash otherwise (an id absent from the
     /// map is unknown; any shard answers None, hash picks one).
-    fn point_shard(&self, name: &str, id: u64) -> usize {
-        if let Some(m) = self.inner.owners.read().get(name)
-            && let Some(&(s, _, _)) = m.get(&id)
-        {
+    fn point_shard_at(&self, g: &PlacementShared, name: &str, id: u64) -> usize {
+        if let Some((s, _, _)) = self.owner_entry_at(g, name, id) {
             return usize::from(s);
         }
         shard_for(&id.to_le_bytes(), self.inner.n)
     }
 
+    /// This row's `(primary, replica, version)`, if the map names it.
+    fn owner_entry_at(
+        &self,
+        _g: &PlacementShared,
+        name: &str,
+        id: u64,
+    ) -> Option<(u8, Option<u8>, u64)> {
+        self.inner
+            .owners
+            .read()
+            .get(name)
+            .and_then(|m| m.get(&id).copied())
+    }
+
+    /// How many LOGICAL rows the map names - one entry per id, however many
+    /// physical copies exist. `None` when this index has no map.
+    fn owner_rows_at(&self, _g: &PlacementShared, name: &str) -> Option<u64> {
+        self.inner.owners.read().get(name).map(|m| m.len() as u64)
+    }
+
+    /// Entries naming a shard this set does not have. For `check`.
+    fn owner_out_of_range_at(&self, _g: &PlacementShared, name: &str) -> usize {
+        self.inner.owners.read().get(name).map_or(0, |m| {
+            m.values()
+                .filter(|(p, r, _)| {
+                    usize::from(*p) >= self.inner.n
+                        || r.is_some_and(|s| usize::from(s) >= self.inner.n)
+                })
+                .count()
+        })
+    }
+
+    /// Record where this row's live copy is. THE COMMIT POINT of a routed
+    /// write: reads route through the map, so the new copy becomes the live one
+    /// here.
+    fn publish_owner_at(
+        &self,
+        _g: &PlacementShared,
+        name: &str,
+        id: u64,
+        entry: (u8, Option<u8>, u64),
+    ) {
+        self.inner
+            .owners
+            .write()
+            .entry(name.to_owned())
+            .or_default()
+            .insert(id, entry);
+    }
+
+    /// Give a row the map already names a replica slot. A no-op otherwise: a
+    /// replica of a row nothing names is a ghost, and recording it would be
+    /// worse than losing it.
+    fn set_replica_at(&self, _g: &PlacementShared, name: &str, id: u64, replica: u8) {
+        if let Some(m) = self.inner.owners.write().get_mut(name)
+            && let Some(e) = m.get_mut(&id)
+        {
+            e.1 = Some(replica);
+        }
+    }
+
+    /// Forget this row: it left the index.
+    fn forget_owner_at(&self, _g: &PlacementShared, name: &str, id: u64) {
+        if let Some(m) = self.inner.owners.write().get_mut(name) {
+            m.remove(&id);
+        }
+    }
+
+    /// The primary shard of each of `ids`, read WITHOUT the placement
+    /// authority. The one site that does, and it is `vsearch`.
+    ///
+    /// A search merges an atomic per-shard snapshot and uses this only as a
+    /// TIE-BREAK, after the version comparison has already chosen. So the worst
+    /// a concurrent publish can do here is make the merge prefer a different
+    /// SHARD's copy of the same id at the same version - never a different id,
+    /// never a different value. Taking a read permit on the hottest path in the
+    /// system to buy that is not a trade worth making; see
+    /// `docs/adr-placement-authority.md`.
+    fn owner_primaries_unsynchronised(
+        &self,
+        name: &str,
+        ids: impl Iterator<Item = u64>,
+    ) -> Option<HashMap<u64, u8>> {
+        let owners = self.inner.owners.read();
+        owners.get(name).map(|m| {
+            ids.filter_map(|id| m.get(&id).map(|&(p, _, _)| (id, p)))
+                .collect()
+        })
+    }
+
     /// A routed vindex whose owner map is missing (fresh open) rebuilds it
     /// before the first point op resolves: correctness cannot depend on a
     /// caller remembering an init step.
+    ///
+    /// Double-checked, and the ONLY place that upgrades to the exclusive lock
+    /// on behalf of a point op. Must be called with no guard in hand - it is
+    /// what [`placement_shared`](Self::placement_shared) does first, and why
+    /// every entry point calls that before taking an owner stripe.
+    ///
+    /// # Errors
+    ///
+    /// A shard being unavailable while the map is built.
     async fn ensure_owner_map(&self, name: &str) -> Result<(), ShardError> {
-        if self.inner.routers.read().contains_key(name)
-            && !self.inner.owners.read().contains_key(name)
-        {
-            self.rebuild_owner_maps().await?;
+        if !self.inner.routers.read().contains_key(name) {
+            return Ok(());
         }
-        Ok(())
+        if self.inner.owners.read().contains_key(name) {
+            return Ok(());
+        }
+        let mut g = self.placement_exclusive(name).await;
+        // Re-checked under the exclusive lock: two point ops racing a cold map
+        // both see it missing, and only one of them may scan.
+        if self.inner.owners.read().contains_key(name) {
+            return Ok(());
+        }
+        self.rebuild_owner_map_locked(name, &mut g).await
     }
 
     pub async fn vdel(&self, name: &str, id: u64, tenant: u128) -> Result<bool, ShardError> {
-        self.ensure_owner_map(name).await?;
+        // ONE placement authority for the whole delete. This used to read the
+        // owner map FOUR times - shard, version, replica slot, and the removal
+        // - each an independent acquisition with shard round trips between
+        // them, and a rebuild publishing in any of those gaps made the delete
+        // address a shard the row had already left: `Existed(false)` to the
+        // client, the entry never removed, and the row still live and
+        // searchable (SD2, audit 18).
+        let placement = self.placement_shared(name).await?;
         // Serialise against a concurrent vset on the same id. Taken whether or
         // not the index is routed: the delete is now a commit followed by a
         // blob reclamation with an await between them, so it has the same
         // interleaving to lose as the write does.
         let _guard = self.owner_stripe(name, id).lock().await;
-        let shard = self.point_shard(name, id);
+        let shard = self.point_shard_at(&placement, name, id);
         // A user delete allocates a version ONLY when the owner map already
         // authoritatively names this row: the same rule a routed write
         // follows, and it is what lets the tombstone beat every copy that
@@ -8183,12 +8482,7 @@ impl ShardSet {
         // (`version: None`, `shard.rs:7172`). An id neither this shard nor
         // any owner map has ever seen then costs nothing - no version, no
         // WAL record, no tombstone (P0-B, audit 16).
-        let known = self
-            .inner
-            .owners
-            .read()
-            .get(name)
-            .and_then(|m| m.get(&id).map(|&(_, _, v)| v));
+        let known = self.owner_entry_at(&placement, name, id).map(|(_, _, v)| v);
         let version = known.map(|known| self.next_version(name, known));
         let req = ShardReq::Vdel {
             name: name.to_owned(),
@@ -8210,11 +8504,8 @@ impl ShardSet {
         // owner map, so this is reachable only when `known` (and therefore
         // `version`) was `Some`.
         let replica = self
-            .inner
-            .owners
-            .read()
-            .get(name)
-            .and_then(|m| m.get(&id).and_then(|&(_, r, _)| r));
+            .owner_entry_at(&placement, name, id)
+            .and_then(|(_, r, _)| r);
         if let Some(rep) = replica {
             let version =
                 version.expect("a replica entry only exists on a row the owner map named");
@@ -8243,8 +8534,8 @@ impl ShardSet {
                 _ => return Err(ShardError::Unavailable),
             }
         }
-        if existed && let Some(m) = self.inner.owners.write().get_mut(name) {
-            m.remove(&id);
+        if existed {
+            self.forget_owner_at(&placement, name, id);
         }
         Ok(existed)
     }
@@ -8410,15 +8701,11 @@ impl ShardSet {
         //
         // The owner map is what VGET routes by, so preferring it also makes
         // search and point reads agree, which they otherwise would not.
-        let owner_of: Option<std::collections::HashMap<u64, u8>> = {
-            let owners = self.inner.owners.read();
-            owners.get(name).map(|m| {
-                merged
-                    .iter()
-                    .filter_map(|&(id, _, _, _, _)| m.get(&id).map(|&(p, _, _)| (id, p)))
-                    .collect()
-            })
-        };
+        //
+        // Read WITHOUT the placement authority, deliberately: see
+        // `owner_primaries_unsynchronised` and
+        // `docs/adr-placement-authority.md`.
+        let owner_of = self.owner_primaries_unsynchronised(name, merged.iter().map(|h| h.0));
         merged.sort_unstable_by(|a, b| {
             let live = |h: &(u64, f32, Option<Bytes>, usize, u64)| {
                 owner_of

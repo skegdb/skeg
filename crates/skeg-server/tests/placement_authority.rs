@@ -205,7 +205,6 @@ async fn a_vset_during_the_owner_map_publish_survives_the_publish() {
     routed_index(&shards, &name, N).await;
 
     let moved_row = 7u64;
-    let before = shards.owners_of(&name, &[moved_row]).await.unwrap()[0].0;
 
     arm_gate_at(FP, &name);
     let publisher = {
@@ -242,12 +241,22 @@ async fn a_vset_during_the_owner_map_publish_survives_the_publish() {
         other_cluster(moved_row),
         "and it must be the NEW value"
     );
-    let after = shards.owners_of(&name, &[moved_row]).await.unwrap()[0].0;
-    assert_ne!(
-        after, before,
-        "the row moved to the other cluster's shard; the map must say so"
+    // The copy the map names is the copy a search returns: the write moved the
+    // row, and nothing here may still prefer the one its own cleanup deleted.
+    let hits = shards
+        .vsearch(&name, other_cluster(moved_row), 5, 64, T, false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.first().map(|(id, _, _)| *id),
+        Some(moved_row),
+        "the new copy must be the one search returns"
     );
     assert_eq!(shards.tenant_vector_count(T), N, "an overwrite is free");
+    assert!(
+        shards.check(&name).await.unwrap().is_empty(),
+        "the owner map must be internally consistent after the publish"
+    );
     assert!(
         !decided_during_the_publish,
         "the VSET chose and published a placement while the map was being \
