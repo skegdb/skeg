@@ -171,7 +171,14 @@ one tenant's index with another tenant's exact vector, and zero rows cross the
 boundary, every time.
 
 - Hard quotas: `max_vectors` and `max_disk_bytes`, set and read at runtime
-  through `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`.
+  through `SKEG.QUOTA.SET` / `SKEG.QUOTA.GET`. `max_disk_bytes` bounds the
+  tenant's live vLog bytes - KV values and vector payload blobs, one counter
+  shared across shards - and it bounds them against internal maintenance as
+  well as client writes: a boundary replica that would not fit is skipped
+  rather than written. It does not cover the vector index files themselves,
+  which `max_vectors` bounds instead, nor dead records still waiting for
+  compaction. [What is inside the number, and what is
+  not.](docs/multi-tenancy.md#per-tenant-quotas)
 - Fair eviction, so a noisy tenant cannot starve a quiet one out of the cache.
 - Authentication via `HELLO 3 AUTH user pass` (argon2id), with prefix-routed
   namespaces.

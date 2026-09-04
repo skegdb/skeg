@@ -438,10 +438,21 @@ pub enum Counter {
     /// this counter, because the alternative is a rate limit that silently
     /// reads as "give up" to every client of that deployment.
     BackendRefusalUnclassified = 54,
+    /// Boundary replicas `overlap` did not write because the second physical
+    /// copy of the row's payload blob would have taken the tenant past its
+    /// `max_disk_bytes`.
+    ///
+    /// A boundary replica is an optimisation - a search finds the row through
+    /// its primary either way - so a tenant at its ceiling gets the replica
+    /// skipped rather than the maintenance run refused. Without this number
+    /// an operator cannot tell a boundary that had nothing to replicate from
+    /// one that was silently left under-replicated, which is the difference
+    /// between a healthy index and a recall cliff at the shard seams.
+    OverlapReplicasSkippedQuota = 55,
 }
 
 impl Counter {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 56;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -498,6 +509,7 @@ impl Counter {
         Counter::IngressReplyOverBudget,
         Counter::QuotaRefused,
         Counter::BackendRefusalUnclassified,
+        Counter::OverlapReplicasSkippedQuota,
     ];
 
     #[inline]
@@ -558,6 +570,7 @@ impl Counter {
             Counter::IngressReplyOverBudget => "skeg_ingress_reply_over_budget_total",
             Counter::QuotaRefused => "skeg_quota_refused_total",
             Counter::BackendRefusalUnclassified => "skeg_backend_refusal_unclassified_total",
+            Counter::OverlapReplicasSkippedQuota => "skeg_overlap_replicas_skipped_quota_total",
         }
     }
 }

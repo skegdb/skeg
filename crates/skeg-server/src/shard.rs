@@ -7802,10 +7802,40 @@ impl ShardSet {
     /// deletes and overwrites remove replicas through the owner map.
     /// Returns the number of rows replicated.
     ///
+    /// No tenant disk quota: equivalent to
+    /// [`overlap_with_disk_limit`](Self::overlap_with_disk_limit) with
+    /// `disk_limit: None`. See [`vset`](Self::vset) for why this stays the
+    /// plain name.
+    ///
     /// # Errors
     ///
     /// Index or router missing, a shard unavailable, or a batch failing.
     pub async fn overlap(&self, name: &str, tau: f32, tenant: u128) -> Result<u64, ShardError> {
+        self.overlap_with_disk_limit(name, tau, tenant, None).await
+    }
+
+    /// [`overlap`](Self::overlap), charging every boundary replica's payload
+    /// blob against the tenant's `max_disk_bytes`.
+    ///
+    /// A replica is a SECOND physical copy of the row's blob, on a second
+    /// shard, and it lives for as long as the row stays near the boundary -
+    /// so unlike a reshard move (which deletes its source copy) it is real,
+    /// permanent disk the quota has to see. It is also an OPTIMISATION: the
+    /// row is found through its primary either way. Both facts together
+    /// decide the behaviour - the replica is skipped, not refused, so a
+    /// tenant at its ceiling gets a boundary that is merely under-replicated
+    /// rather than a maintenance run that will not complete.
+    ///
+    /// # Errors
+    ///
+    /// Index or router missing, a shard unavailable, or a batch failing.
+    pub async fn overlap_with_disk_limit(
+        &self,
+        name: &str,
+        tau: f32,
+        tenant: u128,
+        disk_limit: Option<u64>,
+    ) -> Result<u64, ShardError> {
         const BATCH: usize = 512;
         let Some(router) = self.router(name) else {
             return Err(ShardError::Storage(format!(
@@ -7866,12 +7896,15 @@ impl ShardSet {
                         vector,
                         tenant,
                         limit: None,
-                        // Same reasoning as the reshard destination above: a
-                        // system-driven copy the maintenance loop decided to
-                        // make, not a client write. Refusing it here would
-                        // leave a boundary under-replicated for a tenant that
-                        // did nothing but reach its own limit.
-                        disk_limit: None,
+                        // NOT the reshard's reasoning. A move relocates bytes
+                        // the tenant already paid for and gives the source
+                        // copy back; a replica keeps both, indefinitely. So
+                        // the tenant's own `max_disk_bytes` applies, and the
+                        // refusal it can produce is handled below as a SKIP -
+                        // the one shape that neither strands the maintenance
+                        // run nor lets an internal write grow a tenant past
+                        // its limit (audit/20 B3).
+                        disk_limit,
                         // A boundary replica: a second physical copy of one
                         // logical row.
                         effect: crate::quota::QuotaEffect::Replica,
@@ -7884,6 +7917,28 @@ impl ShardSet {
                     let outcome = match self.call(usize::from(second), req).await {
                         Ok(ShardResp::Done) => Ok(()),
                         Ok(ShardResp::Err(e)) => Err(ShardError::Storage(e)),
+                        // The tenant has no room for a second copy of this
+                        // row's blob. Not an error: a replica is an
+                        // optimisation - the row is reachable through its
+                        // primary either way - so the answer is "not this
+                        // row", not "not this overlap". The refusal happens
+                        // inside `VLog::set_scoped` before a byte is
+                        // appended and before the vector commit, so there is
+                        // nothing here to undo and nothing to take back out:
+                        // no map entry, no second copy, no ghost.
+                        //
+                        // Deliberately NOT `continue`-on-any-refusal: a
+                        // memory refusal or a vector-quota refusal means the
+                        // shard could not do what it was asked, and reporting
+                        // that as a quiet skip would hide it.
+                        Ok(ShardResp::Refused(ShardError::Admission(
+                            crate::admission::AdmissionError::DiskQuota { .. },
+                        ))) => {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::OverlapReplicasSkippedQuota,
+                            );
+                            continue;
+                        }
                         Ok(ShardResp::Refused(e)) => Err(e),
                         Ok(_) => Err(ShardError::Unavailable),
                         Err(e) => Err(e),

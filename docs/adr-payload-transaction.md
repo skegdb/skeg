@@ -146,13 +146,14 @@ already called, checked before anything is written
 written"). **Quota = live KV bytes plus live blob bytes**, by construction:
 one counter, one key format, one check, for both.
 
-Reached from two call sites, mirroring `limit` (the vector-count quota)
-exactly: `ShardSet::vset_with_disk_limit` and the per-item calls inside
-`ShardSet::vmset_with_disk_limit`, both fed from the tenant's
-`max_disk_bytes` at the RESP3 entry point. `vset`/`vmset` (no `_with_disk_limit`)
-still exist, unenforced, for every caller with no limit to enforce: every
-internal relocation, every existing test, and the native listener, which has
-no pluggable tenant backend to read a limit from at all.
+Reached from three call sites, mirroring `limit` (the vector-count quota)
+exactly: `ShardSet::vset_with_disk_limit`, the per-item calls inside
+`ShardSet::vmset_with_disk_limit`, and `ShardSet::overlap_with_disk_limit`
+(below), all fed from the tenant's `max_disk_bytes` at the RESP3 entry point.
+`vset`/`vmset`/`overlap` (no `_with_disk_limit`) still exist, unenforced, for
+every caller with no limit to enforce: the reshard move, every existing test,
+and the native listener, which has no pluggable tenant backend to read a limit
+from at all.
 
 **The temporary physical margin.** Prepare-before-commit means a write is, for
 a while, TWO physical keys: an overwrite's staged blob at the new version's
@@ -162,6 +163,11 @@ lives until the next open collects it. Both are real bytes on disk, and both
 are counted, because the counter is physical, not logical: it cannot tell a
 candidate or an orphan from a live blob, and it must not try to, because the
 same reclamation path that frees them is what makes the count exact again.
+("Physical" here means every record the vLog index still names, staged and
+orphaned ones included. It is not the filesystem's own footprint: a record
+that has been overwritten or deleted stops counting at once and gives its
+space back only at the next compaction, so a churn-heavy tenant occupies more
+of the disk than its number says - see `docs/multi-tenancy.md`.)
 The consequence is stated plainly rather than hidden: **a tenant sitting
 exactly at its `max_disk_bytes` can see a payload-less overwrite refused for
 the width of the staging-to-commit window**, because the carried-forward copy
@@ -171,30 +177,61 @@ counting them - it is the same trade the vector-count quota already makes for
 `Move`/`Replica` (uncharged, because refusing an internal relocation can
 strand a row mid-move) inverted: here the write IS the tenant's own, so it is
 charged, and a tenant that operates payload-heavy workloads near its limit
-should leave headroom for one blob's worth of margin. `VSET`/`VMSET` staged by
-an internal relocation (a reshard move, a boundary replica) pass no disk
-limit at all, for the same reason `Move`/`Replica` pass no vector-count limit:
-they move or duplicate bytes the tenant's writes already paid for, and a
-refusal would leave a shard's data placement stuck rather than a tenant's
-disk usage smaller.
+should leave headroom for one blob's worth of margin.
 
-**Boundary replicas: a permanent, uncounted duplicate.** The reshard move
-above does not duplicate - `CollectMoves` writes the destination and deletes
-the source, verified on a single-shard reshard of 64 rows (`usage` unchanged
-before/after) - but the OTHER internal relocation does. A boundary replica
-(`ShardReq::Vset` with `effect: Replica`, `disk_limit: None`) writes a SECOND
-physical copy of the row's blob on a second shard and never deletes the
-first: the two stand side by side for as long as the row's margin keeps it
-replicated, which is not a window like the overwrite one above - it is
-indefinite, and it is real disk this tenant's quota does not see. The bound
-has a shape, even though nothing enforces it: at most one extra blob per
-row this shard's overlap boundary currently replicates, so the uncounted
-total is bounded by (replicated rows) x (their blob sizes), not by the whole
-tenant. Left open rather than closed here: fixing it means either charging
-the replica's own tenant (which the write-path shape above argues against,
-for the same reason `Move`/`Replica` are uncharged) or teaching the
-reclamation/quota rebuild at open to walk replicas as well as primaries -
-both bigger than this mandate's boundary.
+**The reshard move: no disk limit, because it is a move.** `CollectMoves`
+writes the destination copy and then deletes the source, so the tenant's
+counted bytes are the same on both sides of it - pinned by
+`a_reshard_move_does_not_duplicate_a_blob` (two shards, 60 rows of 4 KiB
+payload, `tenant_disk_bytes` identical before and after), not merely argued.
+It therefore passes `disk_limit: None`, for the same reason `Move` passes no
+vector-count limit: refusing it would leave a shard's data placement stuck
+rather than a tenant's disk usage smaller. Its own margin is stated for
+symmetry: the write and the delete are one row apart and the loop is
+sequential, so a reshard is over the tenant's limit by **at most one blob
+record, for the width of one row**, and an abort or a crash between the two
+leaves that one duplicate until the next open reclaims it.
+
+**Boundary replicas: a permanent duplicate, and therefore charged.** The
+other internal relocation does not move - it duplicates. A boundary replica
+(`ShardReq::Vset` with `effect: Replica`) writes a SECOND physical copy of the
+row's blob on a second shard's vLog and never deletes the first: the two stand
+side by side for as long as the row's margin keeps it replicated, which is not
+a window like the overwrite one above - it is indefinite. With
+`disk_limit: None` it was also invisible to admission: the counter saw the
+copy, nothing refused it, and a tenant sitting exactly at `max_disk_bytes`
+could be carried one blob past its limit for every row it replicated, through
+an operation it triggers itself (`SKEG.VINDEX.OVERLAP`; audit/20 B3).
+
+Closed by `ShardSet::overlap_with_disk_limit`, which carries the tenant's
+`max_disk_bytes` into the replica's `Vset` like any client write - and by
+what it does with the refusal. **A replica that does not fit is SKIPPED, not
+refused.** A boundary replica is an optimisation: the row is reachable through
+its primary from either side of the boundary, only the probe-narrowed search
+loses recall at the seam. Turning the refusal into a failed run would strand
+a maintenance operation for a tenant whose only offence is being at its own
+limit - the very shape the `Move`/`Replica` reasoning exists to avoid - so
+`overlap` treats `AdmissionError::DiskQuota` from the destination as "not
+this row", ticks `skeg_overlap_replicas_skipped_quota_total`, and carries on
+to the next one. Every other refusal (memory, vector quota) still fails the
+run: a shard that could not do what it was asked must not be reported as a
+quiet skip.
+
+Nothing is left behind by a skip. The refusal happens inside
+`VLog::set_scoped` before a byte is appended, and therefore before the vector
+commit, so there is no half-written replica to take back out and no copy the
+owner map does not name - the ghost the undo path below exists for. The
+primary is untouched by construction: `overlap` only ever writes to the
+second-nearest shard.
+
+Consequences, stated rather than hidden: a tenant at its ceiling gets an
+UNDER-REPLICATED boundary, so a probe-narrowed `VSEARCH` can miss rows near
+a shard seam that a full fan-out still finds; the counter is how an operator
+tells that state from a boundary with nothing to replicate; and a later
+overlap re-run replicates the rows that now fit, since the decision is per
+row and per run, not a latch. Where headroom covers only part of the
+boundary, the run fills it and skips the rest
+(`an_overlap_with_room_for_one_replica_writes_one_and_skips_the_rest`).
 
 **Concurrent writers of one tenant.** The check above and the counter update
 happen in the SAME critical section inside `VLog::set_scoped` (no `await`
