@@ -568,7 +568,8 @@ mod tests {
                 "ingress",
                 "memory_at_write",
                 "quota_exceeded",
-                "request_too_large"
+                "request_too_large",
+                "value_changed_under_read"
             ],
             "a variant nothing samples is a classification nothing checks"
         );
