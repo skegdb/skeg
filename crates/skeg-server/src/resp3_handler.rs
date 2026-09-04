@@ -2634,18 +2634,6 @@ fn read_sum_overflow(keys: usize) -> ReadRefusal {
     })
 }
 
-/// Measure, reserve, fetch - in that order, which is the whole of B1.
-///
-/// Every value's length comes from the index (`value_sizes`: one hashmap
-/// lookup per key, no segment touched, nothing allocated for a value); the
-/// sum is taken with checked arithmetic and reserved against the connection
-/// budget; only then is a byte of any value read, and each read is bounded by
-/// the size that was reserved for it so a concurrent overwrite cannot make the
-/// measurement stale (`mget_bounded` -> `VLog::get_bounded`, which checks the
-/// same `IndexEntry` the `pread` allocates from).
-///
-/// `Err` is the refusal frame to send back, and when it is returned NOTHING
-/// was fetched.
 /// A read refusal as a RESP3 error frame. The native listener renders the
 /// same value as an `Err` frame with a code byte; neither invents its own
 /// classification.
@@ -2656,76 +2644,186 @@ fn read_refusal_frame(refusal: &ReadRefusal) -> Frame {
     }
 }
 
+/// The largest number of keys one `MGET` may name.
+///
+/// A key costs about nine bytes on the wire (`$1\r\nk\r\n`) and about
+/// [`PREFLIGHT_BYTES_PER_KEY`] in the structures that answer it, so without a
+/// ceiling the request side of that ratio is the cheap side - the same shape
+/// `MAX_VMSET_ITEMS` already caps for writes, and the same typed refusal. It
+/// also bounds the shard batch: `value_sizes` and `mget_bounded` are ONE
+/// `ShardReq` each, so an unbounded key count is an unbounded amount of work
+/// for one shard worker to do before it looks at anything else.
+pub(crate) const MAX_MGET_KEYS: usize = 4096;
+
+/// What one key of a KV read costs the server BEFORE a byte of any value is
+/// read: a `ScopedKey` (a `Bytes` handle plus a tenant id), the `Bytes` clone
+/// handed to the shard set, the per-shard bucket entry, the `u32` size that
+/// comes back, and the `(index, key, bound)` triple of the bounded batch -
+/// each with its own vector's growth slack.
+///
+/// Deliberately generous and deliberately a constant: it bounds a
+/// RESERVATION, not an allocation, and under-charging here is exactly the
+/// hole it exists to close.
+const PREFLIGHT_BYTES_PER_KEY: usize = 256;
+
+/// Take (or extend) this read's reservation. `grow_to` holds AT LEAST the
+/// figure given, so calling it again with a larger one extends rather than
+/// replaces.
+fn reserve_read(
+    admission: &mut Option<&mut ReadAdmission<'_>>,
+    want: usize,
+) -> Result<(), ReadRefusal> {
+    let Some(admission) = admission.as_mut() else {
+        return Ok(());
+    };
+    let Some(target) = admission.held.checked_add(want) else {
+        return Err(read_sum_overflow(want));
+    };
+    match admission.budget.grow_to(target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
+            Err(ReadRefusal::Admission(
+                crate::admission::AdmissionError::from(e),
+            ))
+        }
+    }
+}
+
+/// The reply's frame shape, sized before it exists: one node per key plus the
+/// array that holds them, which is exactly what `frame_upper_bound` will later
+/// measure on the real `Frame`.
+fn reply_bound_for(sizes: &[u32]) -> Option<usize> {
+    let mut want = FRAME_NODE_OVERHEAD;
+    for &size in sizes {
+        want = want.checked_add((size as usize).checked_add(FRAME_NODE_OVERHEAD)?)?;
+    }
+    Some(want)
+}
+
+/// Measure, reserve, fetch - in that order, which is the whole of B1.
+///
+/// Every value's length comes from the index (`value_sizes`: one hashmap
+/// lookup per key, no segment touched, nothing allocated for a value); the
+/// sum is taken with checked arithmetic and reserved against the connection
+/// budget; only then is a byte of any value read, and each read is bounded by
+/// the size that was reserved for it so a concurrent overwrite cannot make the
+/// measurement stale (`mget_bounded` -> `VLog::get_bounded`, which checks the
+/// same `IndexEntry` the `pread` allocates from).
+///
+/// Three things happen before the first per-key allocation, in this order: the
+/// arity cap, the reservation for the preflight's OWN per-key structures, and
+/// only then their construction. Reserving the reply and not the machinery
+/// that produces it leaves a request whose cheapest part is the wire.
+///
+/// A measurement that goes stale is RETRIED once, not refused. The guard is
+/// fail-closed by construction - a record past its bound is never read - but
+/// failing closed on a legitimate four-byte `GET` because another client
+/// happened to write that key is a denial of service the client cannot fix,
+/// and it happened: 4 refusals in 4000 reads under a writer alternating 1 KiB
+/// and 256 KiB, and with certainty for a key created inside the window, whose
+/// measured size is 0. So: re-measure, re-reserve, fetch again. Only a value
+/// that has moved AGAIN in the second window is refused, and then as a
+/// retryable condition naming the value, because the request was never the
+/// problem.
+///
+/// `Err` is the refusal to send back, and when it is returned nothing was
+/// fetched that the connection had not already been granted.
 pub(crate) async fn fetch_within_budget(
     keys: &[Bytes],
     shards: &ShardSet,
     tenant: TenantId,
     admission: Option<&mut ReadAdmission<'_>>,
 ) -> Result<Vec<Option<Bytes>>, ReadRefusal> {
+    // Before ANY allocation proportional to the key count, including this
+    // function's own.
+    if keys.len() > MAX_MGET_KEYS {
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+        return Err(ReadRefusal::Admission(
+            crate::admission::AdmissionError::RequestTooLarge {
+                what: "keys in one KV read",
+                limit: MAX_MGET_KEYS as u64,
+                got: keys.len() as u64,
+            },
+        ));
+    }
+    let mut admission = admission;
+    let Some(preflight) = keys.len().checked_mul(PREFLIGHT_BYTES_PER_KEY) else {
+        return Err(read_sum_overflow(keys.len()));
+    };
+    reserve_read(&mut admission, preflight)?;
+
     let scoped: Vec<ScopedKey> = keys.iter().map(|k| scope_key(tenant, k)).collect();
     let bytes: Vec<Bytes> = scoped.iter().map(|k| k.as_bytes().clone()).collect();
     let view = shards.tenant(tenant_u128(tenant));
 
-    let sizes = match view.value_sizes(&bytes).await {
+    let mut sizes = match view.value_sizes(&bytes).await {
         Ok(sizes) => sizes,
         Err(e) => return Err(ReadRefusal::Shard(e)),
     };
 
-    // The reply's frame shape, sized before it exists: one node per key plus
-    // the array that holds them, exactly what `frame_upper_bound` will later
-    // measure on the real `Frame`.
-    let mut want = FRAME_NODE_OVERHEAD;
-    for &size in &sizes {
-        let element = (size as usize)
-            .checked_add(FRAME_NODE_OVERHEAD)
-            .ok_or_else(|| read_sum_overflow(keys.len()))?;
-        want = want
-            .checked_add(element)
-            .ok_or_else(|| read_sum_overflow(keys.len()))?;
-    }
+    // Two attempts: the measurement, and one re-measurement if a value moved
+    // under it. Not a loop until it works - that would let a client hold a
+    // shard worker for as long as another client keeps writing.
+    for attempt in 0..2 {
+        let Some(reply) = reply_bound_for(&sizes) else {
+            return Err(read_sum_overflow(keys.len()));
+        };
+        let Some(want) = preflight.checked_add(reply) else {
+            return Err(read_sum_overflow(keys.len()));
+        };
+        reserve_read(&mut admission, want)?;
 
-    if let Some(admission) = admission {
-        let target = admission
-            .held
-            .checked_add(want)
-            .ok_or_else(|| read_sum_overflow(keys.len()))?;
-        if let Err(e) = admission.budget.grow_to(target) {
-            skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
-            skeg_telemetry::tick_counter(skeg_telemetry::Counter::IngressRefusedGrowth);
-            return Err(ReadRefusal::Admission(
-                crate::admission::AdmissionError::from(e),
-            ));
-        }
-    }
+        let got = match view.mget_bounded(&bytes, &sizes).await {
+            Ok(got) => got,
+            Err(e) => return Err(ReadRefusal::Shard(e)),
+        };
 
-    let got = match view.mget_bounded(&bytes, &sizes).await {
-        Ok(got) => got,
-        Err(e) => return Err(ReadRefusal::Shard(e)),
-    };
-    let mut out = Vec::with_capacity(got.len());
-    for (i, slot) in got.into_iter().enumerate() {
-        match slot {
-            BoundedGet::Missing => out.push(None),
-            BoundedGet::Found(v) => out.push(Some(v)),
-            // The window the bound exists to close: between the measurement
-            // and the read, somebody overwrote this key with a larger value.
-            // The reservation was taken for the old size, so the new one is
-            // refused rather than allocated - and by name, with both numbers,
-            // because "try again" is the honest advice here.
-            BoundedGet::Oversize { record_bytes } => {
-                skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
-                return Err(ReadRefusal::Admission(
-                    crate::admission::AdmissionError::RequestTooLarge {
-                        what: "stored value bytes (the value grew after its \
-                               size was reserved)",
-                        limit: u64::from(sizes.get(i).copied().unwrap_or(0)),
-                        got: u64::from(record_bytes),
-                    },
-                ));
+        let mut out = Vec::with_capacity(got.len());
+        let mut moved = None;
+        for (i, slot) in got.into_iter().enumerate() {
+            match slot {
+                BoundedGet::Missing => out.push(None),
+                BoundedGet::Found(v) => out.push(Some(v)),
+                // The window the bound exists to close: between the
+                // measurement and the read, somebody rewrote this key with a
+                // larger value. Nothing was read for it.
+                BoundedGet::Oversize { record_bytes } => {
+                    moved = Some((sizes.get(i).copied().unwrap_or(0), record_bytes));
+                    break;
+                }
             }
         }
+        let Some((measured, found)) = moved else {
+            return Ok(out);
+        };
+        if attempt == 0 {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRemeasured);
+            // Re-measure everything, not just the key that moved: the second
+            // probe costs one lookup per key and no IO, and a second stale
+            // entry elsewhere in the batch would only send us round again.
+            sizes = match view.value_sizes(&bytes).await {
+                Ok(sizes) => sizes,
+                Err(e) => return Err(ReadRefusal::Shard(e)),
+            };
+            continue;
+        }
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::KvReadRefused);
+        return Err(ReadRefusal::Admission(
+            crate::admission::AdmissionError::ValueChangedUnderRead {
+                measured: u64::from(measured),
+                found: u64::from(found),
+            },
+        ));
     }
-    Ok(out)
+    // Unreachable: both arms of the loop above either return or `continue`,
+    // and the second iteration cannot `continue`. Written as a refusal rather
+    // than an `unreachable!` because a panic on the read path is a worse
+    // answer than a retryable error, whatever a future edit does to the loop.
+    Err(ReadRefusal::Admission(
+        crate::admission::AdmissionError::Busy,
+    ))
 }
 
 async fn kv_get(

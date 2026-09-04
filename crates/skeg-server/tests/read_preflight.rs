@@ -570,9 +570,12 @@ async fn a_native_vget_is_reserved_before_the_shard_call() {
 ///
 /// A budget is allowed to refuse a request that does not fit. It is not
 /// allowed to refuse one that does, because somebody else was writing.
-#[ignore = "opens with the audit 25 F1/F2 fixes"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_value_rewritten_under_a_read_is_still_answered() {
+    // Four thousand reads of real values move `KvReadBytesFetched`, which
+    // three tests in this file assert a zero delta on: F3's rule, applied to
+    // the test F1 adds.
+    let _turn = COUNTER_TESTS.lock().await;
     const READS: usize = 4000;
     // Generous: nothing here may be refused for SIZE, so any refusal at all
     // is the race and not the class.
@@ -617,6 +620,7 @@ async fn a_value_rewritten_under_a_read_is_still_answered() {
         }
     });
 
+    let remeasured_before = counter_value(Counter::KvReadRemeasured);
     let mut reader = TcpStream::connect(addr).await.expect("connect");
     let mut spurious: Vec<String> = Vec::new();
     for i in 0..READS {
@@ -640,6 +644,14 @@ async fn a_value_rewritten_under_a_read_is_still_answered() {
     let _ = flipper.await;
     let _ = cycler.await;
 
+    // The race has to have HAPPENED, or this test proves nothing: a run in
+    // which no measurement ever went stale would pass with the retry removed.
+    assert!(
+        counter_value(Counter::KvReadRemeasured) > remeasured_before,
+        "no read ever found its measurement stale, so the retry path was \
+         never exercised and zero spurious errors means nothing"
+    );
+
     let n = spurious.len();
     assert_eq!(
         n,
@@ -658,7 +670,6 @@ async fn a_value_rewritten_under_a_read_is_still_answered() {
 /// `u32` for each of them - about twenty times the request, before anything
 /// is charged. The cap is the same shape `SKEG.VMSET` already has, refused
 /// with the same typed classification.
-#[ignore = "opens with the audit 25 F1/F2 fixes"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_mget_past_the_key_cap_is_refused_before_anything_is_allocated() {
     let _turn = COUNTER_TESTS.lock().await;
@@ -697,7 +708,6 @@ async fn an_mget_past_the_key_cap_is_refused_before_anything_is_allocated() {
 /// exist reserves almost nothing for its reply (a null is thirty-two bytes of
 /// framing) while costing hundreds of bytes per key in the structures that
 /// answer it: the exact request an unbudgeted per-key cost makes free.
-#[ignore = "opens with the audit 25 F1/F2 fixes"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wide_mget_of_absent_keys_is_charged_for_its_own_preflight() {
     let _turn = COUNTER_TESTS.lock().await;

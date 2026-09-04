@@ -459,10 +459,19 @@ pub enum Counter {
     /// than the class can hand back at once, not that they are sending more
     /// than it can take in.
     KvReadRefused = 56,
+    /// `GET`/`MGET` requests whose measured lengths went stale under a
+    /// concurrent write and were re-measured and re-fetched once.
+    ///
+    /// The absorbed half of the same story `skeg_kv_read_refused_total` tells
+    /// the tail of: a climb here is other clients writing the keys this one is
+    /// reading, and costs a second index probe and a second fetch. A climb in
+    /// refusals ALONGSIDE it means the retry is not enough for that key's
+    /// write rate.
+    KvReadRemeasured = 57,
 }
 
 impl Counter {
-    pub const COUNT: usize = 57;
+    pub const COUNT: usize = 58;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -521,6 +530,7 @@ impl Counter {
         Counter::BackendRefusalUnclassified,
         Counter::KvReadBytesFetched,
         Counter::KvReadRefused,
+        Counter::KvReadRemeasured,
     ];
 
     #[inline]
@@ -583,6 +593,7 @@ impl Counter {
             Counter::BackendRefusalUnclassified => "skeg_backend_refusal_unclassified_total",
             Counter::KvReadBytesFetched => "skeg_kv_read_bytes_total",
             Counter::KvReadRefused => "skeg_kv_read_refused_total",
+            Counter::KvReadRemeasured => "skeg_kv_read_remeasured_total",
         }
     }
 }

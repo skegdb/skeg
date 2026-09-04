@@ -102,6 +102,16 @@ pub enum AdmissionError {
     /// A bounded queue inside the engine had no room. Momentary by
     /// construction: what fills it is other traffic, and other traffic ends.
     Busy,
+    /// A KV read measured a value's length, reserved for it, found the value
+    /// had been rewritten larger, re-measured, reserved again - and found it
+    /// rewritten larger a second time.
+    ///
+    /// Momentary for the same reason [`Self::Busy`] is: what causes it is
+    /// another client writing the same key, and writes end. It is NOT a
+    /// statement about the request, which may be four bytes long, so it must
+    /// not be spelled as one - the numbers name the VALUE, and the advice is
+    /// to send the same request again.
+    ValueChangedUnderRead { measured: u64, found: u64 },
     /// A tenant backend refused the command.
     ///
     /// The message is OPAQUE. It is written by a backend that lives outside
@@ -161,6 +171,9 @@ impl AdmissionError {
             // ends. Telling a client `ERR` here is telling it to give up on
             // the one condition where waiting a moment is exactly right.
             Self::Busy => Retryable,
+            // Two writers' worth of bad luck on one key. Nothing about the
+            // request needs to change for the next attempt to work.
+            Self::ValueChangedUnderRead { .. } => Retryable,
             // The one place in the engine that reads a code word out of a
             // string, and only because the string IS the interface: see the
             // variant's own note. One word, the one the trait's doc names;
@@ -251,7 +264,8 @@ impl AdmissionError {
             | Self::QuotaExceeded { .. }
             | Self::DiskQuota { .. }
             | Self::RequestTooLarge { .. }
-            | Self::Busy => ErrCode::InvalidRequest,
+            | Self::Busy
+            | Self::ValueChangedUnderRead { .. } => ErrCode::InvalidRequest,
         }
     }
 }
@@ -388,6 +402,14 @@ impl fmt::Display for AdmissionError {
             // The text the shard error carried before it was classified, so
             // only the code word in front of it changes.
             Self::Busy => write!(f, "vsearch queue is full"),
+            // The numbers are the VALUE's, not the request's, and the advice
+            // is to retry - the request is already as small as it can be.
+            Self::ValueChangedUnderRead { measured, found } => write!(
+                f,
+                "the value under this key was rewritten while the read was \
+                 being admitted: measured {measured} bytes, found {found} on \
+                 the second attempt; send the same request again"
+            ),
             // Verbatim. The backend wrote a complete error line, code word
             // included, and rewriting it would strip the only thing a RESP3
             // client of that deployment already routes on.
@@ -505,6 +527,13 @@ mod tests {
                 },
                 Retryability::Permanent,
             ),
+            (
+                AdmissionError::ValueChangedUnderRead {
+                    measured: 1152,
+                    found: 262_144,
+                },
+                Retryability::Retryable,
+            ),
         ]
     }
 
@@ -517,6 +546,7 @@ mod tests {
             AdmissionError::DiskQuota { .. } => "disk_quota",
             AdmissionError::RequestTooLarge { .. } => "request_too_large",
             AdmissionError::Busy => "busy",
+            AdmissionError::ValueChangedUnderRead { .. } => "value_changed_under_read",
             AdmissionError::Backend { .. } => "backend",
         }
     }
