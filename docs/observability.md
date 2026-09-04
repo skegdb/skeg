@@ -106,6 +106,19 @@ budget could not be established),
 held every vector its limit allows - a tenant at its ceiling used to look
 from outside exactly like a tenant that had stopped writing).
 
+Two more belong to the KV read path:
+`skeg_kv_read_bytes_total` (value bytes actually materialised to answer a
+`GET`/`MGET`, on either wire, counted at the shard worker beside the fetch
+itself) and `skeg_kv_read_refused_total` (reads refused because the summed
+value lengths did not fit the connection's allowance, or because a value
+grew past the size reserved for it between the measurement and the read).
+Read the pair together: a climb in refusals with a flat byte count is the
+preflight doing its job, and a climb in BOTH means clients are asking for
+more than the class can hand back and getting some of it. Note the second
+is about a request refused an ANSWER, where
+`skeg_ingress_refused_growth_total` is about a connection refused a
+BUFFER.
+
 **Read that last one as "a reply could not be charged", not "a reply was
 large".** A reply is written whether or not the class can cover its
 buffer, because it answers work that has already committed; the counter
@@ -118,7 +131,20 @@ about the class being full, read alongside
 #### What the budget covers, and what it does not
 
 It covers the socket buffers a connection holds, in and out, for as long
-as it holds them. It does NOT cover the peak a single request reaches
+as it holds them, and - since 0.8.0 - the reply a `GET`/`MGET` is about to
+build, reserved BEFORE the values are read rather than measured after.
+Those two commands are the only ones whose answer is sized by the store
+rather than by the request, and the size is knowable without paying for
+it: a key's padded on-disk record size is in the in-RAM index. The sizes
+are summed with checked arithmetic, reserved, and only then fetched, with
+each fetch bounded by the size reserved for it so a concurrent overwrite
+cannot make the measurement stale. A read that does not fit is refused
+with nothing fetched. The reservation uses the PADDED record size, so it
+over-states the reply by the record header, the key and up to 127 bytes
+per key; under a tight class a large `MGET` that would just have fitted
+can be refused.
+
+It does NOT cover the peak a single request reaches
 while it is being served: the decoded frame tree, the parsed vectors, and
 the fan-out of one command into concurrent per-item work. That memory
 belongs to a request rather than to a connection, it is gone when the
@@ -219,6 +245,8 @@ spelling from it, so they cannot say different things.
 | frame over the connection allowance | no | `-ERR ingress budget: this connection may hold at most N ...` | `2` InvalidRequest |
 | tenant vector quota exceeded | no | `-ERR tenant vector quota exceeded: ...` | `2` InvalidRequest |
 | request over a fixed ceiling (`SKEG.VMSET` items or bytes, native frame payload) | no | `-ERR ...: at most N, got M ...` | `2` InvalidRequest |
+| `GET`/`MGET` reply over the connection allowance | no | `-ERR ingress budget: this connection may hold at most N ...` | `2` InvalidRequest |
+| a value grew past the size reserved for it | no | `-ERR stored value bytes (the value grew after its size was reserved): at most N, got M` | `2` InvalidRequest |
 | headroom could not be read at all | no | `-ERR ...` | `3` Internal |
 | vector of the wrong dimension | no | `-ERR vindex '...' dim N but vector has M` | `2` InvalidRequest |
 
