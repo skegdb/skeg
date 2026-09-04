@@ -371,12 +371,19 @@ impl WarnSampler {
     /// refusing at the same instant race for the slot and exactly one wins,
     /// rather than both reading the same stale value and both shouting.
     pub fn admit(&self, kind: usize, now_ms: u64) -> bool {
-        // No window yet: today every refusal is shouted about. The next
-        // commit closes it; the seam is here so the tests that measure the
-        // channel can be red against the behaviour rather than absent.
-        let _ = self.last[kind].load(Ordering::Relaxed);
-        let _ = now_ms;
-        true
+        let stamp = now_ms.saturating_add(1);
+        let window = u64::try_from(REFUSAL_WARN_WINDOW.as_millis()).unwrap_or(u64::MAX);
+        let slot = &self.last[kind];
+        let mut last = slot.load(Ordering::Relaxed);
+        loop {
+            if last != 0 && stamp.saturating_sub(last) < window {
+                return false;
+            }
+            match slot.compare_exchange_weak(last, stamp, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(observed) => last = observed,
+            }
+        }
     }
 }
 
@@ -1018,10 +1025,9 @@ mod tests {
     /// process-wide one is shared with every other test in this binary, and
     /// an assertion on it would be an assertion about them.
     #[test]
-    #[ignore = "opens in the commit that bounds the refusal log"]
     fn a_sampler_shouts_once_per_window_per_kind() {
         let sampler = WarnSampler::new();
-        let window = REFUSAL_WARN_WINDOW.as_millis() as u64;
+        let window = u64::try_from(REFUSAL_WARN_WINDOW.as_millis()).unwrap_or(u64::MAX);
 
         assert!(sampler.admit(0, 0), "the first refusal of a kind is news");
         for ms in 0..window {
@@ -1044,7 +1050,6 @@ mod tests {
 
     /// A thousand identical refusals are one warn and a thousand debugs.
     #[test]
-    #[ignore = "opens in the commit that bounds the refusal log"]
     fn a_thousand_refusals_are_logged_once_at_warn() {
         let (counts, _guard) = capture::counting();
         for _ in 0..1000 {
@@ -1068,7 +1073,6 @@ mod tests {
     /// The sampler bounds the CHANNEL, not the signal: the counters still see
     /// every refusal.
     #[test]
-    #[ignore = "opens in the commit that bounds the refusal log"]
     fn sampling_the_log_does_not_sample_the_counter() {
         let (counts, _guard) = capture::counting();
         let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::QuotaRefused);

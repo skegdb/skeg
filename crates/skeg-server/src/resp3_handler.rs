@@ -2498,22 +2498,37 @@ async fn skeg_stats(shards: &ShardSet) -> Frame {
 /// Exhaustive: a variant added to `ShardError` does not compile until
 /// somebody says which code word it carries.
 fn shard_error(e: &crate::shard::ShardError) -> Frame {
-    warn!("shard error: {e}");
+    // The log level is decided PER ARM, not once at the top. A refusal is
+    // caused by the caller and arrives as fast as the caller can send: it
+    // goes to `debug!` with a sampled `warn!` (audit/22 A1), and the
+    // per-kind counters carry the volume. A fault the SERVER had - storage,
+    // an unreachable shard - keeps every one of its warn lines, because
+    // there is no client throttling those and an operator needs each one.
     match e {
-        crate::shard::ShardError::Admission(a) => Frame::Error(a.wire_message()),
+        crate::shard::ShardError::Admission(a) => {
+            crate::admission::log_refusal(a);
+            Frame::Error(a.wire_message())
+        }
         // A full VSEARCH pool is an admission refusal that predates the
         // enum, so it is mapped to its classification here rather than
         // classified here: the retryable bit is still decided in one place.
         crate::shard::ShardError::Busy => {
-            Frame::Error(crate::admission::AdmissionError::Busy.wire_message())
+            let busy = crate::admission::AdmissionError::Busy;
+            crate::admission::log_refusal(&busy);
+            Frame::Error(busy.wire_message())
         }
         crate::shard::ShardError::InvalidRequest(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            crate::admission::log_invalid_request(msg);
             Frame::Error(format!("ERR {msg}"))
         }
-        crate::shard::ShardError::Unavailable => Frame::Error(format!("ERR {e}")),
+        crate::shard::ShardError::Unavailable => {
+            warn!("shard error: {e}");
+            Frame::Error(format!("ERR {e}"))
+        }
         crate::shard::ShardError::Storage(msg) => {
             crate::admission::debug_assert_not_a_smuggled_refusal(msg);
+            warn!("shard error: {e}");
             Frame::Error(format!("ERR {e}"))
         }
     }
@@ -3781,7 +3796,6 @@ mod tests {
     /// static and this binary runs its tests in parallel, so an equality
     /// would be a claim about every other test as well.
     #[tokio::test]
-    #[ignore = "opens in the commit that bounds the refusal log"]
     async fn a_thousand_refused_msets_move_the_counter_not_the_log() {
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 4).unwrap();
