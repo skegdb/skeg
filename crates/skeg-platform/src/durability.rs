@@ -21,6 +21,13 @@
 //! compile time. A runtime override is exposed through
 //! [`resolve_durability_model`] for tests (and operators who need to
 //! force a specific strategy): see the `SKEG_DURABILITY_MODEL` env var.
+//!
+//! The override is not symmetric. `per-file` may be selected anywhere - it
+//! promises less than the platform can do, never more. `device-global` may
+//! not: it is a claim that this platform's durability call is a device-wide
+//! barrier, and where that is false the strategy it selects acks writes as
+//! durable without syncing them. It is honoured on Apple and refused, with a
+//! warning, everywhere else.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 use std::env;
@@ -106,7 +113,21 @@ pub fn resolve_durability_model() -> DurabilityModel {
     let raw_env = env::var("SKEG_DURABILITY_MODEL")
         .ok()
         .map(|s| s.trim().to_ascii_lowercase());
-    let (resolved, _refused) = resolve_model_from(raw_env.as_deref(), IS_APPLE);
+    let (resolved, refused) = resolve_model_from(raw_env.as_deref(), IS_APPLE);
+    if refused {
+        // Loud, and with the reason, because the alternative is a store that
+        // acks writes as durable over pages nothing flushed and says nothing
+        // about it. An operator who set this deliberately needs to know it did
+        // not take effect; one who inherited it needs to know why it must not.
+        tracing::warn!(
+            target: "skeg::durability",
+            "SKEG_DURABILITY_MODEL=device-global ignored on this platform: the durability \
+             call here flushes one file, not the device, so a shared committer would ack \
+             every other file in a batch as durable without ever syncing it. Using the \
+             platform default ({:?}) instead.",
+            DURABILITY_MODEL
+        );
+    }
 
     CACHED_MODEL.store(resolved as u8, Ordering::Relaxed);
     resolved
@@ -120,12 +141,32 @@ pub fn resolve_durability_model() -> DurabilityModel {
 ///
 /// Returns the model, and whether a `device-global` request was REFUSED
 /// because this platform cannot honour it.
-fn resolve_model_from(raw: Option<&str>, _is_apple: bool) -> (DurabilityModel, bool) {
+///
+/// `device-global` is a claim about the hardware, not a preference. The shared
+/// committer it selects issues ONE durability call for a batch spanning
+/// several files, and that is a barrier for all of them only where the call is
+/// device-wide: Apple's `F_FULLFSYNC` asks the drive to flush its whole
+/// buffered cache, and `F_NOCACHE` - `#[cfg(target_os = "macos")]`, applied to
+/// every `PlatformFile` at open - has already taken the other files' bytes out
+/// of the page cache. Linux `fsync(2)` transfers the data "of the file
+/// referred to by the file descriptor fd" and has no equivalent of either, so
+/// the same code there acks every file but one as durable over dirty pages
+/// nothing flushed: lost on power failure AND on a kernel panic.
+///
+/// So it is refused where those premises do not hold, and the platform default
+/// is used instead. `per-file` stays selectable everywhere - it promises less,
+/// never more - and an unrecognised value still falls back silently, because a
+/// typo must not crash the engine.
+fn resolve_model_from(raw: Option<&str>, is_apple: bool) -> (DurabilityModel, bool) {
     match raw {
-        Some("device-global" | "deviceglobal") => (DurabilityModel::DeviceGlobal, false),
+        Some("device-global" | "deviceglobal") => {
+            if is_apple {
+                (DurabilityModel::DeviceGlobal, false)
+            } else {
+                (DURABILITY_MODEL, true)
+            }
+        }
         Some("per-file" | "perfile") => (DurabilityModel::PerFile, false),
-        // Empty, missing, or unrecognised value: use the platform default. A
-        // typo must not crash the engine.
         _ => (DURABILITY_MODEL, false),
     }
 }
@@ -182,7 +223,6 @@ mod tests {
     /// pages no one ever flushed. An operator setting the env var must not be
     /// able to buy that.
     #[test]
-    #[ignore = "opens in the commit that refuses device-global off Apple"]
     fn device_global_is_refused_where_it_is_not_a_device_barrier() {
         let (model, refused) = resolve_model_from(Some("device-global"), true);
         assert_eq!(model, DurabilityModel::DeviceGlobal, "Apple may ask for it");
@@ -215,7 +255,6 @@ mod tests {
     /// parameter. Only meaningful off Apple, so only compiled there.
     #[cfg(not(target_vendor = "apple"))]
     #[test]
-    #[ignore = "opens in the commit that refuses device-global off Apple"]
     fn device_global_is_not_reachable_by_env_on_this_platform() {
         let (model, refused) = resolve_model_from(Some("device-global"), IS_APPLE);
         assert!(refused, "this platform must refuse device-global");
