@@ -249,6 +249,11 @@ async fn a_huge_mget_is_refused_before_any_value_is_fetched() {
 /// answered in full. A preflight that refuses everything is not a fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_mget_inside_the_allowance_is_answered_in_full() {
+    // This one MATERIALISES a megabyte of values, so it moves
+    // `KvReadBytesFetched` - the counter three tests below assert a zero
+    // delta on. Taking the turn is what stops it being their flake (audit 25,
+    // F3): the same shape B7 has just removed from `ingress_budget.rs`.
+    let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
     let (addr, _dir) = resp3_server(&ingress, 8).await;
     let keys = seed(addr, 4, VALUE).await;
@@ -325,17 +330,30 @@ async fn a_get_over_the_allowance_is_refused_before_the_value_is_fetched() {
 /// here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n_concurrent_mgets_never_overshoot_the_class() {
-    const CONNS: usize = 8;
+    // Half the connections ask for eight values (2 MiB of reply, ~4 MiB
+    // charged, comfortably inside the 8 MiB allowance) and half ask for
+    // thirty-two (8 MiB of reply, ~16 MiB charged, twice the allowance).
+    // That makes BOTH outcomes structural rather than a race for the class:
+    // four must be answered and four must be refused whatever the scheduler
+    // does, so the refusal branch this test documents is actually taken -
+    // audit 25, F4, the same demand B7 makes of its twin.
+    const NARROW: usize = 4;
+    const WIDE: usize = 4;
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
     let (addr, _dir) = resp3_server(&ingress, 32).await;
-    let keys = seed(addr, 8, VALUE).await;
+    let keys = seed(addr, 32, VALUE).await;
 
     let over_before = counter_value(Counter::IngressReplyOverBudget);
-    let cmd = Arc::new(mget_command(&keys));
+    let narrow = Arc::new(mget_command(&keys[..8]));
+    let wide = Arc::new(mget_command(&keys));
     let mut tasks = Vec::new();
-    for _ in 0..CONNS {
-        let cmd = Arc::clone(&cmd);
+    for i in 0..NARROW + WIDE {
+        let cmd = if i < NARROW {
+            Arc::clone(&narrow)
+        } else {
+            Arc::clone(&wide)
+        };
         tasks.push(tokio::spawn(async move {
             let mut s = TcpStream::connect(addr).await.expect("connect");
             s.write_all(&cmd).await.expect("mget");
@@ -363,8 +381,19 @@ async fn n_concurrent_mgets_never_overshoot_the_class() {
 
     assert_eq!(
         answered + refused,
-        CONNS,
+        NARROW + WIDE,
         "every connection must get an answer of one kind or the other"
+    );
+    assert_eq!(
+        answered, NARROW,
+        "every request inside the allowance must be answered: {answered} of \
+         {NARROW}"
+    );
+    assert_eq!(
+        refused, WIDE,
+        "every request past the allowance must be REFUSED before its reply is \
+         built, not built and then counted as an overshoot: {refused} of \
+         {WIDE}"
     );
     assert_eq!(
         counter_value(Counter::IngressReplyOverBudget) - over_before,
@@ -524,5 +553,169 @@ async fn a_native_vget_is_reserved_before_the_shard_call() {
             && !err.message.to_lowercase().contains("vindex"),
         "an admission refusal must not be the shard's answer wearing a \
          different code: {err:?}"
+    );
+}
+
+// ------------------------------------------- the read must survive a writer
+
+/// audit 25, F1 (CWE-703). The stale-length guard fails CLOSED, which is the
+/// right direction - but it used to fail closed on a legitimate request. If
+/// another client rewrote the key between this read's measurement and its
+/// fetch, the read was refused outright, with no retry and with a message
+/// (`... send it in smaller pieces`) that a four-byte `GET` cannot act on.
+/// The auditor measured 14 refusals in 4000 reads under a writer alternating
+/// 1 KiB and 256 KiB, and 8 in 4000 under `DEL`+`SET`, where an absent key
+/// measures as `0` and any value written in the window is therefore refused
+/// with certainty.
+///
+/// A budget is allowed to refuse a request that does not fit. It is not
+/// allowed to refuse one that does, because somebody else was writing.
+#[ignore = "opens with the audit 25 F1/F2 fixes"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_rewritten_under_a_read_is_still_answered() {
+    const READS: usize = 4000;
+    // Generous: nothing here may be refused for SIZE, so any refusal at all
+    // is the race and not the class.
+    let ingress = budget(128 * 1024 * 1024);
+    let (addr, _dir) = resp3_server(&ingress, 16).await;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Writer one: the same key, alternating small and large, so the measured
+    // size is stale in both directions.
+    let flip_stop = Arc::clone(&stop);
+    let flipper = tokio::spawn(async move {
+        let mut w = TcpStream::connect(addr).await.expect("connect");
+        let small = vec![b's'; 1024];
+        let large = vec![b'l'; 256 * 1024];
+        let mut big = false;
+        while !flip_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let v: &[u8] = if big { &large } else { &small };
+            big = !big;
+            w.write_all(&resp_array(&[b"SET", b"churn", v]))
+                .await
+                .expect("set");
+            let _ = read_reply(&mut w, Duration::from_secs(30)).await;
+        }
+    });
+
+    // Writer two: delete and recreate, so the read's measurement can find no
+    // key at all - a bound of zero, and a certain refusal for whatever the
+    // write puts there.
+    let cycle_stop = Arc::clone(&stop);
+    let cycler = tokio::spawn(async move {
+        let mut w = TcpStream::connect(addr).await.expect("connect");
+        let value = vec![b'c'; 64 * 1024];
+        while !cycle_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            for cmd in [
+                resp_array(&[b"DEL", b"cycle"]),
+                resp_array(&[b"SET", b"cycle", &value]),
+            ] {
+                w.write_all(&cmd).await.expect("write");
+                let _ = read_reply(&mut w, Duration::from_secs(30)).await;
+            }
+        }
+    });
+
+    let mut reader = TcpStream::connect(addr).await.expect("connect");
+    let mut spurious: Vec<String> = Vec::new();
+    for i in 0..READS {
+        let key: &[u8] = if i % 2 == 0 { b"churn" } else { b"cycle" };
+        reader
+            .write_all(&resp_array(&[b"GET", key]))
+            .await
+            .expect("get");
+        let reply = read_reply(&mut reader, Duration::from_secs(30)).await;
+        if reply.first() == Some(&b'-') {
+            let text = String::from_utf8_lossy(&reply).into_owned();
+            if spurious.len() < 4 {
+                spurious.push(text);
+            } else {
+                spurious.push(String::new());
+            }
+        }
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = flipper.await;
+    let _ = cycler.await;
+
+    let n = spurious.len();
+    assert_eq!(
+        n,
+        0,
+        "a read that fits the class must not be refused because another \
+         client was writing: {n} of {READS} were, first few: {:?}",
+        &spurious[..n.min(4)]
+    );
+}
+
+// ------------------------------------------- what the preflight itself costs
+
+/// audit 25, F2 (CWE-400), first half. `MGET` had no arity cap at all: the
+/// wire cost of a key is about nine bytes (`$1\r\nk\r\n`) and the preflight
+/// then builds a `ScopedKey`, a `Bytes`, a per-shard bucket entry and a
+/// `u32` for each of them - about twenty times the request, before anything
+/// is charged. The cap is the same shape `SKEG.VMSET` already has, refused
+/// with the same typed classification.
+#[ignore = "opens with the audit 25 F1/F2 fixes"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_mget_past_the_key_cap_is_refused_before_anything_is_allocated() {
+    let _turn = COUNTER_TESTS.lock().await;
+    let ingress = budget(128 * 1024 * 1024);
+    let (addr, _dir) = resp3_server(&ingress, 8).await;
+
+    // Past MAX_MGET_KEYS, and every key absent, so nothing but the cap can
+    // refuse it: without one, this is answered with a null per key.
+    let keys: Vec<Vec<u8>> = (0..5000).map(|i| format!("k{i}").into_bytes()).collect();
+
+    let before = counter_value(Counter::KvReadBytesFetched);
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&mget_command(&keys)).await.expect("mget");
+    let reply = read_reply(&mut s, Duration::from_secs(30)).await;
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    assert!(
+        text.starts_with("-ERR "),
+        "an MGET past the key cap must be refused by name: {:?}",
+        &text[..text.len().min(200)]
+    );
+    assert!(
+        text.contains("4096") && text.contains("5000"),
+        "the refusal must name the cap and what was asked: {text:?}"
+    );
+    assert_eq!(
+        counter_value(Counter::KvReadBytesFetched) - before,
+        0,
+        "the cap must be checked before anything is read"
+    );
+}
+
+/// audit 25, F2, second half. The preflight's OWN allocation - one
+/// `ScopedKey`, one `Bytes`, one bucket entry and one `u32` per key, then the
+/// bounded batch's triples - is proportional to the key count and was taken
+/// before `grow_to` had granted anything. A wide `MGET` of keys that do not
+/// exist reserves almost nothing for its reply (a null is thirty-two bytes of
+/// framing) while costing hundreds of bytes per key in the structures that
+/// answer it: the exact request an unbudgeted per-key cost makes free.
+#[ignore = "opens with the audit 25 F1/F2 fixes"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wide_mget_of_absent_keys_is_charged_for_its_own_preflight() {
+    let _turn = COUNTER_TESTS.lock().await;
+    // 4 MiB class => 1 MiB per-connection allowance. 4000 absent keys is
+    // ~128 KiB of reply framing (admitted under any class) against ~1 MiB of
+    // preflight structures (which the allowance cannot cover).
+    let ingress = budget(4 * 1024 * 1024);
+    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let keys: Vec<Vec<u8>> = (0..4000).map(|i| format!("k{i}").into_bytes()).collect();
+
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&mget_command(&keys)).await.expect("mget");
+    let reply = read_reply(&mut s, Duration::from_secs(30)).await;
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    assert!(
+        text.starts_with('-'),
+        "a wide MGET whose preflight cannot be granted must be refused, not \
+         served for free: {:?}",
+        &text[..text.len().min(200)]
     );
 }
