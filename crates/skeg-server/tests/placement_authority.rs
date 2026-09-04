@@ -270,3 +270,70 @@ async fn a_vset_during_the_owner_map_publish_survives_the_publish() {
         Some(other_cluster(moved_row).as_slice())
     );
 }
+
+/// SD4. A DROP that lands during a reshard must credit the tenant every
+/// LOGICAL row, not the ones the reshard loop happened to have moved.
+///
+/// `vindex_drop` counts rows as `owners[name].len()`. A first reshard used to
+/// publish one entry per row it moved, into a map nothing had built - so the
+/// count was the migration's progress, and the tenant stayed charged for the
+/// rest. Under the authority the map is built before the first row moves and
+/// the count cannot be read halfway through a publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drop_during_a_reshard_credits_every_logical_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    const N: u64 = 200;
+    let name = scoped(T, "pa-drop");
+    let shards = open(dir.path());
+    // NOT `routed_index`: this one must be the FIRST reshard the index ever
+    // sees, which is the run with no owner map to start from.
+    shards
+        .vindex_create_scoped(&name, DIM as u32, 4, 1)
+        .await
+        .unwrap();
+    for id in 0..N {
+        shards
+            .vset(&name, id, vec_for(id), T, LIMIT, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(shards.tenant_vector_count(T), N);
+
+    arm_gate_at(FP, &name);
+    let resharder = {
+        let (s, n) = (shards.clone(), name.clone());
+        tokio::spawn(async move { s.reshard(&n, 0.25, 10, T).await })
+    };
+    wait_reached(FP, &name).await;
+
+    let dropper = {
+        let (s, n) = (shards.clone(), name.clone());
+        tokio::spawn(async move { s.vindex_drop(&n, T).await })
+    };
+    tokio::time::sleep(PENDING).await;
+    let counted_during_the_publish = dropper.is_finished();
+
+    release_gate_at(FP, &name);
+    dropper.await.unwrap().expect("vindex_drop");
+    // The reshard is writing to an index that is being dropped underneath it,
+    // so either answer is legitimate; what is not is the accounting.
+    let _ = resharder.await.unwrap();
+    assert!(
+        fired_gate_at(FP, &name),
+        "the gate never fired: this test proved nothing"
+    );
+    assert_eq!(
+        shards.tenant_vector_count(T),
+        0,
+        "the drop credited fewer rows than the index held: the count came off a \
+         map the reshard had only partly built"
+    );
+    assert!(
+        !counted_during_the_publish,
+        "the drop counted the index while its placement was being published"
+    );
+
+    drop(shards);
+    let shards = open(dir.path());
+    assert_eq!(shards.tenant_vector_count(T), 0, "and it stays credited");
+}
