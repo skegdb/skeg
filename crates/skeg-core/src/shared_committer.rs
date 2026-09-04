@@ -379,6 +379,10 @@ async fn committer_loop(mut rx: mpsc::Receiver<Msg>) {
 /// asked to cover. `Ok(())` means every file in the batch wrote and the sync
 /// that covers them succeeded.
 ///
+/// Entries whose file was detached before the batch reached them are the one
+/// thing that does NOT make this fail: those appends were cancelled by their
+/// own caller, not lost by a disk. See the `state.get_mut` miss below.
+///
 /// An empty batch is `Ok(())` for a [`FlushKind::Batch`]. For a
 /// [`FlushKind::Barrier`] it is only `Ok(())` once no file is carrying bytes a
 /// sync has not covered.
@@ -430,16 +434,28 @@ async fn flush_batch(
 
     for (file_id, items) in by_file {
         let Some(fs) = state.get_mut(&file_id) else {
-            // File detached mid-batch: ack each pending entry with
-            // an error. This is rare and bounded (only happens on
-            // race with Drop), but the ack must still arrive so the
-            // caller is not left waiting.
+            // File detached mid-batch: ack each pending entry with an error.
+            // The ack must still arrive so a caller that IS still waiting is
+            // not left hanging.
+            //
+            // Not a `failures` entry, though, and this is the whole
+            // distinction: the detach comes from `EntryInner::drop`, so
+            // reaching here means the last handle to this file went while an
+            // append for it was still queued behind the drop - the write was
+            // CANCELLED, by its own caller, and no disk did anything wrong.
+            // `skeg_vlog_flush_failures_total` is documented as having no
+            // healthy value above zero, and a client closing a connection must
+            // not be able to move it. Counted on its own benign metric
+            // instead, one tick per abandoned entry.
+            let mut orphaned: u64 = 0;
             for (_, reply) in items {
+                orphaned = orphaned.saturating_add(1);
                 let _ = reply.send(Err(io::Error::other("file detached during batch")));
             }
-            // A flush that could not write one of its files did not cover it,
-            // however good the reason.
-            failures.push(io::Error::other("file detached during batch"));
+            skeg_telemetry::add_counter(
+                skeg_telemetry::Counter::VlogCommitOrphanedEntries,
+                orphaned,
+            );
             continue;
         };
 
@@ -781,7 +797,6 @@ mod tests {
     /// healthy value above zero, so a client closing a connection must not be
     /// able to move it.
     #[tokio::test]
-    #[ignore = "opens in the commit that stops a cancelled append reading as a disk failure"]
     async fn a_cancelled_append_does_not_look_like_a_failing_disk() {
         let _counter = counter_guard().await;
         let before_failures = flush_failures();
