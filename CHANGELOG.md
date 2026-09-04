@@ -275,6 +275,69 @@ left", which is a different fact.
 
 New counter `skeg_quota_refused_total`.
 
+### `GET` and `MGET` measure the answer before they fetch it
+
+The reply-side reservation added for mutations, `SKEG.VSEARCH`,
+`SKEG.VGET` and `SKEG.VGRAPH` skipped the two KV reads on the grounds that
+neither is pipelineable, so no one connection can accumulate several of
+them. That bounds the MULTIPLICATION and not the SIZE. `MGET k1 ... kn`
+names its keys in a few hundred bytes and each value behind them is
+bounded only by `MAX_BULK_LEN` (64 MiB); every value was materialised into
+the reply frame first and charged afterwards, so the governor read the
+peak off an allocation that had already happened - on any number of
+connections at once.
+
+Both wires now take the length from the INDEX before reading a byte of
+any value. A key's padded on-disk record size is already in the in-RAM
+index (one hashmap lookup, no segment touched); the sizes are summed with
+checked arithmetic, the sum is reserved against the connection's ingress
+allowance, and only then are the values fetched. A read that does not fit
+is refused with the existing admission classification - `-ERR ingress
+budget: ...` on RESP3, `2` `InvalidRequest` on the native wire - and
+nothing is fetched.
+
+Each fetch then carries the size that was reserved for it. Between the
+measurement and the read another writer can overwrite the key with a
+larger value; `VLog::get_bounded` checks the same `IndexEntry` the `pread`
+allocates from, in the same borrow, before the allocation, so a value that
+grew in that window is refused rather than materialised.
+
+`EXISTS` changed for a stronger reason: it fetched every value in full and
+discarded them all to answer with one integer. It counts index entries
+now.
+
+`Op::Vget` on the native wire joins `native_reply_upper_bound`; RESP3 has
+reserved that bound since 0.8.0's earlier tranche, and the binary wire
+answered with the same vector under no bound at all.
+
+A measurement that goes stale is **retried once**, not refused. Failing
+closed on a legitimate four-byte `GET` because another client happened to
+write that key is a denial of service the client cannot fix, and it
+happened: 4 refusals in 4000 reads under a writer alternating 1 KiB and
+256 KiB, and with certainty for a key created inside the window (an absent
+key measures as zero). The read re-measures, re-reserves and fetches
+again; only a value that has moved a second time is refused, as a
+**retryable** condition whose message names the value's size, not the
+request's.
+
+**`MGET` is capped at 4096 keys**, refused with the same typed
+classification `SKEG.VMSET`'s item cap uses, checked before the first
+allocation. A key costs about nine bytes on the wire and about 256 bytes
+in the structures that answer it; without a cap the cheap side of that
+ratio was the client's. The cap also bounds the shard batch, which is one
+request per shard.
+
+**What this costs.** One extra shard round trip per KV read (an mpsc send
+and a oneshot; no IO), a reservation taken against the PADDED record size
+(which over-states the value by the record header, the key, and up to 127
+bytes of padding per key), and a flat 256 bytes per key reserved for the
+preflight's own structures. Under a tight class a large `MGET` that would
+just have fitted can be refused. Three counters make it visible:
+`skeg_kv_read_bytes_total` (value bytes materialised by a read, counted at
+the shard), `skeg_kv_read_refused_total`, and
+`skeg_kv_read_remeasured_total` (reads whose measurement went stale and
+were retried).
+
 ### What the network may hold is now part of the memory budget
 
 Every limit on incoming bytes was per connection, and the connection

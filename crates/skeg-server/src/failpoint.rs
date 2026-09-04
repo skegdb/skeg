@@ -361,6 +361,19 @@ pub enum IngressFailpoint {
     /// Marks that the close path was actually reached, so "the budget came
     /// back" cannot pass on a connection that never got that far.
     ReleaseDeferredOnClose,
+    /// The point in the RESP3 read loop where a drained input buffer makes the
+    /// connection emit everything it has in flight. Armed, the pipeline is
+    /// HELD instead: replies keep their reservations and accumulate until the
+    /// peer stops writing.
+    ///
+    /// It exists so a test of the pipeline's RUNNING SUM does not depend on
+    /// how the kernel split the burst into reads. Without it, whether several
+    /// reservations are ever outstanding at once is decided by whether the
+    /// server drained between two of the client's writes - which is a race the
+    /// test cannot see and cannot control, and which made
+    /// `pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged`
+    /// fail once under a parallel build and pass six times in isolation.
+    HoldPipelineDrain,
 }
 
 impl IngressFailpoint {
@@ -371,6 +384,7 @@ impl IngressFailpoint {
         match self {
             IngressFailpoint::GrowRefusedMidFrame => 1 << 0,
             IngressFailpoint::ReleaseDeferredOnClose => 1 << 1,
+            IngressFailpoint::HoldPipelineDrain => 1 << 2,
         }
     }
 }

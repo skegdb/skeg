@@ -121,6 +121,16 @@ pub enum AdmissionError {
     /// and a free reading of `xxh3_64(scoped_key) % n_shards` for whoever
     /// asked.
     CrossSlot,
+    /// A KV read measured a value's length, reserved for it, found the value
+    /// had been rewritten larger, re-measured, reserved again - and found it
+    /// rewritten larger a second time.
+    ///
+    /// Momentary for the same reason [`Self::Busy`] is: what causes it is
+    /// another client writing the same key, and writes end. It is NOT a
+    /// statement about the request, which may be four bytes long, so it must
+    /// not be spelled as one - the numbers name the VALUE, and the advice is
+    /// to send the same request again.
+    ValueChangedUnderRead { measured: u64, found: u64 },
     /// A tenant backend refused the command.
     ///
     /// The message is OPAQUE. It is written by a backend that lives outside
@@ -184,6 +194,9 @@ impl AdmissionError {
             // count does not move while the store is open. Nothing about a
             // retry can change the answer.
             Self::CrossSlot => Permanent,
+            // Two writers' worth of bad luck on one key. Nothing about the
+            // request needs to change for the next attempt to work.
+            Self::ValueChangedUnderRead { .. } => Retryable,
             // The one place in the engine that reads a code word out of a
             // string, and only because the string IS the interface: see the
             // variant's own note. One word, the one the trait's doc names;
@@ -215,6 +228,7 @@ impl AdmissionError {
             Self::Busy => 5,
             Self::CrossSlot => 6,
             Self::Backend { .. } => 7,
+            Self::ValueChangedUnderRead { .. } => 8,
         }
     }
 
@@ -242,6 +256,7 @@ impl AdmissionError {
             | Self::DiskQuota { .. }
             | Self::RequestTooLarge { .. }
             | Self::Busy
+            | Self::ValueChangedUnderRead { .. }
             | Self::Backend { .. } => match self.retryability() {
                 Retryability::Retryable => "BACKPRESSURE",
                 Retryability::Permanent => "ERR",
@@ -317,6 +332,7 @@ impl AdmissionError {
             // The key SET is what is wrong with it: send the same keys in one
             // batch per shard and every one of them is accepted.
             | Self::CrossSlot => ErrCode::InvalidRequest,
+            | Self::ValueChangedUnderRead { .. } => ErrCode::InvalidRequest,
         }
     }
 }
@@ -395,12 +411,12 @@ impl Default for WarnSampler {
 
 /// Kinds the sampler keeps a clock for: one per [`AdmissionError`] variant,
 /// plus [`KIND_INVALID_REQUEST`].
-pub const REFUSAL_KINDS: usize = 9;
+pub const REFUSAL_KINDS: usize = 10;
 
 /// The slot for [`crate::shard::ShardError::InvalidRequest`], which is not an
 /// admission refusal but is the same THING for this purpose: permanent, and
 /// decided entirely by what the client sent.
-pub const KIND_INVALID_REQUEST: usize = 8;
+pub const KIND_INVALID_REQUEST: usize = 9;
 
 static REFUSAL_WARNS: WarnSampler = WarnSampler::new();
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -638,6 +654,14 @@ impl fmt::Display for AdmissionError {
             // Redis client already knows character for character. Changing a
             // word here changes the wire.
             Self::CrossSlot => write!(f, "Keys in request don't hash to the same slot"),
+            // The numbers are the VALUE's, not the request's, and the advice
+            // is to retry - the request is already as small as it can be.
+            Self::ValueChangedUnderRead { measured, found } => write!(
+                f,
+                "the value under this key was rewritten while the read was \
+                 being admitted: measured {measured} bytes, found {found} on \
+                 the second attempt; send the same request again"
+            ),
             // Verbatim. The backend wrote a complete error line, code word
             // included, and rewriting it would strip the only thing a RESP3
             // client of that deployment already routes on.
@@ -756,6 +780,13 @@ mod tests {
                 },
                 Retryability::Permanent,
             ),
+            (
+                AdmissionError::ValueChangedUnderRead {
+                    measured: 1152,
+                    found: 262_144,
+                },
+                Retryability::Retryable,
+            ),
         ]
     }
 
@@ -769,6 +800,7 @@ mod tests {
             AdmissionError::RequestTooLarge { .. } => "request_too_large",
             AdmissionError::Busy => "busy",
             AdmissionError::CrossSlot => "cross_slot",
+            AdmissionError::ValueChangedUnderRead { .. } => "value_changed_under_read",
             AdmissionError::Backend { .. } => "backend",
         }
     }
@@ -791,7 +823,8 @@ mod tests {
                 "ingress",
                 "memory_at_write",
                 "quota_exceeded",
-                "request_too_large"
+                "request_too_large",
+                "value_changed_under_read"
             ],
             "a variant nothing samples is a classification nothing checks"
         );
@@ -1108,11 +1141,11 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen,
-            (0..8).collect::<Vec<_>>(),
+            (0..9).collect::<Vec<_>>(),
             "each variant needs its own clock, and KIND_INVALID_REQUEST owns \
              the slot after them"
         );
-        assert_eq!(KIND_INVALID_REQUEST, 8);
+        assert_eq!(KIND_INVALID_REQUEST, 9);
         assert_eq!(REFUSAL_KINDS, KIND_INVALID_REQUEST + 1);
     }
 

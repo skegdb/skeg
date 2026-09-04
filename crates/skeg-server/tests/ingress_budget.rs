@@ -1288,9 +1288,29 @@ fn vgraph_cmd(name: &str, count: usize) -> Vec<u8> {
 ///
 /// `BURST` pipelined `SKEG.VGRAPH count=2048` reads on one connection, sent
 /// without reading their replies, under a class sized for a handful: some
-/// must be admitted (the class is not THAT small) and some must be
-/// refused before they run (the class cannot hold all of `BURST`) - the
-/// same "some, not all, not none" shape the VSEARCH pipeline test proves.
+/// must be admitted (the class is not THAT small) and some must be refused
+/// before they run (the class cannot hold all of `BURST`) - the same "some,
+/// not all, not none" shape the VSEARCH pipeline test proves.
+///
+/// # Why the failpoint (audit 20, B7)
+///
+/// This test used to depend on the kernel. The connection loop drains its
+/// pipeline whenever the decoder runs out of bytes, so whether several
+/// reservations were ever outstanding AT ONCE was decided by whether the
+/// server happened to drain between two of the client's writes. Under a
+/// parallel build it did: all eight requests were admitted one at a time,
+/// `refused` was 0 and the test failed - six times green in isolation, once
+/// red under load, which is exactly the evidence a release gate must not
+/// produce.
+///
+/// `HoldPipelineDrain` replaces that race with an event the test owns. While
+/// it is armed the pipeline is not drained at a dry buffer, so every one of
+/// `BURST` is submitted - and charged, or refused - before any of them is
+/// emitted, however the kernel split the writes. The client then half-closes;
+/// the server's read returns 0, leaves the loop, and the close path's drain
+/// (which the failpoint does not guard) writes every reply in order. The
+/// failpoint's `fired` flag is asserted, so a renamed or unreached point is a
+/// failure rather than a test that quietly proves nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
     const DIM: usize = 8;
@@ -1302,6 +1322,7 @@ async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
     // MiB charged. Sized for roughly half of BURST to fit.
     let ingress = budget(560 * CHUNK_BYTES, Duration::from_millis(50));
     let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let fp_key = key(addr);
 
     let mut setup = TcpStream::connect(addr).await.expect("connect");
     setup
@@ -1317,26 +1338,37 @@ async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
     assert!(text.starts_with('+'), "setup vset must succeed: {text:?}");
     drop(setup);
 
+    // Armed after the setup connection is gone, so the setup traffic runs on
+    // the ordinary path, and keyed on this listener's port so no other test in
+    // this binary can see it.
+    arm_ingress_at(IngressFailpoint::HoldPipelineDrain, &fp_key);
+
     let mut conn = TcpStream::connect(addr).await.expect("connect");
     let request = vgraph_cmd("graph-idx", COUNT);
     for _ in 0..BURST {
         conn.write_all(&request).await.expect("vgraph");
+        // Deliberately spaced, and this is what makes the test STRICTER
+        // rather than flakier: without the hold, a gap this size guarantees
+        // the server drains between two writes and never holds more than one
+        // reservation, which is the passing-for-the-wrong-reason state the
+        // old version fell into by accident. With the hold, the outcome does
+        // not depend on the gap at all.
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    // The barrier: nothing is emitted until the peer stops writing, so all
+    // BURST reservations are taken against the class together.
+    conn.shutdown().await.expect("half-close");
 
     let mut ok = 0usize;
     let mut refused = 0usize;
     let mut buf = Vec::new();
     let mut scratch = [0u8; 65536];
-    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if Instant::now() >= deadline {
-            break;
-        }
-        let n = match tokio::time::timeout(Duration::from_secs(5), conn.read(&mut scratch)).await {
+        let n = match tokio::time::timeout(Duration::from_secs(20), conn.read(&mut scratch)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
-            Ok(Err(_)) => break,
-            Err(_) => break,
+            Ok(Err(e)) => panic!("read error before EOF: {e}"),
+            Err(_) => panic!("the server neither answered nor closed within 20s"),
         };
         buf.extend_from_slice(&scratch[..n]);
         while !buf.is_empty() {
@@ -1352,9 +1384,17 @@ async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
         }
     }
 
+    disarm_ingress_at(IngressFailpoint::HoldPipelineDrain, &fp_key);
     assert!(
-        ok + refused > 0,
-        "no replies arrived at all: nothing was proved"
+        fired_ingress_at(IngressFailpoint::HoldPipelineDrain, &fp_key),
+        "the pipeline was never held, so nothing here was under test"
+    );
+
+    assert_eq!(
+        ok + refused,
+        BURST,
+        "every request must be answered exactly once: {ok} completed, \
+         {refused} refused"
     );
     assert!(
         ok > 0,
