@@ -15,6 +15,7 @@ use skeg_platform::PlatformFile;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
+use crate::failpoint::{self, CommitFailpoint};
 use crate::shared_committer::{SharedCommitter, SharedCommitterEntry};
 
 const MAX_BATCH_BYTES: usize = 256 * 1024; // 256 KB
@@ -186,6 +187,27 @@ impl PerFileCommitter {
 
 // ── Background task ───────────────────────────────────────────────────────────
 
+/// Why a flush is running, which decides whether it owes a sync it was not
+/// asked for.
+///
+/// A `Batch` flush is the committer emptying itself: it owes its entries the
+/// durability THEY asked for and nothing more, so a batch of `Relaxed` writes
+/// correctly issues no sync at all.
+///
+/// A `Barrier` is someone calling `flush()`, and that is a different promise -
+/// "everything submitted before this point is on stable storage". It has to
+/// cover bytes earlier `Relaxed` batches left behind, which no one has synced
+/// and no one else ever will. `Durability::Relaxed` is not a compaction-only
+/// tier: `PAYLOAD_DURABILITY` in the server is `Relaxed`, and it is the
+/// durability of every VSET payload blob and of four tombstone sweeps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FlushKind {
+    /// The 200 µs timer, a full batch, or the entries themselves.
+    Batch,
+    /// An explicit `flush()`, or the last flush before shutdown.
+    Barrier,
+}
+
 async fn committer_task(
     file: Arc<PlatformFile>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
@@ -193,6 +215,11 @@ async fn committer_task(
 ) {
     let mut batch: Vec<WriteReq> = Vec::new();
     let mut batch_bytes: usize = 0;
+    // Bytes written to `file` that no sync has covered yet. Only `Relaxed`
+    // batches can leave any: every other tier syncs before it acks. A
+    // `Barrier` with this above zero owes the disk a sync whatever its own
+    // batch asked for.
+    let mut dirty_bytes: u64 = 0;
 
     loop {
         let flush = tokio::select! {
@@ -200,7 +227,32 @@ async fn committer_task(
                 match msg {
                     None => {
                         // Channel closed: flush remaining entries and exit.
-                        flush_batch(&file, &mut batch, &mut w_offset).await;
+                        //
+                        // Nobody is left to answer, which is exactly why this
+                        // used to be discarded - and exactly why it has to be
+                        // said out loud instead: a shutdown that could not
+                        // land its last batch is otherwise indistinguishable
+                        // from a clean one. The waiters of that batch still
+                        // get their `Err` from inside `flush_batch`; this is
+                        // for the operator, who has no waiter.
+                        //
+                        // A `Barrier`, not a `Batch`: it is the last one this
+                        // file gets, so it also owes a sync for anything a
+                        // `Relaxed` batch left behind.
+                        if let Err(e) = flush_batch(
+                            &file,
+                            &mut batch,
+                            &mut w_offset,
+                            &mut dirty_bytes,
+                            FlushKind::Barrier,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                error = %e,
+                                "group committer: the last flush before shutdown did not land"
+                            );
+                        }
                         return;
                     }
                     Some(Msg::Write(req)) => {
@@ -209,9 +261,16 @@ async fn committer_task(
                         batch_bytes >= MAX_BATCH_BYTES || batch.len() >= MAX_BATCH_ENTRIES
                     }
                     Some(Msg::Flush(reply_tx)) => {
-                        flush_batch(&file, &mut batch, &mut w_offset).await;
+                        let result = flush_batch(
+                            &file,
+                            &mut batch,
+                            &mut w_offset,
+                            &mut dirty_bytes,
+                            FlushKind::Barrier,
+                        )
+                        .await;
                         batch_bytes = 0;
-                        let _ = reply_tx.send(Ok(()));
+                        let _ = reply_tx.send(result);
                         false
                     }
                 }
@@ -222,15 +281,54 @@ async fn committer_task(
         };
 
         if flush {
-            flush_batch(&file, &mut batch, &mut w_offset).await;
+            // A size- or timer-triggered flush has no caller waiting on a
+            // result: every waiter in the batch is answered individually
+            // inside `flush_batch`. The failure is still worth a line, because
+            // it is the first sign the disk under this store is going.
+            if let Err(e) = flush_batch(
+                &file,
+                &mut batch,
+                &mut w_offset,
+                &mut dirty_bytes,
+                FlushKind::Batch,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "group committer: batch flush did not land");
+            }
             batch_bytes = 0;
         }
     }
 }
 
-async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &mut u64) {
+/// Commit `batch` to `file` and answer every waiter in it.
+///
+/// Returns what the batch actually achieved, which is not the same question as
+/// what each waiter is owed: the waiters are answered here either way, and the
+/// result is for the caller who asked for a barrier. `Ok(())` means the bytes
+/// are on the disk at the durability the batch asked for; an `Err` means they
+/// are not, and no caller may treat the flush as one.
+///
+/// An empty batch is `Ok(())` for a [`FlushKind::Batch`]: there was nothing to
+/// make durable. For a [`FlushKind::Barrier`] it is only `Ok(())` once
+/// `dirty_bytes` is zero - an empty batch says nothing about what an earlier
+/// `Relaxed` batch left in the page cache.
+async fn flush_batch(
+    file: &PlatformFile,
+    batch: &mut Vec<WriteReq>,
+    w_offset: &mut u64,
+    dirty_bytes: &mut u64,
+    kind: FlushKind,
+) -> io::Result<()> {
+    let fp_key = failpoint::file_key(file);
     if batch.is_empty() {
-        return;
+        // Nothing to write - but a barrier still owes a sync for whatever an
+        // earlier `Relaxed` batch left unsynced. This is the case that used to
+        // answer `Ok(())` over bytes living only in the page cache.
+        if kind == FlushKind::Barrier && *dirty_bytes > 0 {
+            return sync_barrier(file, fp_key, dirty_bytes).await;
+        }
+        return Ok(());
     }
 
     // Assign sequential offsets and find the strongest durability any entry
@@ -262,7 +360,11 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
     // be mistaken for live data. We preserve the original `ErrorKind`
     // (in particular `StorageFull`) when propagating to the waiter so the
     // caller can detect ENOSPC and surface it to its own user.
-    let write_result = file.write_vectored_at(*w_offset, chunks).await;
+    let write_result = if failpoint::hit(CommitFailpoint::PerFileBatchWrite, fp_key) {
+        Err(failpoint::injected("per-file batch write"))
+    } else {
+        file.write_vectored_at(*w_offset, chunks).await
+    };
     match write_result {
         Ok(()) => {
             // Telemetry: tick one batch per call regardless of durability,
@@ -273,24 +375,44 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
                 skeg_telemetry::Counter::VlogPwritevBytesTotal,
                 total_bytes,
             );
-            let sync_result = match batch_durability {
-                Durability::Relaxed => Ok(()),
-                Durability::Kernel => {
-                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-                    file.sync_data().await
-                }
-                Durability::Power => {
-                    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
-                    // `is_size_fixed` is stable for the handle's whole
-                    // lifetime (set once by `preallocate`), so this
-                    // accurately reflects whether the flush that is about
-                    // to run will take the Linux fdatasync fast path.
-                    if file.is_size_fixed() {
-                        skeg_telemetry::tick_counter(
-                            skeg_telemetry::Counter::VlogFdatasyncFastPath,
-                        );
+            // These bytes are on the disk and nothing has synced them yet.
+            // Counted before the sync below decides whether to clear them, and
+            // saturating because a committer that ran long enough to wrap a
+            // u64 of unsynced bytes should stop counting, not wrap to zero and
+            // claim there is nothing to flush.
+            *dirty_bytes = dirty_bytes.saturating_add(total_bytes);
+
+            // A barrier over unsynced bytes syncs at the strongest tier
+            // whatever the batch asked for: `flush()` means "on stable
+            // storage", and the batch's own answer to that question is not the
+            // caller's.
+            let effective = if kind == FlushKind::Barrier && *dirty_bytes > 0 {
+                Durability::Power
+            } else {
+                batch_durability
+            };
+            let sync_result = if failpoint::hit(CommitFailpoint::PerFileBatchSync, fp_key) {
+                Err(failpoint::injected("per-file batch sync"))
+            } else {
+                match effective {
+                    Durability::Relaxed => Ok(()),
+                    Durability::Kernel => {
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                        file.sync_data().await
                     }
-                    file.sync_durable().await
+                    Durability::Power => {
+                        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+                        // `is_size_fixed` is stable for the handle's whole
+                        // lifetime (set once by `preallocate`), so this
+                        // accurately reflects whether the flush that is about
+                        // to run will take the Linux fdatasync fast path.
+                        if file.is_size_fixed() {
+                            skeg_telemetry::tick_counter(
+                                skeg_telemetry::Counter::VlogFdatasyncFastPath,
+                            );
+                        }
+                        file.sync_durable().await
+                    }
                 }
             };
             let sync_err = sync_result
@@ -310,6 +432,12 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
             // record this function reports as durable always has passed sync.
             if sync_result.is_ok() {
                 *w_offset = pos;
+                // A sync that ran and succeeded covers everything written
+                // before it. `Relaxed` is the one arm that runs no sync, so it
+                // is also the one that leaves the count standing.
+                if effective != Durability::Relaxed {
+                    *dirty_bytes = 0;
+                }
             }
             for (req, (off, sz)) in batch.drain(..).zip(offsets) {
                 let result = match &sync_err {
@@ -318,6 +446,10 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
                 };
                 let _ = req.tx.send(result);
             }
+            match sync_err {
+                None => Ok(()),
+                Some((kind, msg)) => Err(count_failure(io::Error::new(kind, msg))),
+            }
         }
         Err(e) => {
             let kind = e.kind();
@@ -325,8 +457,46 @@ async fn flush_batch(file: &PlatformFile, batch: &mut Vec<WriteReq>, w_offset: &
             for req in batch.drain(..) {
                 let _ = req.tx.send(Err(io::Error::new(kind, msg.clone())));
             }
+            Err(count_failure(e))
         }
     }
+}
+
+/// Sync `file` because someone asked for a barrier and there are bytes no
+/// batch sync has covered.
+///
+/// Always `sync_durable`, never the batch's own tier: the caller asked whether
+/// the data is on stable storage, and `Relaxed` - the only tier that can leave
+/// bytes here - has no opinion worth inheriting. Clears the count on success
+/// only; a failed barrier leaves the bytes owed to the next one.
+async fn sync_barrier(file: &PlatformFile, fp_key: u64, dirty_bytes: &mut u64) -> io::Result<()> {
+    let result = if failpoint::hit(CommitFailpoint::PerFileBatchSync, fp_key) {
+        Err(failpoint::injected("per-file barrier sync"))
+    } else {
+        skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogSyncs);
+        if file.is_size_fixed() {
+            skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogFdatasyncFastPath);
+        }
+        file.sync_durable().await
+    };
+    match result {
+        Ok(()) => {
+            *dirty_bytes = 0;
+            Ok(())
+        }
+        Err(e) => Err(count_failure(e)),
+    }
+}
+
+/// Record that one batch did not become durable, and hand the error back.
+///
+/// Every failed flush passes through here, whoever asked for it - an explicit
+/// `flush()`, a full batch, the 200 µs timer, or the last one before shutdown -
+/// and in either committer. The counter is the only signal for the three of
+/// those that have no caller to answer.
+pub(crate) fn count_failure(e: io::Error) -> io::Error {
+    skeg_telemetry::tick_counter(skeg_telemetry::Counter::VlogFlushFailures);
+    e
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -356,6 +526,326 @@ mod tests {
 
     fn make_file(dir: &TempDir) -> Arc<PlatformFile> {
         Arc::new(PlatformFile::create(dir.path().join("gc.bin").as_path()).unwrap())
+    }
+
+    /// Run `committer_task` over a channel every message of which is queued
+    /// BEFORE the task exists.
+    ///
+    /// Not decoration: it is what makes these tests deterministic. The 200 µs
+    /// timer is a fresh `sleep` constructed inside the `select!` on every
+    /// iteration, so it cannot already be elapsed when it is first polled -
+    /// which means a message that is already in the queue always wins. Queue
+    /// the whole conversation first and the task's route through it is fixed:
+    /// write, then flush, with no batch the timer could have taken first.
+    fn queued_committer(
+        file: Arc<PlatformFile>,
+        initial_offset: u64,
+    ) -> (mpsc::UnboundedSender<Msg>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(committer_task(file, rx, initial_offset));
+        (tx, handle)
+    }
+
+    fn write_msg(
+        data: Vec<u8>,
+        durability: Durability,
+    ) -> (Msg, oneshot::Receiver<io::Result<(u64, u32)>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Msg::Write(WriteReq {
+                data,
+                durability,
+                tx,
+            }),
+            rx,
+        )
+    }
+
+    fn flush_msg() -> (Msg, oneshot::Receiver<io::Result<()>>) {
+        let (tx, rx) = oneshot::channel();
+        (Msg::Flush(tx), rx)
+    }
+
+    /// The process-wide flush-failure counter, held across a whole test so the
+    /// delta it measures is its own.
+    async fn counter_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::failpoint::FLUSH_FAILURE_COUNTER_LOCK.lock().await
+    }
+
+    fn flush_failures() -> u64 {
+        skeg_telemetry::counter_value(skeg_telemetry::Counter::VlogFlushFailures)
+    }
+
+    /// An accepted barrier over bytes nothing has synced is the same lie as an
+    /// accepted barrier over a failed sync - it just takes a `Relaxed` writer
+    /// to reach it.
+    ///
+    /// SD-1: `Relaxed` is a client-reachable path, not a compaction-only one
+    /// (`PAYLOAD_DURABILITY`, `shard.rs:1471`, is the durability of every VSET
+    /// payload blob and of four tombstone sweeps). A flush that answers `Ok`
+    /// having issued no sync at all confirms a barrier that did not happen.
+    #[tokio::test]
+    async fn an_explicit_flush_syncs_what_a_relaxed_batch_left_unsynced() {
+        force_per_file();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![1u8; 64], Durability::Relaxed);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        assert!(flush_rx.await.unwrap().is_ok(), "the disk is healthy");
+        assert_eq!(write_rx.await.unwrap().unwrap(), (0, 64));
+        assert_eq!(
+            file.sync_count(),
+            1,
+            "an accepted barrier over Relaxed bytes must have synced them"
+        );
+    }
+
+    /// The same lie, one step later: the batch has already gone out on the
+    /// timer, so the explicit flush finds nothing pending - and answers `Ok`
+    /// over bytes that are still only in the page cache.
+    #[tokio::test]
+    async fn an_explicit_flush_over_an_empty_batch_still_syncs_earlier_relaxed_bytes() {
+        force_per_file();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
+
+        // The ack only arrives once the containing batch has been flushed, so
+        // by here the timer has already taken it - with no sync, because every
+        // entry in it asked for Relaxed.
+        gc.append(vec![2u8; 64], Durability::Relaxed).await.unwrap();
+        assert_eq!(
+            file.sync_count(),
+            0,
+            "fixture: a Relaxed batch is not supposed to sync"
+        );
+
+        gc.flush().await.unwrap();
+        assert_eq!(
+            file.sync_count(),
+            1,
+            "a barrier over an empty batch must still sync what an earlier Relaxed batch left"
+        );
+    }
+
+    /// And when that barrier sync is the thing that fails, the caller hears
+    /// about it - the same contract as a batch sync failure.
+    #[tokio::test]
+    async fn a_barrier_that_could_not_sync_reports_the_failure() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        let gc = GroupCommitter::start(file.clone(), 0).await;
+
+        gc.append(vec![3u8; 64], Durability::Relaxed).await.unwrap();
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+        let result = gc.flush().await;
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key),
+            "the sync failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            result.is_err(),
+            "a barrier whose sync failed answered Ok: {result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a barrier that could not land must be counted exactly once"
+        );
+    }
+
+    /// A write that never reached the disk must not come back as a barrier.
+    ///
+    /// SD-1: an acknowledged `flush()` means every record submitted before it
+    /// is on stable storage. A failing disk must not be able to produce an
+    /// `Ok(())` here.
+    #[tokio::test]
+    async fn a_flush_over_a_batch_whose_write_failed_reports_the_failure() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![7u8; 64], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        let write_result = write_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key),
+            "the write failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            write_result.is_err(),
+            "the waiter was told its record landed: {write_result:?}"
+        );
+        assert!(
+            flush_result.is_err(),
+            "flush answered Ok over a batch whose write failed: {flush_result:?}"
+        );
+        assert_eq!(
+            file.sync_count(),
+            0,
+            "a batch that never wrote must not have been synced"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a flush that could not land must be counted exactly once"
+        );
+    }
+
+    /// The bytes are on the disk; the proof that they survive is not. That is
+    /// still a failed barrier, and the offset must not move.
+    ///
+    /// SD-1 again, for the half an environmental fault cannot express: the
+    /// write succeeds and the sync does not.
+    #[tokio::test]
+    async fn a_flush_over_a_batch_whose_sync_failed_reports_the_failure() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![0xEEu8; 64], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        let flush_result = flush_rx.await.unwrap();
+        let write_result = write_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchSync, key),
+            "the sync failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            write_result.is_err(),
+            "an unsynced record was acked as durable: {write_result:?}"
+        );
+        assert!(
+            flush_result.is_err(),
+            "flush answered Ok over a batch that was never synced: {flush_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "a flush that could not land must be counted exactly once"
+        );
+        // The write DID happen - this is the sync-only failure - and the
+        // offset must not have advanced over bytes nothing proved durable.
+        assert!(
+            file.pread(0, 64).await.unwrap().iter().all(|&b| b == 0xEE),
+            "fixture: the write itself was supposed to succeed"
+        );
+        let (write2, write2_rx) = write_msg(vec![1u8; 32], Durability::Kernel);
+        let (flush2, flush2_rx) = flush_msg();
+        tx.send(write2).unwrap();
+        tx.send(flush2).unwrap();
+        assert!(
+            flush2_rx.await.unwrap().is_ok(),
+            "the disk is healthy again"
+        );
+        assert_eq!(
+            write2_rx.await.unwrap().unwrap().0,
+            0,
+            "the offset advanced over bytes no sync ever proved durable"
+        );
+    }
+
+    /// The flush a committer runs on the way down has no caller left to tell,
+    /// which is exactly why it used to be discarded. It is still the last
+    /// barrier the store gets.
+    ///
+    /// SD-2: a shutdown that could not land its final batch must leave a
+    /// trace. Silence is indistinguishable from success.
+    #[tokio::test]
+    async fn the_last_flush_on_the_way_down_is_counted_not_discarded() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+        let key = crate::failpoint::file_key(&file);
+        crate::failpoint::arm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        let (tx, task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![3u8; 48], Durability::Kernel);
+        tx.send(write).unwrap();
+        // Closing the channel IS the shutdown: the task flushes what is left
+        // and returns.
+        drop(tx);
+        task.await.unwrap();
+        let write_result = write_rx.await.unwrap();
+        crate::failpoint::disarm_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key);
+
+        assert!(
+            crate::failpoint::fired_at(crate::failpoint::CommitFailpoint::PerFileBatchWrite, key),
+            "the write failpoint never fired: the test proved nothing"
+        );
+        assert!(
+            write_result.is_err(),
+            "the last waiter was told its record landed: {write_result:?}"
+        );
+        assert_eq!(
+            flush_failures(),
+            before + 1,
+            "the shutdown flush failed and nothing counted it"
+        );
+    }
+
+    /// The other half of the contract: a flush that DID land still says so,
+    /// and does not tick the failure counter. Without this a fix that always
+    /// answers `Err` would pass every test above.
+    #[tokio::test]
+    async fn a_flush_that_landed_still_answers_ok() {
+        force_per_file();
+        let _counter = counter_guard().await;
+        let before = flush_failures();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(&dir);
+
+        let (tx, _task) = queued_committer(file.clone(), 0);
+        let (write, write_rx) = write_msg(vec![9u8; 128], Durability::Kernel);
+        let (flush, flush_rx) = flush_msg();
+        tx.send(write).unwrap();
+        tx.send(flush).unwrap();
+
+        assert!(
+            flush_rx.await.unwrap().is_ok(),
+            "a healthy batch must still answer Ok"
+        );
+        assert_eq!(write_rx.await.unwrap().unwrap(), (0, 128));
+        assert!(file.sync_count() >= 1, "Kernel must issue a flush");
+        assert_eq!(
+            flush_failures(),
+            before,
+            "a flush that landed must not tick the failure counter"
+        );
     }
 
     #[tokio::test]

@@ -256,11 +256,17 @@ impl PlatformFile {
         .await?
     }
 
-    /// Flush file data - kernel-crash durable, *not* power-loss durable.
+    /// Flush file data. Kernel-crash durable everywhere, and power-loss
+    /// durable on Apple, where it is the same primitive as
+    /// [`sync_durable`](Self::sync_durable).
     ///
-    /// Uses `fsync` on macOS / `fdatasync` on Linux. Cheaper than
-    /// [`sync_durable`](Self::sync_durable): it does not force the drive's
-    /// write cache out to the storage media.
+    /// `fdatasync` on Linux, where it is genuinely cheaper: it does not force
+    /// the drive's write cache out to the storage media. **On Apple it is
+    /// `F_FULLFSYNC`** - `std::fs::File::sync_data`'s `os_datasync` is
+    /// `fcntl(fd, F_FULLFSYNC)` under `#[cfg(target_vendor = "apple")]` - so
+    /// there it costs and buys exactly what `sync_durable` does (measured on
+    /// APFS / M-series, 60 iterations, 2026-09-04: median 4941 µs against
+    /// 4437 µs). Do not reason about a cheap tier on macOS; there is not one.
     ///
     /// # Errors
     ///

@@ -3492,7 +3492,17 @@ fn run_shard(
                     });
                 }
                 // Channel closed: flush the active committer for durability.
-                let _ = vlog.flush().await;
+                //
+                // The last barrier this shard gets, and the one nobody is
+                // waiting on - which is why its result used to go straight
+                // into `let _`, and exactly why it must not: a shutdown that
+                // could not land its final batch looked identical to a clean
+                // one. The committer counts it in
+                // `skeg_vlog_flush_failures_total`; this line says which
+                // shard, and is the only place the reason is written down.
+                if let Err(e) = vlog.flush().await {
+                    error!("shard {shard_id}: the final flush before shutdown did not land: {e}");
+                }
             })
             .await;
     });

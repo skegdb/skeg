@@ -27,6 +27,14 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true, features = ["alloc"] }
 
+[features]
+# Typed commit-path failpoints (see `src/failpoint.rs`). Off in a normal
+# build: `failpoint::hit` is then a `const false` and the commit path carries
+# no branch. Turned on for this crate's own tests by `cfg(test)`, and exposed
+# as a feature so a dependent crate's integration tests can arm a write or a
+# sync failure without a real broken disk.
+failpoints = []
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }

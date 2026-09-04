@@ -1032,11 +1032,18 @@ impl VLog {
         Ok(out)
     }
 
-    /// Flush the active segment's pending writes to durable storage.
+    /// Barrier: everything written to the active segment before this call is
+    /// on stable storage when it returns `Ok(())`.
+    ///
+    /// Including bytes a `Durability::Relaxed` batch left unsynced - the
+    /// committer tracks them and syncs while any are outstanding, so this is a
+    /// promise about the store and not about whichever batch happened to be
+    /// pending. See `docs/adr-flush-barrier.md`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the flush fails.
+    /// Returns an error if the flush fails. An `Err` means the barrier did not
+    /// happen and no caller may treat it as one.
     pub async fn flush(&self) -> Result<()> {
         let committer = { self.inner.active.borrow().committer.clone() };
         committer.flush().await?;

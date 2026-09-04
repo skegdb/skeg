@@ -459,10 +459,31 @@ pub enum Counter {
     /// `shard_for` is refused every time - a climb here is that client, and
     /// it is the number an operator needs to see it.
     CrossSlotRefused = 56,
+    /// Batch commits whose write or sync failed.
+    ///
+    /// A durability signal, not a throughput one: every tick is a batch whose
+    /// records were NOT made durable, and whose waiters were told so. It also
+    /// counts the flush a committer runs on the way down, which has no caller
+    /// left to tell - so on a shutdown that could not land its last batch this
+    /// is the only number that moves.
+    ///
+    /// Non-zero means the disk under this store is failing or full. There is
+    /// no healthy value above zero.
+    VlogFlushFailures = 57,
+    /// Batch entries whose file was gone by the time the batch was written.
+    ///
+    /// Benign, and separated from `VlogFlushFailures` for exactly that reason:
+    /// the file is detached when the last handle to it drops, so an entry that
+    /// arrives after its own `append` was cancelled - the caller went away, the
+    /// connection closed - finds nothing to write to. Nobody is waiting for
+    /// those bytes and no disk failed. A climb means callers are abandoning
+    /// writes in flight, which is worth seeing, but it is not a durability
+    /// alarm and must never be read as one.
+    VlogCommitOrphanedEntries = 58,
 }
 
 impl Counter {
-    pub const COUNT: usize = 57;
+    pub const COUNT: usize = 59;
     pub const ALL: [Counter; Self::COUNT] = [
         Counter::CacheHits,
         Counter::CacheMisses,
@@ -521,6 +542,8 @@ impl Counter {
         Counter::BackendRefusalUnclassified,
         Counter::OverlapReplicasSkippedQuota,
         Counter::CrossSlotRefused,
+        Counter::VlogFlushFailures,
+        Counter::VlogCommitOrphanedEntries,
     ];
 
     #[inline]
@@ -538,6 +561,8 @@ impl Counter {
             Counter::VlogPwritevBytesTotal => "skeg_vlog_pwritev_bytes_total",
             Counter::VlogWritebackHints => "skeg_vlog_writeback_hints_total",
             Counter::VlogRecoveryRecords => "skeg_vlog_recovery_records_total",
+            Counter::VlogFlushFailures => "skeg_vlog_flush_failures_total",
+            Counter::VlogCommitOrphanedEntries => "skeg_vlog_commit_orphaned_entries_total",
             Counter::PayloadIndexRebuilds => "skeg_payload_index_rebuilds_total",
             Counter::PayloadIndexFromDisk => "skeg_payload_index_from_disk_total",
             Counter::PayloadIndexRefreshed => "skeg_payload_index_refreshed_total",

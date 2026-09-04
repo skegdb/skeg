@@ -118,6 +118,60 @@ shard, is unaffected and keeps the atomic `set_many` and the disk-quota
 reservation it already had.
 
 
+### A flush that failed says so
+
+`flush_batch` returned `()` in both group committers and the `Flush` message
+answered `Ok(())` whatever happened, so `VLog::flush()` reported a barrier
+over a batch whose write returned `ENOSPC` or whose sync returned `EIO`. The
+shard's shutdown discarded the result outright. Individual writers were
+already told the truth; the caller who asked for the barrier was not, and
+nothing outside the process counted the failure.
+
+Both committers now return `io::Result<()>` and the reply carries it. The
+shared (device-global) committer aggregates per file: one file's failed write
+no longer takes the healthy files' writers down with it, and no longer buys
+the flusher an `Ok(())` - the error says how many of the batch's files did not
+commit, and keeps the `ErrorKind` when they all failed the same way, so a
+caller looking for ENOSPC still finds it.
+
+Every failed flush ticks the new counter `skeg_vlog_flush_failures_total`
+(`/metrics` and `SKEG.STATS`), including the three that have no caller to
+answer: a full batch, the batch timer, and the last flush as the committer
+shuts down. There is no healthy value above zero. The shard's shutdown flush
+logs at ERROR.
+
+An explicit flush is now a **barrier**, not just the batch in front of it.
+Both committers count the bytes they have written that no sync has covered,
+and `flush()` syncs while that count is above zero whatever tier the pending
+batch asked for. This matters because `Relaxed` is a client-reachable tier:
+`PAYLOAD_DURABILITY` is the durability of every VSET payload blob and of four
+tombstone sweeps, and a sweep is N deletes with no durable write behind them -
+so the flush that followed used to answer OK over bytes living in the page
+cache. The shared committer keeps the count per file, because its batch path
+syncs one file by design. The cost falls only on `flush()`, which the server
+calls once per shard at shutdown.
+
+`SKEG_DURABILITY_MODEL=device-global` is now **refused off Apple**, with a
+warning naming the reason. It selects a committer that issues one durability
+call for a batch spanning several files, which is a barrier for all of them
+only where that call is device-wide: `F_FULLFSYNC` plus `F_NOCACHE`, both
+macOS-only. On Linux `fsync(2)` covers one file, so the same code acked every
+other file in a batch as durable over pages nothing flushed. `per-file` stays
+selectable everywhere. This was reachable only by setting the variable; the
+compiled default was never affected.
+
+A cancelled append no longer reads as a failing disk. An entry whose file was
+detached before the batch reached it - the caller hung up - used to tick
+`skeg_vlog_flush_failures_total`; it now ticks
+`skeg_vlog_commit_orphaned_entries_total`, which is benign.
+
+Nothing about which bytes go where changed, and the durability tiers
+themselves are untouched. `docs/adr-flush-barrier.md` records the contract, the
+platform facts it rests on (notably: on Apple `sync_data` is `F_FULLFSYNC`, so
+`Kernel` and `Power` are one primitive there), and the three things it still
+does not fix - among them that no client-visible barrier exists on either
+wire.
+
 ### A refusal now says whether retrying is worth it, on both wires
 
 A request can be refused before it runs for half a dozen reasons, and the
