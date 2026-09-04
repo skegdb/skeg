@@ -48,11 +48,11 @@ on:
 # per-architecture digests under a promoted manifest look identical to
 # GHCR, so a blind "delete untagged" would break shipped images).
 
-# `contents: write` for GitHub Release artifact uploads.
-# `packages: write` for pushing the container image to ghcr.io.
+# Least privilege: the default token can only read. The jobs that publish
+# name the one permission they need; everything else (test, builds, gate,
+# the crates.io publish - which uses its own secret) runs read-only.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   guard:
@@ -63,7 +63,7 @@ jobs:
     # downstream `needs: guard` still resolves to "ok".
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         if: github.event_name == 'push'
         with:
           fetch-depth: 0
@@ -88,20 +88,29 @@ jobs:
     needs: guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: changed crates carry unpublished versions
-        run: python3 scripts/check-release-versions.py
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: changed crates carry unpublished versions; the tag names the product version
+        # On a tag push the tag must be exactly v<skeg-server version>: every
+        # other artefact (image tag, GitHub Release, Homebrew formula) is
+        # named after the tag while crates.io ships the manifest versions,
+        # and a mismatch would publish a release whose parts disagree.
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            python3 scripts/check-release-versions.py --tag "$GITHUB_REF_NAME"
+          else
+            python3 scripts/check-release-versions.py
+          fi
 
   test:
     needs: [guard, version-gate]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
@@ -120,13 +129,13 @@ jobs:
     needs: [promote-release, docker-promote]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # Full history + tags needed to diff each crate against the
           # previous release and skip unchanged ones.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: publish changed crates in dep order
         # Per-crate versioning: each crate carries its own `version` and
         # is published only when its source tree changed since the
@@ -215,11 +224,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [guard, test]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: build
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
@@ -250,7 +259,7 @@ jobs:
           shasum -a 256 skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
       # Run artifact only; `promote-release` uploads them to the GitHub
       # Release once every target (and the image) has built.
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: skeg-${{ github.sha }}-${{ matrix.target }}
           path: |
@@ -271,6 +280,9 @@ jobs:
     # manual run builds without pushing so a broken Dockerfile still
     # fails here.
     needs: [guard, test]
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-publish.yml
     with:
       stage: build
@@ -289,14 +301,16 @@ jobs:
     # `validate-cleanup` deletes together with the tag.
     if: github.event_name == 'push' || inputs.validate_promote == true
     needs: [guard, test, build-binaries, docker-build]
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: skeg-${{ github.sha }}-*
           merge-multiple: true
           path: dist
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ github.event_name == 'push' && github.ref_name || format('validate-{0}', github.sha) }}
           draft: ${{ github.event_name != 'push' }}
@@ -310,6 +324,9 @@ jobs:
     # `validate-<sha>`. Same call, `stage: promote`: no rebuild.
     if: github.event_name == 'push' || inputs.validate_promote == true
     needs: [promote-release]
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-publish.yml
     with:
       stage: promote
@@ -325,9 +342,12 @@ jobs:
     # validate run leaves nothing behind either.
     if: always() && github.event_name != 'push' && inputs.validate_promote == true
     needs: [promote-release, docker-promote]
+    permissions:
+      contents: write
+      packages: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: delete the draft release and its tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
