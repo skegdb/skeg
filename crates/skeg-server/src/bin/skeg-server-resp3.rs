@@ -7,8 +7,9 @@
 //! - Default address `127.0.0.1:6379` (Redis port), not `7379`.
 //! - `Server::run_resp3()` instead of `run()`.
 //!
-//! This binary ships single-tenant. The multi-tenant flavour lives in a
-//! separate crate (`skeg-server-tenant`), which installs a `TenantBackend`
+//! One binary, two profiles. With no tenant flags it serves the
+//! single-tenant profile; with `--tenant-auth <auth.kdb> --tenant-strict` it
+//! installs a `TenantBackend`
 //! on top of this engine.
 
 use skeg_server::Server;
@@ -54,6 +55,13 @@ OPTIONS:
                              0 (default) = inline; overload is rejected. Also: SKEG_WORKERS.
     --tier-mmap            mmap the TurboQuant tier. Also: SKEG_TIER_MMAP=1.
     --graph-mmap           mmap the Vamana graph Node array. Also: SKEG_GRAPH_MMAP=1.
+    --tenant-auth <PATH>   Serve the multi-tenant profile against this auth.kdb.
+                           Clients pick their tenant with HELLO 3 AUTH.
+    --tenant-strict        Reject an anonymous HELLO 3. Without it an
+                           unauthenticated client is tenant ZERO, which is not
+                           a multi-tenant deployment: the bind guard below
+                           still applies.
+    --admin-tenant <NAME>  The one tenant allowed to run SKEG.QUOTA.SET/GET.
     --allow-unauthenticated-network
                             This server has no authentication. By default a
                             non-loopback --addr is refused. Pass this flag (or
@@ -110,18 +118,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing()?;
 
     let cfg = Config::parse(args.into_iter());
-    match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network) {
-        Ok(true) => {
-            tracing::warn!(
-                "--allow-unauthenticated-network: {} is reachable over the network with no \
-                 authentication",
-                cfg.addr
-            );
-        }
-        Ok(false) => {}
-        Err(msg) => {
-            eprintln!("{msg}");
-            std::process::exit(1);
+    #[cfg(not(feature = "tenant-auth"))]
+    if cfg.tenant_auth.is_some() || cfg.tenant_strict || cfg.admin_tenant.is_some() {
+        // Never degrade to single-tenant in silence: a build without the
+        // adapter cannot serve the profile these flags ask for.
+        eprintln!(
+            "this build has no tenant-auth support: --tenant-auth / --tenant-strict / \
+             --admin-tenant are not available. Rebuild with the `tenant-auth` feature."
+        );
+        std::process::exit(1);
+    }
+    // Only `--tenant-auth --tenant-strict` makes a bind authenticated: lenient
+    // mode maps an anonymous HELLO to tenant ZERO, which is the same
+    // unauthenticated engine the single profile serves.
+    if cfg.tenant_auth.is_none() || !cfg.tenant_strict {
+        match skeg_server::check_unauthenticated_bind(&cfg.addr, cfg.allow_unauthenticated_network)
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    "--allow-unauthenticated-network: {} is reachable over the network with no \
+                 authentication (no --tenant-auth, or lenient mode without --tenant-strict)",
+                    cfg.addr
+                );
+            }
+            Ok(false) => {}
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
         }
     }
     if cfg.speed {
@@ -180,6 +204,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?
     };
+    #[cfg(feature = "tenant-auth")]
+    let server = match cfg.tenant_auth.as_ref() {
+        Some(path) => {
+            if cfg.tenant_strict {
+                tracing::info!("--tenant-auth {path} (strict): anonymous HELLO rejected");
+            } else {
+                tracing::info!("--tenant-auth {path} (lenient): anonymous HELLO maps to ZERO");
+            }
+            let backend = skeg_server::tenant_auth::AuthStoreBackend::open(
+                path,
+                cfg.tenant_strict,
+                cfg.admin_tenant.as_deref(),
+            )?;
+            server.with_tenant_backend(backend)
+        }
+        None => server,
+    };
     tracing::info!("skeg-resp3 listening on {}", server.local_addr()?);
     let run_result = server.run_resp3_until(skeg_server::shutdown_signal()).await;
     #[cfg(feature = "tracing-otlp")]
@@ -221,6 +262,10 @@ struct Config {
     tier_mmap: bool,
     graph_mmap: bool,
     allow_unauthenticated_network: bool,
+    /// Path of the `auth.kdb` that turns this into the multi-tenant profile.
+    tenant_auth: Option<String>,
+    tenant_strict: bool,
+    admin_tenant: Option<String>,
 }
 
 impl Config {
@@ -246,6 +291,12 @@ impl Config {
                 std::env::var("SKEG_GRAPH_MMAP").as_deref(),
                 Ok("1") | Ok("true") | Ok("on")
             ),
+            tenant_auth: std::env::var("SKEG_TENANT_AUTH").ok(),
+            tenant_strict: matches!(
+                std::env::var("SKEG_TENANT_STRICT").as_deref(),
+                Ok("1" | "true" | "yes")
+            ),
+            admin_tenant: std::env::var("SKEG_ADMIN_TENANT").ok(),
             allow_unauthenticated_network: matches!(
                 std::env::var("SKEG_ALLOW_UNAUTHENTICATED_NETWORK").as_deref(),
                 Ok("1") | Ok("true") | Ok("on")
@@ -292,6 +343,22 @@ impl Config {
                 "--graph-mmap" => {
                     cfg.graph_mmap = true;
                     i += 1;
+                }
+                "--tenant-auth" => {
+                    if let Some(v) = args.get(i + 1) {
+                        cfg.tenant_auth = Some(v.clone());
+                    }
+                    i += 2;
+                }
+                "--tenant-strict" => {
+                    cfg.tenant_strict = true;
+                    i += 1;
+                }
+                "--admin-tenant" => {
+                    if let Some(v) = args.get(i + 1) {
+                        cfg.admin_tenant = Some(v.clone());
+                    }
+                    i += 2;
                 }
                 "--allow-unauthenticated-network" => {
                     cfg.allow_unauthenticated_network = true;

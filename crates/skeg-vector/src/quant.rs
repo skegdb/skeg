@@ -18,21 +18,28 @@ use skeg_simd::{dot_int8, hamming_binary, quantise_centroids_i8, tq2_adc_i8, tq4
 #[derive(Debug)]
 pub(crate) enum CodeBacking {
     Owned(Vec<u8>),
-    Mapped(MappedFile),
+    /// A window over a validated payload inside a mapped cache file. The
+    /// persistent tier cache has a header; mapping the whole file would make
+    /// graph scoring read that header as quantisation codes.
+    Mapped {
+        file: MappedFile,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl CodeBacking {
     pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
             CodeBacking::Owned(v) => v.as_slice(),
-            CodeBacking::Mapped(m) => m.as_bytes(),
+            CodeBacking::Mapped { file, offset, len } => &file.as_bytes()[*offset..*offset + *len],
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
             CodeBacking::Owned(v) => v.len(),
-            CodeBacking::Mapped(m) => m.len(),
+            CodeBacking::Mapped { len, .. } => *len,
         }
     }
 }
@@ -1526,6 +1533,38 @@ impl QuantizedVectors {
         Some(out)
     }
 
+    /// Layout of the TurboQuant code window inside [`tier_payload`](Self::tier_payload).
+    ///
+    /// Returns `(payload_len, codes_offset)`. Keeping this arithmetic beside
+    /// the serializer lets the disk layer mmap only the code bytes without
+    /// materialising a second full payload on every open.
+    #[must_use]
+    pub fn tier_payload_code_window(&self) -> Option<(usize, usize)> {
+        let QuantRepr::TurboQuant {
+            codes,
+            scales,
+            aniso,
+            ..
+        } = &self.repr
+        else {
+            return None;
+        };
+        // bits (u32), n (u64), dim (u64), then four length-prefixed f32
+        // arrays and the length-prefixed code buffer.
+        let mut offset = 4usize.checked_add(8)?.checked_add(8)?;
+        for values in [
+            scales.len(),
+            aniso.shift_slice().len(),
+            aniso.inv_scale_slice().len(),
+            aniso.center_slice().len(),
+        ] {
+            offset = offset.checked_add(8)?.checked_add(values.checked_mul(4)?)?;
+        }
+        let codes_offset = offset.checked_add(8)?;
+        let payload_len = codes_offset.checked_add(codes.len())?;
+        Some((payload_len, codes_offset))
+    }
+
     /// Rebuild a TurboQuant tier from [`tier_payload`](Self::tier_payload).
     ///
     /// Every length is validated against the buffer before it is used: the file
@@ -1649,20 +1688,26 @@ impl QuantizedVectors {
         }
     }
 
-    /// Persist the TurboQuant `codes` buffer to `path` and swap the in-RAM
-    /// `Vec<u8>` for a memory-mapped view of the file. The OS page cache
-    /// then decides which pages stay resident under memory pressure
-    /// instead of swapping anonymous memory.
+    /// Swap TurboQuant codes for a mapped view of a validated cache payload.
+    ///
+    /// `payload_offset` skips the cache header. Persistence belongs to the
+    /// index format layer: it can validate the cache fingerprint and, crucially,
+    /// decide whether the store is writable. Mapping must never rewrite a
+    /// cache as a side effect of a read-only open.
     ///
     /// No-op (returns `Ok(())`) for non-TurboQuant tiers and for an empty
-    /// TurboQuant set. Skips the write if the on-disk file is already
-    /// present at the expected size: the rotation seed is fixed so the
-    /// codes are deterministic, the file from a previous open is reusable.
+    /// TurboQuant set.
     ///
     /// # Errors
     ///
-    /// Propagates any I/O error from writing the file or mapping it.
-    pub fn swap_turboquant_codes_to_mmap(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    /// Propagates any I/O error from mapping a malformed or inaccessible
+    /// cache file.
+    pub fn swap_turboquant_codes_to_mmap(
+        &mut self,
+        path: &std::path::Path,
+        payload_offset: usize,
+        file_len: usize,
+    ) -> std::io::Result<()> {
         let QuantRepr::TurboQuant { codes, .. } = &mut self.repr else {
             return Ok(());
         };
@@ -1670,34 +1715,22 @@ impl QuantizedVectors {
         if len == 0 {
             return Ok(());
         }
-        // Write the codes to disk (or trust an existing file of the right
-        // size - the rotation seed is fixed, so the byte sequence is
-        // deterministic from the parent index alone).
-        let needs_write = match std::fs::metadata(path) {
-            Ok(meta) => meta.len() as usize != len,
-            Err(_) => true,
-        };
-        if needs_write {
-            // Drop the buffer slice after the write so peak RAM does not
-            // double during the swap.
-            let bytes = codes.as_slice();
-            let tmp = path.with_extension("cache.bin.tmp");
-            std::fs::write(&tmp, bytes)?;
-            std::fs::rename(&tmp, path)?;
-        }
         let mapped = MappedFile::open(path)?;
         // Guard against a truncated or substituted cache.bin: if the file
         // changed size between the metadata check and the mmap open (rare
         // - same process holds both ends), the proxy would slice past the
         // buffer on a high-row lookup. Surface a clean error here rather
         // than panic from a bounds-check downstream.
-        if mapped.len() != len {
+        let expected_codes_end = payload_offset.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "tier cache size overflow")
+        })?;
+        if expected_codes_end > file_len || mapped.len() != file_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "tier cache size mismatch: file={} bytes, expected={} bytes",
                     mapped.len(),
-                    len
+                    file_len
                 ),
             ));
         }
@@ -1707,7 +1740,11 @@ impl QuantizedVectors {
         if let Err(e) = mapped.advise_random() {
             tracing::debug!("tier mmap MADV_RANDOM failed: {e}");
         }
-        *codes = CodeBacking::Mapped(mapped);
+        *codes = CodeBacking::Mapped {
+            file: mapped,
+            offset: payload_offset,
+            len,
+        };
         Ok(())
     }
 

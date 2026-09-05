@@ -79,15 +79,13 @@ impl DirLock {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] if a writer holds the exclusive
-    /// lock, or an I/O error if the lock file cannot be opened.
+    /// lock, or an I/O error if the pre-existing lock file cannot be opened.
+    /// A shared open deliberately does not create the file: a completed store
+    /// already has one, and creation / write access would make a genuine
+    /// read-only mount impossible to serve.
     pub fn acquire_shared(dir: &Path) -> io::Result<Self> {
         let path = dir.join(LOCK_FILE);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = OpenOptions::new().read(true).open(&path)?;
         // SAFETY: `flock` on a valid fd owned by `file`; LOCK_NB as above.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
         if rc != 0 {
@@ -129,6 +127,26 @@ mod tests {
         let _w = DirLock::acquire_exclusive(dir.path()).unwrap();
         let err = DirLock::acquire_shared(dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// A replica may be mounted truly read-only. Its lock file was created by
+    /// the writer that produced the store, so taking a shared flock must not
+    /// require `O_RDWR` or permission to create that file.
+    #[cfg(unix)]
+    #[test]
+    fn shared_lock_opens_an_existing_read_only_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        DirLock::acquire_exclusive(dir.path()).unwrap();
+        let path = dir.path().join(LOCK_FILE);
+        let saved = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o400)).unwrap();
+
+        let reader = DirLock::acquire_shared(dir.path())
+            .expect("a shared lock needs only read access to an existing lock file");
+        drop(reader);
+        std::fs::set_permissions(&path, saved).unwrap();
     }
 
     #[test]

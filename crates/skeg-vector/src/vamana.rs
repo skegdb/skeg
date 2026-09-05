@@ -2432,6 +2432,7 @@ fn open_segment(
     tier: QuantKind,
     mmap_tier: bool,
     mmap_graph: bool,
+    cache_writable: bool,
 ) -> io::Result<(Segment, usize, usize)> {
     // graph.vmn
     // The live base files live in dir's current generation slot (or dir
@@ -2630,6 +2631,7 @@ fn open_segment(
         None
     };
 
+    let cache_was_valid = cached.is_some();
     let mut quant = match cached {
         Some(q) => q,
         None => match tier {
@@ -2651,20 +2653,40 @@ fn open_segment(
     // Persist for the next open. Best-effort: a read-only directory or a
     // full disk must not stop the index from opening, it only means the
     // next open pays the rebuild again.
-    if matches!(tier, QuantKind::TurboQuant { .. })
-        && !cache_path.exists()
-        && let Some(body) = quant.tier_payload()
-    {
-        let _ = write_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime, &body);
-    }
-    // TurboQuant tier only, opt-in. Persist the codes buffer to
-    // `tier.cache.bin` and swap
-    // the in-RAM `Vec<u8>` for a `MappedFile`; the OS page cache then
-    // decides which pages stay resident. Other tiers (int8, pq) keep
-    // their `Vec<u8>` representation - the experiment runs on
-    // TurboQuant only.
-    if mmap_tier && matches!(tier, QuantKind::TurboQuant { .. }) {
-        quant.swap_turboquant_codes_to_mmap(&bdir.join(TIER_CACHE_FILE))?;
+    // A stale cache must be replaced only by a writable open. In serve mode
+    // we retain the rebuilt codes in memory: opening a replica must not turn
+    // a cache miss into a persistent write.
+    let cache_ready = if matches!(tier, QuantKind::TurboQuant { .. }) && !cache_was_valid {
+        if cache_writable {
+            quant.tier_payload().is_some_and(|body| {
+                write_tier_cache(&cache_path, n, dim, tier_tag, src_len, src_mtime, &body).is_ok()
+            })
+        } else {
+            false
+        }
+    } else {
+        cache_was_valid
+    };
+    // TurboQuant tier only, opt-in. The cache is a framed file; map its
+    // payload after the validated header instead of overwriting that header
+    // with raw codes. A read-only cache miss deliberately remains owned.
+    if mmap_tier && cache_ready {
+        let (payload_len, codes_offset) = quant.tier_payload_code_window().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TurboQuant cache layout overflow",
+            )
+        })?;
+        let payload_offset = TIER_CACHE_HEADER.checked_add(codes_offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TurboQuant cache offset overflow",
+            )
+        })?;
+        let file_len = TIER_CACHE_HEADER.checked_add(payload_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "TurboQuant cache size overflow")
+        })?;
+        quant.swap_turboquant_codes_to_mmap(&cache_path, payload_offset, file_len)?;
     }
 
     let id_to_main_row: AHashMap<u64, VecId> = ids
@@ -3797,7 +3819,29 @@ impl DiskVamanaIndex {
         mmap_tier: bool,
         mmap_graph: bool,
     ) -> io::Result<DiskVamanaIndex> {
-        let (base, dim, l_search) = open_segment(dir, tier, mmap_tier, mmap_graph)?;
+        Self::open_with_tier_full_mode(dir, tier, mmap_tier, mmap_graph, false)
+    }
+
+    /// Open a disk index without creating or refreshing persistent tier
+    /// caches. Intended for a serve replica: a cache miss is rebuilt in RAM.
+    pub fn open_with_tier_full_read_only(
+        dir: &Path,
+        tier: QuantKind,
+        mmap_tier: bool,
+        mmap_graph: bool,
+    ) -> io::Result<DiskVamanaIndex> {
+        Self::open_with_tier_full_mode(dir, tier, mmap_tier, mmap_graph, true)
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // row < n, and n was read as a u32
+    fn open_with_tier_full_mode(
+        dir: &Path,
+        tier: QuantKind,
+        mmap_tier: bool,
+        mmap_graph: bool,
+        read_only: bool,
+    ) -> io::Result<DiskVamanaIndex> {
+        let (base, dim, l_search) = open_segment(dir, tier, mmap_tier, mmap_graph, !read_only)?;
 
         // Reopen the durable runs. A run directory with a `run.ok` marker was
         // fully written and fsynced before the WAL was compacted past it: it
@@ -3819,7 +3863,9 @@ impl DiskVamanaIndex {
                     if entry.path().join(RUN_OK_FILE).exists() {
                         run_seqs.push(seq);
                     } else {
-                        let _ = std::fs::remove_dir_all(entry.path()); // WAL-covered
+                        if !read_only {
+                            let _ = std::fs::remove_dir_all(entry.path()); // WAL-covered
+                        }
                     }
                 }
             }
@@ -3827,7 +3873,13 @@ impl DiskVamanaIndex {
         run_seqs.sort_unstable();
         let mut runs: Vec<Segment> = Vec::with_capacity(run_seqs.len());
         for &seq in &run_seqs {
-            let (seg, rdim, _) = open_segment(&dir.join(format!("run-{seq}")), tier, false, false)?;
+            let (seg, rdim, _) = open_segment(
+                &dir.join(format!("run-{seq}")),
+                tier,
+                false,
+                false,
+                !read_only,
+            )?;
             if rdim != dim {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -3849,12 +3901,20 @@ impl DiskVamanaIndex {
         // Replay the delta WAL: streaming inserts/deletes since the last
         // consolidation that have not yet been folded into the graph.
         let log_path = dir.join(DELTA_LOG_FILE);
-        let wal = std::fs::read(&log_path).unwrap_or_default();
+        let wal = if read_only {
+            std::fs::read(&log_path)?
+        } else {
+            std::fs::read(&log_path).unwrap_or_default()
+        };
         let (wal_format, wal_ops) = decode_wal(&wal, dim)?;
-        let delta_log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        let delta_log = if read_only {
+            std::fs::OpenOptions::new().read(true).open(&log_path)?
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?
+        };
 
         let mut index = DiskVamanaIndex {
             dim,

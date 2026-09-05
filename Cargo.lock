@@ -1683,6 +1683,7 @@ dependencies = [
  "skeg-resp3",
  "skeg-server",
  "skeg-telemetry",
+ "skeg-tenant",
  "skeg-vector",
  "socket2 0.5.10",
  "tempfile",
@@ -1697,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "skeg-server-tenant"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "parking_lot",
  "skeg-platform",

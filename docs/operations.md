@@ -1,7 +1,9 @@
 # Production operations
 
 This runbook describes the process contract implemented by the three server
-binaries (`skeg`, `skeg-resp3`, and `skeg-server-tenant`). It does not turn a
+binaries (`skeg`, the native protocol, and `skeg-resp3`, which serves both
+the single-tenant and the authenticated multi-tenant profile). It does not
+turn a
 single node into a replicated service: skeg has no quorum, automatic failover,
 or built-in backup scheduler.
 

@@ -356,13 +356,24 @@ impl VLog {
             skeg_platform::DirLock::acquire_exclusive(dir)?
         };
         let seg_ids = list_segments(dir)?;
+        if read_only && seg_ids.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("read-only open found no segments: {}", dir.display()),
+            )));
+        }
         let last_id = seg_ids.last().copied();
 
         // Open every segment file.
+        let open_segment = if read_only {
+            PlatformFile::open_read_only
+        } else {
+            PlatformFile::open
+        };
         let mut read_segments: Vec<ReadSegment> = seg_ids
             .iter()
             .map(|&id| {
-                PlatformFile::open(&segment_path(dir, id)).map(|pf| ReadSegment {
+                open_segment(&segment_path(dir, id)).map(|pf| ReadSegment {
                     id,
                     file: Arc::new(pf),
                     live: Cell::new(0),
@@ -1960,6 +1971,45 @@ mod tests {
         VLog::open(dir.path())
             .await
             .expect("writer reopens after readers close");
+    }
+
+    /// A serve replica must open data files with read permission only. This is
+    /// stronger than refusing `SET`: an operator can mount the completed store
+    /// read-only and the open path itself must still work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_open_needs_no_write_access_to_existing_store_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        {
+            let v = VLog::open(dir.path()).await.unwrap();
+            v.set(b"alpha", b"1", Durability::Kernel).await.unwrap();
+        }
+        let paths = [
+            crate::segment::segment_path(dir.path(), 0),
+            dir.path().join(skeg_platform::LOCK_FILE),
+        ];
+        let saved: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().permissions())
+            .collect();
+        for path in &paths {
+            std::fs::set_permissions(path, PermissionsExt::from_mode(0o400)).unwrap();
+        }
+
+        let reader = VLog::open_read_only(dir.path())
+            .await
+            .expect("a read-only open must not require writable segment files");
+        assert_eq!(
+            reader.get(b"alpha").await.unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        drop(reader);
+
+        for (path, permissions) in paths.iter().zip(saved) {
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
     }
 
     #[tokio::test]

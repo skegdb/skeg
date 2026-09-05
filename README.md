@@ -49,9 +49,10 @@ authentication - anyone who can reach it can read, write and drop indices -
 so binding `0.0.0.0` needs the explicit opt-in above; the same command
 without it fails fast with an operator-facing message instead of starting
 unprotected. The port is then published on the host's loopback interface
-only. For network exposure, put `skeg-server-tenant` (with
-`--tenant-auth`/`--tenant-strict`) or an authenticating proxy in front
-instead of publishing the port directly.
+only. For network exposure, run the same `skeg-resp3` with
+`--tenant-auth <auth.kdb> --tenant-strict` - its authenticated multi-tenant
+profile - or put an authenticating proxy in front, instead of publishing the
+port directly.
 
 It is a Redis server, so any Redis client works:
 
@@ -280,7 +281,8 @@ Hypotheses*, *The Substrate*, *What Was Measured*.
 
 Published crates: `skeg-proto`, `skeg-simd`, `skeg-platform`, `skeg-telemetry`,
 `skeg-resp3`, `skeg-core`, `skeg-vector`, `skeg-server`, `skeg-tenant`,
-`skeg-server-tenant`, `skeg-multi-tenant`. Network adapters live in
+`skeg-server-tenant` (a compatibility shim; the multi-tenant profile is
+served by `skeg-resp3` itself), `skeg-multi-tenant`. Network adapters live in
 [`skeg-rigging`](https://github.com/skegdb/skeg-rigging) and
 [`skeg-rigging-net`](https://github.com/skegdb/skeg-rigging-net).
 

@@ -25,6 +25,8 @@ pub mod resp3_handler;
 pub mod router;
 pub mod shard;
 pub mod tenant;
+#[cfg(feature = "tenant-auth")]
+pub mod tenant_auth;
 #[cfg(feature = "tracing-otlp")]
 pub mod tracing_otlp;
 

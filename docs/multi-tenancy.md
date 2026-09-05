@@ -9,14 +9,18 @@ The engine is single-tenant by default and pays nothing for any of this when
 only one tenant (or anonymous traffic) is present. Everything below activates
 only once a deployment opts in.
 
-## The tenant binary
+## One binary, two profiles
 
-Multi-tenancy ships in three Apache-2.0 crates: `skeg-tenant` (the tenant
-model), `skeg-server-tenant` (the server that resolves and isolates tenants),
-and `skeg-multi-tenant`. The end-user binary is named `skeg-server`.
+Multi-tenancy is a profile of the RESP3 server, not a second executable:
+`skeg-resp3` with no tenant flags serves the single-tenant profile, and the
+same command with `--tenant-auth <auth.kdb> --tenant-strict` resolves and
+isolates tenants. There is nothing to install separately and nothing an
+operator can start by mistake. The crates behind it are `skeg-tenant` (the
+tenant model) and `skeg-multi-tenant`; `skeg-server-tenant` remains only as a
+compatibility re-export for code that named its `AuthStoreBackend`.
 
 ```sh
-skeg-server \
+skeg-resp3 \
   --data-dir ./data \
   --addr 127.0.0.1:6379 \
   --tenant-auth ./data/auth.kdb \

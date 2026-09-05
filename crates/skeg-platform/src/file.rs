@@ -110,6 +110,35 @@ impl PlatformFile {
         Ok(pf)
     }
 
+    /// Open an existing file for reads only and apply `F_NOCACHE`.
+    ///
+    /// This is distinct from [`open`](Self::open): a replica can safely scan
+    /// an immutable store mounted without write permission. It retains the
+    /// same no-symlink rule as the read-write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file does not exist, is a symlink, or
+    /// `F_NOCACHE` fails.
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(path)?;
+        let pf = Self {
+            inner: Arc::new(file),
+            sync_count: Arc::new(AtomicU64::new(0)),
+            read_count: Arc::new(AtomicU64::new(0)),
+            size_fixed: Arc::new(AtomicBool::new(false)),
+        };
+        pf.apply_nocache()?;
+        Ok(pf)
+    }
+
     /// Current file size in bytes.
     ///
     /// # Errors

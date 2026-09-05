@@ -30,7 +30,7 @@ dependency order):
 | skeg-rigging / -skeg / -ingest | 0.1.4 | 0.1.5 | one `skeg-vector 0.2` engine; committed-cleanup outcome propagated |
 | skeg-rigging-net / -resp3 / -http | 0.1.1 | 0.1.2 | `skeg-resp3 0.3`; exact retryability table for remote admission errors |
 | skeg-server | 0.7.2 | **0.8.0** | registry `SVI3`, `payload.idx` v2, `SKEG.VMSET` array reply, `::` refused in names, ingress/maintenance budgets, graceful shutdown, admission classification |
-| skeg-server-tenant | 0.2.4 | 0.2.5 | `--allow-unauthenticated-network`, lenient-mode guard |
+| skeg-server-tenant | 0.2.4 | **0.3.0** | now a compatibility shim: it ships no binary, and re-exports the multi-tenant profile that moved into `skeg-server` |
 | skeg-multi-tenant | 0.1.0 | 0.1.1 | registry-clean graph over Rigging 0.1.5, Rigging Net 0.1.2 and the v0.8 engine/protocol generation |
 
 **Operators.** Stop the server. Take a copy of the store root: this is the
@@ -62,6 +62,19 @@ vector WAL and flushes every VLog. Exit zero means the whole barrier succeeded;
 a connection deadline, worker panic or any shard flush failure produces a
 non-zero exit. Supervisors must allow longer than the connection deadline for
 the subsequent maintenance joins and disk barriers.
+
+**One RESP3 binary, two profiles.** The authenticated multi-tenant server was
+a second executable in its own crate; an operator could start the wrong one,
+or forget which of the two the deployment needed. It is now a profile of
+`skeg-resp3`: no tenant flags serves the single-tenant profile, and
+`--tenant-auth <auth.kdb> --tenant-strict` serves the authenticated
+multi-tenant one, with `--admin-tenant` naming the tenant allowed to run
+`SKEG.QUOTA.SET/GET`. The non-loopback guard treats only the strict profile
+as authenticated, so a lenient `--tenant-auth` still needs the explicit
+opt-in. A build without the `tenant-auth` feature refuses those flags with a
+message instead of quietly serving the single profile. `skeg-server-tenant`
+remains as a re-export for code that named its `AuthStoreBackend`; it ships
+no binary, and neither the image nor the release tarball carries one.
 
 **Clients and SDKs.** `SKEG.VMSET` replies with an array of one result per
 item, in request order, instead of an integer. `MSET` refuses a batch whose
