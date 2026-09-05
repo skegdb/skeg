@@ -121,23 +121,16 @@ panic = "abort"
 inherits = "release"
 debug = true
 
-# skeg-rigging-skeg (crates.io, used by skeg-multi-tenant) depends on
-# `skeg-vector = "0.1"`. Without this patch the registry copy is resolved
-# next to the workspace one and the multi-tenant crate embeds an engine
-# this workspace never built or tested. Same for the crates it drags in.
 [patch.crates-io]
-# Bridge for the 0.8.0 convergence, not a release dependency. skeg-rigging-skeg
-# 0.1.4 on crates.io requires skeg-vector ^0.1, which 0.2.0 cannot satisfy, so
-# the registry copy would embed the previous engine next to this one (the
-# P0.7 defect). skeg-rigging's feat/engine-0.2 branch requires skeg-vector 0.2;
-# patching BOTH rigging crates here (not only in skeg-multi-tenant) replaces
-# the registry copy for every consumer in the graph, including the optional
-# live-attach chain (skeg-rigging-net*), so --all-features resolves to one
-# skeg-rigging. skeg-multi-tenant is not published by the v0.8.0 tag; once
-# skeg-rigging-skeg 0.1.5 (skeg-vector 0.2) is on crates.io these two lines
-# go, and the next tag publishes it.
-skeg-rigging = { git = "https://github.com/skegdb/skeg-rigging", rev = "2578dce4d63901e1bb11f775e495537b6b16fff2" }
-skeg-rigging-skeg = { git = "https://github.com/skegdb/skeg-rigging", rev = "2578dce4d63901e1bb11f775e495537b6b16fff2" }
+# Workspace engine crates replace their registry counterparts so the tested
+# graph uses the exact v0.8 implementation. During the local candidate phase,
+# adapter candidates come from sibling repositories in the skegdb checkout.
+# The hosted release harness checks out these same repositories at full SHAs.
+skeg-rigging = { path = "../skeg-rigging/crates/skeg-rigging" }
+skeg-rigging-skeg = { path = "../skeg-rigging/crates/skeg-rigging-skeg" }
+skeg-rigging-net = { path = "../skeg-rigging-net/crates/skeg-rigging-net" }
+skeg-rigging-net-resp3 = { path = "../skeg-rigging-net/crates/skeg-rigging-net-resp3" }
+skeg-resp3 = { path = "crates/skeg-resp3" }
 skeg-vector = { path = "crates/skeg-vector" }
 skeg-simd = { path = "crates/skeg-simd" }
 skeg-platform = { path = "crates/skeg-platform" }

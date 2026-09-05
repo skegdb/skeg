@@ -27,9 +27,11 @@ dependency order):
 | skeg-core | 0.3.4 | 0.3.5 | additive; disk-quota reservation is atomic |
 | skeg-vector | 0.1.8 | **0.2.0** | WAL `SKWL\x03` + `versions.bin`: no downgrade |
 | skeg-tenant | 0.1.3 | 0.1.3 | unchanged |
+| skeg-rigging / -skeg / -ingest | 0.1.4 | 0.1.5 | one `skeg-vector 0.2` engine; committed-cleanup outcome propagated |
+| skeg-rigging-net / -resp3 / -http | 0.1.1 | 0.1.2 | `skeg-resp3 0.3`; exact retryability table for remote admission errors |
 | skeg-server | 0.7.2 | **0.8.0** | registry `SVI3`, `payload.idx` v2, `SKEG.VMSET` array reply, `::` refused in names, ingress/maintenance budgets, graceful shutdown, admission classification |
 | skeg-server-tenant | 0.2.4 | 0.2.5 | `--allow-unauthenticated-network`, lenient-mode guard |
-| skeg-multi-tenant | 0.1.0 | **not published** | `skeg-rigging-skeg` 0.1.4 requires `skeg-vector ^0.1`; a published copy would embed the previous engine. Ships after a rigging release that depends on 0.2. |
+| skeg-multi-tenant | 0.1.0 | 0.1.1 | registry-clean graph over Rigging 0.1.5, Rigging Net 0.1.2 and the v0.8 engine/protocol generation |
 
 **Operators.** Stop the server. Take a copy of the store root: this is the
 only way back. Start 0.8.0 once: it opens every store written by 0.7.x (the

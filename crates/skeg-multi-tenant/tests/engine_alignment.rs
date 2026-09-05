@@ -15,12 +15,15 @@ use skeg_rigging::prelude::*;
 const DIM: u32 = 4;
 
 fn cargo_tree(args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO"))
+    let mut command = Command::new(env!("CARGO"));
+    command
         .args(["tree", "-p", "skeg-multi-tenant", "-e", "normal"])
         .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("cargo tree");
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    if let Some(config) = std::env::var_os("SKEG_RELEASE_CARGO_CONFIG") {
+        command.arg("--config").arg(config);
+    }
+    let out = command.output().expect("cargo tree");
     assert!(
         out.status.success(),
         "{}",
@@ -38,17 +41,35 @@ fn assert_single_workspace_engine(tree: &str) {
         !lines.is_empty(),
         "skeg-vector absent from the graph:\n{tree}"
     );
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let ws_vector = std::path::Path::new(manifest_dir)
-        .parent()
-        .unwrap()
-        .join("skeg-vector");
+    let expected_source = std::env::var_os("SKEG_EXPECTED_VECTOR_SOURCE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("skeg-vector")
+        });
     for l in &lines {
         assert!(
-            l.contains(&ws_vector.display().to_string()),
-            "skeg-vector resolved from a registry, not the workspace: {l}\n{tree}"
+            l.contains(&expected_source.display().to_string()),
+            "skeg-vector did not resolve from {}: {l}\n{tree}",
+            expected_source.display()
         );
     }
+}
+
+fn assert_single_version(tree: &str, package: &str, version: &str) {
+    let prefix = format!("{package} v");
+    let versions: std::collections::BTreeSet<&str> = tree
+        .lines()
+        .filter_map(|line| line.find(&prefix).map(|at| &line[at + prefix.len()..]))
+        .filter_map(|tail| tail.split_whitespace().next())
+        .collect();
+    assert_eq!(
+        versions,
+        std::collections::BTreeSet::from([version]),
+        "expected only {package} v{version} in the release graph:\n{tree}"
+    );
 }
 
 #[test]
@@ -66,7 +87,13 @@ fn dependency_graph_has_one_engine() {
 
 #[test]
 fn dependency_graph_has_one_engine_with_live_attach() {
-    assert_single_workspace_engine(&cargo_tree(&["--features", "live-attach"]));
+    let tree = cargo_tree(&["--features", "live-attach"]);
+    assert_single_workspace_engine(&tree);
+    assert_single_version(&tree, "skeg-rigging", "0.1.5");
+    assert_single_version(&tree, "skeg-rigging-skeg", "0.1.5");
+    assert_single_version(&tree, "skeg-rigging-net", "0.1.2");
+    assert_single_version(&tree, "skeg-rigging-net-resp3", "0.1.2");
+    assert_single_version(&tree, "skeg-resp3", "0.3.0");
 }
 
 #[test]
