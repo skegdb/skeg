@@ -40,6 +40,7 @@ async fn write_sharded(dir: &std::path::Path) {
             .await
             .unwrap();
     }
+    shards.vindex_consolidate("sv").await.unwrap();
     shards.write_snapshot_and_payload_indexes().await;
 }
 
@@ -135,16 +136,27 @@ async fn serve_mode_leaves_the_store_byte_for_byte_unchanged() {
     let before = inventory(dir.path());
 
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port()));
-    let server = Server::bind_serve_full_mmap(&addr.to_string(), dir.path(), TIER, 1, false, false)
+    let server = Server::bind_serve_full_mmap(&addr.to_string(), dir.path(), TIER, 1, true, false)
         .await
         .expect("serve mode opens the completed store");
     server.shards().vindex_list().await.unwrap();
     drop(server);
 
+    let after = inventory(dir.path());
     assert_eq!(
-        inventory(dir.path()),
-        before,
-        "a read-only open changed the directory inventory or file contents"
+        after.len(),
+        before.len(),
+        "a read-only open changed the directory inventory"
+    );
+    let changed = before
+        .iter()
+        .zip(&after)
+        .find(|(before, after)| before != after)
+        .map(|(before, _)| before.0.display().to_string());
+    assert!(
+        changed.is_none(),
+        "a read-only open changed persistent data: {}",
+        changed.unwrap_or_default()
     );
 }
 

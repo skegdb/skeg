@@ -3096,16 +3096,20 @@ fn recover_vindexes(
             .kind
             .unwrap_or_else(|| open_tier.to_wire().unwrap_or(1));
         let vdir = dir.join(format!("vindex-{}", entry.name));
-        let mut idx = DiskVamanaIndex::open_with_tier_full(&vdir, open_tier, mmap_tier, mmap_graph)
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "shard {shard_id}: recovering vindex '{}' failed: {e}",
-                        entry.name
-                    ),
-                )
-            })?;
+        let open_index = if read_only {
+            DiskVamanaIndex::open_with_tier_full_read_only
+        } else {
+            DiskVamanaIndex::open_with_tier_full
+        };
+        let mut idx = open_index(&vdir, open_tier, mmap_tier, mmap_graph).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "shard {shard_id}: recovering vindex '{}' failed: {e}",
+                    entry.name
+                ),
+            )
+        })?;
         idx.set_auto_flush(false); // flushed off-thread by the maintenance loop
         let generation = entry.generation;
         set.insert(
@@ -4901,10 +4905,17 @@ async fn process(
                     } else {
                         limit
                     };
-                    if was_new
-                        && let Some(max) = limit
-                        && quota.try_add(tenant, 1, max).is_err()
-                    {
+                    // Counted whether or not a ceiling exists, because the
+                    // ceiling can arrive later: `SKEG.QUOTA.SET` on a tenant
+                    // that wrote while it had none used to find a counter at
+                    // zero and hand it another `max_vectors` rows on top of
+                    // the ones it already held - a hard quota that only became
+                    // one at the next restart, when the readiness barrier
+                    // recounted the store. `u64::MAX` is "no ceiling": the
+                    // charge still happens, and only the comparison is
+                    // vacuous.
+                    if was_new && quota.try_add(tenant, 1, limit.unwrap_or(u64::MAX)).is_err() {
+                        let max = limit.unwrap_or(u64::MAX);
                         skeg_telemetry::tick_counter(skeg_telemetry::Counter::QuotaRefused);
                         return ShardResp::Refused(ShardError::Admission(
                             crate::admission::AdmissionError::QuotaExceeded { tenant, limit: max },
@@ -4937,7 +4948,7 @@ async fn process(
                     if let Some(rejected) =
                         forced.or_else(|| idx.reserve_memory(memory, want).err())
                     {
-                        if was_new && limit.is_some() {
+                        if was_new {
                             quota.sub(tenant, 1);
                         }
                         skeg_telemetry::tick_counter(skeg_telemetry::Counter::MemoryRefused);
@@ -4948,7 +4959,7 @@ async fn process(
                     Ok(Some(Admitted {
                         version,
                         previous: existed_before.then_some(previous),
-                        charged: was_new && limit.is_some(),
+                        charged: was_new,
                         generation: idx.generation,
                     }))
                 }
@@ -13970,8 +13981,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vector_quota_untracked_without_limit() {
-        // No limit -> no counting; single-tenant path pays nothing.
+    async fn test_vector_quota_counted_even_without_a_limit() {
+        // Counted whether or not a ceiling exists. This test used to assert
+        // the opposite - "no limit means no quota tracking" - and that was
+        // the defect: a ceiling set later found the counter at zero and gave
+        // the tenant a second allowance on top of the rows it already had,
+        // until a restart recounted the store. The counter is cardinality;
+        // the limit is only what it is compared against.
         let dir = TempDir::new().unwrap();
         let shards = ShardSet::open(dir.path(), 2).unwrap();
         shards.vindex_create("idx", 4, 0, 0).await.unwrap();
@@ -13984,8 +14000,8 @@ mod tests {
         }
         assert_eq!(
             shards.tenant_vector_count(0),
-            0,
-            "no limit means no quota tracking"
+            50,
+            "rows written without a ceiling are still the tenant's rows"
         );
     }
 
