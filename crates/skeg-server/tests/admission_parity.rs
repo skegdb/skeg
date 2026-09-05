@@ -70,7 +70,15 @@ fn roomy() -> Arc<IngressBudget> {
 
 struct Running {
     addr: std::net::SocketAddr,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Running {
@@ -79,6 +87,19 @@ impl Running {
     /// need and that a hand-chosen name cannot guarantee.
     fn key(&self) -> String {
         self.addr.port().to_string()
+    }
+
+    /// Run the server's shutdown barrier and join its task, so nothing is
+    /// still writing when the `TempDir` is removed. A detached `run()`
+    /// outlives the test body, and a `TempDir` dropped under a live writer
+    /// fails its `remove_dir_all` silently and leaves the tree behind.
+    /// `Drop`'s abort is a net for a panicking test, not a substitute.
+    async fn stop(mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        let task = std::mem::replace(&mut self.task, tokio::spawn(async {}));
+        let _ = task.await;
     }
 }
 
@@ -90,10 +111,27 @@ async fn resp3_server(ingress: &Arc<IngressBudget>, max_connections: usize) -> R
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run_resp3().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_resp3_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets when it stops the
+                // server. Draining them would add the full deadline to every
+                // test; the durable barrier that follows is what matters.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    Running { addr, _dir: dir }
+    Running {
+        addr,
+        stop: Some(stop),
+        task,
+        _dir: dir,
+    }
 }
 
 async fn resp3_server_with_backend(
@@ -108,10 +146,27 @@ async fn resp3_server_with_backend(
         .with_tenant_backend(backend)
         .with_max_connections(16);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run_resp3().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_resp3_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets when it stops the
+                // server. Draining them would add the full deadline to every
+                // test; the durable barrier that follows is what matters.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    Running { addr, _dir: dir }
+    Running {
+        addr,
+        stop: Some(stop),
+        task,
+        _dir: dir,
+    }
 }
 
 async fn native_server(ingress: &Arc<IngressBudget>, max_connections: usize) -> Running {
@@ -122,10 +177,27 @@ async fn native_server(ingress: &Arc<IngressBudget>, max_connections: usize) -> 
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets when it stops the
+                // server. Draining them would add the full deadline to every
+                // test; the durable barrier that follows is what matters.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    Running { addr, _dir: dir }
+    Running {
+        addr,
+        stop: Some(stop),
+        task,
+        _dir: dir,
+    }
 }
 
 // ------------------------------------------------------------ wire helpers
@@ -402,7 +474,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
             let line = read_resp3_line(&mut refused)
                 .await
                 .expect("the peer must be told, not dropped");
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::ClassFullMidFrame => {
             let ingress = budget(64 * 1024, Duration::from_millis(50));
@@ -416,7 +490,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                 fired_ingress_at(IngressFailpoint::GrowRefusedMidFrame, &key),
                 "the failpoint never fired, so this row proved nothing"
             );
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::OverConnectionAllowance => {
             // A class whose per-connection quarter is small, and a bulk that
@@ -429,7 +505,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
             head.extend_from_slice(&vec![b'x'; 64 * 1024]);
             let _ = conn.write_all(&head).await;
             let line = read_resp3_line(&mut conn).await.expect("a refusal");
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::MemoryRefusedAtVset | Condition::QuotaRefusedAtVset => {
             let ingress = roomy();
@@ -453,7 +531,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                 fired_admission_at(fp, &name),
                 "the failpoint never fired, so this row proved nothing"
             );
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::RequestTooLarge => {
             let ingress = roomy();
@@ -470,7 +550,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
             let borrowed: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
             let _ = conn.write_all(&resp3_command(&borrowed)).await;
             let line = read_resp3_line(&mut conn).await.expect("vmset replies");
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::VsearchQueueFull => {
             let ingress = roomy();
@@ -494,7 +576,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                 fired_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name),
                 "the failpoint never fired, so this row proved nothing"
             );
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::BackendRateLimited | Condition::BackendUnclassified => {
             let message = if cond == Condition::BackendRateLimited {
@@ -510,7 +594,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
             // backend's admission, and this one refuses all of them.
             let _ = conn.write_all(&resp3_command(&[b"PING"])).await;
             let line = read_resp3_line(&mut conn).await.expect("ping replies");
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
         Condition::DimMismatch => {
             let ingress = roomy();
@@ -536,7 +622,9 @@ async fn drive_resp3(cond: Condition) -> Outcome {
                 ]))
                 .await;
             let line = read_resp3_line(&mut conn).await.expect("vset replies");
-            Outcome::Refused(Refusal::from_resp3_line(&line))
+            let outcome = Outcome::Refused(Refusal::from_resp3_line(&line));
+            server.stop().await;
+            outcome
         }
     }
 }
@@ -561,7 +649,9 @@ async fn drive_native(cond: Condition) -> Outcome {
             let frame = read_native_frame(&mut refused)
                 .await
                 .expect("the peer must be told, not dropped");
-            Outcome::Refused(Refusal::from_native_frame(&frame))
+            let outcome = Outcome::Refused(Refusal::from_native_frame(&frame));
+            server.stop().await;
+            outcome
         }
         Condition::ClassFullMidFrame => {
             let ingress = budget(64 * 1024, Duration::from_millis(50));
@@ -575,7 +665,9 @@ async fn drive_native(cond: Condition) -> Outcome {
                 fired_ingress_at(IngressFailpoint::GrowRefusedMidFrame, &key),
                 "the failpoint never fired, so this row proved nothing"
             );
-            Outcome::Refused(Refusal::from_native_frame(&frame))
+            let outcome = Outcome::Refused(Refusal::from_native_frame(&frame));
+            server.stop().await;
+            outcome
         }
         Condition::OverConnectionAllowance => {
             // The native form of the same refusal is taken on the HEADER: 24
@@ -588,7 +680,9 @@ async fn drive_native(cond: Condition) -> Outcome {
             let frame = read_native_frame(&mut conn)
                 .await
                 .expect("refused BY NAME, not by silence");
-            Outcome::Refused(Refusal::from_native_frame(&frame))
+            let outcome = Outcome::Refused(Refusal::from_native_frame(&frame));
+            server.stop().await;
+            outcome
         }
         Condition::MemoryRefusedAtVset | Condition::QuotaRefusedAtVset => {
             let ingress = roomy();
@@ -617,7 +711,9 @@ async fn drive_native(cond: Condition) -> Outcome {
                 fired_admission_at(fp, &name),
                 "the failpoint never fired, so this row proved nothing"
             );
-            Outcome::Refused(Refusal::from_native_frame(&frame))
+            let outcome = Outcome::Refused(Refusal::from_native_frame(&frame));
+            server.stop().await;
+            outcome
         }
         Condition::RequestTooLarge => Outcome::NotOnThisWire(
             "the native protocol has no VMSET: one frame carries one vector, \
@@ -654,7 +750,9 @@ async fn drive_native(cond: Condition) -> Outcome {
                 fired_admission_at(AdmissionFailpoint::VsearchQueueFullAtSearch, &name),
                 "the failpoint never fired, so this row proved nothing"
             );
-            Outcome::Refused(Refusal::from_native_frame(&frame))
+            let outcome = Outcome::Refused(Refusal::from_native_frame(&frame));
+            server.stop().await;
+            outcome
         }
         Condition::DimMismatch => {
             let ingress = roomy();
@@ -676,7 +774,9 @@ async fn drive_native(cond: Condition) -> Outcome {
                 ))
                 .await;
             let frame = read_native_frame(&mut conn).await.expect("vset replies");
-            Outcome::Refused(Refusal::from_native_frame(&frame))
+            let outcome = Outcome::Refused(Refusal::from_native_frame(&frame));
+            server.stop().await;
+            outcome
         }
     }
 }
@@ -798,4 +898,6 @@ async fn a_frame_over_the_connection_allowance_is_refused_by_name_not_by_silence
         "the refusal must name the limit; it said {:?}",
         refusal.message
     );
+
+    server.stop().await;
 }

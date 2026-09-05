@@ -59,10 +59,38 @@ fn budget(cap: u64) -> Arc<IngressBudget> {
     ))
 }
 
+/// Owns the server task and the directory it writes to. `stop().await` runs
+/// the server's own shutdown barrier and joins the task, so nothing is still
+/// writing when the `TempDir` is removed. Without that wait a detached
+/// `run()` outlives the test body, and `TempDir`'s `remove_dir_all` fails
+/// silently and leaves the whole tree behind. `Drop` only aborts, which is a
+/// net for a panicking test, not a substitute for the wait.
+struct ServerFixture {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl ServerFixture {
+    async fn stop(mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        let task = std::mem::replace(&mut self.task, tokio::spawn(async {}));
+        let _ = task.await;
+    }
+}
+
+impl Drop for ServerFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn resp3_server(
     ingress: &Arc<IngressBudget>,
     max_connections: usize,
-) -> (std::net::SocketAddr, tempfile::TempDir) {
+) -> (std::net::SocketAddr, ServerFixture) {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = Server::bind("127.0.0.1:0", dir.path())
         .await
@@ -70,16 +98,36 @@ async fn resp3_server(
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run_resp3().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_resp3_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets when it calls
+                // `stop()`. Waiting for them to drain would add the full
+                // drain deadline to every test; the durable barrier that
+                // follows is what the fixture actually needs.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    (addr, dir)
+    (
+        addr,
+        ServerFixture {
+            stop: Some(stop),
+            task,
+            _dir: dir,
+        },
+    )
 }
 
 async fn native_server(
     ingress: &Arc<IngressBudget>,
     max_connections: usize,
-) -> (std::net::SocketAddr, tempfile::TempDir) {
+) -> (std::net::SocketAddr, ServerFixture) {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = Server::bind("127.0.0.1:0", dir.path())
         .await
@@ -87,10 +135,30 @@ async fn native_server(
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets when it calls
+                // `stop()`. Waiting for them to drain would add the full
+                // drain deadline to every test; the durable barrier that
+                // follows is what the fixture actually needs.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    (addr, dir)
+    (
+        addr,
+        ServerFixture {
+            stop: Some(stop),
+            task,
+            _dir: dir,
+        },
+    )
 }
 
 fn bulk(arg: &[u8], out: &mut Vec<u8>) {
@@ -222,7 +290,7 @@ const VALUE: usize = 256 * 1024;
 async fn a_huge_mget_is_refused_before_any_value_is_fetched() {
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
     // 64 x 256 KiB = 16 MiB of values against an 8 MiB allowance.
     let keys = seed(addr, 64, VALUE).await;
 
@@ -243,6 +311,8 @@ async fn a_huge_mget_is_refused_before_any_value_is_fetched() {
         "the refusal must precede the fetch: value bytes were materialised \
          for a request that was refused"
     );
+
+    fx.stop().await;
 }
 
 /// The other half of the same criterion: an `MGET` that DOES fit is still
@@ -255,7 +325,7 @@ async fn an_mget_inside_the_allowance_is_answered_in_full() {
     // F3): the same shape B7 has just removed from `ingress_budget.rs`.
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
     let keys = seed(addr, 4, VALUE).await;
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
@@ -271,6 +341,8 @@ async fn an_mget_inside_the_allowance_is_answered_in_full() {
         "the answer must carry every value: {} bytes",
         reply.len()
     );
+
+    fx.stop().await;
 }
 
 /// `GET` of one value larger than the connection's allowance: the same order,
@@ -286,7 +358,7 @@ async fn a_get_over_the_allowance_is_refused_before_the_value_is_fetched() {
     const CHUNKS: usize = 8;
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
 
     let mut w = TcpStream::connect(addr).await.expect("connect");
     let chunk = vec![b'a'; CHUNK];
@@ -320,6 +392,8 @@ async fn a_get_over_the_allowance_is_refused_before_the_value_is_fetched() {
         0,
         "the refusal must precede the fetch"
     );
+
+    fx.stop().await;
 }
 
 /// The multiplication B1 names: not one big request, but N connections each
@@ -341,7 +415,7 @@ async fn n_concurrent_mgets_never_overshoot_the_class() {
     const WIDE: usize = 4;
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
-    let (addr, _dir) = resp3_server(&ingress, 32).await;
+    let (addr, fx) = resp3_server(&ingress, 32).await;
     let keys = seed(addr, 32, VALUE).await;
 
     let over_before = counter_value(Counter::IngressReplyOverBudget);
@@ -402,6 +476,8 @@ async fn n_concurrent_mgets_never_overshoot_the_class() {
          after it: {answered} answered, {refused} refused, and the class was \
          still knowingly overshot"
     );
+
+    fx.stop().await;
 }
 
 // ------------------------------------------------------------ native reads
@@ -454,7 +530,7 @@ async fn native_seed(addr: std::net::SocketAddr, n: usize, value_len: usize) -> 
 async fn a_native_mget_over_the_allowance_is_refused_before_the_fetch() {
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
-    let (addr, _dir) = native_server(&ingress, 8).await;
+    let (addr, fx) = native_server(&ingress, 8).await;
     let keys = native_seed(addr, 32, VALUE).await;
     let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
 
@@ -483,6 +559,8 @@ async fn a_native_mget_over_the_allowance_is_refused_before_the_fetch() {
         0,
         "the refusal must precede the fetch"
     );
+
+    fx.stop().await;
 }
 
 /// A native `GET` goes through the SAME preflighted read as `MGET`: its
@@ -499,7 +577,7 @@ async fn a_native_mget_over_the_allowance_is_refused_before_the_fetch() {
 async fn a_native_get_is_served_through_the_bounded_read() {
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(CAP);
-    let (addr, _dir) = native_server(&ingress, 8).await;
+    let (addr, fx) = native_server(&ingress, 8).await;
     let keys = native_seed(addr, 1, VALUE).await;
 
     let before = counter_value(Counter::KvReadBytesFetched);
@@ -516,6 +594,8 @@ async fn a_native_get_is_served_through_the_bounded_read() {
         VALUE as u64,
         "a native GET must be served through the bounded, counted read"
     );
+
+    fx.stop().await;
 }
 
 /// `SKEG.VGET` on RESP3 reserves `MAX_VGET_VECTOR_BYTES` before dispatch
@@ -530,7 +610,7 @@ async fn a_native_vget_is_reserved_before_the_shard_call() {
     // A 4 MiB class gives a 1 MiB allowance, under the ~2 MiB charge a 1 MiB
     // vector bound carries.
     let ingress = budget(4 * 1024 * 1024);
-    let (addr, _dir) = native_server(&ingress, 8).await;
+    let (addr, fx) = native_server(&ingress, 8).await;
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
     s.write_all(&skeg_proto::encode_vget(1, "does-not-exist", 7))
@@ -554,6 +634,8 @@ async fn a_native_vget_is_reserved_before_the_shard_call() {
         "an admission refusal must not be the shard's answer wearing a \
          different code: {err:?}"
     );
+
+    fx.stop().await;
 }
 
 // ------------------------------------------- the read must survive a writer
@@ -580,7 +662,7 @@ async fn a_value_rewritten_under_a_read_is_still_answered() {
     // Generous: nothing here may be refused for SIZE, so any refusal at all
     // is the race and not the class.
     let ingress = budget(128 * 1024 * 1024);
-    let (addr, _dir) = resp3_server(&ingress, 16).await;
+    let (addr, fx) = resp3_server(&ingress, 16).await;
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -660,6 +742,8 @@ async fn a_value_rewritten_under_a_read_is_still_answered() {
          client was writing: {n} of {READS} were, first few: {:?}",
         &spurious[..n.min(4)]
     );
+
+    fx.stop().await;
 }
 
 // ------------------------------------------- what the preflight itself costs
@@ -674,7 +758,7 @@ async fn a_value_rewritten_under_a_read_is_still_answered() {
 async fn an_mget_past_the_key_cap_is_refused_before_anything_is_allocated() {
     let _turn = COUNTER_TESTS.lock().await;
     let ingress = budget(128 * 1024 * 1024);
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
 
     // Past MAX_MGET_KEYS, and every key absent, so nothing but the cap can
     // refuse it: without one, this is answered with a null per key.
@@ -699,6 +783,8 @@ async fn an_mget_past_the_key_cap_is_refused_before_anything_is_allocated() {
         0,
         "the cap must be checked before anything is read"
     );
+
+    fx.stop().await;
 }
 
 /// audit 25, F2, second half. The preflight's OWN allocation - one
@@ -715,7 +801,7 @@ async fn a_wide_mget_of_absent_keys_is_charged_for_its_own_preflight() {
     // ~128 KiB of reply framing (admitted under any class) against ~1 MiB of
     // preflight structures (which the allowance cannot cover).
     let ingress = budget(4 * 1024 * 1024);
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
     let keys: Vec<Vec<u8>> = (0..4000).map(|i| format!("k{i}").into_bytes()).collect();
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
@@ -728,4 +814,6 @@ async fn a_wide_mget_of_absent_keys_is_charged_for_its_own_preflight() {
          served for free: {:?}",
         &text[..text.len().min(200)]
     );
+
+    fx.stop().await;
 }

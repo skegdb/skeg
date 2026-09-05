@@ -58,11 +58,39 @@ fn budget(cap: u64, stall: Duration) -> Arc<IngressBudget> {
     ))
 }
 
+/// Owns the server task and the directory it writes to. `stop().await` runs
+/// the server's shutdown barrier and joins the task, so nothing is still
+/// writing when the `TempDir` is removed. A detached `run()` outlives the test
+/// body, and a `TempDir` dropped under a live writer fails its
+/// `remove_dir_all` silently and leaves the whole tree behind. `Drop`'s abort
+/// is a net for a panicking test, not a substitute for the wait.
+struct ServerFixture {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl ServerFixture {
+    async fn stop(mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        let task = std::mem::replace(&mut self.task, tokio::spawn(async {}));
+        let _ = task.await;
+    }
+}
+
+impl Drop for ServerFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// A running RESP3 server over the budget supplied, plus its address.
 async fn resp3_server(
     ingress: &Arc<IngressBudget>,
     max_connections: usize,
-) -> (std::net::SocketAddr, tempfile::TempDir) {
+) -> (std::net::SocketAddr, ServerFixture) {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = Server::bind("127.0.0.1:0", dir.path())
         .await
@@ -70,17 +98,36 @@ async fn resp3_server(
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run_resp3().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_resp3_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets here; draining them
+                // would add the full deadline to every test. The durable
+                // barrier that follows is what the fixture needs.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    (addr, dir)
+    (
+        addr,
+        ServerFixture {
+            stop: Some(stop),
+            task,
+            _dir: dir,
+        },
+    )
 }
 
 /// A running native-protocol server over the budget supplied.
 async fn native_server(
     ingress: &Arc<IngressBudget>,
     max_connections: usize,
-) -> (std::net::SocketAddr, tempfile::TempDir) {
+) -> (std::net::SocketAddr, ServerFixture) {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = Server::bind("127.0.0.1:0", dir.path())
         .await
@@ -88,10 +135,29 @@ async fn native_server(
         .with_ingress_budget(Arc::clone(ingress))
         .with_max_connections(max_connections);
     let addr = server.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = server.run().await;
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = server
+            .run_until_with_timeout(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                },
+                // The test still holds its client sockets here; draining them
+                // would add the full deadline to every test. The durable
+                // barrier that follows is what the fixture needs.
+                std::time::Duration::from_millis(0),
+            )
+            .await;
     });
-    (addr, dir)
+    (
+        addr,
+        ServerFixture {
+            stop: Some(stop),
+            task,
+            _dir: dir,
+        },
+    )
 }
 
 /// The failpoint key: the listener's port. Every test binds port 0, so no two
@@ -143,7 +209,7 @@ fn dribbled_command_head(declared: usize) -> Vec<u8> {
 async fn n_connections_mid_frame_pin_at_most_the_budget() {
     let cap = 16 * CHUNK_BYTES;
     let ingress = budget(cap, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let (addr, fx) = resp3_server(&ingress, 64).await;
 
     let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sampler = {
@@ -198,6 +264,8 @@ async fn n_connections_mid_frame_pin_at_most_the_budget() {
         0,
         "the governor's total did not come back with the class share"
     );
+
+    fx.stop().await;
 }
 
 /// A budget that is never given back is a leak with a nicer name. The close
@@ -207,7 +275,7 @@ async fn n_connections_mid_frame_pin_at_most_the_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_budget_is_released_when_a_connection_closes() {
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let (addr, fx) = resp3_server(&ingress, 64).await;
     let k = key(addr);
     arm_ingress_at(IngressFailpoint::ReleaseDeferredOnClose, &k);
 
@@ -232,6 +300,8 @@ async fn the_budget_is_released_when_a_connection_closes() {
         fired,
         "the close path never ran, so the budget coming back proves nothing"
     );
+
+    fx.stop().await;
 }
 
 /// A frame bigger than one connection may ever hold is refused, by name, and
@@ -242,7 +312,7 @@ async fn the_budget_is_released_when_a_connection_closes() {
 async fn a_frame_larger_than_the_connection_allowance_is_refused_not_buffered() {
     let cap = 8 * CHUNK_BYTES;
     let ingress = budget(cap, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let (addr, fx) = resp3_server(&ingress, 64).await;
     let allowance = ingress.per_connection_max();
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
@@ -284,6 +354,8 @@ async fn a_frame_larger_than_the_connection_allowance_is_refused_not_buffered() 
         ingress.held_bytes() == 0
     })
     .await;
+
+    fx.stop().await;
 }
 
 /// A refused growth is not an immediate error: the connection stops reading,
@@ -295,7 +367,7 @@ async fn a_frame_larger_than_the_connection_allowance_is_refused_not_buffered() 
 async fn a_refused_growth_stalls_then_refuses_the_frame_by_name() {
     let stall = Duration::from_millis(300);
     let ingress = budget(16 * CHUNK_BYTES, stall);
-    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let (addr, fx) = resp3_server(&ingress, 64).await;
     let k = key(addr);
     arm_ingress_at(IngressFailpoint::GrowRefusedMidFrame, &k);
 
@@ -333,6 +405,8 @@ async fn a_refused_growth_stalls_then_refuses_the_frame_by_name() {
         waited >= stall,
         "the connection was refused without waiting out the stall: {waited:?}"
     );
+
+    fx.stop().await;
 }
 
 /// The native protocol had no budget at all: no semaphore, an eager 64 KiB
@@ -343,7 +417,7 @@ async fn a_refused_growth_stalls_then_refuses_the_frame_by_name() {
 async fn native_connections_are_bounded_by_the_same_budget() {
     let cap = 16 * CHUNK_BYTES;
     let ingress = budget(cap, Duration::from_millis(50));
-    let (addr, _dir) = native_server(&ingress, 64).await;
+    let (addr, fx) = native_server(&ingress, 64).await;
 
     let mut conns = Vec::new();
     for _ in 0..8 {
@@ -386,6 +460,8 @@ async fn native_connections_are_bounded_by_the_same_budget() {
         ingress.held_bytes()
     );
     drop(conns);
+
+    fx.stop().await;
 }
 
 /// The native accept loop spawned a task per connection with nothing bounding
@@ -394,7 +470,7 @@ async fn native_connections_are_bounded_by_the_same_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_accept_is_bounded_by_the_connection_semaphore() {
     let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = native_server(&ingress, 2).await;
+    let (addr, fx) = native_server(&ingress, 2).await;
 
     // PING, native: header only, no payload.
     let ping = |req_id: u64| {
@@ -436,6 +512,8 @@ async fn native_accept_is_bounded_by_the_connection_semaphore() {
         answered(&mut third, Duration::from_secs(10)).await,
         "the connection never got the permit that was freed"
     );
+
+    fx.stop().await;
 }
 
 /// A thousand connections that say nothing. This is the shape the ceiling was
@@ -649,7 +727,7 @@ fn vmset_of_failing_items(items: usize) -> Vec<u8> {
 async fn a_max_vmset_reply_too_large_for_the_allowance_is_refused_before_it_runs() {
     let _turn = REPLY_OVER_BUDGET_COUNTER_TESTS.lock().await;
     let ingress = budget(16 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let (addr, fx) = resp3_server(&ingress, 64).await;
     let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
 
     let request = vmset_of_failing_items(4096);
@@ -698,6 +776,8 @@ async fn a_max_vmset_reply_too_large_for_the_allowance_is_refused_before_it_runs
         || ingress.held_bytes() <= FLOOR_BYTES,
     )
     .await;
+
+    fx.stop().await;
 }
 
 /// R1 (P0-A) exit criterion: N sockets, each sending the same max-size
@@ -725,7 +805,7 @@ async fn concurrent_max_vmset_replies_under_a_barrier_never_overshoot_the_budget
     // class - a tight margin here would make the assertion about scheduler
     // noise, not about the reservation.
     let ingress = budget(N as u64 * 32 * CHUNK_BYTES, Duration::from_millis(500));
-    let (addr, _dir) = resp3_server(&ingress, 64).await;
+    let (addr, fx) = resp3_server(&ingress, 64).await;
     let before = skeg_telemetry::counter_value(skeg_telemetry::Counter::IngressReplyOverBudget);
 
     let request = std::sync::Arc::new(vmset_of_failing_items(4096));
@@ -779,6 +859,8 @@ async fn concurrent_max_vmset_replies_under_a_barrier_never_overshoot_the_budget
          reserved worst case, must never overshoot: the reservation IS the \
          bound, not an afterthought counted once it is exceeded"
     );
+
+    fx.stop().await;
 }
 
 /// End-to-end fairness under a class that is genuinely full.
@@ -802,7 +884,7 @@ async fn a_saturated_class_still_answers_ping_and_refuses_a_grower_by_name() {
     let cap = 16 * CHUNK_BYTES;
     let stall = Duration::from_millis(300);
     let ingress = budget(cap, stall);
-    let (addr, _dir) = resp3_server(&ingress, 128).await;
+    let (addr, fx) = resp3_server(&ingress, 128).await;
 
     // A connection that exists before the class fills, and must go on being
     // served after it does.
@@ -926,6 +1008,8 @@ async fn a_saturated_class_still_answers_ping_and_refuses_a_grower_by_name() {
         "refused without waiting out the stall: {waited:?}"
     );
     drop((holders, filler));
+
+    fx.stop().await;
 }
 
 // ------------------------------------------------- the reply side, reads (A1)
@@ -1031,7 +1115,7 @@ async fn read_one_reply(s: &mut TcpStream, within: Duration) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vset_payload_over_the_cap_is_refused_by_name() {
     let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
     let mut s = TcpStream::connect(addr).await.expect("connect");
     s.write_all(&vindex_create_flat("payload-cap", 4))
         .await
@@ -1064,6 +1148,8 @@ async fn a_vset_payload_over_the_cap_is_refused_by_name() {
         text.starts_with("_") || text.starts_with("$-1"),
         "the refused write must not have reached the shard: {text:?}"
     );
+
+    fx.stop().await;
 }
 
 /// audit/19 A1, exit criterion: a `SKEG.VSEARCH k WITHPAYLOAD` whose worst
@@ -1076,7 +1162,7 @@ async fn a_max_vsearch_withpayload_reply_too_large_is_refused_before_the_shard_c
     // k=4096 WITHPAYLOAD needs roughly 4096 * 1 MiB - far past any
     // per-connection allowance a small class can grant.
     let ingress = budget(8 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
     let mut s = TcpStream::connect(addr).await.expect("connect");
     s.write_all(&vsearch_withpayload("does-not-exist", 4096, 4))
         .await
@@ -1092,6 +1178,8 @@ async fn a_max_vsearch_withpayload_reply_too_large_is_refused_before_the_shard_c
          (and refusing) a vindex name - which would prove the shard WAS \
          called: {text:?}"
     );
+
+    fx.stop().await;
 }
 
 /// audit/19 A1, the reproduced hazard: pipelined `SKEG.VSEARCH k WITHPAYLOAD`
@@ -1124,7 +1212,7 @@ async fn pipelined_vsearch_withpayload_reads_are_reserved_not_left_uncharged() {
     // so the test does not depend on exactly how many of BURST get through,
     // only that some do and some do not.
     let ingress = budget(64 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
 
     let mut setup = TcpStream::connect(addr).await.expect("connect");
     setup
@@ -1211,6 +1299,8 @@ async fn pipelined_vsearch_withpayload_reads_are_reserved_not_left_uncharged() {
         || ingress.held_bytes() <= ingress.per_connection_max(),
     )
     .await;
+
+    fx.stop().await;
 }
 
 /// Best-effort: the byte length of one complete top-level RESP3 reply at the
@@ -1321,7 +1411,7 @@ async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
     // node, VGRAPH_LINE_BYTES=48, chunk-rounded) is on the order of 12-13
     // MiB charged. Sized for roughly half of BURST to fit.
     let ingress = budget(560 * CHUNK_BYTES, Duration::from_millis(50));
-    let (addr, _dir) = resp3_server(&ingress, 8).await;
+    let (addr, fx) = resp3_server(&ingress, 8).await;
     let fp_key = key(addr);
 
     let mut setup = TcpStream::connect(addr).await.expect("connect");
@@ -1415,4 +1505,6 @@ async fn pipelined_vgraph_count_2048_reads_are_reserved_not_left_uncharged() {
         || ingress.held_bytes() <= ingress.per_connection_max(),
     )
     .await;
+
+    fx.stop().await;
 }

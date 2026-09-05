@@ -11706,8 +11706,11 @@ mod tests {
     async fn reclaim_makes_erased_values_unrecoverable_on_disk() {
         const TENANT: u128 = 9;
         let needle = b"pii-value-to-erase";
-        let base = TempDir::new().unwrap().path().to_owned();
-        std::fs::create_dir_all(&base).unwrap();
+        // The TempDir must outlive the scan below: binding it to `_tmp` keeps
+        // the directory alive. Taking `.path()` off a temporary would drop it
+        // here and leave the recreated directory orphaned on disk.
+        let _tmp = TempDir::new().unwrap();
+        let base = _tmp.path().to_owned();
 
         {
             let shards = ShardSet::open(&base, 2).unwrap();
