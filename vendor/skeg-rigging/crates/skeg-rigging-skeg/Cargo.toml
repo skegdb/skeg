@@ -1,0 +1,37 @@
+[package]
+name = "skeg-rigging-skeg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "skeg-rigging implementation backed by skeg-vector's DiskVamanaIndex and a JSON metadata sidecar."
+readme = "../../README.md"
+keywords = ["skeg", "rigging", "adapter", "vector", "vamana"]
+categories = ["database"]
+
+[dependencies]
+skeg-rigging = { path = "../skeg-rigging", version = "0.1.5" }
+skeg-vector = "0.2"
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "tenant_query"
+harness = false
+
+[[bench]]
+name = "snapshot_restore"
+harness = false
+
+[lints]
+workspace = true

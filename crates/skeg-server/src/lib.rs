@@ -11,6 +11,7 @@
 //! via [`Server::with_tenant_backend`].
 
 pub mod admission;
+mod auth_admission;
 pub mod bind_policy;
 pub mod catalog_intent;
 pub mod failpoint;

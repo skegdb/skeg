@@ -74,6 +74,21 @@ fn tid_from_engine(t: TenantId) -> TenantTenantId {
 }
 
 impl TenantBackend for AuthStoreBackend {
+    fn login_memory_bytes(&self, user: &str) -> u64 {
+        let auth = self.auth.read();
+        let hash = auth.get(user).map_or(&self.decoy, |record| &record.hash);
+        // PHC stores Argon2's memory cost in KiB. Malformed/overflowing costs
+        // fail closed before hashing; verification still validates the full PHC.
+        hash.0
+            .split('$')
+            .nth(3)
+            .and_then(|params| params.split(',').find_map(|p| p.strip_prefix("m=")))
+            .and_then(|m| m.parse::<u64>().ok())
+            .and_then(|m| m.checked_mul(1024))
+            .and_then(|bytes| bytes.checked_add(8 * 1024 * 1024))
+            .unwrap_or(u64::MAX)
+    }
+
     fn verify_login(&self, user: &str, password: &[u8]) -> Option<TenantId> {
         self.auth
             .read()

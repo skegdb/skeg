@@ -1,12 +1,11 @@
 # Security policy
 
-See [skegdb/.github/SECURITY.md](https://github.com/skegdb/.github/blob/main/SECURITY.md)
-for the organization-wide policy.
+Report vulnerabilities privately using
+[GitHub private vulnerability reporting](https://github.com/skegdb/skeg/security/advisories/new).
+Private reporting is enabled for this repository. Include the affected version,
+deployment profile, reproduction and impact; remove production credentials and
+customer data from attachments.
 
-Short version: **do NOT open a public issue with exploit details.**
-Open a brief "Security" issue here saying you have a finding and the
-maintainer will move the conversation to a private channel.
-
-A dedicated `security@` mailbox will be activated in the coming days;
-until then, the GitHub issue tracker is the only entry point.
-
+Do not publish exploit details in an issue. There is no announced security
+mailbox or response-time SLA. Use the private report for follow-up and coordinated
+disclosure. General non-sensitive bugs can use the public issue tracker.

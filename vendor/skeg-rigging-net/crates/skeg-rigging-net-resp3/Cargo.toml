@@ -1,0 +1,28 @@
+[package]
+name = "skeg-rigging-net-resp3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "RESP3 transport for skeg-rigging: federate against a skeg-server over the network."
+keywords = ["skeg", "rigging", "resp3", "redis-protocol", "federation"]
+categories = ["network-programming", "database"]
+readme = "../../README.md"
+
+[dependencies]
+skeg-rigging = { workspace = true }
+skeg-rigging-net = { path = "../skeg-rigging-net", version = "0.1.2" }
+skeg-resp3 = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+
+[lints]
+workspace = true

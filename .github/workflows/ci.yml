@@ -5,12 +5,35 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   ci:
-    # Pinned to a tag, not @main: a reusable workflow on a moving ref means
-    # CI can change under a commit that did not change, so a green build
-    # stops being evidence about that commit.
-    uses: skegdb/.github/.github/workflows/rust-ci.yml@v1
-    with:
-      workspace: true
-      msrv: "1.88"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.88'
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - run: python3 -m unittest discover -s scripts/tests
+      - run: ruby scripts/check-release-graph.rb
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --release --locked -- --test-threads=1
+      - name: tenant lifecycle 20 serial and 20 parallel runs
+        run: python3 scripts/check-tenant-cli.py --profile release --output evidence/tenant-cli
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: tenant-cli-${{ matrix.os }}
+          path: evidence/tenant-cli

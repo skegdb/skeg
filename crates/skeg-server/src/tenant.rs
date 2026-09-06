@@ -126,6 +126,14 @@ pub trait TenantBackend: Send + Sync {
     /// user existence, to avoid leaking valid usernames via timing.
     fn verify_login(&self, user: &str, password: &[u8]) -> Option<TenantId>;
 
+    /// Conservative password verification working set, including allocator slack.
+    /// Backends using more than 64 MiB must override this before serving logins.
+    /// Return `u64::MAX` for an invalid or unrepresentable cost; admission
+    /// rejects it even when no process memory limit is configured.
+    fn login_memory_bytes(&self, _user: &str) -> u64 {
+        64 * 1024 * 1024
+    }
+
     /// True if any record in the backing store is bound to `id`. Used
     /// by the anonymous-prefix forgery defense in the RESP3 handler:
     /// a `TenantId::ZERO` client cannot forge a key whose first 16

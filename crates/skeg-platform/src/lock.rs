@@ -119,6 +119,8 @@ mod tests {
     #[test]
     fn shared_locks_coexist_but_exclude_the_writer() {
         let dir = tempfile::TempDir::new().unwrap();
+        // Readers open an existing completed store; they must not create its lock.
+        drop(DirLock::acquire_exclusive(dir.path()).unwrap());
         let _r1 = DirLock::acquire_shared(dir.path()).unwrap();
         let _r2 = DirLock::acquire_shared(dir.path()).unwrap();
         let err = DirLock::acquire_exclusive(dir.path()).unwrap_err();

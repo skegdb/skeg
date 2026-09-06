@@ -12,18 +12,19 @@ WORKDIR /src
 # the resulting binary runs on any x86_64 machine.
 ARG CARGO_FEATURES=
 
-# Cache dependency builds: copy manifests first, fetch, then bring in sources.
-COPY Cargo.toml Cargo.lock ./
+# Build from the restricted, locked server graph. The root workspace's vendored
+# SDK adapters are not dependencies of the shipped RESP3 server image.
+COPY docker/Cargo.toml ./Cargo.toml
+COPY docker/Cargo.lock ./Cargo.lock
 COPY crates ./crates
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-        --bin skeg --bin skeg-resp3 -p skeg-server \
+        --bin skeg-resp3 -p skeg-server --features tenant-auth \
         ${CARGO_FEATURES:+--features $CARGO_FEATURES} && \
-    cp target/release/skeg /usr/local/bin/skeg && \
     cp target/release/skeg-resp3 /usr/local/bin/skeg-resp3 && \
-    strip /usr/local/bin/skeg /usr/local/bin/skeg-resp3
+    strip /usr/local/bin/skeg-resp3
 
 # ---------- runtime ----------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -36,30 +37,26 @@ RUN apt-get update && \
     mkdir -p /var/lib/skeg && \
     chown -R skeg:skeg /var/lib/skeg
 
-COPY --from=builder /usr/local/bin/skeg        /usr/local/bin/skeg
 COPY --from=builder /usr/local/bin/skeg-resp3  /usr/local/bin/skeg-resp3
 
 USER skeg
 WORKDIR /var/lib/skeg
 VOLUME ["/var/lib/skeg"]
 
-# Native protocol (used by skeg-client-rs, skeg-py, skeg-ollama) on 7379.
-# RESP3 / Redis-compat on 6379 if user runs `--entrypoint skeg-resp3`.
-EXPOSE 7379 6379
+# The public server image is the one RESP3 binary. It is single-tenant with
+# no tenant flags, strict multi-tenant with --tenant-auth --tenant-strict.
+EXPOSE 6379
 
 # Docker's default is already SIGTERM; spelling it here makes the image's
 # durable shutdown contract part of its metadata rather than an assumption.
 STOPSIGNAL SIGTERM
 
-# Listen on all interfaces so the container is reachable from the host via
-# `-p`. This image has no authentication, so the server refuses to start
-# unless the operator explicitly opts in with
-# `-e SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1` on the `docker run` command -
-# see the README quickstart. Override SKEG_ADDR for a custom bind. The
-# operator is relied on to publish the port on the host loopback only
-# (`-p 127.0.0.1:7379:7379`) or otherwise keep the container network-isolated.
-ENV SKEG_ADDR=0.0.0.0:7379 \
+# Listen on all interfaces so Docker port publishing can reach the service.
+# Without strict tenant auth the binary refuses this non-loopback bind unless
+# the operator explicitly opts in to unauthenticated networking. Production
+# invokes this image with --tenant-auth /auth/auth.kdb --tenant-strict.
+ENV SKEG_RESP3_ADDR=0.0.0.0:6379 \
     SKEG_DATA_DIR=/var/lib/skeg \
     RUST_LOG=info
 
-ENTRYPOINT ["/usr/local/bin/skeg"]
+ENTRYPOINT ["/usr/local/bin/skeg-resp3"]

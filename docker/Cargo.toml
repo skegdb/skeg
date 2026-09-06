@@ -1,0 +1,70 @@
+# Docker's self-contained server build graph.
+#
+# This is deliberately a restricted workspace: `skeg-multi-tenant`'s optional
+# Rigging integration belongs to the SDK release graph, not to the RESP3 server
+# artifact. Keeping it out means the server image does not need vendored SDK
+# adapters. Update this manifest and its lockfile
+# whenever the root workspace fields or a server dependency changes.
+
+[workspace]
+members = [
+    "crates/skeg-proto",
+    "crates/skeg-core",
+    "crates/skeg-simd",
+    "crates/skeg-platform",
+    "crates/skeg-vector",
+    "crates/skeg-server",
+    "crates/skeg-resp3",
+    "crates/skeg-telemetry",
+    "crates/skeg-tenant",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/skegdb/skeg"
+homepage = "https://github.com/skegdb/skeg"
+authors = ["skeg contributors"]
+description = "RAM-frugal KV + vector store for Personal AI inference machines"
+keywords = ["vector-database", "kv-store", "personal-ai", "vamana", "ann"]
+categories = ["database", "data-structures"]
+
+[workspace.lints.rust]
+unknown_lints = "allow"
+
+[workspace.lints.clippy]
+uninlined_format_args = "allow"
+manual_is_multiple_of = "allow"
+await_holding_lock = "deny"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+futures-util = { version = "0.3", default-features = false }
+bytes = "1"
+bitflags = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32c = "0.6"
+parking_lot = "0.12"
+smallvec = { version = "1", features = ["union"] }
+fixedbitset = "0.5"
+ahash = "0.8"
+ordered-float = "4"
+libc = "0.2"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+tikv-jemallocator = "0.6"
+rand = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

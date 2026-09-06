@@ -13,11 +13,9 @@ members = [
     "crates/skeg-multi-tenant",
     "crates/repo-audit",
 ]
-# Fuzz targets live outside the workspace (own Cargo.toml). The
-# `live-attach` feature of skeg-multi-tenant only resolves when the
-# sibling skeg-rigging-net repo is available; build the crate without
-# that feature in fresh checkouts.
-exclude = ["fuzz"]
+# Fuzz and vendored adapters have their own workspace manifests. The
+# live-attach graph resolves entirely inside this checkout through the patches below.
+exclude = ["fuzz", "vendor/skeg-rigging", "vendor/skeg-rigging-net"]
 resolver = "2"
 
 [workspace.package]
@@ -122,14 +120,13 @@ inherits = "release"
 debug = true
 
 [patch.crates-io]
-# Workspace engine crates replace their registry counterparts so the tested
-# graph uses the exact v0.8 implementation. During the local candidate phase,
-# adapter candidates come from sibling repositories in the skegdb checkout.
-# The hosted release harness checks out these same repositories at full SHAs.
-skeg-rigging = { path = "../skeg-rigging/crates/skeg-rigging" }
-skeg-rigging-skeg = { path = "../skeg-rigging/crates/skeg-rigging-skeg" }
-skeg-rigging-net = { path = "../skeg-rigging-net/crates/skeg-rigging-net" }
-skeg-rigging-net-resp3 = { path = "../skeg-rigging-net/crates/skeg-rigging-net-resp3" }
+# Candidate adapters are vendored until their compatible registry versions ship.
+# vendor/SOURCES.json pins origin commits and every file; CI verifies it.
+# Engine dependencies still resolve to this workspace's exact implementation.
+skeg-rigging = { path = "vendor/skeg-rigging/crates/skeg-rigging" }
+skeg-rigging-skeg = { path = "vendor/skeg-rigging/crates/skeg-rigging-skeg" }
+skeg-rigging-net = { path = "vendor/skeg-rigging-net/crates/skeg-rigging-net" }
+skeg-rigging-net-resp3 = { path = "vendor/skeg-rigging-net/crates/skeg-rigging-net-resp3" }
 skeg-resp3 = { path = "crates/skeg-resp3" }
 skeg-vector = { path = "crates/skeg-vector" }
 skeg-simd = { path = "crates/skeg-simd" }

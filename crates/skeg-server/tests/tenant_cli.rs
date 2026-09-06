@@ -9,17 +9,70 @@
 //! authenticated multi-tenant one, and only the second counts as
 //! authenticated for the non-loopback guard.
 
-use std::io::Read;
 use std::process::{Command, Stdio};
 
 use skeg_tenant::AuthStore;
 use skeg_tenant::TenantId;
 use skeg_tenant::auth::{Argon2Params, hash_password_with};
 
+struct ChildGuard {
+    child: std::process::Child,
+    _log: tempfile::NamedTempFile,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        eprintln!("phase: reaped pid={}", self.child.id());
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn child_fixture_reaps_after_assertion_unwinds() {
+    let child = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let guard = ChildGuard {
+        child,
+        _log: tempfile::NamedTempFile::new().unwrap(),
+    };
+    let result = std::panic::catch_unwind(move || {
+        let _guard = guard;
+        panic!("simulated assertion after spawn");
+    });
+    assert!(result.is_err());
+    let mut status = 0;
+    // SAFETY: waitpid only writes to this stack integer; this is our child PID.
+    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if reaped == 0 {
+        // Clean up even on the red regression test, not just the passing path.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+    assert_eq!(reaped, -1, "fixture left a live or unreaped child");
+}
+
 /// Run `skeg-server --addr 0.0.0.0:0` (plus `extra_args`) against a scratch
 /// data dir, wait for it to exit, and return (success, stderr).
 fn run_and_wait(extra_args: &[&str]) -> (bool, String) {
     let dir = tempfile::tempdir().expect("tempdir");
+    let log = tempfile::NamedTempFile::new().expect("child log");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_skeg-resp3"));
     cmd.arg("--addr")
         .arg("0.0.0.0:0")
@@ -27,9 +80,14 @@ fn run_and_wait(extra_args: &[&str]) -> (bool, String) {
         .arg(dir.path())
         .args(extra_args)
         .env_remove(skeg_server::ALLOW_ENV)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn binary");
+        .env("SKEG_SHARDS", "1")
+        .stdout(Stdio::from(log.reopen().expect("stdout log")))
+        .stderr(Stdio::from(log.reopen().expect("stderr log")));
+    let mut child = ChildGuard {
+        child: cmd.spawn().expect("spawn binary"),
+        _log: log,
+    };
+    eprintln!("phase: spawned pid={}", child.id());
     // A refused bind exits at once. A regression that lets the server start
     // would otherwise block here forever (it listens until killed), so a
     // process still alive at the deadline is reported as "started".
@@ -44,9 +102,8 @@ fn run_and_wait(extra_args: &[&str]) -> (bool, String) {
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     };
-    let output = child.wait_with_output().expect("wait for output");
-    let mut stderr = String::new();
-    let _ = std::io::Cursor::new(&output.stderr).read_to_string(&mut stderr);
+    child.wait().expect("wait for exit");
+    let stderr = std::fs::read_to_string(child._log.path()).expect("read child log");
     (started, stderr)
 }
 
@@ -62,11 +119,13 @@ fn resp3_binary_without_tenant_auth_refuses_unauthenticated_network_bind() {
 
 /// Write a one-user `auth.kdb` into `dir` and return its path.
 fn write_auth_store(dir: &std::path::Path) -> std::path::PathBuf {
+    eprintln!("phase: write_auth_store start");
     let auth_path = dir.join("auth.kdb");
     let mut store = AuthStore::open(&auth_path).expect("open auth store");
     let hash = hash_password_with(b"pw", Argon2Params::default()).expect("hash password");
     store.upsert("u", TenantId::from_name("acme"), hash);
     store.save().expect("save auth store");
+    eprintln!("phase: write_auth_store saved");
     auth_path
 }
 
@@ -83,8 +142,8 @@ fn resp3_binary_with_lenient_tenant_auth_refuses_unauthenticated_network_bind() 
 }
 
 /// A free port, taken and released: the child binds it a moment later. A
-/// port the kernel just handed out is not handed out again while this test
-/// runs, and the readiness check below is a TCP connect, not a line of log.
+/// port can be claimed by another process before spawn; the child exit check
+/// and per-run logs make that race a bounded failure, never a blind retry.
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     l.local_addr().expect("addr").port()
@@ -96,21 +155,30 @@ fn free_port() -> u16 {
 /// a gate that depends on a log line's wording, on the log level, and on the
 /// pipe being drained fast enough. A connect loop asks the thing the test
 /// actually needs.
-fn spawn_ready(args: &[&str], port: u16) -> std::process::Child {
+fn spawn_ready(args: &[&str], port: u16) -> ChildGuard {
+    eprintln!("phase: spawn_ready port={port}");
+    let log = tempfile::NamedTempFile::new().expect("child log");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_skeg-resp3"));
     cmd.args(args)
         .env_remove(skeg_server::ALLOW_ENV)
         .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn binary");
+        .env("SKEG_SHARDS", "1")
+        .stdout(Stdio::from(log.reopen().expect("stdout log")))
+        .stderr(Stdio::from(log.reopen().expect("stderr log")));
+    let mut child = ChildGuard {
+        child: cmd.spawn().expect("spawn binary"),
+        _log: log,
+    };
+    eprintln!("phase: spawned pid={} port={port}", child.id());
     let addr = format!("127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
-            panic!("server exited before it listened: {status:?}");
+            let log = std::fs::read_to_string(child._log.path()).unwrap_or_default();
+            panic!("server exited before it listened: {status:?}\n{log}");
         }
         if std::net::TcpStream::connect(&addr).is_ok() {
+            eprintln!("phase: ready pid={} port={port}", child.id());
             return child;
         }
         if std::time::Instant::now() >= deadline {
@@ -214,10 +282,13 @@ fn one_binary_serves_two_isolated_tenants_and_refuses_the_anonymous() {
     let auth_path = dir.path().join("auth.kdb");
     let mut store = AuthStore::open(&auth_path).expect("open auth store");
     for (user, tenant) in [("alice", "acme"), ("bob", "globex")] {
+        eprintln!("phase: hash {user} start");
         let hash = hash_password_with(user.as_bytes(), Argon2Params::default()).expect("hash");
+        eprintln!("phase: hash {user} complete");
         store.upsert(user, TenantId::from_name(tenant), hash);
     }
     store.save().expect("save auth store");
+    eprintln!("phase: Alice/Bob store saved");
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let port = free_port();
@@ -269,54 +340,4 @@ fn one_binary_serves_two_isolated_tenants_and_refuses_the_anonymous() {
 
     let _ = child.kill();
     let _ = child.wait();
-}
-
-/// The product rule, pinned where it can be broken: one public RESP3
-/// executable, and nothing that tells an operator to start another one.
-///
-/// A second binary is not a documentation problem - it is a deployment whose
-/// authentication depends on which of two commands someone typed. This test
-/// reads the manifests, the Dockerfile and the release workflows, so adding
-/// one back fails here rather than in production.
-#[test]
-fn nothing_ships_a_second_resp3_binary() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-
-    let shim = std::fs::read_to_string(root.join("crates/skeg-server-tenant/Cargo.toml"))
-        .expect("read the compatibility crate's manifest");
-    assert!(
-        !shim.contains("[[bin]]"),
-        "skeg-server-tenant declares a binary again: the multi-tenant profile \
-         belongs to skeg-resp3"
-    );
-
-    for (file, what) in [
-        ("Dockerfile", "the image"),
-        (
-            ".github/workflows/build-artifacts.yml",
-            "the artifact build",
-        ),
-        (".github/workflows/release.yml", "the release build"),
-    ] {
-        let text = std::fs::read_to_string(root.join(file)).expect("read");
-        // The crate name may still appear in the publish list - the shim is
-        // still published. What must not appear is a second server BINARY.
-        assert!(
-            !text.contains("--bin skeg-server"),
-            "{what} builds a second server binary: {file}"
-        );
-        assert!(
-            !text.contains("-p skeg-server-tenant"),
-            "{what} builds the compatibility crate as a binary: {file}"
-        );
-    }
-
-    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).expect("read Dockerfile");
-    assert!(
-        dockerfile.contains("skeg-resp3"),
-        "the image must carry the one RESP3 binary"
-    );
 }

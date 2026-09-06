@@ -93,6 +93,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: changed crates carry unpublished versions; the tag names the product version
         # On a tag push the tag must be exactly v<skeg-server version>: every
@@ -112,10 +114,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo fmt
         run: cargo fmt --all -- --check
+      - name: release validator regressions
+        run: |
+          python3 -m unittest discover -s scripts/tests
+          ruby scripts/check-release-graph.rb
       - name: cargo clippy
         # `--all-features` is stricter than the CI lint (it also compiles the
         # avx512, metrics-http, tracing-otlp and live-attach code); `--locked`
@@ -126,8 +134,15 @@ jobs:
         # workspace suite exhausted the file-descriptor budget locally
         # (EMFILE); lift once the suite owns its FD budget.
         run: cargo test --workspace --release --locked -- --test-threads=1
+      - name: tenant lifecycle repetitions
+        run: python3 scripts/check-tenant-cli.py --profile release --output evidence/tenant-cli
       - name: maintenance memory gate (real cgroups, 256/512 MiB)
         run: scripts/check-maintenance-cgroup.sh
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: evidence-release-gates
+          path: evidence
 
   publish-crates:
     if: github.event_name == 'push'
@@ -140,6 +155,8 @@ jobs:
           # Full history + tags needed to diff each crate against the
           # previous release and skip unchanged ones.
           fetch-depth: 0
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: publish changed crates in dep order
@@ -223,7 +240,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04-arm
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             features: avx512
@@ -232,38 +249,22 @@ jobs:
     needs: [guard, test]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: build
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            # Same bounded retry as build-artifacts.yml: an apt mirror that
-            # stalls must not hang a release.
-            for attempt in 1 2 3; do
-              if timeout 180 sudo apt-get update \
-                 && timeout 300 sudo apt-get install -y gcc-aarch64-linux-gnu; then
-                installed=1
-                break
-              fi
-              echo "apt attempt $attempt failed or timed out, retrying"
-              sleep 15
-            done
-            if [ "${installed:-0}" != "1" ]; then
-              echo "::error::could not install the aarch64 cross-linker"
-              exit 1
-            fi
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-          fi
           cargo build --release --target ${{ matrix.target }} \
-            --bin skeg --bin skeg-resp3 -p skeg-server --locked \
+            --bin skeg --bin skeg-resp3 -p skeg-server --locked --features tenant-auth \
             ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
       - name: package
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz skeg skeg-resp3
-          shasum -a 256 skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > skeg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          COPYFILE_DISABLE=1 tar -czf skeg-${{ github.event_name == 'push' && github.ref_name || github.sha }}-${{ matrix.target }}.tar.gz skeg skeg-resp3
+          shasum -a 256 skeg-${{ github.event_name == 'push' && github.ref_name || github.sha }}-${{ matrix.target }}.tar.gz > skeg-${{ github.event_name == 'push' && github.ref_name || github.sha }}-${{ matrix.target }}.tar.gz.sha256
       # Run artifact only; `promote-release` uploads them to the GitHub
       # Release once every target (and the image) has built.
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -273,9 +274,41 @@ jobs:
             target/${{ matrix.target }}/release/skeg-*.tar.gz
             target/${{ matrix.target }}/release/skeg-*.tar.gz.sha256
 
-  # Build the multi-binary container image for ghcr.io.
-  # The image bundles both `skeg` (native protocol, 7379) and
-  # `skeg-resp3` (Redis-compat, 6379). Default entrypoint is `skeg`.
+  artifact-smoke:
+    needs: build-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: skeg-${{ github.sha }}-${{ matrix.target }}
+          path: dist
+      - name: stateful smoke of downloaded tarball
+        run: |
+          for artifact in dist/*.tar.gz; do
+            bash scripts/smoke-resp3-artifact.sh --tarball "$artifact" \
+              --require-clean --source-sha "$GITHUB_SHA" --evidence evidence/tarball-${{ matrix.target }}.json
+          done
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: evidence-tarball-${{ matrix.target }}
+          path: evidence
+
+  # Build the canonical RESP3 container image for ghcr.io. The one entrypoint
+  # is `skeg-resp3`: single-tenant without tenant flags, strict multi-tenant
+  # with --tenant-auth plus --tenant-strict.
   # Built natively per architecture (arm64 + amd64 manifest); published tags:
   #   ghcr.io/skegdb/skeg:<version>   (e.g. 0.1.1)
   #   ghcr.io/skegdb/skeg:latest      (only on tag pushes)
@@ -307,24 +340,34 @@ jobs:
     # (drafts are invisible to everyone but maintainers) that
     # `validate-cleanup` deletes together with the tag.
     if: github.event_name == 'push' || inputs.validate_promote == true
-    needs: [guard, test, build-binaries, docker-build]
+    needs: [guard, test, build-binaries, artifact-smoke, docker-build]
     permissions:
       contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: skeg-${{ github.sha }}-*
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: evidence-*
+          merge-multiple: true
+          path: evidence
+      - name: verify and assemble release evidence
+        run: python3 scripts/collect-release-evidence.py evidence "$GITHUB_SHA" dist/release-evidence.json
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ github.event_name == 'push' && github.ref_name || format('validate-{0}', github.sha) }}
           draft: ${{ github.event_name != 'push' }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/skeg-*.tar.gz
             dist/skeg-*.tar.gz.sha256
+            dist/release-evidence.json
 
   docker-promote:
     # Binds the digests `docker-build` pushed under `:<version>` / `:latest`
@@ -357,26 +400,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: delete the draft release and its tag
+      - name: delete and verify validation objects
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eo pipefail
-          tag="validate-${GITHUB_SHA}"
-          gh release delete "$tag" --yes --cleanup-tag || echo "no draft release '$tag' to delete"
-      - name: delete the scratch image tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eo pipefail
-          tag="validate-${GITHUB_SHA}"
-          ids=$(gh api --paginate "/orgs/skegdb/packages/container/skeg/versions" \
-                --jq ".[] | select(.metadata.container.tags | index(\"$tag\")) | .id")
-          if [ -z "$ids" ]; then echo "no image tagged '$tag'"; exit 0; fi
-          for id in $ids; do
-            gh api -X DELETE "/orgs/skegdb/packages/container/skeg/versions/$id"
-            echo "deleted package version $id ($tag)"
-          done
+        run: python3 scripts/cleanup-validation.py
 
   # Custom one-shot brew bump. mislav's action stops working on the
   # second invocation because the version field is already at the

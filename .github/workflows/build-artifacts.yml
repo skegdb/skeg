@@ -30,57 +30,49 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04-arm
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
-      - name: install linux aarch64 cross-linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        timeout-minutes: 15
-        run: |
-          # apt mirrors stall rather than fail: a bare `apt-get update` has
-          # hung this job for an hour with no timeout to stop it. Bound each
-          # call and retry, so a bad mirror costs minutes and a clear error
-          # instead of a workflow that never ends.
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if timeout 180 sudo apt-get update \
-               && timeout 300 sudo apt-get install -y gcc-aarch64-linux-gnu; then
-              installed=1
-              break
-            fi
-            echo "apt attempt $attempt failed or timed out, retrying"
-            sleep 15
-          done
-          if [ "${installed:-0}" != "1" ]; then
-            echo "::error::could not install the aarch64 cross-linker after 3 attempts"
-            exit 1
-          fi
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: cargo build
         run: |
           cargo build --release --locked \
             --target ${{ matrix.target }} \
-            --bin skeg --bin skeg-resp3 -p skeg-server
+            --bin skeg --bin skeg-resp3 -p skeg-server --features tenant-auth
       - name: package
         id: pkg
+        env:
+          VERSION_SUFFIX: ${{ github.event.inputs.version_suffix || 'dev' }}
         run: |
-          SUFFIX="${{ github.event.inputs.version_suffix || 'dev' }}"
-          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          SUFFIX="$VERSION_SUFFIX"
+          [[ "$SUFFIX" =~ ^[a-zA-Z0-9_.-]{1,64}$ ]] || exit 1
+          SHA="${GITHUB_SHA::7}"
           NAME="skeg-${SUFFIX}-${SHA}-${{ matrix.target }}"
           cd target/${{ matrix.target }}/release
-          tar -czf "${NAME}.tar.gz" skeg skeg-resp3
+          COPYFILE_DISABLE=1 tar -czf "${NAME}.tar.gz" skeg skeg-resp3
           shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+      - name: stateful artifact smoke
+        run: |
+          bash scripts/smoke-resp3-artifact.sh \
+            --tarball "target/${{ matrix.target }}/release/${{ steps.pkg.outputs.name }}.tar.gz" \
+            --require-clean --source-sha "$GITHUB_SHA" --evidence evidence/tarball-${{ matrix.target }}.json
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: evidence-${{ matrix.target }}
+          path: evidence
       - name: upload workflow artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:

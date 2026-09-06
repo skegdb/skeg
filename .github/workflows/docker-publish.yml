@@ -55,6 +55,7 @@ on:
     branches: [release]
     paths:
       - 'Dockerfile'
+      - 'docker/**'
       - '.dockerignore'
       - 'crates/**'
       - 'Cargo.toml'
@@ -124,6 +125,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: exact ecosystem candidate
+        run: bash scripts/checkout-ecosystem.sh
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo fmt
@@ -132,6 +135,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo test
         run: cargo test --workspace --release --locked -- --test-threads=1
+      - name: tenant lifecycle repetitions
+        run: python3 scripts/check-tenant-cli.py --profile release --output evidence/tenant-cli
+      - name: maintenance memory gate (real cgroups, 256/512 MiB)
+        run: bash scripts/check-maintenance-cgroup.sh
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: evidence-standalone-release-gates
+          path: evidence
 
   # Tags are derived once and shared: the per-architecture builds push by
   # digest and carry no tags of their own, so a half-finished matrix can
@@ -144,17 +156,28 @@ jobs:
     steps:
       - name: derive tags
         id: meta
+        env:
+          SCRATCH_TAG: ${{ inputs.scratch_tag }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          STAGE: ${{ inputs.stage }}
+          ALSO_LATEST: ${{ github.event.inputs.also_latest }}
         run: |
           SHA_SHORT="${GITHUB_SHA::7}"
           REF="${GITHUB_REF}"
-          if [ -n "${{ inputs.scratch_tag }}" ]; then
+          for candidate in "$SCRATCH_TAG" "$INPUT_TAG"; do
+            if [ -n "$candidate" ] && ! [[ "$candidate" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+              echo '::error::invalid image tag'
+              exit 1
+            fi
+          done
+          if [ -n "$SCRATCH_TAG" ]; then
             # validate-promote: one throwaway tag, deleted by the caller.
-            TAGS="ghcr.io/skegdb/skeg:${{ inputs.scratch_tag }}"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -z "${{ inputs.stage }}" ]; then
-            INPUT_TAG="${{ github.event.inputs.tag }}"
+            TAGS="ghcr.io/skegdb/skeg:${SCRATCH_TAG}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -z "$STAGE" ]; then
             PRIMARY="${INPUT_TAG:-$SHA_SHORT}"
             TAGS="ghcr.io/skegdb/skeg:${PRIMARY}\nghcr.io/skegdb/skeg:sha-${SHA_SHORT}"
-            if [ "${{ github.event.inputs.also_latest }}" = "true" ]; then
+            if [ "$ALSO_LATEST" = "true" ]; then
               TAGS="${TAGS}\nghcr.io/skegdb/skeg:latest"
             fi
           elif [[ "${REF}" == refs/tags/v* ]]; then
@@ -222,12 +245,40 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           build-args: ${{ matrix.build_args }}
-          outputs: type=image,name=ghcr.io/skegdb/skeg,push-by-digest=true,name-canonical=true,push=${{ !inputs.dry_run }}
+          outputs: ${{ inputs.dry_run && 'type=docker,dest=/tmp/skeg-candidate.tar' || 'type=image,name=ghcr.io/skegdb/skeg,push-by-digest=true,name-canonical=true,push=true' }}
+          sbom: ${{ !inputs.dry_run }}
+          provenance: ${{ !inputs.dry_run && 'mode=max' || 'false' }}
           labels: |
             org.opencontainers.image.source=https://github.com/skegdb/skeg
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.description=Vector + KV store, SSD-primary, RAM-frugal.
+      - name: smoke exact candidate image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          clean=()
+          if [ "$DRY_RUN" = true ]; then
+            docker load --input /tmp/skeg-candidate.tar
+            image="$IMAGE_ID"
+          else
+            image="ghcr.io/skegdb/skeg@$DIGEST"
+            docker pull "$image"
+            clean=(--require-clean)
+          fi
+          bash scripts/smoke-resp3-artifact.sh --image "$image" \
+            "${clean[@]}" --source-sha "$GITHUB_SHA" --evidence evidence/image-${{ strategy.job-index }}.json
+          for limit in 256 512; do
+            python3 scripts/stress-artifact-auth.py --image "$image" --memory "$limit" \
+              --evidence evidence/auth-${{ strategy.job-index }}-${limit}.json
+          done
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: evidence-image-${{ strategy.job-index }}
+          path: evidence
       - name: export digest
         if: ${{ !inputs.dry_run }}
         run: |
@@ -269,18 +320,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: create the manifest list
+        env:
+          IMAGE_TAGS: ${{ needs.meta.outputs.tags }}
         run: |
           cd /tmp/digests
-          refs=""
-          for d in *; do refs="$refs ghcr.io/skegdb/skeg@sha256:$d"; done
-          # shellcheck disable=SC2086
+          shopt -s nullglob
+          digests=(*)
+          if [ "${#digests[@]}" -ne 2 ]; then
+            echo '::error::expected exactly two architecture digests'
+            exit 1
+          fi
+          refs=()
+          for d in "${digests[@]}"; do
+            [[ "$d" =~ ^[a-f0-9]{64}$ ]] || exit 1
+            refs+=("ghcr.io/skegdb/skeg@sha256:$d")
+          done
           while read -r tag; do
             [ -n "$tag" ] || continue
-            docker buildx imagetools create --tag "$tag" $refs
-          done <<< "${{ needs.meta.outputs.tags }}"
+            docker buildx imagetools create --tag "$tag" "${refs[@]}"
+          done <<< "$IMAGE_TAGS"
       - name: report what was published
+        env:
+          IMAGE_TAGS: ${{ needs.meta.outputs.tags }}
         run: |
           while read -r tag; do
             [ -n "$tag" ] || continue
             docker buildx imagetools inspect "$tag" | head -20
-          done <<< "${{ needs.meta.outputs.tags }}"
+          done <<< "$IMAGE_TAGS"

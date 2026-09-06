@@ -9,7 +9,7 @@ root = File.expand_path('..', __dir__)
 rel = YAML.load_file(ARGV[0] || File.join(root, '.github/workflows/release.yml'))
 dp  = YAML.load_file(File.join(root, '.github/workflows/docker-publish.yml'))
 jobs = rel['jobs']
-BUILDS = %w[guard version-gate test build-binaries docker-build].freeze
+BUILDS = %w[guard version-gate test build-binaries artifact-smoke docker-build].freeze
 PUBLISH_MARKERS = ['action-gh-release', 'cargo publish', 'git push', 'imagetools create'].freeze
 
 def publishes?(name, job)
@@ -56,6 +56,36 @@ fails << 'build-binaries is not a matrix build' unless jobs['build-binaries'].di
 fails << "docker-publish build job does not skip on stage=promote" unless dp.dig('jobs', 'build', 'if').to_s.include?("inputs.stage != 'promote'")
 fails << "docker-publish merge job does not skip on stage=build" unless dp.dig('jobs', 'merge', 'if').to_s.include?("inputs.stage != 'build'")
 fails << "docker-publish still fires on v* tags by itself" if Array(dp.dig(true, 'push', 'tags') || dp.dig('on', 'push', 'tags')).any?
+
+# Gate contents, not only their job names. A standalone publisher must enforce
+# the same memory contract as the tag path.
+[jobs.fetch('test'), dp.dig('jobs', 'test')].each do |job|
+  text = job.to_yaml
+  %w[check-maintenance-cgroup.sh check-tenant-cli.py].each do |gate|
+    fails << "test job omits #{gate}" unless text.include?(gate)
+  end
+end
+smoke = jobs.fetch('artifact-smoke').to_yaml
+fails << 'tarball gate must test downloaded artifacts' unless smoke.include?('download-artifact@') && smoke.include?('--tarball')
+image_steps = dp.dig('jobs', 'build', 'steps')
+image_smoke = image_steps.index { |s| s['run'].to_s.include?('smoke-resp3-artifact.sh --image') }
+export = image_steps.index { |s| s['name'] == 'export digest' }
+fails << 'image digest exported before stateful smoke' unless image_smoke && export && image_smoke < export
+
+Dir[File.join(root, '.github/workflows/*.yml')].each do |path|
+  workflow = YAML.load_file(path)
+  if File.read(path).include?('tar -czf') && !File.read(path).include?('COPYFILE_DISABLE=1 tar -czf')
+    fails << "#{File.basename(path)} may package AppleDouble metadata instead of exactly two executables"
+  end
+  workflow.fetch('jobs').each do |name, job|
+    next unless job.to_yaml.match?(/cargo (build|test|clippy|publish|rustc)/)
+    fails << "#{File.basename(path)}:#{name} omits exact ecosystem checkout" unless job.to_yaml.include?('checkout-ecosystem.sh')
+  end
+  File.read(path).scan(/uses:\s*([^\s#]+)/).flatten.each do |ref|
+    next if ref.start_with?('./')
+    fails << "mutable action ref #{ref}" unless ref.match?(/@[a-f0-9]{40}\z/)
+  end
+end
 
 if fails.empty?
   puts "ok: publishers #{publishers.join(', ')} all wait for #{BUILDS.join(', ')}"

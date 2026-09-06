@@ -1,0 +1,36 @@
+[package]
+name = "skeg-rigging"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Public extension points for skeg plugins: stable trait-based contracts."
+readme = "../../README.md"
+keywords = ["skeg", "plugin", "extension", "vector", "kv-store"]
+categories = ["database", "api-bindings"]
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+# In-memory `MockTenant` for plugin authors who want to test against
+# the rigging surface without pulling in a real engine.
+mock = []
+# Async trait variants (F.10): `AsyncIterVectors`, `AsyncQueryFiltered`,
+# `AsyncReadOnlyView` for callers running under Tokio. Sync traits stay
+# the default; this is purely additive.
+async = ["dep:async-trait", "dep:futures-core", "dep:tokio"]
+
+[lints]
+workspace = true

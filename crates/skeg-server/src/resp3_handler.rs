@@ -1209,14 +1209,22 @@ async fn dispatch_command(
                                 "WRONGPASS too many failed attempts, try again later".into(),
                             );
                         }
-                        match ctx.verify_login(user, pass.as_bytes()) {
-                            Some(tid) => {
+                        let verified = crate::auth_admission::verify(
+                            Arc::clone(ctx),
+                            Arc::clone(shards.memory()),
+                            user.to_owned(),
+                            pass.as_bytes().to_vec(),
+                        )
+                        .await;
+                        match verified {
+                            Err(message) => return Frame::Error(message.into()),
+                            Ok(Some(tid)) => {
                                 if let Some(ip) = peer_ip {
                                     auth_clear(ip);
                                 }
                                 *tenant = tid;
                             }
-                            None => {
+                            Ok(None) => {
                                 // Count the failure against the source IP and
                                 // tarpit the reply. HELLO/AUTH bypass the QoS
                                 // gate, so this is the only online-guessing

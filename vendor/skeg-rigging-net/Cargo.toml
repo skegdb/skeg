@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/skeg-rigging-net",
+    "crates/skeg-rigging-net-resp3",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/skegdb/skeg-rigging-net"
+homepage = "https://github.com/skegdb/skeg-rigging-net"
+authors = ["skeg contributors"]
+
+[workspace.dependencies]
+skeg-rigging = "0.1.5"
+skeg-resp3 = "0.3"
+bytes = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32c = "0.6"
+zstd = { version = "0.13", default-features = false }
+
+[workspace.lints.clippy]
+uninlined_format_args = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

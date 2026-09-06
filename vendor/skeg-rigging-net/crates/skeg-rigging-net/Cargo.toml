@@ -1,0 +1,25 @@
+[package]
+name = "skeg-rigging-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Shared transport-agnostic types for network-attached skeg-rigging adapters."
+keywords = ["skeg", "rigging", "network", "transport"]
+categories = ["network-programming", "data-structures"]
+readme = "../../README.md"
+
+[dependencies]
+skeg-rigging = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crc32c = { workspace = true }
+zstd = { workspace = true }
+
+[lints]
+workspace = true

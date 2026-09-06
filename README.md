@@ -39,12 +39,11 @@ sits in RAM, so memory grows far more slowly than the corpus it serves.
 ```sh
 docker run -d --name skeg -p 127.0.0.1:6379:6379 -v skeg-data:/var/lib/skeg \
   -e SKEG_ALLOW_UNAUTHENTICATED_NETWORK=1 \
-  --entrypoint /usr/local/bin/skeg-resp3 ghcr.io/skegdb/skeg:latest \
-  --addr 0.0.0.0:6379
+  ghcr.io/skegdb/skeg:latest
 ```
 
-`--addr` is not optional here: that binary defaults to `127.0.0.1:6379`, which
-inside a container only the container can reach. This server has no
+The image entrypoint is `skeg-resp3` and its container default is
+`0.0.0.0:6379`. This server has no
 authentication - anyone who can reach it can read, write and drop indices -
 so binding `0.0.0.0` needs the explicit opt-in above; the same command
 without it fails fast with an operator-facing message instead of starting
@@ -205,19 +204,21 @@ TARGET=aarch64-apple-darwin   # see Platforms for the full list
 TAG=$(curl -s https://api.github.com/repos/skegdb/skeg/releases/latest | grep tag_name | cut -d'"' -f4)
 curl -L -o skeg.tar.gz \
   "https://github.com/skegdb/skeg/releases/latest/download/skeg-${TAG}-${TARGET}.tar.gz"
-tar -xzf skeg.tar.gz && ./skeg --help
+tar -xzf skeg.tar.gz && ./skeg-resp3 --help
 ```
 
 Or from a checkout:
 
 ```sh
 git clone https://github.com/skegdb/skeg && cd skeg
-cargo build --release --bin skeg --bin skeg-resp3
+cargo build --release --bin skeg --bin skeg-resp3 -p skeg-server --features tenant-auth
 ```
 
-The image carries both binaries. Its default entrypoint is `skeg`, the native
-protocol, already bound to `0.0.0.0:7379`; the quickstart overrides that for
-RESP3. An Ollama companion setup lives in
+The image carries the canonical RESP3 binary only: it is single-tenant without
+tenant flags and strict multi-tenant with `--tenant-auth` plus
+`--tenant-strict`. Release tarballs retain the native `skeg` binary for its
+current specialised clients, but it is not a multi-tenant alternative. An
+Ollama companion setup lives in
 [`docker-compose.example.yml`](docker-compose.example.yml).
 
 ## Platforms
@@ -296,8 +297,8 @@ skip it with `SKIP_PREPUSH=1`).
 
 ## Security
 
-Report security issues by opening an issue with a brief description and a request
-to take the conversation private. See [`SECURITY.md`](SECURITY.md).
+Report vulnerabilities through [private vulnerability reporting](https://github.com/skegdb/skeg/security/advisories/new).
+See [`SECURITY.md`](SECURITY.md) and the [deployment runbook](docs/deployment.md).
 
 ## License
 
