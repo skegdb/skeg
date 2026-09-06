@@ -40,7 +40,11 @@ cargo fmt --all -- --check || fail "cargo fmt"
 step "cargo clippy --workspace --all-features -- -D warnings"
 cargo clippy --workspace --all-features --no-deps -- -D warnings || fail "cargo clippy"
 
-step "cargo test --workspace --all-features --no-fail-fast"
-cargo test --workspace --all-features --no-fail-fast || fail "cargo test"
+# Match CI's fixture concurrency. Parallel independent stores exhausted the
+# macOS 256-FD soft limit during setup (EMFILE), before the intended race ran.
+# Tests retain their internal async concurrency; workspace parallel qualification
+# remains a separate resource-budgeted gate, not an implicit pre-push default.
+step "cargo test --workspace --all-features --no-fail-fast -- --test-threads=1"
+cargo test --workspace --all-features --no-fail-fast -- --test-threads=1 || fail "cargo test"
 
 printf '\n\033[1;32m✓ pre-push gate passed\033[0m\n' >&2
